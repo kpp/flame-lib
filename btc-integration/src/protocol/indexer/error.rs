@@ -1,7 +1,7 @@
 use corepc_client::client_sync::Error as RpcError;
 
 use super::types::MAX_HISTORY_BLOCKS;
-use crate::{btc::rpc::BtcBlockTip, protocol::MintingVoteProcessingError};
+use crate::{btc::rpc::BtcBlockTip, protocol::MintingEndorsementProcessingError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HistoryError {
@@ -17,19 +17,19 @@ pub enum HistoryError {
     HistoryUnavailable(String),
     #[error("Bitcoin Core RPC error: {0}")]
     Rpc(#[from] RpcError),
-    #[error("failed to process minting votes: {0}")]
-    VoteProcessing(#[source] MintingVoteProcessingError),
+    #[error("failed to process minting endorsements: {0}")]
+    EndorsementProcessing(#[source] MintingEndorsementProcessingError),
     #[error("Bitcoin target tip was reorganized during the history request")]
     ChainChanged,
 }
 
-impl From<MintingVoteProcessingError> for HistoryError {
-    fn from(error: MintingVoteProcessingError) -> Self {
+impl From<MintingEndorsementProcessingError> for HistoryError {
+    fn from(error: MintingEndorsementProcessingError) -> Self {
         match error {
-            MintingVoteProcessingError::MissingPrevout { .. } => {
+            MintingEndorsementProcessingError::MissingPrevout { .. } => {
                 Self::HistoryUnavailable(error.to_string())
             }
-            _ => Self::VoteProcessing(error),
+            _ => Self::EndorsementProcessing(error),
         }
     }
 }

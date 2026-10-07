@@ -32,7 +32,7 @@ pub struct SendAcquisitionRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SendVoteRequest {
+pub struct SendEndorsementRequest {
     pub minter_id: MinterId,
     pub core_height: u32,
     pub block_hash: FlameBlockHash,

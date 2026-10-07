@@ -1,6 +1,6 @@
 //! Encoding and validation of Minter witness scripts.
 //!
-//! All scripts start with `<FLMV || predicate> OP_DROP`. VoteSigner supports
+//! All scripts start with `<FLMV || predicate> OP_DROP`. EndorsementSigner supports
 //! the canonical authorization suffix `<compressed-public-key> OP_CHECKSIG`.
 
 use corepc_client::bitcoin::{Script, ScriptBuf, secp256k1::PublicKey};

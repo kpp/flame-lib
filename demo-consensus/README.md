@@ -1,10 +1,10 @@
 # Flame Consensus Demo
 
 A local, interactive demo of Flame consensus anchored to Bitcoin. Explore both chains, create blocks and minters, send
-acquisitions and votes, and watch how votes affect weights and branch selection.
+acquisitions and endorsements, and watch how endorsements affect weights and branch selection.
 
-The demo starts with Alice, a confirmed acquisition of 20,000 sats, and a genesis core block with an accepted vote and
-weight 7. Subsequent votes are sent manually. Open **Instruction** in the top bar for a quick guide.
+The demo starts with Alice, a confirmed acquisition of 20,000 sats, and a genesis core block with an accepted endorsement and
+weight 7. Subsequent endorsements are sent manually. Open **Instruction** in the top bar for a quick guide.
 
 ## Run
 

@@ -6,7 +6,7 @@ pub(super) fn params() -> MintingProtocolParams {
         acquisition_maturity: 2,
         default_acquisition_duration: 5.try_into().unwrap(),
         min_acquisition_duration: 1.try_into().unwrap(),
-        max_vote_delay: 10,
+        max_endorsement_delay: 10,
     }
 }
 
@@ -34,10 +34,10 @@ fn tip(header: &BlockHeader) -> BlockTip {
     header.block_tip()
 }
 
-pub(super) fn included(minter: u8, header: &BlockHeader, btc_height: u64) -> IncludedVote {
-    IncludedVote {
+pub(super) fn included(minter: u8, header: &BlockHeader, btc_height: u64) -> IncludedEndorsement {
+    IncludedEndorsement {
         btc_block: btc_tip(btc_height),
-        vote: vote_for_tip(
+        endorsement: endorsement_for_tip(
             minter,
             CoreBlockTip {
                 hash: header.id(),
@@ -54,7 +54,7 @@ pub(super) fn add_acquisition(
     amount: u64,
     duration: u16,
 ) {
-    let minter = vote(minter, 1, 1).auth().minter().p2wsh();
+    let minter = endorsement(minter, 1, 1).auth().minter().p2wsh();
     storage
         .acquisitions
         .entry(minter)
@@ -88,17 +88,17 @@ pub(super) fn add_block(
 
 async fn weigh(
     storage: &Storage,
-    votes: &[IncludedVote],
+    endorsements: &[IncludedEndorsement],
 ) -> Result<HashMap<BlockTip, WeightedBlockHeader>, WeighterError<&'static str, &'static str>> {
-    weigh_changes(storage, votes, &[])
+    weigh_changes(storage, endorsements, &[])
         .await
         .map(|result| result.weighted_blocks)
 }
 
 async fn weigh_changes(
     storage: &Storage,
-    votes: &[IncludedVote],
-    removed_votes: &[WeightedVote],
+    endorsements: &[IncludedEndorsement],
+    removed_endorsements: &[WeightedEndorsement],
 ) -> Result<WeighterResult, WeighterError<&'static str, &'static str>> {
     let params = params();
     let acquisitions = AcquisitionProvider {
@@ -107,8 +107,8 @@ async fn weigh_changes(
         params: &params,
     };
     Weighter {
-        votes,
-        removed_votes,
+        endorsements,
+        removed_endorsements,
         acquisitions: &acquisitions,
         consensus_storage: storage,
         chain_storage: storage,
@@ -128,12 +128,12 @@ async fn returns_updated_headers_using_each_blocks_own_target_and_stored_power()
     add_acquisition(&mut storage, 1, 98, 24, 3); // Power 8 at 100, expired at 103.
     add_acquisition(&mut storage, 1, 101, 40, 5); // Power 8 at 103, not acquired at 100.
     add_acquisition(&mut storage, 2, 98, 18, 3); // Power 6 at 100.
-    let votes = [
+    let endorsements = [
         included(1, &first, 101),
         included(1, &second, 104),
         included(2, &first, 101),
     ];
-    let result = weigh(&storage, &votes).await.unwrap();
+    let result = weigh(&storage, &endorsements).await.unwrap();
     assert_eq!(result.len(), 2);
     assert_eq!(
         result[&tip(&first)],
@@ -180,11 +180,14 @@ async fn includes_all_descendants_and_forks_without_double_counting_overlapping_
         add_block(&mut storage, header, parent_weight, power);
     }
     add_acquisition(&mut storage, 1, 98, 40, 5);
-    let votes = [included(1, &grandchild, 101), included(1, &root, 101)];
-    let result = weigh(&storage, &votes).await.unwrap();
-    let reversed = weigh(&storage, &[votes[1].clone(), votes[0].clone()])
-        .await
-        .unwrap();
+    let endorsements = [included(1, &grandchild, 101), included(1, &root, 101)];
+    let result = weigh(&storage, &endorsements).await.unwrap();
+    let reversed = weigh(
+        &storage,
+        &[endorsements[1].clone(), endorsements[0].clone()],
+    )
+    .await
+    .unwrap();
     assert_eq!(result, reversed);
     assert_eq!(result.len(), 5);
     for (header, parent_weight, effective_power) in [
@@ -192,7 +195,7 @@ async fn includes_all_descendants_and_forks_without_double_counting_overlapping_
         (&child, 12, 0),
         (&grandchild, 12, 12),
         (&fork, 12, 8),
-        (&leaf, 15, 0), // Receives deltas from both voted ancestors.
+        (&leaf, 15, 0), // Receives deltas from both endorsed ancestors.
     ] {
         assert_eq!(
             result[&tip(header)],
@@ -209,9 +212,9 @@ async fn includes_all_descendants_and_forks_without_double_counting_overlapping_
     assert_eq!(reads, vec![100, 100, 101, 101]);
     let mut descendants_reads = storage.descendants_reads.lock().unwrap().clone();
     descendants_reads.sort();
-    let mut expected_reads: Vec<_> = votes
+    let mut expected_reads: Vec<_> = endorsements
         .iter()
-        .flat_map(|vote| [vote.vote.block_tip(); 2])
+        .flat_map(|endorsement| [endorsement.endorsement.block_tip(); 2])
         .collect();
     expected_reads.sort();
     assert_eq!(descendants_reads, expected_reads);
@@ -264,8 +267,8 @@ async fn includes_unchanged_descendants_when_power_changes_without_changing_weig
         );
     }
     assert_eq!(
-        result.weighted_votes,
-        vec![WeightedVote {
+        result.weighted_endorsements,
+        vec![WeightedEndorsement {
             original: added,
             effective_minting_power: 3,
         }],
@@ -276,31 +279,33 @@ async fn includes_unchanged_descendants_when_power_changes_without_changing_weig
 #[tokio::test]
 async fn reports_missing_blocks_and_weight_records_and_storage_errors() {
     let header = header(10, Some((3, 100)), BlockHash::new([0; 32]), 1);
-    let votes = [included(1, &header, 100)];
+    let endorsements = [included(1, &header, 100)];
     let mut storage = Storage::default();
     assert_eq!(
-        weigh(&storage, &votes).await,
-        Err(WeighterError::MissingVotedBlock(votes[0].vote.block_tip()))
+        weigh(&storage, &endorsements).await,
+        Err(WeighterError::MissingEndorsedBlock(
+            endorsements[0].endorsement.block_tip()
+        ))
     );
     storage.blocks.insert(header.id(), header.clone());
     assert_eq!(
-        weigh(&storage, &votes).await,
+        weigh(&storage, &endorsements).await,
         Err(WeighterError::MissingWeight(tip(&header)))
     );
     storage.fail = true;
     assert_eq!(
-        weigh(&storage, &votes).await,
+        weigh(&storage, &endorsements).await,
         Err(WeighterError::ConsensusStorage("storage unavailable"))
     );
     storage.fail_blocks = true;
     assert_eq!(
-        weigh(&storage, &votes).await,
+        weigh(&storage, &endorsements).await,
         Err(WeighterError::ChainStorage("chain storage unavailable"))
     );
 }
 
 #[tokio::test]
-async fn rejects_votes_without_a_matching_core_header() {
+async fn rejects_endorsements_without_a_matching_core_header() {
     let core = header(10, Some((3, 100)), BlockHash::new([0; 32]), 1);
     let non_core = header(11, None, core.id(), 2);
     let mut storage = Storage::default();
@@ -312,13 +317,13 @@ async fn rejects_votes_without_a_matching_core_header() {
             hash: block.id(),
             height: (block.height as u32).into(),
         };
-        let vote = IncludedVote {
+        let endorsement = IncludedEndorsement {
             btc_block: btc_tip(100),
-            vote: vote_for_tip(1, core_tip),
+            endorsement: endorsement_for_tip(1, core_tip),
         };
         assert_eq!(
-            weigh(&storage, &[vote]).await,
-            Err(WeighterError::MissingVotedBlock(core_tip)),
+            weigh(&storage, &[endorsement]).await,
+            Err(WeighterError::MissingEndorsedBlock(core_tip)),
         );
     }
     assert!(storage.weight_reads.lock().unwrap().is_empty());
@@ -326,7 +331,7 @@ async fn rejects_votes_without_a_matching_core_header() {
 }
 
 #[tokio::test]
-async fn checks_effective_power_overflow_and_vote_errors() {
+async fn checks_effective_power_overflow_and_endorsement_errors() {
     let header = header(10, Some((3, 100)), BlockHash::new([0; 32]), 1);
     let mut storage = Storage::default();
     add_block(&mut storage, &header, 0, u64::MAX);
@@ -337,8 +342,8 @@ async fn checks_effective_power_overflow_and_vote_errors() {
     );
     assert_eq!(
         weigh(&storage, &[included(1, &header, 99)]).await,
-        Err(WeighterError::VoteWeight(
-            crate::consensus::engine::weighter::VoteWeightError::VoteBeforeTarget {
+        Err(WeighterError::EndorsementWeight(
+            crate::consensus::engine::weighter::EndorsementWeightError::EndorsementBeforeTarget {
                 inclusion_height: 99,
                 target_height: 100
             }
@@ -349,12 +354,12 @@ async fn checks_effective_power_overflow_and_vote_errors() {
 #[tokio::test]
 async fn preserves_raw_weight_fields_and_checks_parent_weight_overflow() {
     let root = header(10, Some((3, 100)), BlockHash::new([0; 32]), 1);
-    let votes = [included(1, &root, 100)];
+    let endorsements = [included(1, &root, 100)];
     let mut storage = Storage::default();
     for power in [0, 1, 2] {
         add_block(&mut storage, &root, u64::MAX, power);
         assert_eq!(
-            weigh(&storage, &votes).await.unwrap()[&tip(&root)],
+            weigh(&storage, &endorsements).await.unwrap()[&tip(&root)],
             WeightedBlockHeader {
                 header: root.clone(),
                 parent_weight: u64::MAX,
@@ -367,7 +372,7 @@ async fn preserves_raw_weight_fields_and_checks_parent_weight_overflow() {
     add_block(&mut storage, &child, u64::MAX, 0);
     add_acquisition(&mut storage, 1, 98, 10, 5); // Power 2 increases parent weight by 1.
     assert_eq!(
-        weigh(&storage, &votes).await,
+        weigh(&storage, &endorsements).await,
         Err(WeighterError::CumulativeWeightOverflow(tip(&child)))
     );
 }
@@ -381,12 +386,12 @@ async fn removes_stored_power_without_recalculating_expired_acquisitions() {
     add_block(&mut storage, &root, 10, 8);
     add_block(&mut storage, &child, 13, 0);
     add_block(&mut storage, &leaf, 13, 2);
-    let removed = WeightedVote {
+    let removed = WeightedEndorsement {
         original: included(1, &root, 100),
         effective_minting_power: 8,
     };
     let result = weigh_changes(&storage, &[], &[removed]).await.unwrap();
-    assert!(result.weighted_votes.is_empty());
+    assert!(result.weighted_endorsements.is_empty());
     assert_eq!(result.weighted_blocks[&tip(&root)].effective_power, 0);
     assert_eq!(result.weighted_blocks[&tip(&child)].parent_weight, 10);
     assert_eq!(result.weighted_blocks[&tip(&leaf)].parent_weight, 10);
@@ -395,14 +400,14 @@ async fn removes_stored_power_without_recalculating_expired_acquisitions() {
 }
 
 #[tokio::test]
-async fn combines_removals_and_additions_on_the_same_block_and_returns_weighted_votes() {
+async fn combines_removals_and_additions_on_the_same_block_and_returns_weighted_endorsements() {
     let root = header(10, Some((3, 100)), BlockHash::new([0; 32]), 1);
     let child = header(11, None, root.id(), 2);
     let mut storage = Storage::default();
     add_block(&mut storage, &root, 10, u64::MAX);
     add_block(&mut storage, &child, 73, 0);
     add_acquisition(&mut storage, 2, 98, 15, 5);
-    let removed = WeightedVote {
+    let removed = WeightedEndorsement {
         original: included(1, &root, 100),
         effective_minting_power: u64::MAX,
     };
@@ -411,8 +416,8 @@ async fn combines_removals_and_additions_on_the_same_block_and_returns_weighted_
         .await
         .unwrap();
     assert_eq!(
-        result.weighted_votes,
-        vec![WeightedVote {
+        result.weighted_endorsements,
+        vec![WeightedEndorsement {
             original: added,
             effective_minting_power: 3
         }]
@@ -431,7 +436,7 @@ async fn combines_opposite_ancestor_deltas_before_updating_a_shared_descendant()
     add_block(&mut storage, &child, u64::MAX, 1);
     add_block(&mut storage, &leaf, u64::MAX, 0);
     add_acquisition(&mut storage, 2, 98, 5, 5);
-    let removed = WeightedVote {
+    let removed = WeightedEndorsement {
         original: included(1, &root, 100),
         effective_minting_power: 1,
     };
@@ -453,7 +458,7 @@ async fn reports_power_and_parent_weight_underflow() {
     let child = header(11, None, root.id(), 2);
     let mut storage = Storage::default();
     add_block(&mut storage, &root, 0, 1);
-    let removed = WeightedVote {
+    let removed = WeightedEndorsement {
         original: included(1, &root, 100),
         effective_minting_power: 2,
     };

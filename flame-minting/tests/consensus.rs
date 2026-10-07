@@ -1,7 +1,7 @@
 mod common;
 
 use bitcoind::anyhow::{Context, Result};
-use btc_integration::MintingVoteData;
+use btc_integration::MintingEndorsementData;
 use corepc_client::bitcoin::Amount;
 use flame_minting::consensus::ConsensusStorage;
 use flame_storage::CanonicalStorage;
@@ -10,7 +10,7 @@ use flamechain::{BlockTip, CoreBlockTip};
 use common::TestContext;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stronger_late_vote_reorganizes_to_competing_core_block() -> Result<()> {
+async fn stronger_late_endorsement_reorganizes_to_competing_core_block() -> Result<()> {
     TestContext::run(|mut ctx| async move {
         let second_minter = ctx.create_minter().await?;
         ctx.bitcoin.mine_block().await?;
@@ -28,7 +28,7 @@ async fn stronger_late_vote_reorganizes_to_competing_core_block() -> Result<()> 
 
         ctx.start().await?;
         ctx.bitcoin
-            .wait_for_vote(&MintingVoteData::V1 {
+            .wait_for_endorsement(&MintingEndorsementData::V1 {
                 flame_block_height: 1,
                 flame_block_hash: first.header.id(),
             })
@@ -37,7 +37,9 @@ async fn stronger_late_vote_reorganizes_to_competing_core_block() -> Result<()> 
         ctx.wait_for_processing(first_confirmation).await?;
         assert_eq!(canonical.get_tip().await?, Some(first.header.block_tip()));
 
-        second_minter.send_vote(1, second.header.id()).await?;
+        second_minter
+            .send_endorsement(1, second.header.id())
+            .await?;
         let second_confirmation = ctx.bitcoin.mine_block().await?;
         ctx.wait_for_processing(second_confirmation).await?;
         assert_eq!(canonical.get_tip().await?, Some(second.header.block_tip()));
@@ -47,7 +49,7 @@ async fn stronger_late_vote_reorganizes_to_competing_core_block() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn acquisition_and_automatic_vote_select_and_apply_core_block() -> Result<()> {
+async fn acquisition_and_automatic_endorsement_select_and_apply_core_block() -> Result<()> {
     TestContext::run(|mut ctx| async move {
         let acquisition_txid = ctx.send_acquisition(Amount::from_sat(20_000)).await?;
         let starting_tip = ctx.bitcoin.mine_block().await?;
@@ -80,15 +82,20 @@ async fn acquisition_and_automatic_vote_select_and_apply_core_block() -> Result<
 
         let trigger_tip = ctx.bitcoin.mine_block().await?;
         assert_eq!(trigger_tip.height, starting_tip.height + 1);
-        let vote_txid = ctx
+        let endorsement_txid = ctx
             .bitcoin
-            .wait_for_vote(&MintingVoteData::V1 {
+            .wait_for_endorsement(&MintingEndorsementData::V1 {
                 flame_block_height: 1,
                 flame_block_hash: core_tip.hash,
             })
             .await?;
         ctx.wait_for_processing(trigger_tip).await?;
-        assert!(consensus.get_votes_for_block(core_tip).await?.is_empty());
+        assert!(
+            consensus
+                .get_endorsements_for_block(core_tip)
+                .await?
+                .is_empty()
+        );
         let initial_weight = consensus
             .get_cumulative_weight(block.header.block_tip())
             .await?
@@ -98,17 +105,17 @@ async fn acquisition_and_automatic_vote_select_and_apply_core_block() -> Result<
 
         let confirmation = ctx.bitcoin.mine_block().await?;
         assert_eq!(confirmation.height, u64::from(target_btc_height));
-        let votes = ctx.bitcoin.votes_in_block(confirmation).await?;
-        assert_eq!(votes.len(), 1);
-        let vote = &votes[0];
-        assert_eq!(vote.txid(), vote_txid);
-        assert_eq!(vote.block_tip(), core_tip);
-        assert_eq!(vote.auth().minter(), &ctx.identity);
+        let endorsements = ctx.bitcoin.endorsements_in_block(confirmation).await?;
+        assert_eq!(endorsements.len(), 1);
+        let endorsement = &endorsements[0];
+        assert_eq!(endorsement.txid(), endorsement_txid);
+        assert_eq!(endorsement.block_tip(), core_tip);
+        assert_eq!(endorsement.auth().minter(), &ctx.identity);
 
         ctx.wait_for_processing(confirmation).await?;
-        let accepted = consensus.get_votes_for_block(core_tip).await?;
+        let accepted = consensus.get_endorsements_for_block(core_tip).await?;
         assert_eq!(accepted.len(), 1);
-        assert_eq!(accepted[0].original.vote, *vote);
+        assert_eq!(accepted[0].original.endorsement, *endorsement);
         assert_eq!(accepted[0].original.btc_block, confirmation);
         assert_eq!(accepted[0].effective_minting_power, 200);
         let weight = consensus

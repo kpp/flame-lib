@@ -7,13 +7,13 @@ use flamechain::{BlockHash, CoreFlameHeight};
 use readerwriter::{ReadError, Reader};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UncheckedMintingVote {
+pub struct UncheckedMintingEndorsement {
     txid: Txid,
-    output: MintingVoteOutput,
-    auth: MintingVoteAuth,
+    output: MintingEndorsementOutput,
+    auth: MintingEndorsementAuth,
 }
 
-impl UncheckedMintingVote {
+impl UncheckedMintingEndorsement {
     pub fn from_tx(transaction: &Transaction) -> Vec<Self> {
         let mut outputs =
             transaction
@@ -21,7 +21,7 @@ impl UncheckedMintingVote {
                 .iter()
                 .enumerate()
                 .filter_map(|(output_index, output)| {
-                    MintingVoteOutput::from_output(output_index, output)
+                    MintingEndorsementOutput::from_output(output_index, output)
                 });
 
         let Some(output) = outputs.next() else {
@@ -40,7 +40,7 @@ impl UncheckedMintingVote {
                 Some(Self {
                     txid,
                     output: output.clone(),
-                    auth: MintingVoteAuth::from_input(input_index, input)?,
+                    auth: MintingEndorsementAuth::from_input(input_index, input)?,
                 })
             })
             .collect()
@@ -50,23 +50,23 @@ impl UncheckedMintingVote {
         self.txid
     }
 
-    pub fn output(&self) -> &MintingVoteOutput {
+    pub fn output(&self) -> &MintingEndorsementOutput {
         &self.output
     }
 
-    pub fn auth(&self) -> &MintingVoteAuth {
+    pub fn auth(&self) -> &MintingEndorsementAuth {
         &self.auth
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct MintingVoteAuth {
+pub struct MintingEndorsementAuth {
     pub input_index: usize,
     pub previous_output: OutPoint,
     minter: MinterIdentity,
 }
 
-impl MintingVoteAuth {
+impl MintingEndorsementAuth {
     pub fn from_input(input_index: usize, input: &TxIn) -> Option<Self> {
         let witness_script = input.witness.last()?;
         let minter = MinterIdentity::new(ScriptBuf::from_bytes(witness_script.to_vec())).ok()?;
@@ -82,7 +82,7 @@ impl MintingVoteAuth {
     }
 }
 
-impl PartialEq for MintingVoteAuth {
+impl PartialEq for MintingEndorsementAuth {
     fn eq(&self, other: &Self) -> bool {
         self.input_index == other.input_index
             && self.previous_output == other.previous_output
@@ -90,32 +90,32 @@ impl PartialEq for MintingVoteAuth {
     }
 }
 
-impl Eq for MintingVoteAuth {}
+impl Eq for MintingEndorsementAuth {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MintingVoteOutput {
+pub struct MintingEndorsementOutput {
     pub output_index: u32,
-    pub data: MintingVoteData,
+    pub data: MintingEndorsementData,
 }
 
-impl MintingVoteOutput {
+impl MintingEndorsementOutput {
     pub fn from_output(output_index: usize, output: &TxOut) -> Option<Self> {
         Some(Self {
             output_index: u32::try_from(output_index).ok()?,
-            data: MintingVoteData::from_output(output)?,
+            data: MintingEndorsementData::from_output(output)?,
         })
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MintingVoteData {
+pub enum MintingEndorsementData {
     V1 {
         flame_block_height: u32,
         flame_block_hash: BlockHash,
     },
 }
 
-impl MintingVoteData {
+impl MintingEndorsementData {
     pub fn block_height(&self) -> CoreFlameHeight {
         match self {
             Self::V1 {
@@ -170,7 +170,7 @@ impl MintingVoteData {
 
 #[cfg(test)]
 mod tests {
-    use super::{MintingVoteData, UncheckedMintingVote};
+    use super::{MintingEndorsementData, UncheckedMintingEndorsement};
     use crate::protocol::{consts::VERSION_V1, minter_witness_script};
     use corepc_client::bitcoin::{
         Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute,
@@ -180,59 +180,67 @@ mod tests {
     use flamevm::Predicate;
 
     #[test]
-    fn one_vote_input_and_one_vote_output() {
-        let transaction = transaction(vec![vote_input()], vec![vote_output()]);
+    fn one_endorsement_input_and_one_endorsement_output() {
+        let transaction = transaction(vec![endorsement_input()], vec![endorsement_output()]);
 
-        let votes = UncheckedMintingVote::from_tx(&transaction);
+        let endorsements = UncheckedMintingEndorsement::from_tx(&transaction);
 
-        assert_eq!(votes.len(), 1);
-        assert_eq!(votes[0].txid, transaction.compute_txid());
-        assert_eq!(votes[0].auth.input_index, 0);
-        assert_eq!(votes[0].output.output_index, 0);
+        assert_eq!(endorsements.len(), 1);
+        assert_eq!(endorsements[0].txid, transaction.compute_txid());
+        assert_eq!(endorsements[0].auth.input_index, 0);
+        assert_eq!(endorsements[0].output.output_index, 0);
     }
 
     #[test]
-    fn finds_one_vote_among_multiple_inputs_and_outputs() {
+    fn finds_one_endorsement_among_multiple_inputs_and_outputs() {
         let transaction = transaction(
-            vec![regular_input(), vote_input(), regular_input()],
-            vec![regular_output(), vote_output(), regular_output()],
+            vec![regular_input(), endorsement_input(), regular_input()],
+            vec![regular_output(), endorsement_output(), regular_output()],
         );
 
-        let votes = UncheckedMintingVote::from_tx(&transaction);
+        let endorsements = UncheckedMintingEndorsement::from_tx(&transaction);
 
-        assert_eq!(votes.len(), 1);
-        assert_eq!(votes[0].auth.input_index, 1);
-        assert_eq!(votes[0].output.output_index, 1);
+        assert_eq!(endorsements.len(), 1);
+        assert_eq!(endorsements[0].auth.input_index, 1);
+        assert_eq!(endorsements[0].output.output_index, 1);
     }
 
     #[test]
-    fn multiple_vote_inputs_and_one_vote_output() {
+    fn multiple_endorsement_inputs_and_one_endorsement_output() {
         let transaction = transaction(
-            vec![vote_input(), vote_input(), vote_input()],
-            vec![vote_output()],
+            vec![
+                endorsement_input(),
+                endorsement_input(),
+                endorsement_input(),
+            ],
+            vec![endorsement_output()],
         );
 
-        let votes = UncheckedMintingVote::from_tx(&transaction);
+        let endorsements = UncheckedMintingEndorsement::from_tx(&transaction);
 
-        assert_eq!(votes.len(), 3);
+        assert_eq!(endorsements.len(), 3);
         assert_eq!(
-            votes
+            endorsements
                 .iter()
-                .map(|vote| vote.auth.input_index)
+                .map(|endorsement| endorsement.auth.input_index)
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
-        assert!(votes.iter().all(|vote| vote.output.output_index == 0));
+        assert!(
+            endorsements
+                .iter()
+                .all(|endorsement| endorsement.output.output_index == 0)
+        );
     }
 
     #[test]
-    fn one_vote_input_and_multiple_vote_outputs_produces_no_votes() {
+    fn one_endorsement_input_and_multiple_endorsement_outputs_produces_no_endorsements() {
         let transaction = transaction(
-            vec![vote_input()],
-            vec![vote_output(), vote_output(), regular_output()],
+            vec![endorsement_input()],
+            vec![endorsement_output(), endorsement_output(), regular_output()],
         );
 
-        assert!(UncheckedMintingVote::from_tx(&transaction).is_empty());
+        assert!(UncheckedMintingEndorsement::from_tx(&transaction).is_empty());
     }
 
     fn transaction(inputs: Vec<TxIn>, outputs: Vec<TxOut>) -> Transaction {
@@ -244,7 +252,7 @@ mod tests {
         }
     }
 
-    fn vote_input() -> TxIn {
+    fn endorsement_input() -> TxIn {
         let flame_predicate = Predicate::opaque(Predicate::unspendable_key());
         let witness_script = minter_witness_script::build_with_authorization(
             &flame_predicate,
@@ -269,10 +277,10 @@ mod tests {
         }
     }
 
-    fn vote_output() -> TxOut {
+    fn endorsement_output() -> TxOut {
         TxOut {
             value: Amount::ZERO,
-            script_pubkey: MintingVoteData::V1 {
+            script_pubkey: MintingEndorsementData::V1 {
                 flame_block_height: 0x1234_5678,
                 flame_block_hash: BlockHash::from([VERSION_V1; 32]),
             }

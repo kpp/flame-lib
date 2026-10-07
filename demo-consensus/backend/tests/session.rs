@@ -26,7 +26,7 @@ async fn mine(session: &mut DemoSession) -> Result<BitcoinBlockTip> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn startup_seeds_alice_and_a_confirmed_vote_for_core_genesis() -> Result<()> {
+async fn startup_seeds_alice_and_a_confirmed_endorsement_for_core_genesis() -> Result<()> {
     let mut session = DemoSession::start().await?;
     let result: Result<()> = async {
         let snapshot = session.snapshot().await?;
@@ -36,7 +36,10 @@ async fn startup_seeds_alice_and_a_confirmed_vote_for_core_genesis() -> Result<(
             alice.id == MinterId(0) && alice.name == "Alice",
             "missing Alice"
         );
-        ensure!(!alice.automatic_voting, "Alice is not manually controlled");
+        ensure!(
+            !alice.automatic_endorsement,
+            "Alice is not manually controlled"
+        );
         ensure!(
             snapshot.flame.blocks.len() == 1,
             "unexpected initial blocks"
@@ -74,29 +77,35 @@ async fn startup_seeds_alice_and_a_confirmed_vote_for_core_genesis() -> Result<(
                     + u64::from(snapshot.consensus.parameters.acquisition_maturity),
             "genesis target does not account for acquisition maturity"
         );
-        ensure!(snapshot.votes.len() == 1, "expected one initial vote");
-        let vote = &snapshot.votes[0];
         ensure!(
-            vote.minter_id == alice.id
-                && vote.block_hash == genesis.tip.hash
-                && vote.core_height == core.height,
-            "initial vote targets the wrong block or minter"
+            snapshot.endorsements.len() == 1,
+            "expected one initial endorsement"
+        );
+        let endorsement = &snapshot.endorsements[0];
+        ensure!(
+            endorsement.minter_id == alice.id
+                && endorsement.block_hash == genesis.tip.hash
+                && endorsement.core_height == core.height,
+            "initial endorsement targets the wrong block or minter"
         );
         ensure!(
             matches!(
-                vote.processing_status,
-                VoteProcessingStatus::Accepted {
+                endorsement.processing_status,
+                EndorsementProcessingStatus::Accepted {
                     effective_minting_power: 200
                 }
             ),
-            "initial vote was not accepted at full power"
+            "initial endorsement was not accepted at full power"
         );
-        let TransactionStatus::Confirmed { block: vote_block } = &vote.transaction_status else {
-            anyhow::bail!("initial vote is unconfirmed");
+        let TransactionStatus::Confirmed {
+            block: endorsement_block,
+        } = &endorsement.transaction_status
+        else {
+            anyhow::bail!("initial endorsement is unconfirmed");
         };
         ensure!(
-            vote_block.height == u64::from(core.target_btc_height),
-            "initial vote was delayed"
+            endorsement_block.height == u64::from(core.target_btc_height),
+            "initial endorsement was delayed"
         );
         ensure!(
             genesis.parent_weight == 0 && genesis.block_weight == 7 && genesis.chain_weight == 7,
@@ -104,7 +113,7 @@ async fn startup_seeds_alice_and_a_confirmed_vote_for_core_genesis() -> Result<(
         );
         ensure!(
             snapshot.bitcoin.tip == snapshot.consensus.btc_cursor
-                && snapshot.bitcoin.tip == *vote_block
+                && snapshot.bitcoin.tip == *endorsement_block
                 && snapshot.bitcoin.mempool.is_empty(),
             "startup returned before initialization completed"
         );
@@ -127,14 +136,15 @@ async fn startup_seeds_alice_and_a_confirmed_vote_for_core_genesis() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn manual_votes_reorganize_competing_branches_and_double_sign_removes_power() -> Result<()> {
+async fn manual_endorsements_reorganize_competing_branches_and_double_sign_removes_power()
+-> Result<()> {
     let mut session = DemoSession::start().await?;
     let result: Result<()> = async {
         let root = session.canonical_tip().await?;
         let first_minter = session.minters().await?.remove(0);
         ensure!(
-            !first_minter.automatic_voting,
-            "manual session enabled automatic voting"
+            !first_minter.automatic_endorsement,
+            "manual session enabled automatic endorsement"
         );
         let second_minter = session
             .create_minter(CreateMinterRequest { name: "Bob".into() })
@@ -171,34 +181,37 @@ async fn manual_votes_reorganize_competing_branches_and_double_sign_removes_powe
         );
         ensure!(
             session.bitcoin_mempool().await?.is_empty(),
-            "manual mode sent an automatic vote"
+            "manual mode sent an automatic endorsement"
         );
-        let first_vote = session
-            .send_vote(SendVoteRequest {
+        let first_endorsement = session
+            .send_endorsement(SendEndorsementRequest {
                 minter_id: first_minter.id,
                 core_height: first.core.as_ref().unwrap().height,
                 block_hash: first.tip.hash.clone(),
             })
             .await?;
         ensure!(
-            session.bitcoin_mempool().await?.contains(&first_vote.txid),
-            "vote missing from mempool"
+            session
+                .bitcoin_mempool()
+                .await?
+                .contains(&first_endorsement.txid),
+            "endorsement missing from mempool"
         );
         ensure!(
             session.flame_block(&first.tip.hash).await?.effective_power == 0,
-            "unconfirmed vote changed power"
+            "unconfirmed endorsement changed power"
         );
         mine(&mut session).await?;
         ensure!(
             session.canonical_tip().await? == first.tip,
-            "first vote did not select its block"
+            "first endorsement did not select its block"
         );
         ensure!(
             session.flame_block(&first.tip.hash).await?.effective_power == 200,
-            "incorrect first vote power"
+            "incorrect first endorsement power"
         );
         session
-            .send_vote(SendVoteRequest {
+            .send_endorsement(SendEndorsementRequest {
                 minter_id: second_minter.id,
                 core_height: second.core.as_ref().unwrap().height,
                 block_hash: second.tip.hash.clone(),
@@ -207,11 +220,11 @@ async fn manual_votes_reorganize_competing_branches_and_double_sign_removes_powe
         mine(&mut session).await?;
         ensure!(
             session.canonical_tip().await? == second.tip,
-            "stronger vote did not reorganize the chain"
+            "stronger endorsement did not reorganize the chain"
         );
         ensure!(
             session.flame_block(&second.tip.hash).await?.effective_power == 400,
-            "late vote power was not reduced"
+            "late endorsement power was not reduced"
         );
         ensure!(
             !session.flame_block(&first.tip.hash).await?.is_canonical,
@@ -222,7 +235,7 @@ async fn manual_votes_reorganize_competing_branches_and_double_sign_removes_powe
             "canonical ancestor was omitted"
         );
         session
-            .send_vote(SendVoteRequest {
+            .send_endorsement(SendEndorsementRequest {
                 minter_id: second_minter.id,
                 core_height: first.core.as_ref().unwrap().height,
                 block_hash: first.tip.hash.clone(),
@@ -268,7 +281,7 @@ async fn manual_votes_reorganize_competing_branches_and_double_sign_removes_powe
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn session_requires_manual_votes_after_bootstrap() -> Result<()> {
+async fn session_requires_manual_endorsements_after_bootstrap() -> Result<()> {
     let mut session = DemoSession::start().await?;
     let result: Result<()> = async {
         let root = session.canonical_tip().await?;
@@ -283,23 +296,23 @@ async fn session_requires_manual_votes_after_bootstrap() -> Result<()> {
         mine(&mut session).await?;
         let snapshot = session.snapshot().await?;
         ensure!(
-            snapshot.votes.len() == 1,
-            "session sent a vote without a command"
+            snapshot.endorsements.len() == 1,
+            "session sent an endorsement without a command"
         );
         ensure!(
             snapshot.bitcoin.mempool.is_empty(),
-            "unexpected pending vote"
+            "unexpected pending endorsement"
         );
         ensure!(
             session.flame_block(&block.tip.hash).await?.block_weight == 0,
-            "unvoted block gained weight"
+            "unendorsed block gained weight"
         );
         ensure!(
             snapshot
                 .minters
                 .iter()
-                .all(|minter| !minter.automatic_voting),
-            "automatic voting enabled"
+                .all(|minter| !minter.automatic_endorsement),
+            "automatic endorsement enabled"
         );
         Ok(())
     }
@@ -348,7 +361,7 @@ async fn invalid_commands_leave_the_session_usable() -> Result<()> {
         }
         ensure!(
             session
-                .send_vote(SendVoteRequest {
+                .send_endorsement(SendEndorsementRequest {
                     minter_id: MinterId(0),
                     core_height: 1,
                     block_hash: FlameBlockHash("00".into()),

@@ -13,7 +13,7 @@ use crate::{
         bitcoin_facade::BitcoinFacade,
         rpc::{BtcBlockTip, BtcTransactionWithPrevouts, RpcApi},
     },
-    protocol::{Acquisition, validate_transaction_votes},
+    protocol::{Acquisition, validate_transaction_endorsements},
 };
 
 const PARALLEL_LOADS: usize = 4;
@@ -89,15 +89,15 @@ fn index_transactions(
     let mut block = IndexedBlock {
         btc_block_tip: tip,
         acquisitions: Vec::new(),
-        votes: Vec::new(),
+        endorsements: Vec::new(),
     };
     for transaction in transactions {
         block
             .acquisitions
             .extend(Acquisition::from_tx(&transaction.transaction));
         block
-            .votes
-            .extend(validate_transaction_votes(&transaction)?);
+            .endorsements
+            .extend(validate_transaction_endorsements(&transaction)?);
     }
     Ok(block)
 }

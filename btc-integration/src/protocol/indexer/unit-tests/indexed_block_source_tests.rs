@@ -12,7 +12,7 @@ fn source(rpc: &Arc<FakeRpc>) -> Arc<IndexedBlockSource<FakeRpc>> {
 }
 
 #[tokio::test]
-async fn parses_acquisitions_and_only_authenticated_votes() {
+async fn parses_acquisitions_and_only_authenticated_endorsements() {
     let tip = block_tip(1, 1);
     let rpc = FakeRpc::new(
         linear_chain(0).block(
@@ -20,8 +20,8 @@ async fn parses_acquisitions_and_only_authenticated_votes() {
             Some(block_hash(0)),
             vec![
                 acquisition_transaction(1000),
-                vote_transaction(true),
-                vote_transaction(false),
+                endorsement_transaction(true),
+                endorsement_transaction(false),
             ],
         ),
         tip,
@@ -30,14 +30,14 @@ async fn parses_acquisitions_and_only_authenticated_votes() {
     assert_eq!(block.btc_block_tip, tip);
     assert_eq!(block.acquisitions.len(), 1);
     assert_eq!(block.acquisitions[0].amount().to_sat(), 1000);
-    assert_eq!(block.votes.len(), 1);
+    assert_eq!(block.endorsements.len(), 1);
 }
 
 #[tokio::test]
 async fn missing_or_misaligned_prevouts_fail_the_whole_load() {
-    let mut missing = vote_transaction(true);
+    let mut missing = endorsement_transaction(true);
     missing.prevouts[0] = None;
-    let mut malformed = vote_transaction(true);
+    let mut malformed = endorsement_transaction(true);
     malformed.prevouts.clear();
     let rpc = FakeRpc::new(
         linear_chain(0)
@@ -57,7 +57,7 @@ async fn missing_or_misaligned_prevouts_fail_the_whole_load() {
     ));
     assert!(matches!(
         source.load(block_tip(3, 3)).await,
-        Err(HistoryError::VoteProcessing(_))
+        Err(HistoryError::EndorsementProcessing(_))
     ));
 }
 

@@ -16,7 +16,7 @@ use crate::core_block_notifier::CoreBlockNotifier;
 use crate::minter::manager::{
     ShutdownError as MinterShutdownError, StartupError as MinterStartupError,
 };
-use crate::minter::{MinterManager, VotePolicy, journal::in_memory::InMemoryMinterJournal};
+use crate::minter::{EndorsementPolicy, MinterManager, journal::in_memory::InMemoryMinterJournal};
 use crate::rewards::RewardsStorage;
 
 pub use btc_integration::HistoryUpdate as BtcEvent;
@@ -79,7 +79,7 @@ where
         bitcoin_config: BitcoinConfig,
         initial_btc_cursor: BtcBlockTip,
         identity_config: IdentityConfig,
-        vote_policy: VotePolicy,
+        endorsement_policy: EndorsementPolicy,
     ) -> Result<Self, corepc_client::client_sync::Error> {
         let rpc = Arc::new(Core31RpcApi::new(
             &bitcoin_config.node_rpc_url,
@@ -96,7 +96,7 @@ where
             Arc::new(core_block_source),
             btc_sender.clone(),
             Arc::new(InMemoryMinterJournal::new()),
-            vote_policy,
+            endorsement_policy,
         );
 
         Ok(Self {

@@ -10,7 +10,7 @@ export const commandLabels: Record<Command['kind'], string> = {
   flame: 'Creating a Flame block',
   minter: 'Creating a minter',
   acquisition: 'Sending acquisition',
-  vote: 'Sending vote',
+  endorsement: 'Sending endorsement',
   reset: 'Resetting session',
 };
 const queryKey = ['demo-state'];

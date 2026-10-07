@@ -13,7 +13,7 @@ use flame_minting::{
         applier::journal::InMemoryMintingJournal, storage::InMemoryConsensusStorage,
     },
     core_block_notifier::CoreBlockNotifier,
-    minter::{MinterManager, VotePolicy, journal::in_memory::InMemoryMinterJournal},
+    minter::{EndorsementPolicy, MinterManager, journal::in_memory::InMemoryMinterJournal},
     orchestrator::{
         consensus::ConsensusLoop,
         cursor_storage::in_memory::InMemoryCursorStorage,
@@ -108,7 +108,7 @@ impl DemoRuntime {
             acquisition_maturity: 1,
             default_acquisition_duration: NonZeroU16::new(100).unwrap(),
             min_acquisition_duration: NonZeroU16::MIN,
-            max_vote_delay: 10,
+            max_endorsement_delay: 10,
         });
         let blocks = InMemoryChainStorage::new();
         let consensus = InMemoryConsensusStorage::new();
@@ -156,7 +156,7 @@ impl DemoRuntime {
             Arc::new(chain.clone()),
             btc_sender.clone(),
             Arc::new(InMemoryMinterJournal::new()),
-            VotePolicy::Manual,
+            EndorsementPolicy::Manual,
         );
         let orchestrator = MintingOrchestrator {
             identity_manager,

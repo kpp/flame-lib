@@ -54,7 +54,7 @@ impl DemoMinter {
             name: self.name.clone(),
             p2wsh_address: Address::p2wsh(self.identity.witness_script(), Network::Regtest)
                 .to_string(),
-            automatic_voting: false,
+            automatic_endorsement: false,
             is_double_signed: consensus
                 .is_minter_double_signed(&self.identity.p2wsh())
                 .await?,

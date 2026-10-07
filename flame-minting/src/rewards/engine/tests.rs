@@ -4,8 +4,10 @@ use corepc_client::bitcoin::{BlockHash as BtcBlockHash, hashes::Hash};
 use flamechain::{Block, Blockchain, ChainParams, CoreBlockHeader, CoreBlockTip};
 
 use super::*;
-use crate::consensus::engine::tests::{Storage, vote_for_tip};
-use crate::consensus::{IncludedAcquisition, IncludedVote, MinterAcquisitions, WeightedVote};
+use crate::consensus::engine::tests::{Storage, endorsement_for_tip};
+use crate::consensus::{
+    IncludedAcquisition, IncludedEndorsement, MinterAcquisitions, WeightedEndorsement,
+};
 use btc_integration::{Acquisition, AcquisitionData, MinterP2wsh};
 use corepc_client::bitcoin::{Amount, Transaction, TxOut, absolute, transaction};
 use flamevm::Predicate;
@@ -15,7 +17,7 @@ pub(crate) fn protocol_params() -> Arc<MintingProtocolParams> {
         acquisition_maturity: 1,
         default_acquisition_duration: 100.try_into().unwrap(),
         min_acquisition_duration: 1.try_into().unwrap(),
-        max_vote_delay: 10,
+        max_endorsement_delay: 10,
     })
 }
 
@@ -226,14 +228,14 @@ fn reward_header() -> BlockHeader {
     storage.insert_chain(100, 1)
 }
 
-fn included_vote(minter: u8, header: &BlockHeader, delay: u64) -> WeightedVote {
-    WeightedVote {
-        original: IncludedVote {
+fn included_endorsement(minter: u8, header: &BlockHeader, delay: u64) -> WeightedEndorsement {
+    WeightedEndorsement {
+        original: IncludedEndorsement {
             btc_block: BtcBlockTip {
                 height: u64::from(header.core_block.as_ref().unwrap().target_btc_height) + delay,
                 ..btc_tip()
             },
-            vote: vote_for_tip(
+            endorsement: endorsement_for_tip(
                 minter,
                 CoreBlockTip {
                     hash: header.id(),
@@ -306,12 +308,12 @@ fn pair(access: u64) -> PredicatePair {
 #[tokio::test]
 async fn groups_predicates_and_recalculates_fractional_power_with_duration_and_delay() {
     let header = reward_header();
-    let first = included_vote(1, &header, 0);
-    let second = included_vote(2, &header, 1);
-    let first_minter = first.original.vote.auth().minter().p2wsh();
-    let second_minter = second.original.vote.auth().minter().p2wsh();
+    let first = included_endorsement(1, &header, 0);
+    let second = included_endorsement(2, &header, 1);
+    let first_minter = first.original.endorsement.auth().minter().p2wsh();
+    let second_minter = second.original.endorsement.auth().minter().p2wsh();
     let mut storage = Storage::default();
-    storage.votes = vec![first, second];
+    storage.endorsements = vec![first, second];
     storage.acquisitions.insert(
         first_minter,
         MinterAcquisitions {
@@ -352,7 +354,7 @@ async fn groups_predicates_and_recalculates_fractional_power_with_duration_and_d
     );
 
     let storage = Arc::get_mut(&mut engine.consensus_storage).unwrap();
-    storage.votes.reverse();
+    storage.endorsements.reverse();
     for minter in storage.acquisitions.values_mut() {
         minter.acquisitions.reverse();
     }
@@ -385,9 +387,9 @@ async fn excludes_inactive_disqualified_late_future_and_other_block_contribution
         (3, 0, &header),
         (4, 0, &other),
     ] {
-        let vote = included_vote(minter, target, delay);
-        let identity = vote.original.vote.auth().minter().p2wsh();
-        storage.votes.push(vote);
+        let endorsement = included_endorsement(minter, target, delay);
+        let identity = endorsement.original.endorsement.auth().minter().p2wsh();
+        storage.endorsements.push(endorsement);
         storage.acquisitions.insert(
             identity,
             MinterAcquisitions {
@@ -396,7 +398,12 @@ async fn excludes_inactive_disqualified_late_future_and_other_block_contribution
             },
         );
     }
-    let first = storage.votes[0].original.vote.auth().minter().p2wsh();
+    let first = storage.endorsements[0]
+        .original
+        .endorsement
+        .auth()
+        .minter()
+        .p2wsh();
     let mut immature = acquisition(first, 5, 100, Some(100));
     immature.btc_block.height = 100;
     let expired = acquisition(first, 6, 100, Some(2));
@@ -433,10 +440,10 @@ async fn excludes_inactive_disqualified_late_future_and_other_block_contribution
 }
 
 #[tokio::test]
-async fn propagates_vote_and_acquisition_storage_errors() {
+async fn propagates_endorsement_and_acquisition_storage_errors() {
     let header = reward_header();
     let mut storage = Storage::default();
-    storage.fail_vote_reads = true;
+    storage.fail_endorsement_reads = true;
     let mut engine = test_engine(storage);
     assert!(matches!(
         calculator(&engine, &header, btc_tip()).calculate().await,
@@ -445,8 +452,10 @@ async fn propagates_vote_and_acquisition_storage_errors() {
         ))
     ));
     let storage = Arc::get_mut(&mut engine.consensus_storage).unwrap();
-    storage.fail_vote_reads = false;
-    storage.votes.push(included_vote(1, &header, 0));
+    storage.fail_endorsement_reads = false;
+    storage
+        .endorsements
+        .push(included_endorsement(1, &header, 0));
     storage.fail_active_acquisition_reads = true;
     assert!(matches!(
         calculator(&engine, &header, btc_tip()).calculate().await,
@@ -504,9 +513,16 @@ async fn calculates_cycle_rewards_and_combines_matching_predicates_across_blocks
                     .is_some_and(|core| core.height.as_u32() == height)
             })
             .unwrap();
-        storage.votes.push(included_vote(1, header, 0));
+        storage
+            .endorsements
+            .push(included_endorsement(1, header, 0));
     }
-    let minter = storage.votes[0].original.vote.auth().minter().p2wsh();
+    let minter = storage.endorsements[0]
+        .original
+        .endorsement
+        .auth()
+        .minter()
+        .p2wsh();
     let mut acquisition = acquisition(minter, 1, 100, Some(200));
     acquisition.btc_block.height = 0;
     storage.acquisitions.insert(

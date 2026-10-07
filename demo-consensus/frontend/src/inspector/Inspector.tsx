@@ -1,4 +1,4 @@
-import type { Command, Selection, Snapshot, Vote } from '../api/types';
+import type { Command, Selection, Snapshot, Endorsement } from '../api/types';
 import { Badge, Detail, Empty, Hash, MinterLabel, ProcessingStatus, TxStatus } from '../components';
 import { integer, minterName } from '../state/model';
 
@@ -10,45 +10,48 @@ type Props = {
   disabled: boolean;
 };
 
-function VoteDetails({
+function EndorsementDetails({
   data,
-  votes,
+  endorsements,
   select,
 }: {
   data: Snapshot;
-  votes: Vote[];
+  endorsements: Endorsement[];
   select: Props['select'];
 }) {
   return (
     <div className="inspector-list">
-      {votes.map((vote) => (
-        <div className="inspector-item" key={`${vote.txid}:${vote.output_index}:${vote.minter_id}`}>
+      {endorsements.map((endorsement) => (
+        <div
+          className="inspector-item"
+          key={`${endorsement.txid}:${endorsement.output_index}:${endorsement.minter_id}`}
+        >
           <div className="item-heading">
             <MinterLabel
               data={data}
-              id={vote.minter_id}
-              onClick={() => select({ kind: 'minter', id: vote.minter_id })}
+              id={endorsement.minter_id}
+              onClick={() => select({ kind: 'minter', id: endorsement.minter_id })}
             />
           </div>
           <button
             className="text-button"
-            onClick={() => select({ kind: 'transaction', id: vote.txid })}
+            onClick={() => select({ kind: 'transaction', id: endorsement.txid })}
           >
-            <Hash value={vote.txid} />
+            <Hash value={endorsement.txid} />
           </button>
           <div className="badge-row">
-            <TxStatus status={vote.transaction_status} />
-            <ProcessingStatus status={vote.processing_status.status} />
+            <TxStatus status={endorsement.transaction_status} />
+            <ProcessingStatus status={endorsement.processing_status.status} />
           </div>
-          {vote.transaction_status.status === 'confirmed' && (
+          {endorsement.transaction_status.status === 'confirmed' && (
             <button
               className="text-button muted"
               onClick={() =>
-                vote.transaction_status.status === 'confirmed' &&
-                select({ kind: 'bitcoin', id: vote.transaction_status.block.hash })
+                endorsement.transaction_status.status === 'confirmed' &&
+                select({ kind: 'bitcoin', id: endorsement.transaction_status.block.hash })
               }
             >
-              Open BTC #{vote.transaction_status.block.height} ↗
+              Open BTC #{endorsement.transaction_status.block.height} ↗
             </button>
           )}
         </div>
@@ -71,7 +74,9 @@ export function Inspector({ data, selection, select, openCommand, disabled }: Pr
       ? data.minters.find((minter) => minter.id === selection.id)
       : undefined;
   const txid = selection?.kind === 'transaction' ? selection.id : undefined;
-  const txVotes = txid ? data.votes.filter((vote) => vote.txid === txid) : [];
+  const txEndorsements = txid
+    ? data.endorsements.filter((endorsement) => endorsement.txid === txid)
+    : [];
   const acquisitions = txid
     ? data.acquisitions.filter((item) => item.txid === txid)
     : minter
@@ -80,11 +85,11 @@ export function Inspector({ data, selection, select, openCommand, disabled }: Pr
   const confirmedIn = txid
     ? data.bitcoin.blocks.find((item) => item.transactions.includes(txid))
     : undefined;
-  const votes = block
-    ? data.votes.filter((vote) => vote.block_hash === block.tip.hash)
+  const endorsements = block
+    ? data.endorsements.filter((endorsement) => endorsement.block_hash === block.tip.hash)
     : minter
-      ? data.votes.filter((vote) => vote.minter_id === minter.id)
-      : txVotes;
+      ? data.endorsements.filter((endorsement) => endorsement.minter_id === minter.id)
+      : txEndorsements;
   return (
     <aside className="panel inspector">
       <div className="panel-heading">
@@ -112,13 +117,13 @@ export function Inspector({ data, selection, select, openCommand, disabled }: Pr
             <div className="inspect-orbit">⌖</div>
             <h3>Select a block or transaction</h3>
             <p>
-              Select a block, minter, or transaction to see its connections, votes, and contribution
-              to consensus.
+              Select a block, minter, or transaction to see its connections, endorsements, and
+              contribution to consensus.
             </p>
           </div>
         )}
         {selection?.kind === 'flame' && !block && (
-          <Empty>This core block is not yet known. The vote may be waiting for it.</Empty>
+          <Empty>This core block is not yet known. The endorsement may be waiting for it.</Empty>
         )}
         {block && (
           <>
@@ -155,19 +160,19 @@ export function Inspector({ data, selection, select, openCommand, disabled }: Pr
                 <button
                   className="button primary"
                   disabled={disabled}
-                  onClick={() => openCommand('vote')}
+                  onClick={() => openCommand('endorsement')}
                 >
-                  Send vote
+                  Send endorsement
                 </button>
               )}
             </div>
             <h3>
-              Votes <span className="subtle">{votes.length}</span>
+              Endorsements <span className="subtle">{endorsements.length}</span>
             </h3>
-            {votes.length ? (
-              <VoteDetails data={data} votes={votes} select={select} />
+            {endorsements.length ? (
+              <EndorsementDetails data={data} endorsements={endorsements} select={select} />
             ) : (
-              <Empty>No votes for this block yet.</Empty>
+              <Empty>No endorsements for this block yet.</Empty>
             )}
           </>
         )}
@@ -193,8 +198,8 @@ export function Inspector({ data, selection, select, openCommand, disabled }: Pr
                 >
                   <Hash value={tx} />
                   <span className="subtle">
-                    {data.votes.some((item) => item.txid === tx)
-                      ? 'Vote'
+                    {data.endorsements.some((item) => item.txid === tx)
+                      ? 'Endorsement'
                       : data.acquisitions.some((item) => item.txid === tx)
                         ? 'Acquisition'
                         : 'Bitcoin tx'}{' '}
@@ -228,9 +233,9 @@ export function Inspector({ data, selection, select, openCommand, disabled }: Pr
               <button
                 className="button primary"
                 disabled={disabled}
-                onClick={() => openCommand('vote')}
+                onClick={() => openCommand('endorsement')}
               >
-                Vote
+                Endorse
               </button>
             </div>
             <h3>Acquisitions</h3>
@@ -254,10 +259,10 @@ export function Inspector({ data, selection, select, openCommand, disabled }: Pr
                 <Badge>Not in the current snapshot</Badge>
               )}
             </div>
-            {!txVotes.length && !acquisitions.length && (
+            {!txEndorsements.length && !acquisitions.length && (
               <p className="help">
                 Bitcoin transaction: funding, coinbase, or another operation without an acquisition
-                or vote.
+                or endorsement.
               </p>
             )}
           </>
@@ -293,21 +298,21 @@ export function Inspector({ data, selection, select, openCommand, disabled }: Pr
         ))}
         {minter && (
           <>
-            <h3>Votes</h3>
-            <VoteDetails data={data} votes={votes} select={select} />
+            <h3>Endorsements</h3>
+            <EndorsementDetails data={data} endorsements={endorsements} select={select} />
           </>
         )}
         {txid &&
-          txVotes.map((vote) => (
-            <div key={`${vote.output_index}:${vote.minter_id}`}>
-              <h3>Vote · {minterName(data, vote.minter_id)}</h3>
+          txEndorsements.map((endorsement) => (
+            <div key={`${endorsement.output_index}:${endorsement.minter_id}`}>
+              <h3>Endorsement · {minterName(data, endorsement.minter_id)}</h3>
               <button
                 className="text-button"
-                onClick={() => select({ kind: 'flame', id: vote.block_hash })}
+                onClick={() => select({ kind: 'flame', id: endorsement.block_hash })}
               >
-                Core #{vote.core_height} · <Hash value={vote.block_hash} /> ↗
+                Core #{endorsement.core_height} · <Hash value={endorsement.block_hash} /> ↗
               </button>
-              <VoteDetails data={data} votes={[vote]} select={select} />
+              <EndorsementDetails data={data} endorsements={[endorsement]} select={select} />
             </div>
           ))}
         <div className="protocol-parameters">
@@ -322,7 +327,9 @@ export function Inspector({ data, selection, select, openCommand, disabled }: Pr
             <Detail label="Min duration">
               {data.consensus.parameters.min_acquisition_duration} BTC
             </Detail>
-            <Detail label="Max vote delay">{data.consensus.parameters.max_vote_delay} BTC</Detail>
+            <Detail label="Max endorsement delay">
+              {data.consensus.parameters.max_endorsement_delay} BTC
+            </Detail>
           </dl>
         </div>
       </div>

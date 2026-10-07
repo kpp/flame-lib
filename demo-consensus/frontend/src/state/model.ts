@@ -21,7 +21,7 @@ export function selectionExists(selection: Selection, data: Snapshot): boolean {
     case 'flame':
       return (
         data.flame.blocks.some((block) => block.tip.hash === selection.id) ||
-        data.votes.some((vote) => vote.block_hash === selection.id)
+        data.endorsements.some((endorsement) => endorsement.block_hash === selection.id)
       );
     case 'bitcoin':
       return data.bitcoin.blocks.some((block) => block.tip.hash === selection.id);

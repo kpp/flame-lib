@@ -23,7 +23,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
 
 use crate::{
     btc::rpc::{BtcBlockHeaderInfo, BtcBlockTip, BtcTransactionWithPrevouts, RpcApi},
-    protocol::{AcquisitionData, MinterP2wsh, MintingVoteData, minter_witness_script},
+    protocol::{AcquisitionData, MinterP2wsh, MintingEndorsementData, minter_witness_script},
 };
 
 pub(super) struct TestChain {
@@ -242,7 +242,7 @@ pub(super) fn acquisition_transaction(satoshis: u64) -> BtcTransactionWithPrevou
     }
 }
 
-pub(super) fn vote_transaction(authenticated: bool) -> BtcTransactionWithPrevouts {
+pub(super) fn endorsement_transaction(authenticated: bool) -> BtcTransactionWithPrevouts {
     let predicate = Predicate::opaque(Predicate::unspendable_key());
     let witness_script = minter_witness_script::build_with_authorization(
         &predicate,
@@ -260,7 +260,7 @@ pub(super) fn vote_transaction(authenticated: bool) -> BtcTransactionWithPrevout
         }],
         output: vec![TxOut {
             value: Amount::ZERO,
-            script_pubkey: MintingVoteData::V1 {
+            script_pubkey: MintingEndorsementData::V1 {
                 flame_block_height: 42,
                 flame_block_hash: FlameBlockHash::from([0x42; 32]),
             }

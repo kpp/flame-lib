@@ -4,7 +4,7 @@ use crate::consensus::engine::weighter::WeighterError;
 
 fn outcome_engine(
     storage: Storage,
-    votes: Vec<AuthenticatedMintingVote>,
+    endorsements: Vec<AuthenticatedMintingEndorsement>,
     acquisitions: Vec<Acquisition>,
 ) -> MintingEngine<Storage, Storage, Storage> {
     let storage = Arc::new(storage);
@@ -12,7 +12,7 @@ fn outcome_engine(
         Arc::new(IndexedBlock {
             btc_block_tip: btc_tip(100),
             acquisitions,
-            votes,
+            endorsements,
         }),
         Arc::new(params()),
         Arc::clone(&storage),
@@ -22,7 +22,8 @@ fn outcome_engine(
 }
 
 #[tokio::test]
-async fn produces_an_outcome_with_weighted_votes_acquisitions_pending_votes_and_cursor() {
+async fn produces_an_outcome_with_weighted_endorsements_acquisitions_pending_endorsements_and_cursor()
+ {
     let root = header(10, Some((3, 100)), BlockHash::new([0; 32]), 1);
     let child = header(11, None, root.id(), 2);
     let mut storage = Storage::default();
@@ -32,14 +33,14 @@ async fn produces_an_outcome_with_weighted_votes_acquisitions_pending_votes_and_
     add_acquisition(&mut storage, 2, 98, 10, 5);
     add_acquisition(&mut storage, 3, 98, 10, 5);
     let accepted = included(1, &root, 100);
-    let pending = vote(2, 4, 99);
-    let another_pending = vote(3, 4, 99);
+    let pending = endorsement(2, 4, 99);
+    let another_pending = endorsement(3, 4, 99);
     let acquisition = acquisition(Some(5));
     let engine = outcome_engine(
         storage,
         vec![
-            accepted.vote.clone(),
-            accepted.vote.clone(),
+            accepted.endorsement.clone(),
+            accepted.endorsement.clone(),
             pending.clone(),
             another_pending.clone(),
         ],
@@ -47,8 +48,8 @@ async fn produces_an_outcome_with_weighted_votes_acquisitions_pending_votes_and_
     );
     let outcome = engine.get_minting_outcome().await.unwrap();
     assert_eq!(
-        outcome.accepted_votes,
-        vec![WeightedVote {
+        outcome.accepted_endorsements,
+        vec![WeightedEndorsement {
             original: accepted,
             effective_minting_power: 8
         }]
@@ -60,16 +61,16 @@ async fn produces_an_outcome_with_weighted_votes_acquisitions_pending_votes_and_
             acquisition
         }]
     );
-    assert_eq!(outcome.pending_votes.len(), 1);
-    let pending_group = &outcome.pending_votes[&pending.block_tip()];
+    assert_eq!(outcome.pending_endorsements.len(), 1);
+    let pending_group = &outcome.pending_endorsements[&pending.block_tip()];
     assert_eq!(pending_group.len(), 2);
-    for vote in [pending, another_pending] {
-        assert!(pending_group.contains(&IncludedVote {
+    for endorsement in [pending, another_pending] {
+        assert!(pending_group.contains(&IncludedEndorsement {
             btc_block: btc_tip(100),
-            vote
+            endorsement
         }));
     }
-    assert!(outcome.removed_votes.is_empty());
+    assert!(outcome.removed_endorsements.is_empty());
     assert!(outcome.double_signs.is_empty());
     assert_eq!(outcome.next_btc_cursor, btc_tip(100));
     assert_eq!(
@@ -87,7 +88,7 @@ async fn produces_an_outcome_with_weighted_votes_acquisitions_pending_votes_and_
 }
 
 #[tokio::test]
-async fn double_sign_removes_the_stored_vote_and_decreases_descendant_weights() {
+async fn double_sign_removes_the_stored_endorsement_and_decreases_descendant_weights() {
     let root = header(10, Some((3, 100)), BlockHash::new([0; 32]), 1);
     let fork = header(10, Some((3, 100)), BlockHash::new([0; 32]), 2);
     let child = header(11, None, root.id(), 3);
@@ -96,19 +97,19 @@ async fn double_sign_removes_the_stored_vote_and_decreases_descendant_weights() 
     add_block(&mut storage, &fork, 10, 0);
     add_block(&mut storage, &child, 13, 0);
     add_acquisition(&mut storage, 1, 98, 40, 5);
-    let stored = WeightedVote {
+    let stored = WeightedEndorsement {
         original: included(1, &root, 100),
         effective_minting_power: 8,
     };
-    storage.votes.push(stored.clone());
-    let mut engine = outcome_engine(storage, vec![included(1, &fork, 101).vote], vec![]);
+    storage.endorsements.push(stored.clone());
+    let mut engine = outcome_engine(storage, vec![included(1, &fork, 101).endorsement], vec![]);
     Arc::make_mut(&mut engine.new_block).btc_block_tip = btc_tip(101);
     let outcome = engine.get_minting_outcome().await.unwrap();
-    assert!(outcome.accepted_votes.is_empty());
-    assert_eq!(outcome.removed_votes, vec![stored.clone()]);
+    assert!(outcome.accepted_endorsements.is_empty());
+    assert_eq!(outcome.removed_endorsements, vec![stored.clone()]);
     assert_eq!(outcome.double_signs.len(), 1);
     assert_eq!(
-        outcome.double_signs[0].votes,
+        outcome.double_signs[0].endorsements,
         vec![stored.original, included(1, &fork, 101)]
     );
     assert_eq!(outcome.weighted_blocks.len(), 2);
@@ -128,15 +129,20 @@ async fn counts_current_block_acquisitions_when_maturity_is_zero() {
     let root = header(10, Some((3, 100)), BlockHash::new([0; 32]), 1);
     let mut storage = Storage::default();
     add_block(&mut storage, &root, 10, 0);
-    let vote = included(1, &root, 100);
-    let acquisition = acquisition_with_amount(vote.vote.auth().minter().p2wsh(), Some(5), 15);
-    let mut engine = outcome_engine(storage, vec![vote.vote.clone()], vec![acquisition]);
+    let endorsement = included(1, &root, 100);
+    let acquisition =
+        acquisition_with_amount(endorsement.endorsement.auth().minter().p2wsh(), Some(5), 15);
+    let mut engine = outcome_engine(
+        storage,
+        vec![endorsement.endorsement.clone()],
+        vec![acquisition],
+    );
     Arc::make_mut(&mut engine.protocol_params).acquisition_maturity = 0;
     let outcome = engine.get_minting_outcome().await.unwrap();
     assert_eq!(
-        outcome.accepted_votes,
-        vec![WeightedVote {
-            original: vote,
+        outcome.accepted_endorsements,
+        vec![WeightedEndorsement {
+            original: endorsement,
             effective_minting_power: 3
         }]
     );
@@ -161,12 +167,12 @@ async fn returns_empty_outcome_without_reading_storage() {
     assert_eq!(
         outcome,
         MintingOutcome {
-            accepted_votes: vec![],
-            removed_votes: vec![],
+            accepted_endorsements: vec![],
+            removed_endorsements: vec![],
             weighted_blocks: HashMap::new(),
             accepted_acquisitions: vec![],
             double_signs: vec![],
-            pending_votes: BTreeMap::new(),
+            pending_endorsements: BTreeMap::new(),
             next_btc_cursor: btc_tip(100),
         }
     );
@@ -181,7 +187,7 @@ async fn propagates_storage_validation_and_weighter_errors() {
             blocks: HashMap::from([(root.id(), root.clone())]),
             ..Storage::default()
         },
-        vec![included(1, &root, 100).vote],
+        vec![included(1, &root, 100).endorsement],
         vec![],
     );
     assert_eq!(
@@ -191,15 +197,18 @@ async fn propagates_storage_validation_and_weighter_errors() {
     let mut storage = Storage::default();
     storage.blocks.insert(root.id(), root.clone());
     add_acquisition(&mut storage, 1, 98, 40, 5);
-    let engine = outcome_engine(storage, vec![included(1, &root, 100).vote], vec![]);
+    let engine = outcome_engine(storage, vec![included(1, &root, 100).endorsement], vec![]);
     assert_eq!(
         engine.get_minting_outcome().await,
         Err(MintingEngineError::Weighter(WeighterError::MissingWeight(
             root.block_tip()
         )))
     );
-    let mut failed_chain =
-        outcome_engine(Storage::default(), engine.new_block.votes.clone(), vec![]);
+    let mut failed_chain = outcome_engine(
+        Storage::default(),
+        engine.new_block.endorsements.clone(),
+        vec![],
+    );
     failed_chain.consensus_storage = Arc::clone(&engine.consensus_storage);
     failed_chain.chain_storage = Arc::new(Storage {
         fail_blocks: true,

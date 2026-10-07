@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
-use btc_integration::{Acquisition, AuthenticatedMintingVote, MinterP2wsh, UncheckedMintingVote};
+use btc_integration::{
+    Acquisition, AuthenticatedMintingEndorsement, MinterP2wsh, UncheckedMintingEndorsement,
+};
 use corepc_client::bitcoin::{Transaction, Txid};
 use flame_minting::{
     consensus::{ConsensusStorage, MintingProtocolParams},
@@ -12,15 +14,15 @@ use crate::types::*;
 
 use super::{DemoSession, bitcoin_tip, flame_tip, runtime::RecordedBlock};
 
-type VoteKey = (String, u32, u32);
+type EndorsementKey = (String, u32, u32);
 type DoubleSignKey = (u32, u32);
 
 struct ProtocolSnapshotBuilder<'a> {
     parameters: &'a MintingProtocolParams,
     minters: HashMap<MinterP2wsh, MinterId>,
     acquisitions: Vec<AcquisitionSnapshot>,
-    votes: BTreeMap<VoteKey, VoteSnapshot>,
-    double_signs: BTreeMap<DoubleSignKey, Vec<VoteKey>>,
+    endorsements: BTreeMap<EndorsementKey, EndorsementSnapshot>,
+    double_signs: BTreeMap<DoubleSignKey, Vec<EndorsementKey>>,
 }
 
 impl DemoSession {
@@ -37,7 +39,7 @@ impl DemoSession {
                 .map(|minter| (minter.identity.p2wsh(), minter.id))
                 .collect(),
             acquisitions: Vec::new(),
-            votes: BTreeMap::new(),
+            endorsements: BTreeMap::new(),
             double_signs: BTreeMap::new(),
         };
         for record in history
@@ -52,12 +54,12 @@ impl DemoSession {
         let double_signs = builder
             .double_signs
             .iter()
-            .map(|(&(minter, height), votes)| DoubleSignSnapshot {
+            .map(|(&(minter, height), endorsements)| DoubleSignSnapshot {
                 minter_id: MinterId(minter),
                 core_height: height,
-                votes: votes
+                endorsements: endorsements
                     .iter()
-                    .filter_map(|key| builder.votes.get(key).cloned())
+                    .filter_map(|key| builder.endorsements.get(key).cloned())
                     .collect(),
             })
             .collect();
@@ -70,7 +72,7 @@ impl DemoSession {
             },
             minters: self.minters().await?,
             acquisitions: builder.acquisitions,
-            votes: builder.votes.into_values().collect(),
+            endorsements: builder.endorsements.into_values().collect(),
             consensus: ConsensusSnapshot {
                 btc_cursor: bitcoin_tip(cursor),
                 heaviest_tip: self
@@ -83,7 +85,7 @@ impl DemoSession {
                     acquisition_maturity: parameters.acquisition_maturity,
                     default_acquisition_duration: parameters.default_acquisition_duration,
                     min_acquisition_duration: parameters.min_acquisition_duration,
-                    max_vote_delay: parameters.max_vote_delay,
+                    max_endorsement_delay: parameters.max_endorsement_delay,
                 },
                 double_signs,
             },
@@ -116,30 +118,33 @@ impl ProtocolSnapshotBuilder<'_> {
             };
             self.add_acquisition(acquisition, transaction_status.clone(), processing);
         }
-        for vote in &record.block.votes {
-            self.add_vote(
-                vote.txid(),
-                vote.output(),
-                vote.auth().minter().p2wsh(),
+        for endorsement in &record.block.endorsements {
+            self.add_endorsement(
+                endorsement.txid(),
+                endorsement.output(),
+                endorsement.auth().minter().p2wsh(),
                 transaction_status.clone(),
-                VoteProcessingStatus::Rejected,
+                EndorsementProcessingStatus::Rejected,
             );
         }
-        for vote in record.outcome.pending_votes.values().flatten() {
-            self.set_vote_status(&vote.vote, VoteProcessingStatus::PendingBlock);
+        for endorsement in record.outcome.pending_endorsements.values().flatten() {
+            self.set_endorsement_status(
+                &endorsement.endorsement,
+                EndorsementProcessingStatus::PendingBlock,
+            );
         }
-        for vote in &record.outcome.accepted_votes {
-            self.set_vote_status(
-                &vote.original.vote,
-                VoteProcessingStatus::Accepted {
-                    effective_minting_power: vote.effective_minting_power,
+        for endorsement in &record.outcome.accepted_endorsements {
+            self.set_endorsement_status(
+                &endorsement.original.endorsement,
+                EndorsementProcessingStatus::Accepted {
+                    effective_minting_power: endorsement.effective_minting_power,
                 },
             );
         }
-        for vote in &record.outcome.removed_votes {
-            self.set_vote_status(
-                &vote.original.vote,
-                VoteProcessingStatus::InvalidatedByDoubleSign,
+        for endorsement in &record.outcome.removed_endorsements {
+            self.set_endorsement_status(
+                &endorsement.original.endorsement,
+                EndorsementProcessingStatus::InvalidatedByDoubleSign,
             );
         }
         for sign in &record.outcome.double_signs {
@@ -147,11 +152,14 @@ impl ProtocolSnapshotBuilder<'_> {
                 continue;
             };
             let mut keys = Vec::new();
-            for vote in &sign.votes {
-                self.set_vote_status(&vote.vote, VoteProcessingStatus::InvalidatedByDoubleSign);
+            for endorsement in &sign.endorsements {
+                self.set_endorsement_status(
+                    &endorsement.endorsement,
+                    EndorsementProcessingStatus::InvalidatedByDoubleSign,
+                );
                 keys.push((
-                    vote.vote.txid().to_string(),
-                    vote.vote.output().output_index,
+                    endorsement.endorsement.txid().to_string(),
+                    endorsement.endorsement.output().output_index,
                     minter.0,
                 ));
             }
@@ -168,13 +176,13 @@ impl ProtocolSnapshotBuilder<'_> {
                 AcquisitionProcessingStatus::Unprocessed,
             );
         }
-        for vote in UncheckedMintingVote::from_tx(transaction) {
-            self.add_vote(
-                vote.txid(),
-                vote.output(),
-                vote.auth().minter().p2wsh(),
+        for endorsement in UncheckedMintingEndorsement::from_tx(transaction) {
+            self.add_endorsement(
+                endorsement.txid(),
+                endorsement.output(),
+                endorsement.auth().minter().p2wsh(),
                 TransactionStatus::Mempool,
-                VoteProcessingStatus::Unprocessed,
+                EndorsementProcessingStatus::Unprocessed,
             );
         }
     }
@@ -202,21 +210,21 @@ impl ProtocolSnapshotBuilder<'_> {
         });
     }
 
-    fn add_vote(
+    fn add_endorsement(
         &mut self,
         txid: Txid,
-        output: &btc_integration::MintingVoteOutput,
+        output: &btc_integration::MintingEndorsementOutput,
         minter: MinterP2wsh,
         transaction_status: TransactionStatus,
-        processing_status: VoteProcessingStatus,
+        processing_status: EndorsementProcessingStatus,
     ) {
         let Some(&minter_id) = self.minters.get(&minter) else {
             return;
         };
         let txid = txid.to_string();
-        self.votes.insert(
+        self.endorsements.insert(
             (txid.clone(), output.output_index, minter_id.0),
-            VoteSnapshot {
+            EndorsementSnapshot {
                 txid: BitcoinTxid(txid),
                 output_index: output.output_index,
                 minter_id,
@@ -228,16 +236,20 @@ impl ProtocolSnapshotBuilder<'_> {
         );
     }
 
-    fn set_vote_status(&mut self, vote: &AuthenticatedMintingVote, status: VoteProcessingStatus) {
-        let Some(&minter) = self.minters.get(&vote.auth().minter().p2wsh()) else {
+    fn set_endorsement_status(
+        &mut self,
+        endorsement: &AuthenticatedMintingEndorsement,
+        status: EndorsementProcessingStatus,
+    ) {
+        let Some(&minter) = self.minters.get(&endorsement.auth().minter().p2wsh()) else {
             return;
         };
         let key = (
-            vote.txid().to_string(),
-            vote.output().output_index,
+            endorsement.txid().to_string(),
+            endorsement.output().output_index,
             minter.0,
         );
-        if let Some(snapshot) = self.votes.get_mut(&key) {
+        if let Some(snapshot) = self.endorsements.get_mut(&key) {
             snapshot.processing_status = status;
         }
     }

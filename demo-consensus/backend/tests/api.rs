@@ -157,37 +157,37 @@ async fn api_exposes_mempool_consensus_forks_double_signs_and_reset() -> Result<
         )
         .await?;
         let second = call(&app, "POST", "/api/flame/blocks", Some(block_request), 200).await?;
-        let first_vote = call(
+        let first_endorsement = call(
             &app,
             "POST",
-            "/api/votes",
+            "/api/endorsements",
             Some(json!({"minter_id":0,"core_height":first["core"]["height"],"block_hash":first["tip"]["hash"]})),
             200,
         )
         .await?;
         let pending = snapshot(&app).await?;
-        let pending_vote = pending["votes"].as_array().unwrap().iter()
-            .find(|vote| vote["txid"] == first_vote["txid"]).context("missing pending vote")?;
+        let pending_endorsement = pending["endorsements"].as_array().unwrap().iter()
+            .find(|endorsement| endorsement["txid"] == first_endorsement["txid"]).context("missing pending endorsement")?;
         ensure!(
-            pending_vote["processing_status"]["status"] == "unprocessed",
-            "unconfirmed vote counted"
+            pending_endorsement["processing_status"]["status"] == "unprocessed",
+            "unconfirmed endorsement counted"
         );
         mine(&app).await?;
         let first_state = snapshot(&app).await?;
         ensure!(
             first_state["flame"]["canonical_tip"] == first["tip"],
-            "first vote did not select its block"
+            "first endorsement did not select its block"
         );
-        let accepted_vote = first_state["votes"].as_array().unwrap().iter()
-            .find(|vote| vote["txid"] == first_vote["txid"]).context("missing accepted vote")?;
+        let accepted_endorsement = first_state["endorsements"].as_array().unwrap().iter()
+            .find(|endorsement| endorsement["txid"] == first_endorsement["txid"]).context("missing accepted endorsement")?;
         ensure!(
-            accepted_vote["processing_status"]["effective_minting_power"] == 200,
-            "wrong vote power"
+            accepted_endorsement["processing_status"]["effective_minting_power"] == 200,
+            "wrong endorsement power"
         );
         call(
             &app,
             "POST",
-            "/api/votes",
+            "/api/endorsements",
             Some(json!({"minter_id":1,"core_height":second["core"]["height"],"block_hash":second["tip"]["hash"]})),
             200,
         )
@@ -196,7 +196,7 @@ async fn api_exposes_mempool_consensus_forks_double_signs_and_reset() -> Result<
         let switched = snapshot(&app).await?;
         ensure!(
             switched["flame"]["canonical_tip"] == second["tip"],
-            "stronger vote did not switch branches"
+            "stronger endorsement did not switch branches"
         );
         ensure!(
             switched["consensus"]["heaviest_tip"] == second["tip"],
@@ -205,7 +205,7 @@ async fn api_exposes_mempool_consensus_forks_double_signs_and_reset() -> Result<
         call(
             &app,
             "POST",
-            "/api/votes",
+            "/api/endorsements",
             Some(json!({"minter_id":1,"core_height":first["core"]["height"],"block_hash":first["tip"]["hash"]})),
             200,
         )
@@ -221,7 +221,7 @@ async fn api_exposes_mempool_consensus_forks_double_signs_and_reset() -> Result<
             "missing minter penalty"
         );
         ensure!(
-            penalized["consensus"]["double_signs"][0]["votes"]
+            penalized["consensus"]["double_signs"][0]["endorsements"]
                 .as_array()
                 .unwrap()
                 .len()
@@ -229,19 +229,19 @@ async fn api_exposes_mempool_consensus_forks_double_signs_and_reset() -> Result<
             "missing double-sign evidence"
         );
         ensure!(
-            penalized["votes"]
+            penalized["endorsements"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|vote| vote["processing_status"]["status"] == "invalidated_by_double_sign")
+                .filter(|endorsement| endorsement["processing_status"]["status"] == "invalidated_by_double_sign")
                 .count()
                 == 2,
-            "removed votes still counted"
+            "removed endorsements still counted"
         );
         call(
             &app,
             "POST",
-            "/api/votes",
+            "/api/endorsements",
             Some(json!({"minter_id":0,"core_height":50,"block_hash":"cc".repeat(32)})),
             200,
         )
@@ -249,11 +249,11 @@ async fn api_exposes_mempool_consensus_forks_double_signs_and_reset() -> Result<
         mine(&app).await?;
         let pending_block = snapshot(&app).await?;
         ensure!(
-            pending_block["votes"]
+            pending_block["endorsements"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|vote| vote["processing_status"]["status"] == "pending_block"),
+                .any(|endorsement| endorsement["processing_status"]["status"] == "pending_block"),
             "missing pending-block status"
         );
         let reset = call(
@@ -269,8 +269,8 @@ async fn api_exposes_mempool_consensus_forks_double_signs_and_reset() -> Result<
             "reset retained old minters"
         );
         ensure!(
-            reset["minters"][0]["automatic_voting"] == false,
-            "reset enabled automatic voting"
+            reset["minters"][0]["automatic_endorsement"] == false,
+            "reset enabled automatic endorsement"
         );
         ensure!(
             reset["minters"][0]["p2wsh_address"] != initial["minters"][0]["p2wsh_address"],
@@ -280,7 +280,7 @@ async fn api_exposes_mempool_consensus_forks_double_signs_and_reset() -> Result<
             reset["flame"]["blocks"].as_array().unwrap().len() == 1,
             "reset retained Flame branches"
         );
-        for field in ["acquisitions", "votes"] {
+        for field in ["acquisitions", "endorsements"] {
             ensure!(
                 reset[field].as_array().unwrap().len() == 1,
                 "reset did not seed exactly one {field}"
@@ -289,7 +289,7 @@ async fn api_exposes_mempool_consensus_forks_double_signs_and_reset() -> Result<
         }
         ensure!(reset["minters"][0]["name"] == "Alice", "reset omitted Alice");
         ensure!(reset["acquisitions"][0]["amount_sats"] == 20_000, "reset seeded wrong acquisition");
-        ensure!(reset["votes"][0]["processing_status"]["status"] == "accepted", "reset seed vote was rejected");
+        ensure!(reset["endorsements"][0]["processing_status"]["status"] == "accepted", "reset seed endorsement was rejected");
         ensure!(reset["flame"]["blocks"][0]["core"]["height"] == 1, "reset genesis is not core");
         ensure!(reset["flame"]["blocks"][0]["chain_weight"] == 7, "reset genesis has no weight");
         ensure!(
@@ -328,7 +328,7 @@ async fn api_validates_requests_and_serializes_concurrent_commands() -> Result<(
             &app,
             "POST",
             "/api/reset",
-            Some(json!({"automatic_voting":true})),
+            Some(json!({"automatic_endorsement":true})),
             422,
         )
         .await?;
@@ -371,13 +371,13 @@ async fn api_validates_requests_and_serializes_concurrent_commands() -> Result<(
         call(
             &app,
             "POST",
-            "/api/votes",
+            "/api/endorsements",
             Some(json!({"minter_id":0,"core_height":1,"block_hash":"00"})),
             400,
         )
         .await?;
         call(&app, "GET", "/api/missing", None, 404).await?;
-        call(&app, "GET", "/api/votes", None, 405).await?;
+        call(&app, "GET", "/api/endorsements", None, 405).await?;
         raw_call(&app, "POST", "/api/minters", "x".repeat(17 * 1024), 413).await?;
         let before = snapshot(&app).await?;
         ensure!(

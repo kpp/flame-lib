@@ -29,7 +29,7 @@ let mut updates = indexer.subscribe();
 indexer.startup().await?;
 
 sender.send_acquisition(Amount::from_sat(50_000)).await?;
-sender.send_vote(height, hash).await?;
+sender.send_endorsement(height, hash).await?;
 // The application consumes get_history(cursor, limit) and persists its cursor.
 indexer.shutdown().await?;
 # Ok(())

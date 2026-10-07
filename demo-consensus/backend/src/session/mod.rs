@@ -22,7 +22,7 @@ use crate::{
     types::{
         BitcoinBlockHash, BitcoinBlockTip, BitcoinTxid, CreateBitcoinBlocksRequest,
         CreateFlameBlockRequest, CreateMinterRequest, FlameBlockHash, FlameBlockSnapshot,
-        FlameBlockTip, MinterId, MinterSnapshot, SendAcquisitionRequest, SendVoteRequest,
+        FlameBlockTip, MinterId, MinterSnapshot, SendAcquisitionRequest, SendEndorsementRequest,
         SubmittedTransaction,
     },
 };
@@ -95,20 +95,20 @@ impl DemoSession {
             let genesis_tip = session.canonical_tip().await?;
             let genesis = session.flame_block(&genesis_tip.hash).await?;
             session
-                .send_vote(SendVoteRequest {
+                .send_endorsement(SendEndorsementRequest {
                     minter_id: MinterId(0),
                     core_height: genesis.core.context("genesis is not a core block")?.height,
                     block_hash: genesis_tip.hash,
                 })
                 .await?;
-            let voted_tip = session.bitcoin.mine_block().await?;
+            let endorsed_tip = session.bitcoin.mine_block().await?;
             session
                 .runtime
                 .orchestrator
                 .startup()
                 .await
                 .map_err(|error| anyhow!("start orchestrator: {error:?}"))?;
-            session.wait_for_processing(voted_tip).await
+            session.wait_for_processing(endorsed_tip).await
         };
         match timeout(Duration::from_secs(30), startup)
             .await
@@ -195,12 +195,15 @@ impl DemoSession {
         })
     }
 
-    pub async fn send_vote(&mut self, request: SendVoteRequest) -> Result<SubmittedTransaction> {
+    pub async fn send_endorsement(
+        &mut self,
+        request: SendEndorsementRequest,
+    ) -> Result<SubmittedTransaction> {
         let hash = parse_flame_hash(&request.block_hash)?;
         let txid = self
             .minter(request.minter_id)?
             .sender
-            .send_vote(request.core_height, hash)
+            .send_endorsement(request.core_height, hash)
             .await?;
         Ok(SubmittedTransaction {
             txid: BitcoinTxid(txid.to_string()),

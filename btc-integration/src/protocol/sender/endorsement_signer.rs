@@ -15,7 +15,7 @@ use thiserror::Error;
 use super::signer::{RequiredInput, SignTransactionRequest, TransactionSigner};
 use crate::{
     btc::rpc::{BtcFundedTransaction, RpcApi},
-    protocol::{minter_witness_script, vote::MintingVoteOutput},
+    protocol::{endorsement::MintingEndorsementOutput, minter_witness_script},
 };
 
 #[async_trait]
@@ -63,12 +63,12 @@ impl Drop for ErasingSecretKey {
     }
 }
 
-pub struct VoteSigner<R: ?Sized, S> {
+pub struct EndorsementSigner<R: ?Sized, S> {
     btc_facade: Arc<BitcoinFacade<R>>,
     secret_key_access: SecretKeyAccess<S>,
 }
 
-impl<R: ?Sized, S: SecretStorage> VoteSigner<R, S> {
+impl<R: ?Sized, S: SecretStorage> EndorsementSigner<R, S> {
     pub fn new(secret_storage: S, btc_facade: Arc<BitcoinFacade<R>>) -> Self {
         Self {
             btc_facade,
@@ -78,12 +78,12 @@ impl<R: ?Sized, S: SecretStorage> VoteSigner<R, S> {
 }
 
 #[async_trait]
-impl<R, S> TransactionSigner for VoteSigner<R, S>
+impl<R, S> TransactionSigner for EndorsementSigner<R, S>
 where
     R: RpcApi + ?Sized,
     S: SecretStorage,
 {
-    type Error = VoteSignerError<S::Error>;
+    type Error = EndorsementSignerError<S::Error>;
 
     async fn fund_and_sign(
         &self,
@@ -108,42 +108,44 @@ where
                 sign_transaction(funded, witness_script, secret_key)
             })
             .await
-            .map_err(VoteSignerError::SecretStorage)
+            .map_err(EndorsementSignerError::SecretStorage)
             .and_then(|result| result)
     }
 }
 
 fn validate_request<E>(
     request: &SignTransactionRequest,
-) -> Result<(&ScriptBuf, PublicKey), VoteSignerError<E>>
+) -> Result<(&ScriptBuf, PublicKey), EndorsementSignerError<E>>
 where
     E: Error + Send + Sync + 'static,
 {
     if !request.transaction.input.is_empty() {
-        return Err(VoteSignerError::InvalidRequest(
-            "a vote transaction must not contain inputs before funding",
+        return Err(EndorsementSignerError::InvalidRequest(
+            "an endorsement transaction must not contain inputs before funding",
         ));
     }
     if request.transaction.output.len() != 1
         || request.transaction.output[0].value != Amount::ZERO
-        || MintingVoteOutput::from_output(0, &request.transaction.output[0]).is_none()
+        || MintingEndorsementOutput::from_output(0, &request.transaction.output[0]).is_none()
     {
-        return Err(VoteSignerError::InvalidRequest(
-            "VoteSigner only accepts a single zero-value Minting vote output",
+        return Err(EndorsementSignerError::InvalidRequest(
+            "EndorsementSigner only accepts a single zero-value Minting endorsement output",
         ));
     }
 
     let [RequiredInput::P2wsh { witness_script }] = request.required_inputs.as_slice() else {
-        return Err(VoteSignerError::InvalidRequest(
-            "VoteSigner requires exactly one Minter P2WSH input",
+        return Err(EndorsementSignerError::InvalidRequest(
+            "EndorsementSigner requires exactly one Minter P2WSH input",
         ));
     };
     let parsed = minter_witness_script::parse(witness_script).map_err(|_| {
-        VoteSignerError::InvalidRequest("the Minter witness script has an invalid FLMV prefix")
+        EndorsementSignerError::InvalidRequest(
+            "the Minter witness script has an invalid FLMV prefix",
+        )
     })?;
     let public_key = minter_witness_script::single_key_public_key(parsed.authorization).ok_or(
-        VoteSignerError::InvalidRequest(
-            "VoteSigner only supports <compressed-pubkey> OP_CHECKSIG authorization",
+        EndorsementSignerError::InvalidRequest(
+            "EndorsementSigner only supports <compressed-pubkey> OP_CHECKSIG authorization",
         ),
     )?;
     Ok((witness_script, public_key))
@@ -152,13 +154,13 @@ where
 fn validate_secret_key<E>(
     secret_key: &SecretKey,
     expected: &PublicKey,
-) -> Result<(), VoteSignerError<E>>
+) -> Result<(), EndorsementSignerError<E>>
 where
     E: Error + Send + Sync + 'static,
 {
     let actual = secret_key.public_key(&Secp256k1::signing_only());
     if actual != *expected {
-        return Err(VoteSignerError::SecretKeyMismatch);
+        return Err(EndorsementSignerError::SecretKeyMismatch);
     }
     Ok(())
 }
@@ -167,7 +169,7 @@ fn validate_funded_transaction<E>(
     original: &Transaction,
     funded: &BtcFundedTransaction,
     script_pubkey: &ScriptBuf,
-) -> Result<(), VoteSignerError<E>>
+) -> Result<(), EndorsementSignerError<E>>
 where
     E: Error + Send + Sync + 'static,
 {
@@ -176,7 +178,7 @@ where
         || funded.transaction.input.is_empty()
         || funded.transaction.input.len() != funded.inputs.len()
     {
-        return Err(VoteSignerError::RpcContractViolation);
+        return Err(EndorsementSignerError::RpcContractViolation);
     }
     if funded
         .transaction
@@ -188,7 +190,7 @@ where
                 || funding.prevout.script_pubkey != *script_pubkey
         })
     {
-        return Err(VoteSignerError::RpcContractViolation);
+        return Err(EndorsementSignerError::RpcContractViolation);
     }
 
     let original_output_count = funded
@@ -204,7 +206,7 @@ where
                 output == &original.output[0] || output.script_pubkey == *script_pubkey
             });
     if !valid_outputs {
-        return Err(VoteSignerError::RpcContractViolation);
+        return Err(EndorsementSignerError::RpcContractViolation);
     }
     Ok(())
 }
@@ -213,7 +215,7 @@ fn sign_transaction<E>(
     mut funded: BtcFundedTransaction,
     witness_script: &ScriptBuf,
     secret_key: &SecretKey,
-) -> Result<Transaction, VoteSignerError<E>>
+) -> Result<Transaction, EndorsementSignerError<E>>
 where
     E: Error + Send + Sync + 'static,
 {
@@ -225,7 +227,7 @@ where
                 funding.prevout.value,
                 EcdsaSighashType::All,
             )
-            .map_err(|error| VoteSignerError::Sighash {
+            .map_err(|error| EndorsementSignerError::Sighash {
                 input_index,
                 message: error.to_string(),
             })?;
@@ -242,7 +244,7 @@ where
 }
 
 #[derive(Debug, Error)]
-pub enum VoteSignerError<E>
+pub enum EndorsementSignerError<E>
 where
     E: Error + Send + Sync + 'static,
 {
@@ -250,11 +252,13 @@ where
     SecretStorage(#[source] E),
     #[error("Bitcoin Core RPC error: {0}")]
     Rpc(#[from] RpcError),
-    #[error("invalid VoteSigner request: {0}")]
+    #[error("invalid EndorsementSigner request: {0}")]
     InvalidRequest(&'static str),
     #[error("the secret key does not match the public key in the Minter witness script")]
     SecretKeyMismatch,
-    #[error("Bitcoin Core returned a funded transaction that violates the VoteSigner contract")]
+    #[error(
+        "Bitcoin Core returned a funded transaction that violates the EndorsementSigner contract"
+    )]
     RpcContractViolation,
     #[error("failed to calculate the P2WSH signature hash for input {input_index}: {message}")]
     Sighash { input_index: usize, message: String },

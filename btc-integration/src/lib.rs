@@ -18,14 +18,15 @@ pub mod prelude {
     pub use crate::btc::transaction_builder::BitcoinTransactionBuilder;
     pub use crate::identity::{IdentityConfig, IdentityError, IdentityManager};
     pub use crate::protocol::{
-        Acquisition, AcquisitionData, AuthenticatedMintingVote, HistoryChange, HistoryError,
-        HistoryUpdate, IndexedBlock, MinterIdentity, MinterIdentityError, MinterP2wsh,
-        MintingSendError, MintingVoteAuth, MintingVoteData, MintingVoteOutput,
-        MintingVoteProcessingError, MintingVoteValidationError, MintingVoteValidator,
+        Acquisition, AcquisitionData, AuthenticatedMintingEndorsement, EndorsementSender,
+        EndorsementSigner, EndorsementSignerError, HistoryChange, HistoryError, HistoryUpdate,
+        IndexedBlock, MinterIdentity, MinterIdentityError, MinterP2wsh, MintingEndorsementAuth,
+        MintingEndorsementData, MintingEndorsementOutput, MintingEndorsementProcessingError,
+        MintingEndorsementValidationError, MintingEndorsementValidator, MintingSendError,
         ProtocolIndexer, RequiredInput, SecretStorage, Sender, ShutdownError,
         SignTransactionRequest, SignerContractViolation, StartupError, TestSender, TestSigner,
-        TestSignerError, TransactionSigner, UncheckedMintingVote, VoteSender, VoteSigner,
-        VoteSignerError, validate_transaction_votes,
+        TestSignerError, TransactionSigner, UncheckedMintingEndorsement,
+        validate_transaction_endorsements,
     };
     pub use corepc_client::client_sync::Auth as BitcoinRpcAuth;
     pub use flamechain::BlockHash;

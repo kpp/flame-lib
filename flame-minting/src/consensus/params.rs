@@ -9,6 +9,6 @@ pub struct MintingProtocolParams {
     pub default_acquisition_duration: NonZeroU16,
     /// Minimum permitted acquisition duration.
     pub min_acquisition_duration: NonZeroU16,
-    /// Votes delayed beyond this many Bitcoin blocks have zero effective power.
-    pub max_vote_delay: u32,
+    /// Endorsements delayed beyond this many Bitcoin blocks have zero effective power.
+    pub max_endorsement_delay: u32,
 }

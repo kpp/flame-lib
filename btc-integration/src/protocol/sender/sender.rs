@@ -11,11 +11,13 @@ use tokio::sync::Mutex;
 
 use crate::btc::rpc::RpcApi;
 use crate::protocol::{
+    endorsement::{MintingEndorsementAuth, MintingEndorsementData, MintingEndorsementOutput},
     minter_identity::MinterIdentity,
     sender::signer::{RequiredInput, SignTransactionRequest, TransactionSigner},
-    vote::{MintingVoteAuth, MintingVoteData, MintingVoteOutput},
 };
-use crate::{Acquisition, AcquisitionData, SecretStorage, TestSigner, TestSignerError, VoteSigner};
+use crate::{
+    Acquisition, AcquisitionData, EndorsementSigner, SecretStorage, TestSigner, TestSignerError,
+};
 
 pub struct Sender<R: ?Sized, S: ?Sized> {
     pub(super) rpc: Arc<BitcoinFacade<R>>,
@@ -44,14 +46,14 @@ where
     R: RpcApi + ?Sized,
     S: TransactionSigner + ?Sized,
 {
-    /// Sends vote to the bitcoin network
-    pub async fn send_vote(
+    /// Sends endorsement to the bitcoin network
+    pub async fn send_endorsement(
         &self,
         height: u32,
         hash: BlockHash,
     ) -> Result<Txid, MintingSendError<S::Error>> {
         let _sending = self.sending.lock().await;
-        let expected = MintingVoteData::V1 {
+        let expected = MintingEndorsementData::V1 {
             flame_block_height: height,
             flame_block_hash: hash,
         };
@@ -68,7 +70,7 @@ where
             .await
             .map_err(MintingSendError::Signing)?;
 
-        validate_signed_vote(&signed, &expected, &self.minter)?;
+        validate_signed_endorsement(&signed, &expected, &self.minter)?;
 
         self.rpc
             .publish_transaction_with_burn(&signed, Amount::ZERO)
@@ -77,10 +79,10 @@ where
     }
 }
 
-/// A sender supporting only Minting votes.
-pub type VoteSender<R, S> = Sender<R, VoteSigner<R, S>>;
+/// A sender supporting only Minting endorsements.
+pub type EndorsementSender<R, S> = Sender<R, EndorsementSigner<R, S>>;
 
-/// A regtest sender supporting both `send_vote` and `send_acquisition`.
+/// A regtest sender supporting both `send_endorsement` and `send_acquisition`.
 pub type TestSender<R, S> = Sender<R, TestSigner<R, S>>;
 
 impl<R: RpcApi + ?Sized, S: SecretStorage> Sender<R, TestSigner<R, S>> {
@@ -142,9 +144,9 @@ fn validate_signed_acquisition(
     }
 }
 
-fn validate_signed_vote(
+fn validate_signed_endorsement(
     transaction: &Transaction,
-    expected_data: &MintingVoteData,
+    expected_data: &MintingEndorsementData,
     expected_minter: &MinterIdentity,
 ) -> Result<(), SignerContractViolation> {
     validate_transaction_header(transaction)?;
@@ -156,20 +158,20 @@ fn validate_signed_vote(
         .output
         .iter()
         .enumerate()
-        .filter_map(|(index, output)| MintingVoteOutput::from_output(index, output))
+        .filter_map(|(index, output)| MintingEndorsementOutput::from_output(index, output))
         .collect::<Vec<_>>();
     match outputs.as_slice() {
-        [] => return Err(SignerContractViolation::MissingVoteOutput),
+        [] => return Err(SignerContractViolation::MissingEndorsementOutput),
         [output]
             if output.data == *expected_data
                 && transaction.output[output.output_index as usize].value == Amount::ZERO => {}
-        [_] => return Err(SignerContractViolation::ChangedVoteOutput),
-        _ => return Err(SignerContractViolation::MultipleVoteOutputs),
+        [_] => return Err(SignerContractViolation::ChangedEndorsementOutput),
+        _ => return Err(SignerContractViolation::MultipleEndorsementOutputs),
     }
 
     let mut found_expected_minter = false;
     for (input_index, input) in transaction.input.iter().enumerate() {
-        let Some(auth) = MintingVoteAuth::from_input(input_index, input) else {
+        let Some(auth) = MintingEndorsementAuth::from_input(input_index, input) else {
             continue;
         };
 
@@ -209,12 +211,12 @@ pub enum SignerContractViolation {
     ChangedAcquisitionOutput,
     #[error("transaction signer added another Acquisition output")]
     MultipleAcquisitionOutputs,
-    #[error("transaction signer removed the requested Minting vote output")]
-    MissingVoteOutput,
-    #[error("transaction signer changed the requested Minting vote output")]
-    ChangedVoteOutput,
-    #[error("transaction signer added another Minting vote output")]
-    MultipleVoteOutputs,
+    #[error("transaction signer removed the requested Minting endorsement output")]
+    MissingEndorsementOutput,
+    #[error("transaction signer changed the requested Minting endorsement output")]
+    ChangedEndorsementOutput,
+    #[error("transaction signer added another Minting endorsement output")]
+    MultipleEndorsementOutputs,
     #[error("transaction signer did not add the required Minter P2WSH authentication")]
     MissingMinterAuthentication,
     #[error("input {input_index} contains authentication for an unexpected Minter")]
@@ -260,7 +262,7 @@ mod tests {
     use crate::{
         btc::rpc::{BtcBlockHeaderInfo, BtcBlockTip, RpcApi},
         protocol::{
-            MinterIdentity, MintingVoteData, RequiredInput, SignTransactionRequest,
+            MinterIdentity, MintingEndorsementData, RequiredInput, SignTransactionRequest,
             TransactionSigner, minter_witness_script,
         },
     };
@@ -413,7 +415,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vote_requires_minter_p2wsh_then_publishes_without_a_burn_allowance() {
+    async fn endorsement_requires_minter_p2wsh_then_publishes_without_a_burn_allowance() {
         let rpc = Arc::new(RecordingRpc::default());
         let signer = Arc::new(RecordingSigner::new(SignerMode::Valid));
         let script = witness_script(&predicate());
@@ -424,7 +426,10 @@ mod tests {
         );
         let hash = BlockHash::from([0x44; 32]);
 
-        sender.send_vote(123, hash).await.expect("send vote");
+        sender
+            .send_endorsement(123, hash)
+            .await
+            .expect("send endorsement");
 
         let requests = signer.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -437,7 +442,7 @@ mod tests {
         );
         assert_eq!(
             requests[0].transaction.output[0].script_pubkey,
-            MintingVoteData::V1 {
+            MintingEndorsementData::V1 {
                 flame_block_height: 123,
                 flame_block_hash: hash,
             }
@@ -451,7 +456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_a_vote_without_the_required_authentication_before_rpc() {
+    async fn rejects_an_endorsement_without_the_required_authentication_before_rpc() {
         let rpc = Arc::new(RecordingRpc::default());
         let signer = Arc::new(RecordingSigner::new(SignerMode::MissingAuthentication));
         let sender = Sender::new(
@@ -461,7 +466,7 @@ mod tests {
         );
 
         let error = sender
-            .send_vote(123, BlockHash::from([0x44; 32]))
+            .send_endorsement(123, BlockHash::from([0x44; 32]))
             .await
             .expect_err("missing authentication must fail");
 
@@ -473,7 +478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_a_removed_vote_output_before_rpc() {
+    async fn rejects_a_removed_endorsement_output_before_rpc() {
         let rpc = Arc::new(RecordingRpc::default());
         let signer = Arc::new(RecordingSigner::new(SignerMode::RemoveProtocolOutput));
         let sender = Sender::new(
@@ -483,19 +488,19 @@ mod tests {
         );
 
         let error = sender
-            .send_vote(125, BlockHash::from([0x66; 32]))
+            .send_endorsement(125, BlockHash::from([0x66; 32]))
             .await
-            .expect_err("removed vote must fail");
+            .expect_err("removed endorsement must fail");
 
         assert!(matches!(
             error,
-            MintingSendError::SignerContract(SignerContractViolation::MissingVoteOutput)
+            MintingSendError::SignerContract(SignerContractViolation::MissingEndorsementOutput)
         ));
         assert!(rpc.published.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn votes_are_serialized_through_publication() {
+    async fn endorsements_are_serialized_through_publication() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let rpc = Arc::new(RecordingRpc {
             events: Arc::clone(&events),
@@ -513,10 +518,10 @@ mod tests {
 
         let results = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             tokio::join!(
-                sender.send_vote(125, BlockHash::from([0x66; 32])),
-                sender.send_vote(123, BlockHash::from([0x44; 32])),
-                sender.send_vote(124, BlockHash::from([0x55; 32])),
-                sender.send_vote(126, BlockHash::from([0x77; 32])),
+                sender.send_endorsement(125, BlockHash::from([0x66; 32])),
+                sender.send_endorsement(123, BlockHash::from([0x44; 32])),
+                sender.send_endorsement(124, BlockHash::from([0x55; 32])),
+                sender.send_endorsement(126, BlockHash::from([0x77; 32])),
             )
         })
         .await
@@ -546,8 +551,8 @@ mod tests {
         let (failed, next) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             tokio::join!(
                 biased;
-                sender.send_vote(125, BlockHash::from([0x66; 32])),
-                sender.send_vote(123, BlockHash::from([0x44; 32])),
+                sender.send_endorsement(125, BlockHash::from([0x66; 32])),
+                sender.send_endorsement(123, BlockHash::from([0x44; 32])),
             )
         })
         .await
@@ -566,9 +571,13 @@ mod tests {
             minter_identity(&predicate()),
         );
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            let failed = sender.send_vote(123, BlockHash::from([0x44; 32])).await;
+            let failed = sender
+                .send_endorsement(123, BlockHash::from([0x44; 32]))
+                .await;
             assert!(matches!(failed, Err(MintingSendError::SignerContract(_))));
-            let next = sender.send_vote(124, BlockHash::from([0x55; 32])).await;
+            let next = sender
+                .send_endorsement(124, BlockHash::from([0x55; 32]))
+                .await;
             assert!(matches!(next, Err(MintingSendError::SignerContract(_))));
         })
         .await

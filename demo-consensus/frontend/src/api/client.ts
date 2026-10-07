@@ -12,7 +12,7 @@ const smallIntegers = new Set([
   'acquisition_maturity',
   'default_acquisition_duration',
   'min_acquisition_duration',
-  'max_vote_delay',
+  'max_endorsement_delay',
 ]);
 
 export function decodeJson(text: string): unknown {
@@ -74,7 +74,7 @@ const paths = {
   flame: 'flame/blocks',
   minter: 'minters',
   acquisition: 'acquisitions',
-  vote: 'votes',
+  endorsement: 'endorsements',
   reset: 'reset',
 };
 

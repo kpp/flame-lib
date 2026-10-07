@@ -1,10 +1,12 @@
 use super::{ConsensusStorage, IncludedAcquisition, MintingOutcome, MintingProtocolParams};
 use acquisition_provider::AcquisitionProvider;
 use btc_integration::IndexedBlock;
+use endorsement_validation::{
+    EndorsementValidationError, EndorsementValidationResult, EndorsementValidator,
+};
 use flame_storage::{CanonicalStorage, ChainStorage};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use vote_validation::{VoteValidationError, VoteValidationResult, VoteValidator};
 use weighter::{Weighter, WeighterError};
 
 pub struct MintingEngine<C: ConsensusStorage, H: ChainStorage, S: CanonicalStorage> {
@@ -42,17 +44,19 @@ impl<C: ConsensusStorage, H: ChainStorage, S: CanonicalStorage> MintingEngine<C,
             params: &self.protocol_params,
         };
         let validated = self
-            .validate_votes(&accepted_acquisitions)
+            .validate_endorsements(&accepted_acquisitions)
             .await
             .map_err(|error| match error {
-                VoteValidationError::ConsensusStorage(error) => {
+                EndorsementValidationError::ConsensusStorage(error) => {
                     MintingEngineError::ConsensusStorage(error)
                 }
-                VoteValidationError::ChainStorage(error) => MintingEngineError::ChainStorage(error),
+                EndorsementValidationError::ChainStorage(error) => {
+                    MintingEngineError::ChainStorage(error)
+                }
             })?;
         let weighted = Weighter {
-            votes: &validated.valid_votes,
-            removed_votes: &validated.removed_votes,
+            endorsements: &validated.valid_endorsements,
+            removed_endorsements: &validated.removed_endorsements,
             acquisitions: &acquisition_provider,
             consensus_storage: self.consensus_storage.as_ref(),
             chain_storage: self.chain_storage.as_ref(),
@@ -61,20 +65,20 @@ impl<C: ConsensusStorage, H: ChainStorage, S: CanonicalStorage> MintingEngine<C,
         .weigh()
         .await
         .map_err(MintingEngineError::Weighter)?;
-        let mut pending_votes = BTreeMap::new();
-        for vote in validated.pending_votes {
-            pending_votes
-                .entry(vote.vote.block_tip())
+        let mut pending_endorsements = BTreeMap::new();
+        for endorsement in validated.pending_endorsements {
+            pending_endorsements
+                .entry(endorsement.endorsement.block_tip())
                 .or_insert_with(Vec::new)
-                .push(vote);
+                .push(endorsement);
         }
         Ok(MintingOutcome {
-            accepted_votes: weighted.weighted_votes,
-            removed_votes: validated.removed_votes,
+            accepted_endorsements: weighted.weighted_endorsements,
+            removed_endorsements: validated.removed_endorsements,
             weighted_blocks: weighted.weighted_blocks,
             accepted_acquisitions,
             double_signs: validated.double_signs,
-            pending_votes,
+            pending_endorsements,
             next_btc_cursor: self.new_block.btc_block_tip,
         })
     }
@@ -97,11 +101,11 @@ impl<C: ConsensusStorage, H: ChainStorage, S: CanonicalStorage> MintingEngine<C,
             .collect()
     }
 
-    async fn validate_votes(
+    async fn validate_endorsements(
         &self,
         new_acquisitions: &[IncludedAcquisition],
-    ) -> Result<VoteValidationResult, VoteValidationError<C::Error, H::Error>> {
-        VoteValidator {
+    ) -> Result<EndorsementValidationResult, EndorsementValidationError<C::Error, H::Error>> {
+        EndorsementValidator {
             new_block: &self.new_block,
             protocol_params: &self.protocol_params,
             consensus_storage: self.consensus_storage.as_ref(),
@@ -121,8 +125,8 @@ pub enum MintingEngineError<C, H> {
 }
 
 pub mod acquisition_provider;
+mod endorsement_validation;
+mod endorsement_weight;
 #[cfg(test)]
 pub(crate) mod tests;
-mod vote_validation;
-mod vote_weight;
 pub mod weighter;

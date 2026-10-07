@@ -5,11 +5,11 @@ use flame_chain_service::CoreBlockSource;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use super::{MinterJournal, ports::VoteSender, voter::Voter};
+use super::{MinterJournal, endorser::Endorser, ports::EndorsementSender};
 
 pub(super) struct MinterWorker<C, S, J> {
     core_block_source: Arc<C>,
-    voter: Arc<Voter<S, J>>,
+    endorser: Arc<Endorser<S, J>>,
     subscription: watch::Receiver<Option<BtcBlockTip>>,
     cancellation: CancellationToken,
 }
@@ -18,20 +18,20 @@ impl<C, S, J> MinterWorker<C, S, J>
 where
     C: CoreBlockSource + Send + Sync,
     C::Error: Debug + Send,
-    S: VoteSender,
+    S: EndorsementSender,
     S::Error: Debug,
     J: MinterJournal<TransactionId = S::TransactionId> + Send + Sync,
     J::Error: Debug + Send,
 {
     pub fn new(
         core_block_source: Arc<C>,
-        voter: Arc<Voter<S, J>>,
+        endorser: Arc<Endorser<S, J>>,
         subscription: watch::Receiver<Option<BtcBlockTip>>,
         cancellation: CancellationToken,
     ) -> Self {
         Self {
             core_block_source,
-            voter,
+            endorser,
             subscription,
             cancellation,
         }
@@ -98,8 +98,8 @@ where
             );
             return;
         }
-        if let Err(error) = self.voter.vote(block).await {
-            log::error!("failed to vote for target BTC height {target_height}: {error:?}");
+        if let Err(error) = self.endorser.endorse(block).await {
+            log::error!("failed to endorse for target BTC height {target_height}: {error:?}");
         }
     }
 }

@@ -26,11 +26,11 @@ impl DoubleSignStorage {
             .or_insert_with(|| DoubleSign {
                 minter: double_sign.minter,
                 target_flame_height: double_sign.target_flame_height,
-                votes: Vec::new(),
+                endorsements: Vec::new(),
             });
-        for vote in &double_sign.votes {
-            if !stored.votes.contains(vote) {
-                stored.votes.push(vote.clone());
+        for endorsement in &double_sign.endorsements {
+            if !stored.endorsements.contains(endorsement) {
+                stored.endorsements.push(endorsement.clone());
             }
         }
         Ok(())
@@ -50,18 +50,18 @@ impl DoubleSignStorage {
 }
 
 fn validate_double_sign(double_sign: &DoubleSign) -> Result<(), InMemoryConsensusStorageError> {
-    let Some(first) = double_sign.votes.first() else {
+    let Some(first) = double_sign.endorsements.first() else {
         return Err(InMemoryConsensusStorageError::InvalidDoubleSign);
     };
-    let matching_votes = double_sign.votes.iter().all(|vote| {
-        vote.vote.auth().minter().p2wsh() == double_sign.minter
-            && vote.block_height() == double_sign.target_flame_height
+    let matching_endorsements = double_sign.endorsements.iter().all(|endorsement| {
+        endorsement.endorsement.auth().minter().p2wsh() == double_sign.minter
+            && endorsement.block_height() == double_sign.target_flame_height
     });
     let conflicting_hashes = double_sign
-        .votes
+        .endorsements
         .iter()
-        .any(|vote| vote.block_hash() != first.block_hash());
-    if !matching_votes || !conflicting_hashes {
+        .any(|endorsement| endorsement.block_hash() != first.block_hash());
+    if !matching_endorsements || !conflicting_hashes {
         return Err(InMemoryConsensusStorageError::InvalidDoubleSign);
     }
     Ok(())

@@ -26,7 +26,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/flame/blocks", post(create_flame_block))
         .route("/api/minters", post(create_minter))
         .route("/api/acquisitions", post(send_acquisition))
-        .route("/api/votes", post(send_vote))
+        .route("/api/endorsements", post(send_endorsement))
         .route("/api/reset", post(reset))
         .fallback(|| async {
             ApiError::new(StatusCode::NOT_FOUND, "not_found", "unknown API route")
@@ -136,14 +136,14 @@ async fn send_acquisition(
     ))
 }
 
-async fn send_vote(
+async fn send_endorsement(
     State(state): State<ApiState>,
-    body: Result<Json<SendVoteRequest>, JsonRejection>,
+    body: Result<Json<SendEndorsementRequest>, JsonRejection>,
 ) -> ApiResult<SubmittedTransaction> {
     let Json(request) = body?;
     Ok(Json(
         state
-            .execute(move |session| Box::pin(session.send_vote(request)))
+            .execute(move |session| Box::pin(session.send_endorsement(request)))
             .await?,
     ))
 }

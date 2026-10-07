@@ -17,7 +17,7 @@ const titles = {
   flame: 'Create a Flame core block',
   minter: 'Create a minter',
   acquisition: 'Send acquisition',
-  vote: 'Send vote',
+  endorsement: 'Send endorsement',
   reset: 'Start a new session',
 };
 
@@ -57,14 +57,14 @@ export function CommandDialog({
   const [error, setError] = useState('');
   const [failedRequest, setFailedRequest] = useState(false);
   const coreBlocks = data.flame.blocks.filter((block) => block.core);
-  const votedBlock = coreBlocks.find((block) => block.tip.hash === blockHash);
-  const doubleVote =
-    votedBlock &&
-    data.votes.some(
-      (vote) =>
-        vote.minter_id === minterId &&
-        String(vote.core_height) === votedBlock.core?.height &&
-        vote.block_hash !== blockHash,
+  const endorsedBlock = coreBlocks.find((block) => block.tip.hash === blockHash);
+  const doubleEndorsement =
+    endorsedBlock &&
+    data.endorsements.some(
+      (endorsement) =>
+        endorsement.minter_id === minterId &&
+        String(endorsement.core_height) === endorsedBlock.core?.height &&
+        endorsement.block_hash !== blockHash,
     );
 
   useEffect(() => {
@@ -106,13 +106,13 @@ export function CommandDialog({
         command = { kind, payload: { minter_id: minterId, amount_sats: BigInt(amount) } };
         break;
       }
-      case 'vote': {
-        if (!votedBlock?.core) return setError('Create a Flame core block first.');
+      case 'endorsement': {
+        if (!endorsedBlock?.core) return setError('Create a Flame core block first.');
         command = {
           kind,
           payload: {
             minter_id: minterId,
-            core_height: Number(votedBlock.core.height),
+            core_height: Number(endorsedBlock.core.height),
             block_hash: blockHash,
           },
         };
@@ -189,8 +189,8 @@ export function CommandDialog({
                 />
               </label>
               <p className="help">
-                The minter receives 50,000 sats to fund vote transactions. After creation, confirm
-                the funding with a BTC block.
+                The minter receives 50,000 sats to fund endorsement transactions. After creation,
+                confirm the funding with a BTC block.
               </p>
             </>
           )}
@@ -230,7 +230,7 @@ export function CommandDialog({
               </p>
             </>
           )}
-          {(kind === 'acquisition' || kind === 'vote') && (
+          {(kind === 'acquisition' || kind === 'endorsement') && (
             <label>
               Minter
               <select
@@ -266,7 +266,7 @@ export function CommandDialog({
               </p>
             </>
           )}
-          {kind === 'vote' && (
+          {kind === 'endorsement' && (
             <>
               <label>
                 Core block
@@ -286,15 +286,15 @@ export function CommandDialog({
                 </select>
               </label>
               <p className="help">
-                {votedBlock
-                  ? `Core height: ${votedBlock.core!.height}. Target BTC: ${votedBlock.core!.target_btc_height}.`
+                {endorsedBlock
+                  ? `Core height: ${endorsedBlock.core!.height}. Target BTC: ${endorsedBlock.core!.target_btc_height}.`
                   : 'Create a core block first.'}{' '}
-                After sending, create a BTC block to confirm the vote.
+                After sending, create a BTC block to confirm the endorsement.
               </p>
-              {doubleVote && (
+              {doubleEndorsement && (
                 <div className="inline-warning">
-                  This minter has already voted for another block at this core height. Sending this
-                  vote demonstrates a double sign.
+                  This minter has already endorsed another block at this core height. Sending this
+                  endorsement demonstrates a double sign.
                 </div>
               )}
             </>
@@ -316,7 +316,7 @@ export function CommandDialog({
           </button>
           <button
             className={`button ${kind === 'reset' ? 'danger' : 'primary'}`}
-            disabled={pending || (kind === 'vote' && !votedBlock)}
+            disabled={pending || (kind === 'endorsement' && !endorsedBlock)}
           >
             {pending ? 'Running…' : kind === 'reset' ? 'Reset session' : 'Run'}
           </button>

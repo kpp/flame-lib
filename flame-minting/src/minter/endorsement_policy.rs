@@ -1,5 +1,5 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VotePolicy {
+pub enum EndorsementPolicy {
     Auto,
     Manual,
 }

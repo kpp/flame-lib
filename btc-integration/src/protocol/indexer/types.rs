@@ -1,6 +1,6 @@
 use crate::{
     btc::rpc::BtcBlockTip,
-    protocol::{Acquisition, AuthenticatedMintingVote},
+    protocol::{Acquisition, AuthenticatedMintingEndorsement},
 };
 
 pub(super) const MAX_HISTORY_BLOCKS: usize = 1000;
@@ -9,7 +9,7 @@ pub(super) const MAX_HISTORY_BLOCKS: usize = 1000;
 pub struct IndexedBlock {
     pub btc_block_tip: BtcBlockTip,
     pub acquisitions: Vec<Acquisition>,
-    pub votes: Vec<AuthenticatedMintingVote>,
+    pub endorsements: Vec<AuthenticatedMintingEndorsement>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

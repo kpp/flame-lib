@@ -4,16 +4,17 @@ use flame_storage::ChainStorage;
 use flamechain::{BlockTip, CoreBlockTip};
 
 use crate::consensus::{
-    ConsensusStorage, IncludedVote, MintingProtocolParams, WeightedBlockHeader, WeightedVote,
+    ConsensusStorage, IncludedEndorsement, MintingProtocolParams, WeightedBlockHeader,
+    WeightedEndorsement,
 };
 
 use super::acquisition_provider::AcquisitionProvider;
-pub use super::vote_weight::VoteWeightError;
-use super::vote_weight::weight_vote;
+pub use super::endorsement_weight::EndorsementWeightError;
+use super::endorsement_weight::weight_endorsement;
 
 pub struct Weighter<'a, C, H> {
-    pub votes: &'a [IncludedVote],
-    pub removed_votes: &'a [WeightedVote],
+    pub endorsements: &'a [IncludedEndorsement],
+    pub removed_endorsements: &'a [WeightedEndorsement],
     pub acquisitions: &'a AcquisitionProvider<'a, C>,
     pub consensus_storage: &'a C,
     pub chain_storage: &'a H,
@@ -22,36 +23,41 @@ pub struct Weighter<'a, C, H> {
 
 impl<C: ConsensusStorage, H: ChainStorage> Weighter<'_, C, H> {
     /// Returns updated headers with raw effective power and parent chain weight,
-    /// including all known descendants affected by the votes.
+    /// including all known descendants affected by the endorsements.
     pub async fn weigh(&self) -> Result<WeighterResult, WeighterError<C::Error, H::Error>> {
-        let votes_by_block = group_vote_changes(self.votes, self.removed_votes);
+        let endorsements_by_block =
+            group_endorsement_changes(self.endorsements, self.removed_endorsements);
         let mut pending_blocks = HashMap::new();
-        let mut weighted_votes = Vec::with_capacity(self.votes.len());
+        let mut weighted_endorsements = Vec::with_capacity(self.endorsements.len());
 
-        for (core_tip, votes) in votes_by_block {
+        for (core_tip, endorsements) in endorsements_by_block {
             let (header, descendants) = self
                 .chain_storage
                 .get_core_block_header_with_core_descendants(core_tip)
                 .await
                 .map_err(WeighterError::ChainStorage)?
-                .ok_or(WeighterError::MissingVotedBlock(core_tip))?;
+                .ok_or(WeighterError::MissingEndorsedBlock(core_tip))?;
             let tip = header.block_tip();
             let core = header
                 .core_block
                 .as_ref()
-                .ok_or(WeighterError::MissingVotedBlock(core_tip))?;
+                .ok_or(WeighterError::MissingEndorsedBlock(core_tip))?;
             let target = u64::from(core.target_btc_height);
 
             let pending = self.load_pending_block(&mut pending_blocks, tip).await?;
-            let added_votes = self.weigh_added_votes(&votes.added, target).await?;
+            let added_endorsements = self
+                .weigh_added_endorsements(&endorsements.added, target)
+                .await?;
 
             let change = calculate_block_power_change(
                 pending.weighted.effective_power,
-                votes
+                endorsements
                     .removed
                     .iter()
-                    .map(|vote| vote.effective_minting_power),
-                added_votes.iter().map(|vote| vote.effective_minting_power),
+                    .map(|endorsement| endorsement.effective_minting_power),
+                added_endorsements
+                    .iter()
+                    .map(|endorsement| endorsement.effective_minting_power),
             )
             .map_err(|error| match error {
                 WeightArithmeticError::Underflow => WeighterError::EffectivePowerUnderflow(tip),
@@ -59,7 +65,7 @@ impl<C: ConsensusStorage, H: ChainStorage> Weighter<'_, C, H> {
             })?;
 
             pending.weighted.effective_power = change.new_effective_power;
-            weighted_votes.extend(added_votes);
+            weighted_endorsements.extend(added_endorsements);
 
             for descendant in descendants {
                 let pending = self
@@ -87,16 +93,16 @@ impl<C: ConsensusStorage, H: ChainStorage> Weighter<'_, C, H> {
             .collect::<Result<_, _>>()?;
         Ok(WeighterResult {
             weighted_blocks,
-            weighted_votes,
+            weighted_endorsements,
         })
     }
 
-    async fn weigh_added_votes(
+    async fn weigh_added_endorsements(
         &self,
-        votes: &[&IncludedVote],
+        endorsements: &[&IncludedEndorsement],
         target_height: u64,
-    ) -> Result<Vec<WeightedVote>, WeighterError<C::Error, H::Error>> {
-        if votes.is_empty() {
+    ) -> Result<Vec<WeightedEndorsement>, WeighterError<C::Error, H::Error>> {
+        if endorsements.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -105,17 +111,22 @@ impl<C: ConsensusStorage, H: ChainStorage> Weighter<'_, C, H> {
             .active_at(target_height)
             .await
             .map_err(WeighterError::ConsensusStorage)?;
-        votes
+        endorsements
             .iter()
-            .map(|&vote| {
-                let minter = vote.vote.auth().minter().p2wsh();
+            .map(|&endorsement| {
+                let minter = endorsement.endorsement.auth().minter().p2wsh();
                 let active = acquisitions
                     .get(&minter)
                     .filter(|minter| !minter.is_double_signed)
                     .map(|minter| minter.acquisitions.as_slice())
                     .unwrap_or_default();
-                weight_vote(vote.clone(), target_height, active, self.protocol_params)
-                    .map_err(WeighterError::VoteWeight)
+                weight_endorsement(
+                    endorsement.clone(),
+                    target_height,
+                    active,
+                    self.protocol_params,
+                )
+                .map_err(WeighterError::EndorsementWeight)
             })
             .collect()
     }
@@ -143,26 +154,26 @@ impl<C: ConsensusStorage, H: ChainStorage> Weighter<'_, C, H> {
     }
 }
 
-fn group_vote_changes<'a>(
-    added_votes: &'a [IncludedVote],
-    removed_votes: &'a [WeightedVote],
-) -> HashMap<CoreBlockTip, BlockVotes<'a>> {
-    let mut votes_by_block: HashMap<CoreBlockTip, BlockVotes<'a>> = HashMap::new();
-    for vote in added_votes {
-        votes_by_block
-            .entry(vote.vote.block_tip())
+fn group_endorsement_changes<'a>(
+    added_endorsements: &'a [IncludedEndorsement],
+    removed_endorsements: &'a [WeightedEndorsement],
+) -> HashMap<CoreBlockTip, BlockEndorsements<'a>> {
+    let mut endorsements_by_block: HashMap<CoreBlockTip, BlockEndorsements<'a>> = HashMap::new();
+    for endorsement in added_endorsements {
+        endorsements_by_block
+            .entry(endorsement.endorsement.block_tip())
             .or_default()
             .added
-            .push(vote);
+            .push(endorsement);
     }
-    for vote in removed_votes {
-        votes_by_block
-            .entry(vote.original.vote.block_tip())
+    for endorsement in removed_endorsements {
+        endorsements_by_block
+            .entry(endorsement.original.endorsement.block_tip())
             .or_default()
             .removed
-            .push(vote);
+            .push(endorsement);
     }
-    votes_by_block
+    endorsements_by_block
 }
 
 fn block_weight(effective_power: u64) -> u32 {
@@ -224,26 +235,26 @@ enum WeightArithmeticError {
 }
 
 #[derive(Default)]
-struct BlockVotes<'a> {
-    added: Vec<&'a IncludedVote>,
-    removed: Vec<&'a WeightedVote>,
+struct BlockEndorsements<'a> {
+    added: Vec<&'a IncludedEndorsement>,
+    removed: Vec<&'a WeightedEndorsement>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct WeighterResult {
     pub weighted_blocks: HashMap<BlockTip, WeightedBlockHeader>,
-    pub weighted_votes: Vec<WeightedVote>,
+    pub weighted_endorsements: Vec<WeightedEndorsement>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WeighterError<C, H> {
     ConsensusStorage(C),
     ChainStorage(H),
-    MissingVotedBlock(CoreBlockTip),
+    MissingEndorsedBlock(CoreBlockTip),
     MissingWeight(BlockTip),
     EffectivePowerOverflow(BlockTip),
     EffectivePowerUnderflow(BlockTip),
     CumulativeWeightOverflow(BlockTip),
     CumulativeWeightUnderflow(BlockTip),
-    VoteWeight(VoteWeightError),
+    EndorsementWeight(EndorsementWeightError),
 }

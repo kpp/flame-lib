@@ -8,7 +8,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{MinterJournal, VotePolicy, ports::VoteSender, voter::Voter, worker::MinterWorker};
+use super::{
+    EndorsementPolicy, MinterJournal, endorser::Endorser, ports::EndorsementSender,
+    worker::MinterWorker,
+};
 
 #[derive(Debug)]
 pub enum StartupError {
@@ -32,9 +35,9 @@ impl Drop for MinterWorkerHandle {
 }
 
 pub struct MinterManager<C, S, J> {
-    vote_policy: VotePolicy,
+    endorsement_policy: EndorsementPolicy,
     core_block_source: Arc<C>,
-    voter: Arc<Voter<S, J>>,
+    endorser: Arc<Endorser<S, J>>,
     worker: Mutex<Option<MinterWorkerHandle>>,
 }
 
@@ -42,7 +45,7 @@ impl<C, S, J> MinterManager<C, S, J>
 where
     C: CoreBlockSource + Send + Sync + 'static,
     C::Error: Debug + Send,
-    S: VoteSender,
+    S: EndorsementSender,
     S::Error: Debug,
     J: MinterJournal<TransactionId = S::TransactionId> + Send + Sync + 'static,
     J::Error: Debug + Send,
@@ -51,12 +54,12 @@ where
         core_block_source: Arc<C>,
         sender: Arc<S>,
         journal: Arc<J>,
-        vote_policy: VotePolicy,
+        endorsement_policy: EndorsementPolicy,
     ) -> Self {
         Self {
-            vote_policy,
+            endorsement_policy,
             core_block_source,
-            voter: Arc::new(Voter::new(sender, journal)),
+            endorser: Arc::new(Endorser::new(sender, journal)),
             worker: Mutex::new(None),
         }
     }
@@ -65,7 +68,7 @@ where
         &self,
         subscription: watch::Receiver<Option<BtcBlockTip>>,
     ) -> Result<(), StartupError> {
-        if self.vote_policy == VotePolicy::Manual {
+        if self.endorsement_policy == EndorsementPolicy::Manual {
             return Ok(());
         }
 
@@ -77,7 +80,7 @@ where
         let cancellation = CancellationToken::new();
         let worker = MinterWorker::new(
             self.core_block_source.clone(),
-            self.voter.clone(),
+            self.endorser.clone(),
             subscription,
             cancellation.clone(),
         );

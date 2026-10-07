@@ -7,15 +7,15 @@ use std::sync::Arc;
 use bitcoind::anyhow::Context;
 use btc_integration::{
     BitcoinConfig, BitcoinConnection, BitcoinRpcAuth, IdentityConfig, IdentityManager,
-    MintingVoteData, SecretStorage, identity::storage::InMemorySecretStorage,
-    protocol::validate_transaction_votes,
+    MintingEndorsementData, SecretStorage, identity::storage::InMemorySecretStorage,
+    protocol::validate_transaction_endorsements,
 };
 use corepc_client::bitcoin::{Address, Amount, Network};
 use flamechain::BlockHash;
 use flamevm::Predicate;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn generated_identity_signs_votes_and_reconnects_with_shared_storage()
+async fn generated_identity_signs_endorsements_and_reconnects_with_shared_storage()
 -> bitcoind::anyhow::Result<()> {
     let ctx = test_context::setup()?;
     let storage = Arc::new(InMemorySecretStorage::default());
@@ -33,7 +33,7 @@ async fn generated_identity_signs_votes_and_reconnects_with_shared_storage()
         auth: BitcoinRpcAuth::CookieFile(ctx.cookie_file.clone()),
     };
     let connection =
-        BitcoinConnection::votes(config.clone(), identity.clone(), storage.clone()).await?;
+        BitcoinConnection::endorsements(config.clone(), identity.clone(), storage.clone()).await?;
     let sender = connection.get_sender();
     assert_eq!(sender.minter(), &identity);
 
@@ -42,7 +42,7 @@ async fn generated_identity_signs_votes_and_reconnects_with_shared_storage()
     ctx.rpc.publish_transaction(&funding.tx).await?;
     ctx.generate_next_block()?;
     let hash = BlockHash::from([0x42; 32]);
-    let txid = sender.send_vote(1234, hash).await?;
+    let txid = sender.send_endorsement(1234, hash).await?;
     let confirmation = ctx.generate_next_block()?;
     let transaction = ctx
         .rpc
@@ -50,25 +50,26 @@ async fn generated_identity_signs_votes_and_reconnects_with_shared_storage()
         .await?
         .into_iter()
         .find(|entry| entry.transaction.compute_txid() == txid)
-        .context("vote was not confirmed")?;
-    let votes = validate_transaction_votes(&transaction)?;
-    assert_eq!(votes.len(), 1);
-    assert_eq!(votes[0].auth().minter(), &identity);
+        .context("endorsement was not confirmed")?;
+    let endorsements = validate_transaction_endorsements(&transaction)?;
+    assert_eq!(endorsements.len(), 1);
+    assert_eq!(endorsements[0].auth().minter(), &identity);
     assert_eq!(
-        votes[0].output().data,
-        MintingVoteData::V1 {
+        endorsements[0].output().data,
+        MintingEndorsementData::V1 {
             flame_block_height: 1234,
             flame_block_hash: hash,
         }
     );
 
     let persisted = storage.get_secret_key().await?;
-    let reconnected = BitcoinConnection::votes(config, identity.clone(), storage.clone()).await?;
+    let reconnected =
+        BitcoinConnection::endorsements(config, identity.clone(), storage.clone()).await?;
     assert_eq!(reconnected.get_sender().minter(), &identity);
     assert_eq!(storage.get_secret_key().await?, persisted);
     let second_txid = reconnected
         .get_sender()
-        .send_vote(1235, BlockHash::from([0x43; 32]))
+        .send_endorsement(1235, BlockHash::from([0x43; 32]))
         .await?;
     assert_ne!(second_txid, txid);
     let indexer = reconnected.create_indexer();

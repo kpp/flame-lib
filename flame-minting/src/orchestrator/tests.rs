@@ -132,7 +132,7 @@ async fn check_startup(fail_sender: bool) {
             height: 0,
         },
         config.clone(),
-        VotePolicy::Auto,
+        EndorsementPolicy::Auto,
     )
     .unwrap();
     assert!(orchestrator.identity_manager.identity().is_none());

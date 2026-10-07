@@ -38,7 +38,7 @@ where
         acquisition_maturity: 1,
         default_acquisition_duration: NonZeroU16::new(100).unwrap(),
         min_acquisition_duration: NonZeroU16::MIN,
-        max_vote_delay: 10,
+        max_endorsement_delay: 10,
     });
     let consensus_storage = InMemoryConsensusStorage::new();
     let chain_storage = Arc::new(InMemoryChainStorage::new());

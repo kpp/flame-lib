@@ -12,7 +12,7 @@ pub struct DemoSnapshot {
     pub flame: FlameChainSnapshot,
     pub minters: Vec<MinterSnapshot>,
     pub acquisitions: Vec<AcquisitionSnapshot>,
-    pub votes: Vec<VoteSnapshot>,
+    pub endorsements: Vec<EndorsementSnapshot>,
     pub consensus: ConsensusSnapshot,
 }
 
@@ -60,7 +60,7 @@ pub struct MinterSnapshot {
     pub id: MinterId,
     pub name: String,
     pub p2wsh_address: String,
-    pub automatic_voting: bool,
+    pub automatic_endorsement: bool,
     pub is_double_signed: bool,
 }
 
@@ -76,14 +76,14 @@ pub struct AcquisitionSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VoteSnapshot {
+pub struct EndorsementSnapshot {
     pub txid: BitcoinTxid,
     pub output_index: u32,
     pub minter_id: MinterId,
     pub core_height: u32,
     pub block_hash: FlameBlockHash,
     pub transaction_status: TransactionStatus,
-    pub processing_status: VoteProcessingStatus,
+    pub processing_status: EndorsementProcessingStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,7 +106,7 @@ pub enum AcquisitionProcessingStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum VoteProcessingStatus {
+pub enum EndorsementProcessingStatus {
     Unprocessed,
     PendingBlock,
     Accepted { effective_minting_power: u64 },
@@ -127,12 +127,12 @@ pub struct ProtocolParameters {
     pub acquisition_maturity: u32,
     pub default_acquisition_duration: NonZeroU16,
     pub min_acquisition_duration: NonZeroU16,
-    pub max_vote_delay: u32,
+    pub max_endorsement_delay: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoubleSignSnapshot {
     pub minter_id: MinterId,
     pub core_height: u32,
-    pub votes: Vec<VoteSnapshot>,
+    pub endorsements: Vec<EndorsementSnapshot>,
 }

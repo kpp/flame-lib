@@ -103,9 +103,9 @@ export function Minters({ data, selection, select, disabled, openCommand }: Prop
                 <button
                   className="button"
                   disabled={disabled}
-                  onClick={() => openCommand('vote', minter.id)}
+                  onClick={() => openCommand('endorsement', minter.id)}
                 >
-                  Vote
+                  Endorse
                 </button>
               </div>
               <div className="minter-status" aria-label="Minter status">

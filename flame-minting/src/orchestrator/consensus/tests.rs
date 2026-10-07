@@ -85,7 +85,7 @@ impl ConsensusIndexer for Indexer {
                 new_blocks: vec![IndexedBlock {
                     btc_block_tip: btc_tip(1),
                     acquisitions: vec![],
-                    votes: vec![],
+                    endorsements: vec![],
                 }],
             },
         })
@@ -104,12 +104,12 @@ impl ConsensusEngine for Engine {
             return std::future::pending().await;
         }
         Ok(MintingOutcome {
-            accepted_votes: vec![],
-            removed_votes: vec![],
+            accepted_endorsements: vec![],
+            removed_endorsements: vec![],
             weighted_blocks: Default::default(),
             accepted_acquisitions: vec![],
             double_signs: vec![],
-            pending_votes: Default::default(),
+            pending_endorsements: Default::default(),
             next_btc_cursor: block.btc_block_tip,
         })
     }

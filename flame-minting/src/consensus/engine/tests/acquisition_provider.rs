@@ -1,4 +1,4 @@
-use super::vote_weight::{included_acquisition, params};
+use super::endorsement_weight::{included_acquisition, params};
 use super::*;
 
 #[tokio::test]
@@ -117,7 +117,7 @@ async fn loads_double_sign_status_for_minters_with_only_new_acquisitions() {
         double_signs: vec![DoubleSign {
             minter,
             target_flame_height: 1.into(),
-            votes: vec![],
+            endorsements: vec![],
         }],
         ..Storage::default()
     };

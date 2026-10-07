@@ -10,7 +10,8 @@ pub use applier::{MintingJournal, MintingOutcomeApplier, MintingOutcomeApplierEr
 pub use engine::{MintingEngine, MintingEngineError};
 pub use manager::MintingManager;
 pub use outcome::{
-    DoubleSign, IncludedAcquisition, IncludedVote, MintingOutcome, PendingVotes, WeightedVote,
+    DoubleSign, IncludedAcquisition, IncludedEndorsement, MintingOutcome, PendingEndorsements,
+    WeightedEndorsement,
 };
 pub use params::MintingProtocolParams;
 pub use storage::{ConsensusStorage, MinterAcquisitions};

@@ -2,10 +2,12 @@ use std::{sync::Arc, time::Duration};
 
 use bitcoind::anyhow::{Context, Result};
 use btc_integration::{
-    AuthenticatedMintingVote, UncheckedMintingVote, btc::rpc::Core31RpcApi,
-    protocol::validate_transaction_votes,
+    AuthenticatedMintingEndorsement, UncheckedMintingEndorsement, btc::rpc::Core31RpcApi,
+    protocol::validate_transaction_endorsements,
 };
-use btc_integration::{BitcoinConfig, BitcoinFacade, BitcoinRpcAuth, BtcBlockTip, MintingVoteData};
+use btc_integration::{
+    BitcoinConfig, BitcoinFacade, BitcoinRpcAuth, BtcBlockTip, MintingEndorsementData,
+};
 use corepc_client::bitcoin::Txid;
 use tokio::time::{sleep, timeout};
 
@@ -39,15 +41,15 @@ impl BitcoinRegtest {
         Ok(self.rpc.best_block_tip().await?)
     }
 
-    pub async fn wait_for_vote(&self, expected: &MintingVoteData) -> Result<Txid> {
+    pub async fn wait_for_endorsement(&self, expected: &MintingEndorsementData) -> Result<Txid> {
         timeout(Duration::from_secs(10), async {
             loop {
                 for txid in self.node.client.get_raw_mempool()?.0 {
                     let txid = txid.parse()?;
                     let transaction = self.node.client.get_raw_transaction(txid)?.transaction()?;
-                    if UncheckedMintingVote::from_tx(&transaction)
+                    if UncheckedMintingEndorsement::from_tx(&transaction)
                         .iter()
-                        .any(|vote| &vote.output().data == expected)
+                        .any(|endorsement| &endorsement.output().data == expected)
                     {
                         return Ok(txid);
                     }
@@ -56,21 +58,21 @@ impl BitcoinRegtest {
             }
         })
         .await
-        .context("timed out waiting for the automatic vote in the mempool")?
+        .context("timed out waiting for the automatic endorsement in the mempool")?
     }
 
-    pub async fn votes_in_block(
+    pub async fn endorsements_in_block(
         &self,
         block: BtcBlockTip,
-    ) -> Result<Vec<AuthenticatedMintingVote>> {
+    ) -> Result<Vec<AuthenticatedMintingEndorsement>> {
         let transactions = self
             .rpc
             .transactions_with_prevouts_in_block(block.hash)
             .await?;
-        let mut votes = Vec::new();
+        let mut endorsements = Vec::new();
         for transaction in &transactions {
-            votes.extend(validate_transaction_votes(transaction)?);
+            endorsements.extend(validate_transaction_endorsements(transaction)?);
         }
-        Ok(votes)
+        Ok(endorsements)
     }
 }

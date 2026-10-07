@@ -23,11 +23,11 @@ export function BitcoinChain({ data, selection, select, disabled, createBlock }:
     if (followingTip.current && viewport.current)
       viewport.current.scrollLeft = viewport.current.scrollWidth;
   }, [data.bitcoin.tip.hash, session]);
-  const selectedVotes =
+  const selectedEndorsements =
     selection?.kind === 'flame'
-      ? data.votes.filter((vote) => vote.block_hash === selection.id)
+      ? data.endorsements.filter((endorsement) => endorsement.block_hash === selection.id)
       : [];
-  const relatedTransactions = new Set(selectedVotes.map((vote) => vote.txid));
+  const relatedTransactions = new Set(selectedEndorsements.map((endorsement) => endorsement.txid));
   const blocks = data.bitcoin.blocks.filter(
     (block) => BigInt(block.tip.height) >= BigInt(data.bitcoin.start_height),
   );
@@ -71,7 +71,7 @@ export function BitcoinChain({ data, selection, select, disabled, createBlock }:
             const acquisitions = data.acquisitions.filter((item) =>
               block.transactions.includes(item.txid),
             ).length;
-            const votes = data.votes.filter((item) =>
+            const endorsements = data.endorsements.filter((item) =>
               block.transactions.includes(item.txid),
             ).length;
             const related = block.transactions.some((txid) => relatedTransactions.has(txid));
@@ -89,7 +89,7 @@ export function BitcoinChain({ data, selection, select, disabled, createBlock }:
                 </span>
                 <Hash value={block.tip.hash} />
                 <span className="block-meta">
-                  {acquisitions} acquisition · {votes} vote
+                  {acquisitions} acquisition · {endorsements} endorsement
                 </span>
                 <span className="block-footer">
                   {block.transactions.length} transactions <span>↗</span>
@@ -116,7 +116,7 @@ export function BitcoinChain({ data, selection, select, disabled, createBlock }:
               </button>
             ))
           ) : (
-            <span className="subtle">Empty · send an acquisition or vote</span>
+            <span className="subtle">Empty · send an acquisition or endorsement</span>
           )}
         </div>
       </div>
@@ -215,7 +215,7 @@ export function FlameChain({ data, selection, select, disabled, createBlock }: P
         </div>
       </div>
       <div className="panel-footnote">
-        Select a block to see its votes and related BTC confirmations.
+        Select a block to see its endorsements and related BTC confirmations.
       </div>
     </section>
   );

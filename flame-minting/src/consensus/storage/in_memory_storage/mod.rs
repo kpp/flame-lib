@@ -8,20 +8,20 @@ use btc_integration::{BtcBlockTip, MinterP2wsh};
 use flamechain::{BlockTip, CoreBlockTip, CoreFlameHeight};
 
 use crate::consensus::{
-    DoubleSign, IncludedAcquisition, IncludedVote, MintingProtocolParams, WeightedBlockHeader,
-    WeightedVote,
+    DoubleSign, IncludedAcquisition, IncludedEndorsement, MintingProtocolParams,
+    WeightedBlockHeader, WeightedEndorsement,
 };
 
 use super::{ConsensusStorage, MinterAcquisitions};
 
 mod acquisition_storage;
 mod double_sign_storage;
-mod vote_storage;
+mod endorsement_storage;
 mod weighted_header_storage;
 
 use acquisition_storage::AcquisitionStorage;
 use double_sign_storage::DoubleSignStorage;
-use vote_storage::VoteStorage;
+use endorsement_storage::EndorsementStorage;
 use weighted_header_storage::WeightedHeaderStorage;
 
 #[derive(Clone, Default)]
@@ -32,7 +32,7 @@ pub struct InMemoryConsensusStorage {
 #[derive(Default)]
 struct StorageState {
     acquisitions: AcquisitionStorage,
-    votes: VoteStorage,
+    endorsements: EndorsementStorage,
     weighted_headers: WeightedHeaderStorage,
     double_signs: DoubleSignStorage,
 }
@@ -113,41 +113,52 @@ impl ConsensusStorage for InMemoryConsensusStorage {
         Ok(acquisitions)
     }
 
-    async fn store_vote(
+    async fn store_endorsement(
         &self,
         btc_block: BtcBlockTip,
-        vote: &WeightedVote,
+        endorsement: &WeightedEndorsement,
     ) -> Result<(), Self::Error> {
-        self.write_state()?.votes.store_vote(btc_block, vote)
+        self.write_state()?
+            .endorsements
+            .store_endorsement(btc_block, endorsement)
     }
 
-    async fn get_votes_for_block(
+    async fn get_endorsements_for_block(
         &self,
         tip: CoreBlockTip,
-    ) -> Result<Vec<WeightedVote>, Self::Error> {
-        self.read_state()?.votes.get_votes_for_block(tip)
+    ) -> Result<Vec<WeightedEndorsement>, Self::Error> {
+        self.read_state()?
+            .endorsements
+            .get_endorsements_for_block(tip)
     }
 
-    async fn get_minter_vote_for_height(
+    async fn get_minter_endorsement_for_height(
         &self,
         minter: &MinterP2wsh,
         flame_height: CoreFlameHeight,
-    ) -> Result<Option<WeightedVote>, Self::Error> {
+    ) -> Result<Option<WeightedEndorsement>, Self::Error> {
         self.read_state()?
-            .votes
-            .get_minter_vote_for_height(minter, flame_height)
+            .endorsements
+            .get_minter_endorsement_for_height(minter, flame_height)
     }
 
-    async fn remove_vote(&self, vote: &WeightedVote) -> Result<(), Self::Error> {
-        self.write_state()?.votes.remove_vote(vote)
+    async fn remove_endorsement(
+        &self,
+        endorsement: &WeightedEndorsement,
+    ) -> Result<(), Self::Error> {
+        self.write_state()?
+            .endorsements
+            .remove_endorsement(endorsement)
     }
 
-    async fn store_pending_vote(
+    async fn store_pending_endorsement(
         &self,
         tip: CoreBlockTip,
-        vote: &IncludedVote,
+        endorsement: &IncludedEndorsement,
     ) -> Result<(), Self::Error> {
-        self.write_state()?.votes.store_pending_vote(tip, vote)
+        self.write_state()?
+            .endorsements
+            .store_pending_endorsement(tip, endorsement)
     }
 
     async fn get_block_tip_with_most_weight(&self) -> Result<Option<BlockTip>, Self::Error> {
@@ -219,14 +230,16 @@ impl fmt::Display for InMemoryConsensusStorageError {
             Self::BitcoinBlockMismatch => {
                 write!(formatter, "Bitcoin block does not match the record")
             }
-            Self::CoreBlockMismatch => write!(formatter, "core block does not match the vote"),
+            Self::CoreBlockMismatch => {
+                write!(formatter, "core block does not match the endorsement")
+            }
             Self::BlockTipMismatch => {
                 write!(formatter, "block tip does not match the weighted header")
             }
             Self::ConflictingRecord => write!(formatter, "conflicting consensus storage record"),
             Self::InvalidDoubleSign => write!(
                 formatter,
-                "double sign must contain conflicting votes from the specified minter at the specified height"
+                "double sign must contain conflicting endorsements from the specified minter at the specified height"
             ),
         }
     }

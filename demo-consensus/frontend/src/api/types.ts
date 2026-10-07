@@ -15,7 +15,7 @@ export type Minter = {
   id: number;
   name: string;
   p2wsh_address: string;
-  automatic_voting: false;
+  automatic_endorsement: false;
   is_double_signed: boolean;
 };
 export type TransactionStatus = { status: 'mempool' } | { status: 'confirmed'; block: Tip };
@@ -26,7 +26,7 @@ export type AcquisitionProcessing =
       activates_at_btc_height: Decimal;
       expires_at_btc_height_exclusive: Decimal;
     };
-export type VoteProcessing =
+export type EndorsementProcessing =
   | { status: 'unprocessed' | 'pending_block' | 'invalidated_by_double_sign' | 'rejected' }
   | { status: 'accepted'; effective_minting_power: Decimal };
 export type Acquisition = {
@@ -38,21 +38,21 @@ export type Acquisition = {
   transaction_status: TransactionStatus;
   processing_status: AcquisitionProcessing;
 };
-export type Vote = {
+export type Endorsement = {
   txid: string;
   output_index: number;
   minter_id: number;
   core_height: number;
   block_hash: string;
   transaction_status: TransactionStatus;
-  processing_status: VoteProcessing;
+  processing_status: EndorsementProcessing;
 };
 export type Snapshot = {
   bitcoin: { start_height: Decimal; tip: Tip; blocks: BitcoinBlock[]; mempool: string[] };
   flame: { canonical_tip: Tip | null; blocks: FlameBlock[] };
   minters: Minter[];
   acquisitions: Acquisition[];
-  votes: Vote[];
+  endorsements: Endorsement[];
   consensus: {
     btc_cursor: Tip;
     heaviest_tip: Tip | null;
@@ -60,9 +60,9 @@ export type Snapshot = {
       acquisition_maturity: number;
       default_acquisition_duration: number;
       min_acquisition_duration: number;
-      max_vote_delay: number;
+      max_endorsement_delay: number;
     };
-    double_signs: { minter_id: number; core_height: number; votes: Vote[] }[];
+    double_signs: { minter_id: number; core_height: number; endorsements: Endorsement[] }[];
   };
 };
 export type Commands = {
@@ -70,7 +70,7 @@ export type Commands = {
   flame: { parent_hash: string; target_btc_height: number };
   minter: { name: string };
   acquisition: { minter_id: number; amount_sats: bigint };
-  vote: { minter_id: number; core_height: number; block_hash: string };
+  endorsement: { minter_id: number; core_height: number; block_hash: string };
   reset: Record<string, never>;
 };
 export type Command = { [K in keyof Commands]: { kind: K; payload: Commands[K] } }[keyof Commands];

@@ -9,13 +9,14 @@ use crate::btc::{bitcoin_facade::BitcoinFacade, rpc::RpcApi};
 use crate::protocol::{AcquisitionData, MinterIdentity};
 
 use super::{
-    SecretStorage, SignTransactionRequest, TransactionSigner, VoteSigner, VoteSignerError,
+    EndorsementSigner, EndorsementSignerError, SecretStorage, SignTransactionRequest,
+    TransactionSigner,
 };
 
-/// Regtest signer: Core wallet funding for acquisitions, P2WSH signing for votes.
+/// Regtest signer: Core wallet funding for acquisitions, P2WSH signing for endorsements.
 pub struct TestSigner<R: ?Sized, S> {
     acquisition_wallet: Arc<BitcoinFacade<R>>,
-    vote: VoteSigner<R, S>,
+    endorsement: EndorsementSigner<R, S>,
     access_predicate: Predicate,
     validator_pubkey: VerifyingKey,
 }
@@ -23,13 +24,13 @@ pub struct TestSigner<R: ?Sized, S> {
 impl<R: ?Sized, S> TestSigner<R, S> {
     pub(crate) fn new(
         acquisition_wallet: Arc<BitcoinFacade<R>>,
-        vote: VoteSigner<R, S>,
+        endorsement: EndorsementSigner<R, S>,
         access_predicate: Predicate,
         validator_pubkey: VerifyingKey,
     ) -> Self {
         Self {
             acquisition_wallet,
-            vote,
+            endorsement,
             access_predicate,
             validator_pubkey,
         }
@@ -58,7 +59,7 @@ impl<R: RpcApi + ?Sized, S: SecretStorage> TransactionSigner for TestSigner<R, S
                 .fund_and_sign_with_wallet(&request.transaction)
                 .await?);
         }
-        Ok(self.vote.fund_and_sign(request).await?)
+        Ok(self.endorsement.fund_and_sign(request).await?)
     }
 }
 
@@ -67,5 +68,5 @@ pub enum TestSignerError<E: std::error::Error + Send + Sync + 'static> {
     #[error("acquisition wallet RPC error: {0}")]
     Rpc(#[from] RpcError),
     #[error(transparent)]
-    Vote(#[from] VoteSignerError<E>),
+    Endorsement(#[from] EndorsementSignerError<E>),
 }

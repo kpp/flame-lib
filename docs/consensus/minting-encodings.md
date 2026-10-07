@@ -1,7 +1,7 @@
 # Minting Bitcoin Encodings
 
 This document defines the canonical Bitcoin script encodings used by Flame Acquisition and Minting transactions. Their
-consensus meaning, lifecycle, voting rules, and reward behavior are defined in [Consensus Design](design-doc.md).
+consensus meaning, lifecycle, endorsement rules, and reward behavior are defined in [Consensus Design](design-doc.md).
 
 ## Conventions
 
@@ -78,10 +78,10 @@ The payload layout is:
 |      9 |   32 | Flame Hash                          |
 
 The Bitcoin output value may be zero or non-zero. It does not contribute Minting Power and is ignored when calculating
-the vote's weight.
+the endorsement's weight.
 
 A Minting Transaction must contain exactly one eligible Minting Output. A transaction containing no eligible Minting
-Output or more than one eligible Minting Output produces no Minting votes. An unsupported Version, `OP_PUSHDATA1`,
+Output or more than one eligible Minting Output produces no Minting endorsements. An unsupported Version, `OP_PUSHDATA1`,
 `OP_PUSHDATA2`, `OP_PUSHDATA4`, and all push opcodes other than the exact `OP_PUSHBYTES_41` encoding above are invalid,
 as are malformed fields and trailing script bytes.
 

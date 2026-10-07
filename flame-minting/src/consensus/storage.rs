@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use crate::consensus::{
-    DoubleSign, IncludedAcquisition, IncludedVote, MintingProtocolParams, WeightedBlockHeader,
-    WeightedVote,
+    DoubleSign, IncludedAcquisition, IncludedEndorsement, MintingProtocolParams,
+    WeightedBlockHeader, WeightedEndorsement,
 };
 use btc_integration::{BtcBlockTip, MinterP2wsh};
 use flamechain::{BlockTip, CoreBlockTip, CoreFlameHeight};
@@ -43,13 +43,13 @@ pub trait ConsensusStorage {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Returns acquisitions recorded through `btc_height`, including immature and expired ones.
-    /// Acquisition activity is evaluated by consensus at each vote's target Bitcoin height.
+    /// Acquisition activity is evaluated by consensus at each endorsement's target Bitcoin height.
     fn get_acquisitions_by_minters(
         &self,
         btc_height: u64,
     ) -> impl Future<Output = Result<HashMap<MinterP2wsh, MinterAcquisitions>, Self::Error>> + Send;
 
-    /// Returns this minter's acquisitions active at the vote's target Bitcoin height.
+    /// Returns this minter's acquisitions active at the endorsement's target Bitcoin height.
     /// An unknown minter or one without active acquisitions has an empty list.
     /// Double-sign status is taken from the current storage snapshot, even when
     /// the requested height is in the past or the acquisition list is empty.
@@ -60,33 +60,33 @@ pub trait ConsensusStorage {
         params: &MintingProtocolParams,
     ) -> impl Future<Output = Result<MinterAcquisitions, Self::Error>> + Send;
 
-    fn store_vote(
+    fn store_endorsement(
         &self,
         btc_block: BtcBlockTip,
-        vote: &WeightedVote,
+        endorsement: &WeightedEndorsement,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    fn get_votes_for_block(
+    fn get_endorsements_for_block(
         &self,
         tip: CoreBlockTip,
-    ) -> impl Future<Output = Result<Vec<WeightedVote>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Vec<WeightedEndorsement>, Self::Error>> + Send;
 
-    fn remove_vote(
+    fn remove_endorsement(
         &self,
-        vote: &WeightedVote,
+        endorsement: &WeightedEndorsement,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    fn store_pending_vote(
+    fn store_pending_endorsement(
         &self,
         tip: CoreBlockTip,
-        vote: &IncludedVote,
+        endorsement: &IncludedEndorsement,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    fn get_minter_vote_for_height(
+    fn get_minter_endorsement_for_height(
         &self,
         minter: &MinterP2wsh,
         flame_height: CoreFlameHeight,
-    ) -> impl Future<Output = Result<Option<WeightedVote>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<WeightedEndorsement>, Self::Error>> + Send;
 
     fn add_double_sign(
         &self,

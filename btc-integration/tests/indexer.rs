@@ -9,7 +9,7 @@ use corepc_client::bitcoin::Amount;
 use flamechain::BlockHash;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn indexer_binds_acquisitions_and_votes_to_their_bitcoin_block()
+async fn indexer_binds_acquisitions_and_endorsements_to_their_bitcoin_block()
 -> bitcoind::anyhow::Result<()> {
     let ctx = setup()?;
     let connection = create_connection(&ctx).await?;
@@ -21,7 +21,9 @@ async fn indexer_binds_acquisitions_and_votes_to_their_bitcoin_block()
     let cursor = events.borrow_and_update().expect("running indexer");
 
     let acquisition_txid = sender.send_acquisition(Amount::from_sat(20_000)).await?;
-    let vote_txid = sender.send_vote(777, BlockHash::from([0x77; 32])).await?;
+    let endorsement_txid = sender
+        .send_endorsement(777, BlockHash::from([0x77; 32]))
+        .await?;
     let block_hash = ctx.generate_next_block()?;
     let block_tip = ctx.rpc.best_block_tip().await?;
     assert_eq!(block_tip.hash, block_hash);
@@ -42,8 +44,8 @@ async fn indexer_binds_acquisitions_and_votes_to_their_bitcoin_block()
     assert_eq!(block.btc_block_tip, block_tip);
     assert_eq!(block.acquisitions.len(), 1);
     assert_eq!(block.acquisitions[0].txid(), acquisition_txid);
-    assert_eq!(block.votes.len(), 1);
-    assert_eq!(block.votes[0].txid(), vote_txid);
+    assert_eq!(block.endorsements.len(), 1);
+    assert_eq!(block.endorsements[0].txid(), endorsement_txid);
 
     indexer.shutdown().await?;
     Ok(())

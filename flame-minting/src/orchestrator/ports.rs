@@ -16,7 +16,7 @@ use crate::consensus::{
 use crate::minter::{
     MinterJournal, MinterManager,
     manager::{ShutdownError as MinterShutdownError, StartupError as MinterStartupError},
-    ports::VoteSender,
+    ports::EndorsementSender,
 };
 
 use super::sender::{MintingSender, SenderStartupError};
@@ -50,7 +50,7 @@ impl<C, S, J> MinterLifecycle for MinterManager<C, S, J>
 where
     C: CoreBlockSource + Send + Sync + 'static,
     C::Error: Debug + Send,
-    S: VoteSender,
+    S: EndorsementSender,
     S::Error: Debug,
     J: MinterJournal<TransactionId = S::TransactionId> + Send + Sync + 'static,
     J::Error: Debug + Send,

@@ -36,29 +36,30 @@ impl<C: ConsensusStorage> BlockWeightCalculator<'_, C> {
             height: core.height,
         };
         let target_height = u64::from(core.target_btc_height);
-        let mut votes = self
+        let mut endorsements = self
             .consensus_storage
-            .get_votes_for_block(tip)
+            .get_endorsements_for_block(tip)
             .await
             .map_err(BlockWeightCalculatorError::ConsensusStorage)?;
-        votes.sort_by_key(|vote| vote.original.vote.auth().minter().p2wsh());
+        endorsements
+            .sort_by_key(|endorsement| endorsement.original.endorsement.auth().minter().p2wsh());
 
         let mut weights = BTreeMap::new();
-        for vote in votes {
-            let included = &vote.original;
+        for endorsement in endorsements {
+            let included = &endorsement.original;
             if included.btc_block.height > self.btc_tip.height {
                 continue;
             }
             let delay = included.btc_block.height.checked_sub(target_height).ok_or(
-                BlockWeightCalculatorError::VoteBeforeTarget {
+                BlockWeightCalculatorError::EndorsementBeforeTarget {
                     inclusion_height: included.btc_block.height,
                     target_height,
                 },
             )?;
-            if delay > u64::from(self.protocol_params.max_vote_delay) {
+            if delay > u64::from(self.protocol_params.max_endorsement_delay) {
                 continue;
             }
-            let minter = included.vote.auth().minter();
+            let minter = included.endorsement.auth().minter();
             let mut active = self
                 .consensus_storage
                 .get_active_minter_acquisitions_at_height(
@@ -107,7 +108,7 @@ impl<C: ConsensusStorage> BlockWeightCalculator<'_, C> {
 pub enum BlockWeightCalculatorError<C> {
     ConsensusStorage(C),
     NotCoreBlock(BlockTip),
-    VoteBeforeTarget {
+    EndorsementBeforeTarget {
         inclusion_height: u64,
         target_height: u64,
     },

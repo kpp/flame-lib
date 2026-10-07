@@ -1,13 +1,13 @@
 use std::future::Future;
 
-use btc_integration::{AuthenticatedMintingVote, MintingVoteData};
+use btc_integration::{AuthenticatedMintingEndorsement, MintingEndorsementData};
 
 pub mod in_memory;
 
 pub use in_memory::{InMemoryMinterJournal, InMemoryMinterJournalError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VoteReservation {
+pub enum EndorsementReservation {
     Reserved,
     AlreadyReserved,
 }
@@ -16,19 +16,19 @@ pub trait MinterJournal {
     type Error;
     type TransactionId;
 
-    fn write_reserve_vote(
+    fn write_reserve_endorsement(
         &self,
-        vote: &MintingVoteData,
-    ) -> impl Future<Output = Result<VoteReservation, Self::Error>> + Send;
+        endorsement: &MintingEndorsementData,
+    ) -> impl Future<Output = Result<EndorsementReservation, Self::Error>> + Send;
 
-    fn write_sent_vote(
+    fn write_sent_endorsement(
         &self,
-        vote: &MintingVoteData,
+        endorsement: &MintingEndorsementData,
         transaction_id: &Self::TransactionId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    fn write_committed_vote(
+    fn write_committed_endorsement(
         &self,
-        vote: &AuthenticatedMintingVote,
+        endorsement: &AuthenticatedMintingEndorsement,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

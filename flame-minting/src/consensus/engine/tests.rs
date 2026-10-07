@@ -1,10 +1,10 @@
 use super::*;
 use crate::consensus::{
-    DoubleSign, IncludedVote, MinterAcquisitions, WeightedBlockHeader, WeightedVote,
+    DoubleSign, IncludedEndorsement, MinterAcquisitions, WeightedBlockHeader, WeightedEndorsement,
 };
 use btc_integration::{
-    Acquisition, AcquisitionData, AuthenticatedMintingVote, BtcBlockTip, MinterP2wsh,
-    MintingVoteValidator, UncheckedMintingVote, protocol::minter_witness_script,
+    Acquisition, AcquisitionData, AuthenticatedMintingEndorsement, BtcBlockTip, MinterP2wsh,
+    MintingEndorsementValidator, UncheckedMintingEndorsement, protocol::minter_witness_script,
 };
 use corepc_client::bitcoin::{
     Amount, Script, ScriptBuf, Transaction, TxIn, TxOut, Witness, absolute, hashes::Hash,
@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 #[derive(Default)]
 pub(crate) struct Storage {
-    pub(crate) votes: Vec<WeightedVote>,
+    pub(crate) endorsements: Vec<WeightedEndorsement>,
     pub(crate) acquisitions: HashMap<MinterP2wsh, MinterAcquisitions>,
     acquisition_reads: Mutex<Vec<u64>>,
     pub(crate) active_acquisition_reads: Mutex<Vec<(MinterP2wsh, u64)>>,
@@ -32,7 +32,7 @@ pub(crate) struct Storage {
     fail_blocks: bool,
     double_signs: Vec<DoubleSign>,
     fail: bool,
-    pub(crate) fail_vote_reads: bool,
+    pub(crate) fail_endorsement_reads: bool,
     pub(crate) fail_active_acquisition_reads: bool,
     fail_double_sign: bool,
     reads: Mutex<Vec<(MinterP2wsh, CoreFlameHeight)>>,
@@ -117,33 +117,37 @@ impl ConsensusStorage for Storage {
         Ok(minters)
     }
 
-    async fn store_vote(&self, _: BtcBlockTip, _: &WeightedVote) -> Result<(), Self::Error> {
+    async fn store_endorsement(
+        &self,
+        _: BtcBlockTip,
+        _: &WeightedEndorsement,
+    ) -> Result<(), Self::Error> {
         unreachable!()
     }
 
-    async fn get_votes_for_block(
+    async fn get_endorsements_for_block(
         &self,
         tip: CoreBlockTip,
-    ) -> Result<Vec<WeightedVote>, Self::Error> {
-        if self.fail || self.fail_vote_reads {
+    ) -> Result<Vec<WeightedEndorsement>, Self::Error> {
+        if self.fail || self.fail_endorsement_reads {
             return Err("storage unavailable");
         }
         Ok(self
-            .votes
+            .endorsements
             .iter()
-            .filter(|vote| vote.original.vote.block_tip() == tip)
+            .filter(|endorsement| endorsement.original.endorsement.block_tip() == tip)
             .cloned()
             .collect())
     }
 
-    async fn remove_vote(&self, _: &WeightedVote) -> Result<(), Self::Error> {
+    async fn remove_endorsement(&self, _: &WeightedEndorsement) -> Result<(), Self::Error> {
         unreachable!()
     }
 
-    async fn store_pending_vote(
+    async fn store_pending_endorsement(
         &self,
         _: CoreBlockTip,
-        _: &IncludedVote,
+        _: &IncludedEndorsement,
     ) -> Result<(), Self::Error> {
         unreachable!()
     }
@@ -174,21 +178,21 @@ impl ConsensusStorage for Storage {
         Ok(self.double_signs.iter().any(|sign| sign.minter == *minter))
     }
 
-    async fn get_minter_vote_for_height(
+    async fn get_minter_endorsement_for_height(
         &self,
         minter: &MinterP2wsh,
         height: CoreFlameHeight,
-    ) -> Result<Option<WeightedVote>, Self::Error> {
+    ) -> Result<Option<WeightedEndorsement>, Self::Error> {
         self.reads.lock().unwrap().push((*minter, height));
-        if self.fail || self.fail_vote_reads {
+        if self.fail || self.fail_endorsement_reads {
             return Err("storage unavailable");
         }
         Ok(self
-            .votes
+            .endorsements
             .iter()
-            .find(|vote| {
-                vote.original.vote.auth().minter().p2wsh() == *minter
-                    && vote.original.block_height() == height
+            .find(|endorsement| {
+                endorsement.original.endorsement.auth().minter().p2wsh() == *minter
+                    && endorsement.original.block_height() == height
             })
             .cloned())
     }
@@ -313,8 +317,8 @@ fn btc_tip(height: u64) -> BtcBlockTip {
     }
 }
 
-fn vote(minter: u8, height: u32, hash: u8) -> AuthenticatedMintingVote {
-    vote_for_tip(
+fn endorsement(minter: u8, height: u32, hash: u8) -> AuthenticatedMintingEndorsement {
+    endorsement_for_tip(
         minter,
         CoreBlockTip {
             height: height.into(),
@@ -323,7 +327,10 @@ fn vote(minter: u8, height: u32, hash: u8) -> AuthenticatedMintingVote {
     )
 }
 
-pub(crate) fn vote_for_tip(minter: u8, tip: CoreBlockTip) -> AuthenticatedMintingVote {
+pub(crate) fn endorsement_for_tip(
+    minter: u8,
+    tip: CoreBlockTip,
+) -> AuthenticatedMintingEndorsement {
     let witness_script = minter_witness_script::build_with_authorization(
         &Predicate::opaque(Predicate::unspendable_key()),
         Script::from_bytes(&[minter]),
@@ -346,8 +353,8 @@ pub(crate) fn vote_for_tip(minter: u8, tip: CoreBlockTip) -> AuthenticatedMintin
             ),
         }],
     };
-    MintingVoteValidator::validate(
-        UncheckedMintingVote::from_tx(&tx).pop().unwrap(),
+    MintingEndorsementValidator::validate(
+        UncheckedMintingEndorsement::from_tx(&tx).pop().unwrap(),
         &TxOut {
             value: Amount::from_sat(1),
             script_pubkey: witness_script.to_p2wsh(),
@@ -357,34 +364,34 @@ pub(crate) fn vote_for_tip(minter: u8, tip: CoreBlockTip) -> AuthenticatedMintin
 }
 
 fn engine(
-    votes: Vec<AuthenticatedMintingVote>,
+    endorsements: Vec<AuthenticatedMintingEndorsement>,
     storage: Storage,
 ) -> MintingEngine<Storage, Storage, Storage> {
-    let blocks = votes
+    let blocks = endorsements
         .iter()
-        .map(|vote| {
+        .map(|endorsement| {
             let mut block = Blockchain::new(ChainParams::default())
                 .unwrap()
                 .build_block([0; 32], vec![])
                 .unwrap();
             block.header.core_block = Some(CoreBlockHeader {
-                height: vote.block_height(),
+                height: endorsement.block_height(),
                 target_btc_height: 100,
             });
-            (vote.block_hash(), block.header)
+            (endorsement.block_hash(), block.header)
         })
         .collect();
     let mut engine = MintingEngine::new(
         Arc::new(IndexedBlock {
             btc_block_tip: btc_tip(100),
             acquisitions: vec![],
-            votes,
+            endorsements,
         }),
         Arc::new(MintingProtocolParams {
             acquisition_maturity: 1,
             default_acquisition_duration: 1.try_into().unwrap(),
             min_acquisition_duration: 1.try_into().unwrap(),
-            max_vote_delay: 10,
+            max_endorsement_delay: 10,
         }),
         Arc::new(storage),
         Arc::new(Storage {
@@ -406,10 +413,10 @@ fn active_acquisitions(
 ) -> HashMap<MinterP2wsh, MinterAcquisitions> {
     engine
         .new_block
-        .votes
+        .endorsements
         .iter()
-        .map(|vote| {
-            let minter = vote.auth().minter().p2wsh();
+        .map(|endorsement| {
+            let minter = endorsement.auth().minter().p2wsh();
             (
                 minter,
                 MinterAcquisitions {
@@ -501,20 +508,20 @@ fn validates_default_duration_when_acquisition_duration_is_omitted() {
 }
 
 #[tokio::test]
-async fn accepts_votes_and_deduplicates_the_same_block() {
-    let first = vote(0x51, 42, 1);
+async fn accepts_endorsements_and_deduplicates_the_same_block() {
+    let first = endorsement(0x51, 42, 1);
     let minter = first.auth().minter().p2wsh();
     let engine = engine(vec![first.clone(), first.clone()], Storage::default());
-    let result = engine.validate_votes(&[]).await.unwrap();
+    let result = engine.validate_endorsements(&[]).await.unwrap();
     assert_eq!(
-        result.valid_votes,
-        vec![IncludedVote {
+        result.valid_endorsements,
+        vec![IncludedEndorsement {
             btc_block: btc_tip(100),
-            vote: first
+            endorsement: first
         }]
     );
     assert!(result.double_signs.is_empty());
-    assert!(result.removed_votes.is_empty());
+    assert!(result.removed_endorsements.is_empty());
     assert_eq!(engine.consensus_storage.reads.lock().unwrap().len(), 1);
     assert_eq!(
         *engine
@@ -535,12 +542,12 @@ async fn accepts_votes_and_deduplicates_the_same_block() {
 }
 
 #[tokio::test]
-async fn groups_conflicts_by_minter_and_height_and_appends_subsequent_votes() {
-    let first = vote(0x51, 42, 1);
-    let second = vote(0x51, 42, 2);
-    let third = vote(0x51, 42, 3);
-    let other_height = vote(0x51, 43, 4);
-    let other_minter = vote(0x52, 42, 2);
+async fn groups_conflicts_by_minter_and_height_and_appends_subsequent_endorsements() {
+    let first = endorsement(0x51, 42, 1);
+    let second = endorsement(0x51, 42, 2);
+    let third = endorsement(0x51, 42, 3);
+    let other_height = endorsement(0x51, 43, 4);
+    let other_minter = endorsement(0x52, 42, 2);
     let engine = engine(
         vec![
             first.clone(),
@@ -552,63 +559,73 @@ async fn groups_conflicts_by_minter_and_height_and_appends_subsequent_votes() {
         ],
         Storage::default(),
     );
-    let result = engine.validate_votes(&[]).await.unwrap();
-    assert_eq!(result.valid_votes.len(), 1);
-    assert!(!result.valid_votes.iter().any(|v| v.vote == other_height));
-    assert!(result.valid_votes.iter().any(|v| v.vote == other_minter));
+    let result = engine.validate_endorsements(&[]).await.unwrap();
+    assert_eq!(result.valid_endorsements.len(), 1);
+    assert!(
+        !result
+            .valid_endorsements
+            .iter()
+            .any(|v| v.endorsement == other_height)
+    );
+    assert!(
+        result
+            .valid_endorsements
+            .iter()
+            .any(|v| v.endorsement == other_minter)
+    );
     assert_eq!(
         result.double_signs,
         vec![DoubleSign {
             minter: first.auth().minter().p2wsh(),
             target_flame_height: 42.into(),
-            votes: [first.clone(), second, third, first]
+            endorsements: [first.clone(), second, third, first]
                 .into_iter()
-                .map(|vote| IncludedVote {
+                .map(|endorsement| IncludedEndorsement {
                     btc_block: btc_tip(100),
-                    vote
+                    endorsement
                 })
                 .collect(),
         }]
     );
-    assert!(result.removed_votes.is_empty());
+    assert!(result.removed_endorsements.is_empty());
     assert_eq!(engine.consensus_storage.reads.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]
-async fn removes_a_conflicting_stored_vote_once_and_preserves_its_inclusion() {
-    let stored = WeightedVote {
-        original: IncludedVote {
+async fn removes_a_conflicting_stored_endorsement_once_and_preserves_its_inclusion() {
+    let stored = WeightedEndorsement {
+        original: IncludedEndorsement {
             btc_block: btc_tip(99),
-            vote: vote(0x51, 42, 1),
+            endorsement: endorsement(0x51, 42, 1),
         },
         effective_minting_power: 7,
     };
-    let second = vote(0x51, 42, 2);
-    let third = vote(0x51, 42, 3);
+    let second = endorsement(0x51, 42, 2);
+    let third = endorsement(0x51, 42, 3);
     let engine = engine(
         vec![second.clone(), third.clone()],
         Storage {
-            votes: vec![stored.clone()],
+            endorsements: vec![stored.clone()],
             ..Storage::default()
         },
     );
-    let result = engine.validate_votes(&[]).await.unwrap();
-    assert!(result.valid_votes.is_empty());
-    assert_eq!(result.removed_votes, vec![stored.clone()]);
+    let result = engine.validate_endorsements(&[]).await.unwrap();
+    assert!(result.valid_endorsements.is_empty());
+    assert_eq!(result.removed_endorsements, vec![stored.clone()]);
     assert_eq!(
         result.double_signs,
         vec![DoubleSign {
             minter: second.auth().minter().p2wsh(),
             target_flame_height: 42.into(),
-            votes: vec![
+            endorsements: vec![
                 stored.original,
-                IncludedVote {
+                IncludedEndorsement {
                     btc_block: btc_tip(100),
-                    vote: second
+                    endorsement: second
                 },
-                IncludedVote {
+                IncludedEndorsement {
                     btc_block: btc_tip(100),
-                    vote: third
+                    endorsement: third
                 }
             ],
         }]
@@ -620,59 +637,59 @@ async fn removes_a_conflicting_stored_vote_once_and_preserves_its_inclusion() {
 }
 
 #[tokio::test]
-async fn deduplicates_votes_when_storage_has_the_same_hash() {
+async fn deduplicates_endorsements_when_storage_has_the_same_hash() {
     for power in [0, 7] {
-        let incoming = vote(0x51, 42, 1);
+        let incoming = endorsement(0x51, 42, 1);
         let engine = engine(
             vec![incoming.clone(), incoming],
             Storage {
-                votes: vec![WeightedVote {
-                    original: IncludedVote {
+                endorsements: vec![WeightedEndorsement {
+                    original: IncludedEndorsement {
                         btc_block: btc_tip(99),
-                        vote: vote(0x51, 42, 1),
+                        endorsement: endorsement(0x51, 42, 1),
                     },
                     effective_minting_power: power,
                 }],
                 ..Storage::default()
             },
         );
-        let result = engine.validate_votes(&[]).await.unwrap();
-        assert!(result.valid_votes.is_empty());
+        let result = engine.validate_endorsements(&[]).await.unwrap();
+        assert!(result.valid_endorsements.is_empty());
         assert!(result.double_signs.is_empty());
-        assert!(result.removed_votes.is_empty());
+        assert!(result.removed_endorsements.is_empty());
     }
 }
 
 #[tokio::test]
-async fn detects_a_conflicting_stored_vote_with_zero_power() {
-    let stored = WeightedVote {
-        original: IncludedVote {
+async fn detects_a_conflicting_stored_endorsement_with_zero_power() {
+    let stored = WeightedEndorsement {
+        original: IncludedEndorsement {
             btc_block: btc_tip(99),
-            vote: vote(0x51, 42, 1),
+            endorsement: endorsement(0x51, 42, 1),
         },
         effective_minting_power: 0,
     };
-    let incoming = vote(0x51, 42, 2);
+    let incoming = endorsement(0x51, 42, 2);
     let engine = engine(
         vec![incoming.clone()],
         Storage {
-            votes: vec![stored.clone()],
+            endorsements: vec![stored.clone()],
             ..Storage::default()
         },
     );
-    let result = engine.validate_votes(&[]).await.unwrap();
-    assert!(result.valid_votes.is_empty());
-    assert_eq!(result.removed_votes, vec![stored.clone()]);
+    let result = engine.validate_endorsements(&[]).await.unwrap();
+    assert!(result.valid_endorsements.is_empty());
+    assert_eq!(result.removed_endorsements, vec![stored.clone()]);
     assert_eq!(
         result.double_signs,
         vec![DoubleSign {
             minter: incoming.auth().minter().p2wsh(),
             target_flame_height: 42.into(),
-            votes: vec![
+            endorsements: vec![
                 stored.original,
-                IncludedVote {
+                IncludedEndorsement {
                     btc_block: btc_tip(100),
-                    vote: incoming,
+                    endorsement: incoming,
                 }
             ],
         }]
@@ -680,19 +697,19 @@ async fn detects_a_conflicting_stored_vote_with_zero_power() {
 }
 
 #[tokio::test]
-async fn removes_stored_vote_regardless_of_current_vote_order_and_power() {
-    let first = vote(0x51, 42, 1);
-    let second = vote(0x51, 42, 2);
-    let third = vote(0x51, 42, 3);
+async fn removes_stored_endorsement_regardless_of_current_endorsement_order_and_power() {
+    let first = endorsement(0x51, 42, 1);
+    let second = endorsement(0x51, 42, 2);
+    let third = endorsement(0x51, 42, 3);
     for power in [0, 7] {
-        let stored = WeightedVote {
-            original: IncludedVote {
+        let stored = WeightedEndorsement {
+            original: IncludedEndorsement {
                 btc_block: btc_tip(99),
-                vote: first.clone(),
+                endorsement: first.clone(),
             },
             effective_minting_power: power,
         };
-        for (case, votes) in [
+        for (case, endorsements) in [
             vec![first.clone(), second.clone(), third.clone()],
             vec![second.clone(), first.clone(), third.clone()],
             vec![
@@ -706,35 +723,31 @@ async fn removes_stored_vote_regardless_of_current_vote_order_and_power() {
         .into_iter()
         .enumerate()
         {
-            let mut expected_votes = vec![stored.original.clone()];
+            let mut expected_endorsements = vec![stored.original.clone()];
             // Only the first scenario starts with a duplicate before the conflict.
             let skipped = if case == 0 { 1 } else { 0 };
-            expected_votes.extend(
-                votes
-                    .iter()
-                    .skip(skipped)
-                    .cloned()
-                    .map(|vote| IncludedVote {
-                        btc_block: btc_tip(100),
-                        vote,
-                    }),
-            );
+            expected_endorsements.extend(endorsements.iter().skip(skipped).cloned().map(
+                |endorsement| IncludedEndorsement {
+                    btc_block: btc_tip(100),
+                    endorsement,
+                },
+            ));
             let engine = engine(
-                votes,
+                endorsements,
                 Storage {
-                    votes: vec![stored.clone()],
+                    endorsements: vec![stored.clone()],
                     ..Storage::default()
                 },
             );
-            let result = engine.validate_votes(&[]).await.unwrap();
-            assert!(result.valid_votes.is_empty());
-            assert_eq!(result.removed_votes, vec![stored.clone()]);
+            let result = engine.validate_endorsements(&[]).await.unwrap();
+            assert!(result.valid_endorsements.is_empty());
+            assert_eq!(result.removed_endorsements, vec![stored.clone()]);
             assert_eq!(
                 result.double_signs,
                 vec![DoubleSign {
                     minter: first.auth().minter().p2wsh(),
                     target_flame_height: 42.into(),
-                    votes: expected_votes,
+                    endorsements: expected_endorsements,
                 }]
             );
         }
@@ -742,77 +755,87 @@ async fn removes_stored_vote_regardless_of_current_vote_order_and_power() {
 }
 
 #[tokio::test]
-async fn skips_votes_for_a_stored_double_sign_without_reading_stored_votes() {
-    let first = vote(0x51, 42, 1);
-    let second = vote(0x51, 42, 2);
+async fn skips_endorsements_for_a_stored_double_sign_without_reading_stored_endorsements() {
+    let first = endorsement(0x51, 42, 1);
+    let second = endorsement(0x51, 42, 2);
     let engine = engine(
-        vec![first.clone(), second.clone(), vote(0x51, 42, 3)],
+        vec![first.clone(), second.clone(), endorsement(0x51, 42, 3)],
         Storage {
             double_signs: vec![DoubleSign {
                 minter: first.auth().minter().p2wsh(),
                 target_flame_height: 42.into(),
-                votes: vec![
-                    IncludedVote {
+                endorsements: vec![
+                    IncludedEndorsement {
                         btc_block: btc_tip(98),
-                        vote: first,
+                        endorsement: first,
                     },
-                    IncludedVote {
+                    IncludedEndorsement {
                         btc_block: btc_tip(99),
-                        vote: second,
+                        endorsement: second,
                     },
                 ],
             }],
-            fail_vote_reads: true,
+            fail_endorsement_reads: true,
             ..Storage::default()
         },
     );
-    let result = engine.validate_votes(&[]).await.unwrap();
-    assert!(result.valid_votes.is_empty());
+    let result = engine.validate_endorsements(&[]).await.unwrap();
+    assert!(result.valid_endorsements.is_empty());
     assert!(result.double_signs.is_empty());
-    assert!(result.removed_votes.is_empty());
+    assert!(result.removed_endorsements.is_empty());
     assert!(engine.consensus_storage.reads.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn stored_double_sign_rejects_other_heights_but_not_other_minters() {
-    let first = vote(0x51, 42, 1);
-    let other_minter = vote(0x52, 42, 1);
-    let other_height = vote(0x51, 43, 4);
+    let first = endorsement(0x51, 42, 1);
+    let other_minter = endorsement(0x52, 42, 1);
+    let other_height = endorsement(0x51, 43, 4);
     let engine = engine(
         vec![other_minter.clone(), other_height.clone()],
         Storage {
             double_signs: vec![DoubleSign {
                 minter: first.auth().minter().p2wsh(),
                 target_flame_height: 42.into(),
-                votes: vec![
-                    IncludedVote {
+                endorsements: vec![
+                    IncludedEndorsement {
                         btc_block: btc_tip(98),
-                        vote: first,
+                        endorsement: first,
                     },
-                    IncludedVote {
+                    IncludedEndorsement {
                         btc_block: btc_tip(99),
-                        vote: vote(0x51, 42, 2),
+                        endorsement: endorsement(0x51, 42, 2),
                     },
                 ],
             }],
             ..Storage::default()
         },
     );
-    let result = engine.validate_votes(&[]).await.unwrap();
-    assert_eq!(result.valid_votes.len(), 1);
-    assert!(result.valid_votes.iter().any(|v| v.vote == other_minter));
-    assert!(!result.valid_votes.iter().any(|v| v.vote == other_height));
+    let result = engine.validate_endorsements(&[]).await.unwrap();
+    assert_eq!(result.valid_endorsements.len(), 1);
+    assert!(
+        result
+            .valid_endorsements
+            .iter()
+            .any(|v| v.endorsement == other_minter)
+    );
+    assert!(
+        !result
+            .valid_endorsements
+            .iter()
+            .any(|v| v.endorsement == other_height)
+    );
     assert!(result.double_signs.is_empty());
-    assert!(result.removed_votes.is_empty());
+    assert!(result.removed_endorsements.is_empty());
 }
 
 #[tokio::test]
 async fn propagates_chain_storage_errors() {
-    let mut engine = engine(vec![vote(0x51, 42, 1)], Storage::default());
+    let mut engine = engine(vec![endorsement(0x51, 42, 1)], Storage::default());
     Arc::get_mut(&mut engine.chain_storage).unwrap().fail_blocks = true;
     assert!(matches!(
-        engine.validate_votes(&[]).await,
-        Err(VoteValidationError::ChainStorage(
+        engine.validate_endorsements(&[]).await,
+        Err(EndorsementValidationError::ChainStorage(
             "chain storage unavailable"
         ))
     ));
@@ -822,15 +845,17 @@ async fn propagates_chain_storage_errors() {
 #[tokio::test]
 async fn propagates_storage_errors() {
     let engine = engine(
-        vec![vote(0x51, 42, 1)],
+        vec![endorsement(0x51, 42, 1)],
         Storage {
             fail: true,
             ..Storage::default()
         },
     );
     assert!(matches!(
-        engine.validate_votes(&[]).await,
-        Err(VoteValidationError::ConsensusStorage("storage unavailable"))
+        engine.validate_endorsements(&[]).await,
+        Err(EndorsementValidationError::ConsensusStorage(
+            "storage unavailable"
+        ))
     ));
 }
 
@@ -843,21 +868,21 @@ async fn accepts_an_empty_block_without_reading_storage() {
             ..Storage::default()
         },
     );
-    let result = engine.validate_votes(&[]).await.unwrap();
-    assert!(result.valid_votes.is_empty());
+    let result = engine.validate_endorsements(&[]).await.unwrap();
+    assert!(result.valid_endorsements.is_empty());
     assert!(result.double_signs.is_empty());
-    assert!(result.removed_votes.is_empty());
+    assert!(result.removed_endorsements.is_empty());
     assert!(engine.consensus_storage.reads.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn skips_votes_without_active_acquisitions_before_reading_stored_votes() {
-    let incoming = vote(0x51, 42, 1);
+async fn skips_endorsements_without_active_acquisitions_before_reading_stored_endorsements() {
+    let incoming = endorsement(0x51, 42, 1);
     let minter = incoming.auth().minter().p2wsh();
     let mut engine = engine(
-        vec![incoming, vote(0x51, 42, 2)],
+        vec![incoming, endorsement(0x51, 42, 2)],
         Storage {
-            fail_vote_reads: true,
+            fail_endorsement_reads: true,
             fail_double_sign: true,
             ..Storage::default()
         },
@@ -875,19 +900,19 @@ async fn skips_votes_without_active_acquisitions_before_reading_stored_votes() {
         Arc::get_mut(&mut engine.consensus_storage)
             .unwrap()
             .acquisitions = acquisitions;
-        let result = engine.validate_votes(&[]).await.unwrap();
-        assert!(result.valid_votes.is_empty());
+        let result = engine.validate_endorsements(&[]).await.unwrap();
+        assert!(result.valid_endorsements.is_empty());
         assert!(result.double_signs.is_empty());
-        assert!(result.removed_votes.is_empty());
+        assert!(result.removed_endorsements.is_empty());
         assert!(engine.consensus_storage.reads.lock().unwrap().is_empty());
     }
 }
 
 #[tokio::test]
-async fn accepts_only_votes_from_minters_with_active_acquisitions() {
-    let active = vote(0x51, 42, 1);
-    let missing = vote(0x52, 42, 1);
-    let empty = vote(0x53, 42, 1);
+async fn accepts_only_endorsements_from_minters_with_active_acquisitions() {
+    let active = endorsement(0x51, 42, 1);
+    let missing = endorsement(0x52, 42, 1);
+    let empty = endorsement(0x53, 42, 1);
     let mut engine = engine(
         vec![missing.clone(), active.clone(), empty.clone()],
         Storage::default(),
@@ -903,16 +928,16 @@ async fn accepts_only_votes_from_minters_with_active_acquisitions() {
     Arc::get_mut(&mut engine.consensus_storage)
         .unwrap()
         .acquisitions = acquisitions;
-    let result = engine.validate_votes(&[]).await.unwrap();
+    let result = engine.validate_endorsements(&[]).await.unwrap();
     assert_eq!(
-        result.valid_votes,
-        vec![IncludedVote {
+        result.valid_endorsements,
+        vec![IncludedEndorsement {
             btc_block: btc_tip(100),
-            vote: active.clone(),
+            endorsement: active.clone(),
         }]
     );
     assert!(result.double_signs.is_empty());
-    assert!(result.removed_votes.is_empty());
+    assert!(result.removed_endorsements.is_empty());
     assert_eq!(
         engine.consensus_storage.reads.lock().unwrap().as_slice(),
         &[(active.auth().minter().p2wsh(), 42.into())]
@@ -920,40 +945,40 @@ async fn accepts_only_votes_from_minters_with_active_acquisitions() {
 }
 
 #[tokio::test]
-async fn validates_vote_inclusion_against_target_btc_height() {
+async fn validates_endorsement_inclusion_against_target_btc_height() {
     for inclusion_height in [99, 100, 101, 111, u64::from(u32::MAX) + 1] {
-        let incoming = vote(0x51, 42, 1);
+        let incoming = endorsement(0x51, 42, 1);
         let mut engine = engine(vec![incoming.clone()], Storage::default());
         Arc::make_mut(&mut engine.new_block).btc_block_tip = btc_tip(inclusion_height);
 
-        let result = engine.validate_votes(&[]).await.unwrap();
+        let result = engine.validate_endorsements(&[]).await.unwrap();
         if inclusion_height < 100 {
-            assert!(result.valid_votes.is_empty());
+            assert!(result.valid_endorsements.is_empty());
             assert!(engine.consensus_storage.reads.lock().unwrap().is_empty());
         } else {
             assert_eq!(
-                result.valid_votes,
-                vec![IncludedVote {
+                result.valid_endorsements,
+                vec![IncludedEndorsement {
                     btc_block: btc_tip(inclusion_height),
-                    vote: incoming,
+                    endorsement: incoming,
                 }]
             );
         }
         assert!(result.double_signs.is_empty());
-        assert!(result.removed_votes.is_empty());
-        assert!(result.pending_votes.is_empty());
+        assert!(result.removed_endorsements.is_empty());
+        assert!(result.pending_endorsements.is_empty());
     }
 }
 
 #[tokio::test]
-async fn premature_vote_does_not_conflict_with_a_stored_vote() {
+async fn premature_endorsement_does_not_conflict_with_a_stored_endorsement() {
     let mut engine = engine(
-        vec![vote(0x51, 42, 2)],
+        vec![endorsement(0x51, 42, 2)],
         Storage {
-            votes: vec![WeightedVote {
-                original: IncludedVote {
+            endorsements: vec![WeightedEndorsement {
+                original: IncludedEndorsement {
                     btc_block: btc_tip(99),
-                    vote: vote(0x51, 42, 1),
+                    endorsement: endorsement(0x51, 42, 1),
                 },
                 effective_minting_power: 7,
             }],
@@ -970,34 +995,34 @@ async fn premature_vote_does_not_conflict_with_a_stored_vote() {
         .unwrap()
         .target_btc_height = 101;
 
-    let result = engine.validate_votes(&[]).await.unwrap();
-    assert!(result.valid_votes.is_empty());
+    let result = engine.validate_endorsements(&[]).await.unwrap();
+    assert!(result.valid_endorsements.is_empty());
     assert!(result.double_signs.is_empty());
-    assert!(result.removed_votes.is_empty());
-    assert!(result.pending_votes.is_empty());
+    assert!(result.removed_endorsements.is_empty());
+    assert!(result.pending_endorsements.is_empty());
     assert!(engine.consensus_storage.reads.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn defers_votes_for_unknown_blocks() {
-    let incoming = vote(0x51, 42, 1);
+async fn defers_endorsements_for_unknown_blocks() {
+    let incoming = endorsement(0x51, 42, 1);
     let mut engine = engine(vec![incoming.clone()], Storage::default());
     Arc::get_mut(&mut engine.chain_storage)
         .unwrap()
         .blocks
         .clear();
 
-    let result = engine.validate_votes(&[]).await.unwrap();
+    let result = engine.validate_endorsements(&[]).await.unwrap();
     assert_eq!(
-        result.pending_votes,
-        vec![IncludedVote {
+        result.pending_endorsements,
+        vec![IncludedEndorsement {
             btc_block: btc_tip(100),
-            vote: incoming,
+            endorsement: incoming,
         }]
     );
-    assert!(result.valid_votes.is_empty());
+    assert!(result.valid_endorsements.is_empty());
     assert!(result.double_signs.is_empty());
-    assert!(result.removed_votes.is_empty());
+    assert!(result.removed_endorsements.is_empty());
     assert!(engine.consensus_storage.reads.lock().unwrap().is_empty());
     assert!(
         engine
@@ -1010,8 +1035,8 @@ async fn defers_votes_for_unknown_blocks() {
 }
 
 #[tokio::test]
-async fn defers_votes_without_a_matching_core_header() {
-    let incoming = vote(0x51, 42, 1);
+async fn defers_endorsements_without_a_matching_core_header() {
+    let incoming = endorsement(0x51, 42, 1);
     let mut engine = engine(vec![incoming.clone()], Storage::default());
     Arc::get_mut(&mut engine.chain_storage)
         .unwrap()
@@ -1020,22 +1045,22 @@ async fn defers_votes_without_a_matching_core_header() {
         .unwrap()
         .core_block = None;
 
-    let result = engine.validate_votes(&[]).await.unwrap();
-    assert!(result.valid_votes.is_empty());
+    let result = engine.validate_endorsements(&[]).await.unwrap();
+    assert!(result.valid_endorsements.is_empty());
     assert!(result.double_signs.is_empty());
-    assert!(result.removed_votes.is_empty());
+    assert!(result.removed_endorsements.is_empty());
     assert_eq!(
-        result.pending_votes,
-        vec![IncludedVote {
+        result.pending_endorsements,
+        vec![IncludedEndorsement {
             btc_block: btc_tip(100),
-            vote: incoming,
+            endorsement: incoming,
         }]
     );
     assert!(engine.consensus_storage.reads.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn validates_acquisition_activity_at_the_vote_target_height() {
+async fn validates_acquisition_activity_at_the_endorsement_target_height() {
     // The acquisition is included at 90. Explicit duration overrides the default of 7.
     for (maturity, duration, target, accepted) in [
         (10, Some(5), 89, false),
@@ -1053,7 +1078,7 @@ async fn validates_acquisition_activity_at_the_vote_target_height() {
         (0, Some(5), 94, true),
         (0, Some(5), 95, false),
     ] {
-        let incoming = vote(0x51, 42, 1);
+        let incoming = endorsement(0x51, 42, 1);
         let minter = incoming.auth().minter().p2wsh();
         let mut engine = engine(vec![incoming.clone()], Storage::default());
         let params = Arc::make_mut(&mut engine.protocol_params);
@@ -1084,22 +1109,22 @@ async fn validates_acquisition_activity_at_the_vote_target_height() {
         Arc::get_mut(&mut engine.consensus_storage)
             .unwrap()
             .acquisitions = acquisitions;
-        let result = engine.validate_votes(&[]).await.unwrap();
+        let result = engine.validate_endorsements(&[]).await.unwrap();
         let expected = if accepted {
-            vec![IncludedVote {
+            vec![IncludedEndorsement {
                 btc_block: btc_tip(110),
-                vote: incoming,
+                endorsement: incoming,
             }]
         } else {
             vec![]
         };
         assert_eq!(
-            result.valid_votes, expected,
+            result.valid_endorsements, expected,
             "{maturity}, {duration:?}, {target}"
         );
         assert!(result.double_signs.is_empty());
-        assert!(result.removed_votes.is_empty());
-        assert!(result.pending_votes.is_empty());
+        assert!(result.removed_endorsements.is_empty());
+        assert!(result.pending_endorsements.is_empty());
         assert_eq!(
             engine.consensus_storage.reads.lock().unwrap().len(),
             usize::from(accepted)
@@ -1108,9 +1133,9 @@ async fn validates_acquisition_activity_at_the_vote_target_height() {
 }
 
 #[tokio::test]
-async fn finds_an_active_acquisition_separately_for_each_vote_target() {
-    let active_target = vote(0x51, 42, 1);
-    let expired_target = vote(0x51, 43, 2);
+async fn finds_an_active_acquisition_separately_for_each_endorsement_target() {
+    let active_target = endorsement(0x51, 42, 1);
+    let expired_target = endorsement(0x51, 43, 2);
     let minter = active_target.auth().minter().p2wsh();
     let mut engine = engine(
         vec![active_target.clone(), expired_target.clone()],
@@ -1143,17 +1168,17 @@ async fn finds_an_active_acquisition_separately_for_each_vote_target() {
     Arc::get_mut(&mut engine.consensus_storage)
         .unwrap()
         .acquisitions = acquisitions;
-    let result = engine.validate_votes(&[]).await.unwrap();
+    let result = engine.validate_endorsements(&[]).await.unwrap();
     assert_eq!(
-        result.valid_votes,
-        vec![IncludedVote {
+        result.valid_endorsements,
+        vec![IncludedEndorsement {
             btc_block: btc_tip(110),
-            vote: active_target,
+            endorsement: active_target,
         }]
     );
     assert!(result.double_signs.is_empty());
-    assert!(result.removed_votes.is_empty());
-    assert!(result.pending_votes.is_empty());
+    assert!(result.removed_endorsements.is_empty());
+    assert!(result.pending_endorsements.is_empty());
     assert_eq!(
         engine.consensus_storage.reads.lock().unwrap().as_slice(),
         &[(minter, 42.into())]
@@ -1177,28 +1202,28 @@ async fn finds_an_active_acquisition_separately_for_each_vote_target() {
 }
 
 #[tokio::test]
-async fn removes_all_current_votes_from_double_signers_regardless_of_order() {
-    let first = vote(0x51, 42, 1);
-    let second = vote(0x51, 42, 2);
-    let other_height = vote(0x51, 43, 3);
-    let pending = vote(0x51, 44, 4);
-    let other_minter = vote(0x52, 43, 3);
-    let other_minter_pending = vote(0x52, 44, 4);
+async fn removes_all_current_endorsements_from_double_signers_regardless_of_order() {
+    let first = endorsement(0x51, 42, 1);
+    let second = endorsement(0x51, 42, 2);
+    let other_height = endorsement(0x51, 43, 3);
+    let pending = endorsement(0x51, 44, 4);
+    let other_minter = endorsement(0x52, 43, 3);
+    let other_minter_pending = endorsement(0x52, 44, 4);
 
     for stored_conflict in [false, true] {
-        let stored = WeightedVote {
-            original: IncludedVote {
+        let stored = WeightedEndorsement {
+            original: IncludedEndorsement {
                 btc_block: btc_tip(99),
-                vote: first.clone(),
+                endorsement: first.clone(),
             },
             effective_minting_power: 7,
         };
-        let stored_votes = if stored_conflict {
+        let stored_endorsements = if stored_conflict {
             vec![stored.clone()]
         } else {
             vec![]
         };
-        let mut votes = vec![
+        let mut endorsements = vec![
             first.clone(),
             second.clone(),
             other_height.clone(),
@@ -1206,11 +1231,11 @@ async fn removes_all_current_votes_from_double_signers_regardless_of_order() {
             other_minter.clone(),
             other_minter_pending.clone(),
         ];
-        for _ in 0..votes.len() {
+        for _ in 0..endorsements.len() {
             let mut engine = engine(
-                votes.clone(),
+                endorsements.clone(),
                 Storage {
-                    votes: stored_votes.clone(),
+                    endorsements: stored_endorsements.clone(),
                     ..Storage::default()
                 },
             );
@@ -1219,32 +1244,32 @@ async fn removes_all_current_votes_from_double_signers_regardless_of_order() {
                 .blocks
                 .remove(&pending.block_hash());
 
-            let result = engine.validate_votes(&[]).await.unwrap();
+            let result = engine.validate_endorsements(&[]).await.unwrap();
             assert_eq!(
-                result.valid_votes,
-                vec![IncludedVote {
+                result.valid_endorsements,
+                vec![IncludedEndorsement {
                     btc_block: btc_tip(100),
-                    vote: other_minter.clone(),
+                    endorsement: other_minter.clone(),
                 }]
             );
             assert_eq!(
-                result.pending_votes,
-                vec![IncludedVote {
+                result.pending_endorsements,
+                vec![IncludedEndorsement {
                     btc_block: btc_tip(100),
-                    vote: other_minter_pending.clone(),
+                    endorsement: other_minter_pending.clone(),
                 }]
             );
-            assert_eq!(result.removed_votes, stored_votes);
+            assert_eq!(result.removed_endorsements, stored_endorsements);
             assert_eq!(result.double_signs.len(), 1);
             let sign = &result.double_signs[0];
             assert_eq!(sign.minter, first.auth().minter().p2wsh());
             assert_eq!(sign.target_flame_height, 42.into());
-            assert!(sign.votes.iter().any(|v| v.vote == first));
-            assert!(sign.votes.iter().any(|v| v.vote == second));
+            assert!(sign.endorsements.iter().any(|v| v.endorsement == first));
+            assert!(sign.endorsements.iter().any(|v| v.endorsement == second));
             if stored_conflict {
-                assert!(sign.votes.contains(&stored.original));
+                assert!(sign.endorsements.contains(&stored.original));
             }
-            votes.rotate_left(1);
+            endorsements.rotate_left(1);
         }
     }
 }
@@ -1253,18 +1278,18 @@ async fn removes_all_current_votes_from_double_signers_regardless_of_order() {
 async fn preserves_double_sign_evidence_at_multiple_heights() {
     let engine = engine(
         vec![
-            vote(0x51, 42, 1),
-            vote(0x51, 42, 2),
-            vote(0x51, 43, 3),
-            vote(0x51, 43, 4),
-            vote(0x51, 44, 5),
+            endorsement(0x51, 42, 1),
+            endorsement(0x51, 42, 2),
+            endorsement(0x51, 43, 3),
+            endorsement(0x51, 43, 4),
+            endorsement(0x51, 44, 5),
         ],
         Storage::default(),
     );
-    let result = engine.validate_votes(&[]).await.unwrap();
-    assert!(result.valid_votes.is_empty());
-    assert!(result.pending_votes.is_empty());
-    assert!(result.removed_votes.is_empty());
+    let result = engine.validate_endorsements(&[]).await.unwrap();
+    assert!(result.valid_endorsements.is_empty());
+    assert!(result.pending_endorsements.is_empty());
+    assert!(result.removed_endorsements.is_empty());
     assert_eq!(result.double_signs.len(), 2);
     for height in [42, 43] {
         let sign = result
@@ -1272,13 +1297,20 @@ async fn preserves_double_sign_evidence_at_multiple_heights() {
             .iter()
             .find(|sign| sign.target_flame_height == height.into())
             .unwrap();
-        assert_eq!(sign.votes.len(), 2);
-        assert!(sign.votes.iter().all(|v| v.block_height() == height.into()));
-        assert_ne!(sign.votes[0].block_hash(), sign.votes[1].block_hash());
+        assert_eq!(sign.endorsements.len(), 2);
+        assert!(
+            sign.endorsements
+                .iter()
+                .all(|v| v.block_height() == height.into())
+        );
+        assert_ne!(
+            sign.endorsements[0].block_hash(),
+            sign.endorsements[1].block_hash()
+        );
     }
 }
 
 mod acquisition_provider;
+mod endorsement_weight;
 mod outcome;
-mod vote_weight;
 mod weighter;

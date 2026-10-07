@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use btc_integration::{
-    BitcoinConfig, BitcoinConnection, BitcoinConnectionError, IdentityManager, MintingSendError,
-    VoteSender as BitcoinVoteSender, VoteSignerError,
+    BitcoinConfig, BitcoinConnection, BitcoinConnectionError,
+    EndorsementSender as BitcoinEndorsementSender, EndorsementSignerError, IdentityManager,
+    MintingSendError,
     btc::rpc::Core31RpcApi,
     identity::storage::{InMemorySecretStorage, MissingSecret},
 };
@@ -10,9 +11,9 @@ use corepc_client::bitcoin::Txid;
 use flamechain::BlockHash;
 use tokio::sync::OnceCell;
 
-use crate::minter::ports::VoteSender;
+use crate::minter::ports::EndorsementSender;
 
-type InitializedSender = BitcoinVoteSender<Core31RpcApi, Arc<InMemorySecretStorage>>;
+type InitializedSender = BitcoinEndorsementSender<Core31RpcApi, Arc<InMemorySecretStorage>>;
 
 pub struct MintingSender {
     bitcoin_config: BitcoinConfig,
@@ -40,7 +41,7 @@ impl MintingSender {
                     .identity_manager
                     .identity()
                     .ok_or(SenderStartupError::IdentityNotInitialized)?;
-                let connection = BitcoinConnection::votes(
+                let connection = BitcoinConnection::endorsements(
                     self.bitcoin_config.clone(),
                     identity.clone(),
                     self.identity_manager.secret_storage().clone(),
@@ -52,11 +53,15 @@ impl MintingSender {
         Ok(())
     }
 
-    pub async fn send_vote(&self, height: u32, hash: BlockHash) -> Result<Txid, SenderError> {
+    pub async fn send_endorsement(
+        &self,
+        height: u32,
+        hash: BlockHash,
+    ) -> Result<Txid, SenderError> {
         self.sender
             .get()
             .ok_or(SenderError::NotStarted)?
-            .send_vote(height, hash)
+            .send_endorsement(height, hash)
             .await
             .map_err(SenderError::Send)
     }
@@ -75,15 +80,15 @@ pub enum SenderError {
     #[error("minting sender has not been started")]
     NotStarted,
     #[error(transparent)]
-    Send(MintingSendError<VoteSignerError<MissingSecret>>),
+    Send(MintingSendError<EndorsementSignerError<MissingSecret>>),
 }
 
-impl VoteSender for MintingSender {
+impl EndorsementSender for MintingSender {
     type Error = SenderError;
     type TransactionId = Txid;
 
-    async fn send_vote(&self, height: u32, hash: BlockHash) -> Result<Txid, Self::Error> {
-        self.send_vote(height, hash).await
+    async fn send_endorsement(&self, height: u32, hash: BlockHash) -> Result<Txid, Self::Error> {
+        self.send_endorsement(height, hash).await
     }
 }
 
@@ -112,7 +117,7 @@ mod tests {
             identity.clone(),
         );
         assert!(matches!(
-            sender.send_vote(1, BlockHash::from([1; 32])).await,
+            sender.send_endorsement(1, BlockHash::from([1; 32])).await,
             Err(SenderError::NotStarted)
         ));
         assert!(matches!(
@@ -127,7 +132,7 @@ mod tests {
             ));
             assert!(sender.sender.get().is_none());
             assert!(matches!(
-                sender.send_vote(1, BlockHash::from([1; 32])).await,
+                sender.send_endorsement(1, BlockHash::from([1; 32])).await,
                 Err(SenderError::NotStarted)
             ));
         }

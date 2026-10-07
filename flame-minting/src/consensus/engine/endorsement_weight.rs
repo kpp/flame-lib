@@ -1,22 +1,26 @@
-use crate::consensus::{IncludedAcquisition, IncludedVote, MintingProtocolParams, WeightedVote};
+use crate::consensus::{
+    IncludedAcquisition, IncludedEndorsement, MintingProtocolParams, WeightedEndorsement,
+};
 
-pub fn weight_vote(
-    vote: IncludedVote,
+pub fn weight_endorsement(
+    endorsement: IncludedEndorsement,
     target_btc_height: u64,
     acquisitions: &[IncludedAcquisition],
     params: &MintingProtocolParams,
-) -> Result<WeightedVote, VoteWeightError> {
-    let delay = vote.btc_block.height.checked_sub(target_btc_height).ok_or(
-        VoteWeightError::VoteBeforeTarget {
-            inclusion_height: vote.btc_block.height,
+) -> Result<WeightedEndorsement, EndorsementWeightError> {
+    let delay = endorsement
+        .btc_block
+        .height
+        .checked_sub(target_btc_height)
+        .ok_or(EndorsementWeightError::EndorsementBeforeTarget {
+            inclusion_height: endorsement.btc_block.height,
             target_height: target_btc_height,
-        },
-    )?;
+        })?;
 
-    let effective_minting_power = if delay > u64::from(params.max_vote_delay) {
+    let effective_minting_power = if delay > u64::from(params.max_endorsement_delay) {
         0
     } else {
-        let minter = vote.vote.auth().minter().p2wsh();
+        let minter = endorsement.endorsement.auth().minter().p2wsh();
         let base_power = acquisitions
             .iter()
             .filter(|acquisition| {
@@ -28,7 +32,7 @@ pub fn weight_vote(
                     / u64::from(acquisition.duration(params));
                 total
                     .checked_add(power)
-                    .ok_or(VoteWeightError::MintingPowerOverflow)
+                    .ok_or(EndorsementWeightError::MintingPowerOverflow)
             })?;
         if delay >= u64::from(u64::BITS) {
             0
@@ -37,15 +41,15 @@ pub fn weight_vote(
         }
     };
 
-    Ok(WeightedVote {
-        original: vote,
+    Ok(WeightedEndorsement {
+        original: endorsement,
         effective_minting_power,
     })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VoteWeightError {
-    VoteBeforeTarget {
+pub enum EndorsementWeightError {
+    EndorsementBeforeTarget {
         inclusion_height: u64,
         target_height: u64,
     },

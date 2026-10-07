@@ -9,29 +9,29 @@ use crate::minter::journal::in_memory::InMemoryMinterJournal;
 
 struct UnusedSender;
 
-impl VoteSender for UnusedSender {
+impl EndorsementSender for UnusedSender {
     type Error = Infallible;
     type TransactionId = Txid;
 
-    async fn send_vote(&self, _: u32, _: BlockHash) -> Result<Txid, Self::Error> {
+    async fn send_endorsement(&self, _: u32, _: BlockHash) -> Result<Txid, Self::Error> {
         unreachable!()
     }
 }
 
 fn manager(
-    vote_policy: VotePolicy,
+    endorsement_policy: EndorsementPolicy,
 ) -> MinterManager<InMemoryChain, UnusedSender, InMemoryMinterJournal> {
     MinterManager::new(
         Arc::new(InMemoryChain::default()),
         Arc::new(UnusedSender),
         Arc::new(InMemoryMinterJournal::new()),
-        vote_policy,
+        endorsement_policy,
     )
 }
 
 #[tokio::test]
 async fn manual_policy_does_not_start_a_worker() {
-    let manager = manager(VotePolicy::Manual);
+    let manager = manager(EndorsementPolicy::Manual);
     let (updates, subscription) = watch::channel(None);
 
     manager.startup(subscription).await.unwrap();
@@ -45,7 +45,7 @@ async fn manual_policy_does_not_start_a_worker() {
 
 #[tokio::test]
 async fn auto_policy_starts_a_single_worker_and_supports_restart() {
-    let manager = manager(VotePolicy::Auto);
+    let manager = manager(EndorsementPolicy::Auto);
     let (updates, subscription) = watch::channel(None);
 
     manager.startup(subscription).await.unwrap();

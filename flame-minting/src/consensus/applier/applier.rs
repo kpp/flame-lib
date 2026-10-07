@@ -6,20 +6,20 @@ use flame_storage::CanonicalStorage;
 use flamechain::{BlockHeader, BlockTip, CoreBlockTip};
 
 use crate::consensus::{
-    ConsensusStorage, DoubleSign, IncludedAcquisition, MintingOutcome, PendingVotes,
-    WeightedBlockHeader, WeightedVote,
+    ConsensusStorage, DoubleSign, IncludedAcquisition, MintingOutcome, PendingEndorsements,
+    WeightedBlockHeader, WeightedEndorsement,
 };
 
 use super::{BlockAttacher, BlockAttacherError, BlockDetacher, BlockDetacherError, MintingJournal};
 
 #[repr(u64)]
 enum ApplyIntent {
-    RemoveVotes = 1,
-    StoreVotes = 2,
+    RemoveEndorsements = 1,
+    StoreEndorsements = 2,
     StoreAcquisitions = 3,
     StoreBlockWeights = 4,
     StoreDoubleSigns = 5,
-    StorePendingVotes = 6,
+    StorePendingEndorsements = 6,
     ApplyChainPath = 7,
 }
 
@@ -71,14 +71,14 @@ impl<C: ConsensusStorage, H: ChainAccess, J: MintingJournal, S: CanonicalStorage
         outcome: &MintingOutcome,
     ) -> Result<Vec<BlockHeader>, MintingOutcomeApplierError<C::Error, J::Error, S::Error, H::Error>>
     {
-        self.with_intent(ApplyIntent::RemoveVotes as u64, || async {
-            self.remove_votes(&outcome.removed_votes)
+        self.with_intent(ApplyIntent::RemoveEndorsements as u64, || async {
+            self.remove_endorsements(&outcome.removed_endorsements)
                 .await
                 .map_err(MintingOutcomeApplierError::ConsensusStorage)
         })
         .await?;
-        self.with_intent(ApplyIntent::StoreVotes as u64, || async {
-            self.store_votes(&outcome.accepted_votes)
+        self.with_intent(ApplyIntent::StoreEndorsements as u64, || async {
+            self.store_endorsements(&outcome.accepted_endorsements)
                 .await
                 .map_err(MintingOutcomeApplierError::ConsensusStorage)
         })
@@ -101,8 +101,8 @@ impl<C: ConsensusStorage, H: ChainAccess, J: MintingJournal, S: CanonicalStorage
                 .map_err(MintingOutcomeApplierError::ConsensusStorage)
         })
         .await?;
-        self.with_intent(ApplyIntent::StorePendingVotes as u64, || async {
-            self.store_pending_votes(&outcome.pending_votes)
+        self.with_intent(ApplyIntent::StorePendingEndorsements as u64, || async {
+            self.store_pending_endorsements(&outcome.pending_endorsements)
                 .await
                 .map_err(MintingOutcomeApplierError::ConsensusStorage)
         })
@@ -189,18 +189,26 @@ impl<C: ConsensusStorage, H: ChainAccess, J: MintingJournal, S: CanonicalStorage
         Ok(attached_core_headers)
     }
 
-    async fn remove_votes(&self, votes: &[WeightedVote]) -> Result<(), C::Error> {
-        for vote in votes {
-            self.consensus_storage.remove_vote(vote).await?;
+    async fn remove_endorsements(
+        &self,
+        endorsements: &[WeightedEndorsement],
+    ) -> Result<(), C::Error> {
+        for endorsement in endorsements {
+            self.consensus_storage
+                .remove_endorsement(endorsement)
+                .await?;
         }
 
         Ok(())
     }
 
-    async fn store_votes(&self, votes: &[WeightedVote]) -> Result<(), C::Error> {
-        for vote in votes {
+    async fn store_endorsements(
+        &self,
+        endorsements: &[WeightedEndorsement],
+    ) -> Result<(), C::Error> {
+        for endorsement in endorsements {
             self.consensus_storage
-                .store_vote(vote.original.btc_block, vote)
+                .store_endorsement(endorsement.original.btc_block, endorsement)
                 .await?;
         }
 
@@ -241,13 +249,15 @@ impl<C: ConsensusStorage, H: ChainAccess, J: MintingJournal, S: CanonicalStorage
         Ok(())
     }
 
-    async fn store_pending_votes(
+    async fn store_pending_endorsements(
         &self,
-        pending_votes: &BTreeMap<CoreBlockTip, PendingVotes>,
+        pending_endorsements: &BTreeMap<CoreBlockTip, PendingEndorsements>,
     ) -> Result<(), C::Error> {
-        for (&tip, votes) in pending_votes {
-            for vote in votes {
-                self.consensus_storage.store_pending_vote(tip, vote).await?;
+        for (&tip, endorsements) in pending_endorsements {
+            for endorsement in endorsements {
+                self.consensus_storage
+                    .store_pending_endorsement(tip, endorsement)
+                    .await?;
             }
         }
 
@@ -299,7 +309,7 @@ mod tests {
     use flame_storage::state::canonical::InMemoryCanonicalStorage;
     use flamechain::{Block, BlockHash, Blockchain, ChainParams, CoreBlockHeader, CoreFlameHeight};
 
-    use crate::consensus::{IncludedVote, MinterAcquisitions, MintingProtocolParams};
+    use crate::consensus::{IncludedEndorsement, MinterAcquisitions, MintingProtocolParams};
 
     type TestApplier = MintingOutcomeApplier<Storage, Chain, Journal, Storage>;
     type TestError =
@@ -417,34 +427,38 @@ mod tests {
             unreachable!()
         }
 
-        async fn store_vote(&self, _: BtcBlockTip, _: &WeightedVote) -> Result<(), Self::Error> {
-            unreachable!()
-        }
-
-        async fn get_votes_for_block(
+        async fn store_endorsement(
             &self,
-            _: CoreBlockTip,
-        ) -> Result<Vec<WeightedVote>, Self::Error> {
-            unreachable!()
-        }
-
-        async fn remove_vote(&self, _: &WeightedVote) -> Result<(), Self::Error> {
-            unreachable!()
-        }
-
-        async fn store_pending_vote(
-            &self,
-            _: CoreBlockTip,
-            _: &IncludedVote,
+            _: BtcBlockTip,
+            _: &WeightedEndorsement,
         ) -> Result<(), Self::Error> {
             unreachable!()
         }
 
-        async fn get_minter_vote_for_height(
+        async fn get_endorsements_for_block(
+            &self,
+            _: CoreBlockTip,
+        ) -> Result<Vec<WeightedEndorsement>, Self::Error> {
+            unreachable!()
+        }
+
+        async fn remove_endorsement(&self, _: &WeightedEndorsement) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        async fn store_pending_endorsement(
+            &self,
+            _: CoreBlockTip,
+            _: &IncludedEndorsement,
+        ) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        async fn get_minter_endorsement_for_height(
             &self,
             _: &MinterP2wsh,
             _: CoreFlameHeight,
-        ) -> Result<Option<WeightedVote>, Self::Error> {
+        ) -> Result<Option<WeightedEndorsement>, Self::Error> {
             unreachable!()
         }
 

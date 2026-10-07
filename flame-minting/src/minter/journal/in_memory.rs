@@ -4,35 +4,38 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use btc_integration::{AuthenticatedMintingVote, MintingVoteData};
+use btc_integration::{AuthenticatedMintingEndorsement, MintingEndorsementData};
 use corepc_client::bitcoin::Txid;
 use flamechain::{BlockHash, CoreFlameHeight};
 
-use super::{MinterJournal, VoteReservation};
+use super::{EndorsementReservation, MinterJournal};
 
 #[derive(Clone, Default)]
 pub struct InMemoryMinterJournal {
-    votes: Arc<RwLock<BTreeMap<CoreFlameHeight, VoteRecord>>>,
+    endorsements: Arc<RwLock<BTreeMap<CoreFlameHeight, EndorsementRecord>>>,
 }
 
-struct VoteRecord {
-    vote: MintingVoteData,
-    state: VoteState,
+struct EndorsementRecord {
+    endorsement: MintingEndorsementData,
+    state: EndorsementState,
 }
 
-enum VoteState {
+enum EndorsementState {
     Reserved,
     Sent(Txid),
-    Committed(AuthenticatedMintingVote),
+    Committed(AuthenticatedMintingEndorsement),
 }
 
-impl VoteRecord {
-    fn check_vote(&self, vote: &MintingVoteData) -> Result<(), InMemoryMinterJournalError> {
-        if self.vote != *vote {
-            return Err(InMemoryMinterJournalError::ConflictingVote {
-                height: vote.block_height(),
-                expected: self.vote.block_hash(),
-                actual: vote.block_hash(),
+impl EndorsementRecord {
+    fn check_endorsement(
+        &self,
+        endorsement: &MintingEndorsementData,
+    ) -> Result<(), InMemoryMinterJournalError> {
+        if self.endorsement != *endorsement {
+            return Err(InMemoryMinterJournalError::ConflictingEndorsement {
+                height: endorsement.block_height(),
+                expected: self.endorsement.block_hash(),
+                actual: endorsement.block_hash(),
             });
         }
         Ok(())
@@ -40,9 +43,9 @@ impl VoteRecord {
 
     fn transaction_id(&self) -> Option<Txid> {
         match &self.state {
-            VoteState::Reserved => None,
-            VoteState::Sent(txid) => Some(*txid),
-            VoteState::Committed(vote) => Some(vote.txid()),
+            EndorsementState::Reserved => None,
+            EndorsementState::Sent(txid) => Some(*txid),
+            EndorsementState::Committed(endorsement) => Some(endorsement.txid()),
         }
     }
 
@@ -66,58 +69,67 @@ impl MinterJournal for InMemoryMinterJournal {
     type Error = InMemoryMinterJournalError;
     type TransactionId = Txid;
 
-    async fn write_reserve_vote(
+    async fn write_reserve_endorsement(
         &self,
-        vote: &MintingVoteData,
-    ) -> Result<VoteReservation, Self::Error> {
-        let mut votes = self.votes.write().map_err(|_| Self::Error::LockPoisoned)?;
-        match votes.entry(vote.block_height()) {
+        endorsement: &MintingEndorsementData,
+    ) -> Result<EndorsementReservation, Self::Error> {
+        let mut endorsements = self
+            .endorsements
+            .write()
+            .map_err(|_| Self::Error::LockPoisoned)?;
+        match endorsements.entry(endorsement.block_height()) {
             Entry::Vacant(entry) => {
-                entry.insert(VoteRecord {
-                    vote: vote.clone(),
-                    state: VoteState::Reserved,
+                entry.insert(EndorsementRecord {
+                    endorsement: endorsement.clone(),
+                    state: EndorsementState::Reserved,
                 });
-                Ok(VoteReservation::Reserved)
+                Ok(EndorsementReservation::Reserved)
             }
             Entry::Occupied(entry) => {
-                entry.get().check_vote(vote)?;
-                Ok(VoteReservation::AlreadyReserved)
+                entry.get().check_endorsement(endorsement)?;
+                Ok(EndorsementReservation::AlreadyReserved)
             }
         }
     }
 
-    async fn write_sent_vote(
+    async fn write_sent_endorsement(
         &self,
-        vote: &MintingVoteData,
+        endorsement: &MintingEndorsementData,
         transaction_id: &Txid,
     ) -> Result<(), Self::Error> {
-        let mut votes = self.votes.write().map_err(|_| Self::Error::LockPoisoned)?;
-        let record = votes
-            .get_mut(&vote.block_height())
-            .ok_or(Self::Error::VoteNotReserved(vote.block_height()))?;
-        record.check_vote(vote)?;
+        let mut endorsements = self
+            .endorsements
+            .write()
+            .map_err(|_| Self::Error::LockPoisoned)?;
+        let record = endorsements.get_mut(&endorsement.block_height()).ok_or(
+            Self::Error::EndorsementNotReserved(endorsement.block_height()),
+        )?;
+        record.check_endorsement(endorsement)?;
         record.check_transaction_id(*transaction_id)?;
-        if matches!(record.state, VoteState::Reserved) {
-            record.state = VoteState::Sent(*transaction_id);
+        if matches!(record.state, EndorsementState::Reserved) {
+            record.state = EndorsementState::Sent(*transaction_id);
         }
         Ok(())
     }
 
-    async fn write_committed_vote(
+    async fn write_committed_endorsement(
         &self,
-        vote: &AuthenticatedMintingVote,
+        endorsement: &AuthenticatedMintingEndorsement,
     ) -> Result<(), Self::Error> {
-        let mut votes = self.votes.write().map_err(|_| Self::Error::LockPoisoned)?;
-        let record = votes
-            .get_mut(&vote.block_height())
-            .ok_or(Self::Error::VoteNotReserved(vote.block_height()))?;
-        record.check_vote(&vote.output().data)?;
+        let mut endorsements = self
+            .endorsements
+            .write()
+            .map_err(|_| Self::Error::LockPoisoned)?;
+        let record = endorsements.get_mut(&endorsement.block_height()).ok_or(
+            Self::Error::EndorsementNotReserved(endorsement.block_height()),
+        )?;
+        record.check_endorsement(&endorsement.output().data)?;
         if record.transaction_id().is_none() {
-            return Err(Self::Error::VoteNotSent(vote.block_height()));
+            return Err(Self::Error::EndorsementNotSent(endorsement.block_height()));
         }
-        record.check_transaction_id(vote.txid())?;
-        if matches!(record.state, VoteState::Sent(_)) {
-            record.state = VoteState::Committed(vote.clone());
+        record.check_transaction_id(endorsement.txid())?;
+        if matches!(record.state, EndorsementState::Sent(_)) {
+            record.state = EndorsementState::Committed(endorsement.clone());
         }
         Ok(())
     }
@@ -126,9 +138,9 @@ impl MinterJournal for InMemoryMinterJournal {
 #[derive(Debug, PartialEq, Eq)]
 pub enum InMemoryMinterJournalError {
     LockPoisoned,
-    VoteNotReserved(CoreFlameHeight),
-    VoteNotSent(CoreFlameHeight),
-    ConflictingVote {
+    EndorsementNotReserved(CoreFlameHeight),
+    EndorsementNotSent(CoreFlameHeight),
+    ConflictingEndorsement {
         height: CoreFlameHeight,
         expected: BlockHash,
         actual: BlockHash,
@@ -143,23 +155,29 @@ impl fmt::Display for InMemoryMinterJournalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LockPoisoned => write!(formatter, "minter journal lock poisoned"),
-            Self::VoteNotReserved(height) => {
-                write!(formatter, "vote at core height {height:?} is not reserved")
+            Self::EndorsementNotReserved(height) => {
+                write!(
+                    formatter,
+                    "endorsement at core height {height:?} is not reserved"
+                )
             }
-            Self::VoteNotSent(height) => {
-                write!(formatter, "vote at core height {height:?} is not sent")
+            Self::EndorsementNotSent(height) => {
+                write!(
+                    formatter,
+                    "endorsement at core height {height:?} is not sent"
+                )
             }
-            Self::ConflictingVote {
+            Self::ConflictingEndorsement {
                 height,
                 expected,
                 actual,
             } => write!(
                 formatter,
-                "conflicting vote at core height {height:?}: expected {expected:?}, got {actual:?}"
+                "conflicting endorsement at core height {height:?}: expected {expected:?}, got {actual:?}"
             ),
             Self::TransactionIdMismatch { expected, actual } => write!(
                 formatter,
-                "vote transaction ID mismatch: expected {expected}, got {actual}"
+                "endorsement transaction ID mismatch: expected {expected}, got {actual}"
             ),
         }
     }
