@@ -9,7 +9,10 @@ The concrete implementation is now specified in [cells.md](cells.md) and
 [encoding.md](encoding.md). Those documents supersede the provisional
 Tree/Link, request-manifest, and ContractRef API sketches below. The code uses
 Cell Tries, a whole execution witness hierarchy committed through TxID, ID-only Contract
-inputs, lazy authenticated Dict paths, and actor freezing. Utreexo alone
+inputs, lazy authenticated Dict paths, and actor freezing. Taproot roots now
+contain executable policy code: `open` authenticates hash(0), while bytecode
+uses `runslice` / `loadref` / `exec` for optional branch dispatch. The historical
+program/blinding leaf sketches below are superseded. Utreexo alone
 retains specialized accumulator proofs. The sketches here remain design
 rationale, not additional APIs to implement alongside Cells.
 

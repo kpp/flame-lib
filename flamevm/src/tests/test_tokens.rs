@@ -509,7 +509,7 @@ fn issuepriv_prove_then_verify_end_to_end() {
     let result = Prover::prove(&pc_gens, outer, dummy_header(), 1_000_000).expect("prove ok");
     let txid_p = result.txid;
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -520,9 +520,9 @@ fn issuepriv_prove_then_verify_end_to_end() {
     // witnesses on the wire (the leaf bytes encode just the opaque
     // commitment point and the bare opcodes).
     let pc_gens_v = PedersenGens::default();
-    let verified = Verifier::verify_with_cells(
+    let verified = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,

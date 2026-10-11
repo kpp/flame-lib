@@ -543,16 +543,16 @@ fn confidential_1_to_1_with_fee() {
     // Verifier round-trip.
     let txid_p = prover_result.txid;
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = prover_result;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    let v = Verifier::verify_with_cells(
+    let v = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -592,16 +592,16 @@ fn confidential_unbalanced_inputs_rejected() {
         Err(_) => { /* prover refused — good */ }
         Ok(result) => {
             let TxResult {
-                bytecode,
+                program,
                 proof,
                 cells,
                 ..
             } = result;
             let proof = proof.expect("proof set");
             let pc_gens_v = PedersenGens::default();
-            let err = Verifier::verify_with_cells(
+            let err = Verifier::verify_cell_with_cells(
                 &pc_gens_v,
-                bytecode,
+                program,
                 &proof,
                 dummy_header(),
                 1_000_000,
@@ -640,16 +640,16 @@ fn confidential_flavor_mismatch_rejected() {
         Err(_) => { /* prover refused — good */ }
         Ok(result) => {
             let TxResult {
-                bytecode,
+                program,
                 proof,
                 cells,
                 ..
             } = result;
             let proof = proof.expect("proof set");
             let pc_gens_v = PedersenGens::default();
-            let err = Verifier::verify_with_cells(
+            let err = Verifier::verify_cell_with_cells(
                 &pc_gens_v,
-                bytecode,
+                program,
                 &proof,
                 dummy_header(),
                 1_000_000,
@@ -718,16 +718,16 @@ fn confidential_with_fee_undersupply_rejected() {
         Err(_) => { /* prover refused the bad witness — good */ }
         Ok(result) => {
             let TxResult {
-                bytecode,
+                program,
                 proof,
                 cells,
                 ..
             } = result;
             let proof = proof.expect("proof set");
             let pc_gens_v = PedersenGens::default();
-            let err = Verifier::verify_with_cells(
+            let err = Verifier::verify_cell_with_cells(
                 &pc_gens_v,
-                bytecode,
+                program,
                 &proof,
                 dummy_header(),
                 1_000_000,

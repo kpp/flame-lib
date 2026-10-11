@@ -238,7 +238,7 @@ impl ScriptBuilder {
     /// Host byte literal carrying a witness-bearing compatibility sub-script. The
     /// prover pushes the inner ScriptBuilder's instructions (witness
     /// slots intact) wrapped in `String::Witness(StringWitness::Script)`;
-    /// downstream `op_open` / `op_signcall` walk those
+    /// downstream `op_signcall` walks those
     /// instructions directly. Verifier-side bytecode encodes to
     /// the compiled bytes of `inner.to_bytecode()`, so both sides
     /// see the same wire form.
@@ -323,6 +323,21 @@ impl ScriptBuilder {
     }
     pub fn endcell(mut self) -> Self {
         self.instructions.push(Instruction::EndCell);
+        self
+    }
+    /// `s index loadref → s' c`: remove a zero-based remaining reference.
+    pub fn load_ref(mut self) -> Self {
+        self.instructions.push(Instruction::LoadRef);
+        self
+    }
+    /// `c cellinfo → c bytes refs depth level pruned`, using factual metadata.
+    pub fn cell_info(mut self) -> Self {
+        self.instructions.push(Instruction::CellInfo);
+        self
+    }
+    /// Snapshot the unread current-program Slice after this instruction.
+    pub fn run_slice(mut self) -> Self {
+        self.instructions.push(Instruction::RunSlice);
         self
     }
     pub fn read_uint(mut self) -> Self {
@@ -810,27 +825,25 @@ impl ScriptBuilder {
         self
     }
 
-    /// Pushes `internal_key root_id index` and embeds the selected public Cell
-    /// path into this program. For a tree made with `PredicateTree::from_scripts`,
+    /// Pushes `internal_key program_cell` with one branch supplied and others pruned.
+    /// For a tree made with `PredicateTree::from_scripts`,
     /// also retains that program's assignments and nested witnesses. No caller
     /// assembly of a separate witness bag is needed before `build_tx`.
     ///
     /// `program_index` selects a program in logical input order, not a blinded
-    /// Trie position. Push the gas grant, arguments, and count before `open`.
+    /// tree position. Push the gas grant, arguments, and count before `open`.
     pub fn push_taproot_proof(
         mut self,
         tree: &PredicateTree,
         program_index: usize,
     ) -> Result<Self, VMError> {
-        let (proof, cells) = tree.witness_for(program_index)?;
-        self.cells.push(cells);
+        let opening = tree.opening_for(program_index)?;
         if let Some(script) = tree.script_witness(program_index) {
             self = self.with_script_witness(script.clone())?;
         }
         Ok(self
-            .push_point(*proof.internal_key.as_bytes())
-            .push_str(String::from(proof.root.to_vec()))
-            .push_int(proof.index))
+            .push_point(*opening.internal_key.as_bytes())
+            .push_cell(opening.root))
     }
     pub fn contract(mut self) -> Self {
         self.instructions.push(Instruction::Contract);
@@ -1157,13 +1170,18 @@ pub(crate) fn compile_program(
 
 /// Independent consuming byte and reference streams over the current Cell.
 pub(crate) struct Program {
-    pub root: Cell,
+    pub root: Arc<Cell>,
     pub len: usize,
     ref_cursor: usize,
 }
 
 impl Program {
-    pub fn new(root: Cell) -> Result<Self, CellError> {
+    #[cfg(feature = "debugger")]
+    pub(crate) fn reference_cursor(&self) -> usize {
+        self.ref_cursor
+    }
+    pub fn new(root: impl Into<Arc<Cell>>) -> Result<Self, CellError> {
+        let root = root.into();
         if root.is_pruned() {
             return Err(CellError::PrunedCell);
         }
@@ -1187,6 +1205,13 @@ impl Program {
 
     pub fn bytes(&self, offset: usize) -> &[u8] {
         &self.root.payload()[offset..]
+    }
+
+    pub fn slice(&self, byte_cursor: usize) -> Result<crate::Slice, CellError> {
+        let mut slice = crate::Slice::new(Arc::clone(&self.root))?;
+        slice.advance_bytes(byte_cursor);
+        slice.advance_refs(self.ref_cursor);
+        Ok(slice)
     }
 }
 

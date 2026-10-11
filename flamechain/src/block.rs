@@ -1853,7 +1853,7 @@ mod tests {
             [3; 32],
         )
         .unwrap();
-        let (opening, branch_cells) = tree.witness_for(0).unwrap();
+        let opening = tree.opening_for(0).unwrap();
         let inputs = [70, 71].map(|anchor| {
             Contract::new(
                 Predicate::tree(tree.clone()),
@@ -1876,12 +1876,10 @@ mod tests {
 
         let send = |input: &Contract| {
             ScriptBuilder::new()
-                .with_cells(branch_cells.clone())
                 .push_str(flamevm::String::contract(input.clone()))
                 .input()
                 .push_point(*opening.internal_key.as_bytes())
-                .push_str(opening.root.to_vec())
-                .push_int(opening.index)
+                .push_cell(opening.root.clone())
                 .push_int(20_000u64)
                 .push_int(0u64)
                 .open()

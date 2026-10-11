@@ -44,16 +44,16 @@ fn range_proof_accepts_in_range_value() {
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove succeeds");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = _pp;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -87,16 +87,16 @@ fn range_proof_rejects_out_of_range_value() {
         }
         Ok(_pp) => {
             let TxResult {
-                bytecode,
+                program,
                 proof,
                 cells,
                 ..
             } = _pp;
             let proof = proof.expect("proof set");
             let pc_gens_v = PedersenGens::default();
-            let err = Verifier::verify_with_cells(
+            let err = Verifier::verify_cell_with_cells(
                 &pc_gens_v,
-                bytecode,
+                program,
                 &proof,
                 dummy_header(),
                 1_000_000,
@@ -159,16 +159,16 @@ fn constraint_and_overload_combines_two_constraints() {
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove succeeds");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = _pp;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -194,16 +194,16 @@ fn constraint_or_overload_combines_two_constraints() {
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove succeeds");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = _pp;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -225,16 +225,16 @@ fn constraint_not_overload_negates_constraint() {
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove succeeds");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = _pp;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -261,16 +261,16 @@ fn constraint_and_with_false_branch_rejected() {
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000)
         .expect("prove succeeds (constructs proof of unsatisfiable constraint)");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = _pp;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    let err = Verifier::verify_with_cells(
+    let err = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -337,7 +337,7 @@ fn failed_call_unsat_cs_does_not_pollute_parent_proof() {
         .verify();
     let result = Prover::prove(&pc_gens, outer, dummy_header(), 1_000_000).expect("prove ok");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -348,9 +348,9 @@ fn failed_call_unsat_cs_does_not_pollute_parent_proof() {
     // out of the CS; only the parent's satisfiable `7+3==10`
     // remains.
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -384,7 +384,7 @@ fn clean_call_cs_alloc_propagates_to_parent_proof() {
     let result = Prover::prove(&pc_gens, outer, dummy_header(), 1_000_000)
         .expect("prover always builds something");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -392,9 +392,9 @@ fn clean_call_cs_alloc_propagates_to_parent_proof() {
     let proof = proof.expect("proof set");
 
     let pc_gens_v = PedersenGens::default();
-    let err = Verifier::verify_with_cells(
+    let err = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -517,15 +517,15 @@ fn failed_call_rolls_back_every_state_lane() {
     //   - batch: 1·G != identity → `BatchSignatureVerificationFailed`.
     //   - CS: 7+3==99 unsatisfiable → `InvalidR1CSProof`.
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = result;
     let proof = proof.expect("proof set");
-    let verifier_result = Verifier::verify_with_cells(
+    let verifier_result = Verifier::verify_cell_with_cells(
         &pc_gens,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,

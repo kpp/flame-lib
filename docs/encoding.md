@@ -69,7 +69,8 @@ Transport and execution have separate scopes:
   proof, and witness hierarchy. Its bodies are not implicitly VM witnesses.
 - The **execution index** is the immutable set available to the external VM and
   every synchronous call and asynchronous descendant it initiates. It contains
-  Contract bodies, predicate paths, and optional actor/Dict bodies.
+  Contract bodies and optional actor/Dict bodies; inline policy Cells remain
+  in the executable graph rather than being duplicated here.
 
 External execution emits `Header` followed by effects. There is no `CellWitness`
 entry: the factual program graph is already committed by the body ID.
@@ -83,10 +84,10 @@ instructions do not belong in the public transport or witness snapshot.
 Keep witnesses in `ScriptBuilder` until `build_tx`; raw `to_bytecode()` is not
 a standalone transaction. `PredicateTree::from_scripts` retains typed branch
 programs, including their allocation assignments and nested witnesses.
-`push_taproot_proof(&tree, logical_index)` emits the short selector and attaches
-the selected public path plus that program's private overlay. Unselected
-programs' witnesses are not collected. Code already present in a literal or
-predicate leaf is not duplicated as a separate code Cell in the execution index.
+`push_taproot_proof(&tree, logical_index)` emits the inner Point and partial
+policy Cell, and attaches that program's private overlay and nested lookup
+witnesses. Unselected programs' witnesses are not collected. Inline policy code
+is not duplicated as a separate code Cell in the execution index.
 
 For a Contract protected by `tree`, the public workflow is:
 
@@ -241,41 +242,50 @@ without revealing private token openings.
 
 ## Predicate branches
 
-A Predicate remains a single 32-byte tweaked key. Its tree witness is an
-ordered eight-byte-key Trie whose raw root CellID is used directly in the
-Taproot tweak. There is no intermediate root/count envelope. Branch lookup
-needs only the fixed key width and selected index, not the total leaf count.
-Each logical program is blinded with a second leaf. A leaf is the sum
-payload `0` plus a program Cell reference, or payload `1 | blinding_bytes:32`
-with no references.
+A Predicate remains a single 32-byte tweaked key:
+`P = X + h(X, program_cell.hash(0))·B`. The root is executable code, not a
+native index, a tagged program leaf, or a separate Merkle proof. A one-Cell
+policy needs no tree at all. A branching policy decides which child to execute
+using ordinary bytecode: `runslice`, indexed `loadref`, and `exec`.
 
-A branch selector contains internal_key:32, root_CellID:32, index:u64 LE.
-No sibling-hash array or bit-position string is encoded.
-`PredicateTree::witness_for(logical_index)` returns this selector plus a
-Cell hierarchy containing only the selected path and its program/continuations.
-`Predicate::open_program(selector, resolver)` verifies the tweaked-key relation
-and returns the selected native program Cell. `open_branch` is a bytecode-only
-inspection helper returning that Cell's payload, not flattening its graph.
-Execution reads further Cells only if instructions request them. Missing indices fail lookup; selecting a blinding leaf
-fails the program-tag check. Unvisited sibling bodies are not decoded.
+The supplied root may have pruned descendants. Its level-zero hash
+authenticates the underlying policy, while its factual highest-level hash
+commits the exact supplied graph in TxID. Execution does not virtualize that
+graph or hydrate explicitly pruned branches. A pruned root cannot execute;
+accessing a pruned child fails with normal child-call recovery.
 
-Removing the old count envelope changes predicate roots and tweaked points,
-and thus IDs of Contracts using those predicates. This is a format change,
-not a compatibility decoder for the previous wrapper layout.
+The optional host `PredicateTree` builds up to four-way executable dispatch
+Cells and salted `pushcell drop pushcell exec` leaf trampolines. The first
+leaf ref is a secret-derived 32-byte salt Cell, the second the actual program.
+Dispatch bytecode selects the first unpruned child using `cellinfo`; it fails
+if none is supplied. `opening_for(logical_index)` returns the inner Point and
+a root Cell carrying one selected path with all other choices explicitly
+pruned. No root/index selector or separate sibling-hash vector is serialized.
+
+`ScriptBuilder::push_taproot_proof` pushes the Point and opening root directly,
+retaining only the selected program's private assignments and nested lookup
+witnesses. The inline code graph is not duplicated in the execution index.
+Private overlays must compile to the exact factual program Cell. Further
+bodies are read only when instructions request them.
 
 VM stack form:
 
 ```text
-contract internal_key root_id index gas args… k  open
+contract internal_key program_cell gas args… k  open
   → results… k' 1
   | contract args… k 0       (entered child failed)
 ```
 
 The child starts with the single payload followed by the explicit arguments.
-Invalid selectors or missing pre-entry path bodies hard-fail the current
-frame; failures after child entry retain the existing Contract/argument
-escrow rules. Merlin is used for the Taproot tweak and signature/proof
-binding, not for raw content addresses.
+Invalid commitments, missing/pruned executable roots, or malformed operands
+hard-fail the current frame before entry. Failures after entry restore the
+original Contract and arguments. Unused synchronous-call gas returns on both
+success and failure, but consumed work remains charged. Merlin binds the
+Taproot tweak and cryptographic proofs, not raw Cell content addresses.
+
+Replacing the former native program Trie changes helper-built predicate roots,
+tweaked points, and corresponding Contract IDs. This is a format change with no
+legacy decoder or state migration.
 
 ## Actors and messages
 

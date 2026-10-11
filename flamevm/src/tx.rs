@@ -1201,7 +1201,6 @@ mod envelope_tests {
             .eq()
             .verify();
         let inner = PredicateTree::from_scripts(None, vec![leaf], [1; 32]).unwrap();
-        let inner_id = inner.root_id();
         let inner_contract = Contract::new(
             Predicate::tree(inner.clone()),
             Anchor([2; 32]),
@@ -1260,7 +1259,7 @@ mod envelope_tests {
                 limits,
             )
             .unwrap();
-        for id in [contract_id, inner_contract_id, outer.root_id(), inner_id] {
+        for id in [contract_id, inner_contract_id] {
             assert!(unsigned.witnesses().contains(&id));
         }
         assert!(
@@ -1290,7 +1289,7 @@ mod envelope_tests {
         let mut missing = decoded;
         let mut bag = CellIndex::new();
         for (id, cell) in missing.witnesses().iter() {
-            if *id != outer.root_id() {
+            if *id != contract_id {
                 bag.insert(Arc::clone(cell)).unwrap();
             }
         }

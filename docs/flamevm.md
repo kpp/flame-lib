@@ -64,8 +64,8 @@ separate memory-limit operand or storage-derived RAM allowance. Variable-size
 allocation work is charged to the active frame's gas before allocation; these
 charges are monotonic, so the gas cap bounds hostile allocation even after
 values are dropped. Calls are bounded to 64 nested frames. Instruction fetch,
-EOF checks, and forward label scans consume gas; a failed entered call burns its
-grant, while an availability failure before entry refunds it.
+EOF checks, and forward label scans consume gas. Synchronous calls return
+unused gas on success or failure; consumed work is never refunded.
 
 External transaction effects are atomic and independently verifiable. Internal
 transactions execute serially because they share actor state. Expired leases
@@ -278,7 +278,7 @@ Stack-only types (non-portable and without an implemented `Value` encoding):
 
 | Type | Description |
 | --- | --- |
-| Slice | Owned shared Cell and independent byte/ref cursors; copyable and droppable. |
+| Slice | Owned shared Cell, byte cursor and ordered remaining refs; copyable and droppable. |
 | Builder | Mutable payload/ref buffers; non-copyable, droppable; finalized into a Cell. |
 | Contract | Linear contract handle. `Contract` has its own top-level encoding, but `Value::Contract` has no generic value tag. |
 | WideToken | Possibly-negative encrypted token tied to the current constraint system. |
@@ -417,7 +417,7 @@ Ristretto255 group element. Stored as compressed 32-byte encoding. Used to repre
 
 - `Point::Opaque(CompressedRistretto)` — verifier's view; no witness.
 - `Point::Commitment(Commitment::Open(value, blinding))` — Pedersen commitment with cleartext opening (used by [`commit`](#commit) / [`expr`](#expr) to skip re-opening).
-- `Point::Predicate(PredicateTree)` — Taproot predicate with a Cell Trie (used by [`contract`](#contract) / [`output`](#output) to attach an unlock witness, and by [`signtx`](#signtx) / [`signcall`](#signcall) for the verification key).
+- `Point::Predicate(PredicateTree)` — Taproot predicate with an executable Cell graph (used by [`contract`](#contract) / [`output`](#output) to attach an unlock witness, and by [`signtx`](#signtx) / [`signcall`](#signcall) for the verification key).
 
 A Point on the value stack downcasts via `to_commitment` / `to_predicate` to extract its witness (preserved through `Point::Commitment` / `Point::Predicate`) or to wrap an `Opaque` as the verifier's `Closed` / `Opaque` form.
 
@@ -737,11 +737,14 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | a7 | [exec](#exec) | | cell → ø | Replace the current program Cell, preserving this frame. |
 | a8 | [slice](#slice) | | c → s | Resolve an ordinary Cell and create an owned Slice. |
 | a9 | [endcell](#endcell) | | b → c | Finalize a Builder, computing its Cell hashes. |
+| aa | [loadref](#loadref) | | s index → s' c | Remove any indexed remaining reference; do not load the child body. |
+| ab | [cellinfo](#cellinfo) | | c → c bytes refs depth level pruned | Inspect the Cell's own factual record; preserve the handle. |
+| ac | [runslice](#runslice) | | ø → s | Copy the current program's unread byte/ref cursors after this instruction. |
 |    | **Contracts & predicates** | | | |
 | c0 | [input](#input) | ext. | id → contract | Resolve a Utreexo-validated ContractID through the execution witness hierarchy. |
 | c1 | [contract](#contract) | | payload pred → contract | Lock one portable Value under the predicate. |
 | c2 | [output](#output) | | payload pred → ø | Like `contract`, but emits an Output. |
-| c3 | [open](#open) | | contract ik root index gas args… k → {results… k' 1 \| contract args… k 0} | Resolve a predicate program through its Cell Trie and run an isolated frame. |
+| c3 | [open](#open) | | contract ik program gas args… k → {results… k' 1 \| contract args… k 0} | Authenticate the program Cell's hash(0) and run an isolated frame. |
 | c4 | [signtx](#signtx) | ext. | contract → payload | Authorize TxID and unwrap the single payload Value. |
 | c5 | [signcall](#signcall) | | contract script sig gas args… m → {results… k' 1 \| contract args… m 0} | Run a script signed by the contract predicate in an isolated frame. |
 |    | **Actors** | | | |
@@ -925,7 +928,7 @@ Immediate-encoded `roll` with `k ∈ 0..=15` taken from the low nibble of the op
 
 ## Cell byte/reference instructions
 
-A Slice owns shared immutable data and independent byte/reference cursors; a
+A Slice owns shared immutable data, a byte cursor and an ordered remaining-reference view; a
 Builder owns mutable payload/reference buffers. Neither is portable. Cells and
 Slices are copyable with ordinary `dup`; Builders are not. All three are
 droppable plain serialization data, not authority to instantiate bearer assets.
@@ -942,7 +945,27 @@ is four. Ordinary writes never spill or implicitly descend into another Cell.
 _c_ → _s_
 
 Resolves the Cell body in the current metered context and creates an owned Slice
-at byte/ref offsets zero. Missing bodies or explicit pruning hard-fail.
+at byte offset zero with all references available. Missing bodies or explicit pruning hard-fail.
+
+### loadref
+
+_s index_ → _s' c_
+
+Removes the reference at the zero-based index in the Slice's **remaining**
+references and pushes its Cell handle above the updated Slice. Later references
+shift down, preserving their relative order. For `[A, B, C]`, `1 loadref` yields
+`[A, C]` and `B`; a subsequent `1 loadref` yields `[A]` and `C`.
+Unread bytes and other copies of the Slice are unchanged. Invalid indexes
+(including negative indexes or indexes past the remaining refs) hard-fail with
+`IndexOutOfRange`; there is no success flag.
+
+The child is not resolved or parsed. Unloaded and explicitly pruned references
+are valid results. Use the separate `slice` instruction to read a child's body;
+it hard-fails for an unavailable or explicitly pruned Cell, even if a full
+version of the underlying data exists elsewhere. Removal performs bounded
+inline bookkeeping and charges only the base instruction gas, with no payload
+copy, child-body read or heap allocation. Equality and `appendrefs` use only the
+references still present in the updated Slice.
 
 ### endcell
 
@@ -950,6 +973,50 @@ _b_ → _c_
 
 Consumes the Builder and computes its ordinary Cell and all significant hashes.
 Finalization precharges a conservative bound for all sixteen possible hashes.
+
+### cellinfo
+
+_c_ → _c bytes refs depth level pruned_
+
+Peeks a **Cell** and pushes five Scalars in this order (`pruned` is on top):
+
+| Result | Meaning |
+| --- | --- |
+| `bytes` | This record's own payload length, not descendant payloads. |
+| `refs` | This record's immediate reference count. |
+| `depth` | Cached depth at the highest significant level: the factual depth. |
+| `level` | Highest significant hash level, not the number of set mask bits. |
+| `pruned` | `1` for an explicit pruned record, otherwise `0`. |
+
+Resolves the Cell's own record through the metered resolver, equally priced for
+resident and unloaded handles. Child bodies are not loaded. The original handle
+and its private annotations stay unchanged. Missing records, invalid commitments,
+wrong types (`TypeNotCell`), and exhausted gas hard-fail before any stats are
+pushed. There is no success flag and no change to `size`.
+
+Pruned records can be inspected even though `slice` cannot parse them. They
+report `34 * popcount(mask)` payload bytes (retained hashes/depths), zero refs,
+factual depth zero, their highest level, and flag `1`. An ordinary Cell with
+pruned descendants may have a nonzero level but still reports flag `0`.
+These are stats of the supplied factual record, not the hidden logical tree;
+lower-level depths retained in a pruning record are not this opcode's `depth`.
+
+### runslice
+
+ø → _s_
+
+Copies the current frame's program Slice **after** the instruction cursor has
+passed `runslice`. Its bytes start at the next instruction; its references
+exclude those already consumed by `pushcell`. Copies share immutable public
+data, have independent byte/ref cursors, and do not contain private assignments.
+No body lookup, payload copy or heap allocation is needed; only base instruction
+gas is charged. The result is copyable and droppable, but non-portable.
+
+`loadref` can select any remaining reference on this copy without advancing the
+actual program's reference cursor. `exec` may enter that Cell in the same frame.
+The snapshot remains valid after execution advances, jumps, or replaces its
+program; a subsequent `runslice` sees the new current Cell, never caller code.
+An end-of-payload snapshot has zero bytes but may still have unread references.
 
 ### readuint
 
@@ -1558,24 +1625,28 @@ Same construction as [contract](#contract), but emits an Output effect.
 
 ### open
 
-_contract internal_key root_id index gas args… k_ →
+_contract internal_key program_cell gas args… k_ →
 _{results… k' 1 | contract args… k 0}_
 
-Pops the explicit argument count and portable arguments, gas grant, branch
-index (u64 Scalar), root ID (32-byte String), internal key (Point), and Contract.
-Checks the tweaked-key relation `P = X + h(X, root_id)·B`, resolves the
-program at that index through the predicate's Cell Trie, and enters its raw
-program Cell. There are no sibling hashes, position bits, or caller-supplied public
-program bytes. Private program instructions and operand refs must compile to
-the authenticated Cell ID. Child program Cells are loaded only when `exec` runs.
-`root_id` is the raw eight-byte-key Trie root; there is no intermediate
-count-envelope Cell. Lookup validates the visited path without relying on
-or scanning a total program count.
+Pops the explicit argument count and portable arguments, gas grant, program
+Cell, internal key (Point), and Contract. Resolves the program's own record and
+checks `P = X + h(X, program_cell.hash(0))·B`, then executes its raw bytecode.
+There is no native branch index, Trie lookup, or leaf tag. A single Cell can hold
+the entire policy. Optional branch dispatch belongs to that committed code:
+`runslice` exposes remaining references, `loadref` selects one, and `exec` enters
+it. Child bodies are read only when requested. Pruned records authenticate but
+cannot execute. Authentication does not globally virtualize the supplied graph:
+pruned descendants remain pruned during execution. TxID commits the graph's
+factual highest-level hash. Private overlays must compile to the exact factual
+program Cell, including its operand refs.
 
 The prover can build branches with `PredicateTree::from_scripts` and emit a
-selector with `ScriptBuilder::push_taproot_proof(&tree, logical_index)`. This
-attaches the selected path, private assignments, and nested program witnesses
-to the builder. `build_tx` packages public bodies into the frozen execution witness hierarchy;
+opening with `ScriptBuilder::push_taproot_proof(&tree, logical_index)`. The helper
+builds salted executable leaves and bytecode dispatchers; its opening supplies
+one branch and prunes the others, preserving hash(0). It pushes the inner Point
+and root Cell, and attaches only the selected program's private assignments and
+nested lookup witnesses. The inline graph is not duplicated in the lookup index.
+`build_tx` packages public lookup bodies into the frozen execution witness hierarchy;
 `UnsignedTx` preserves it through signing and `ExternalTx::verify` consumes it
 directly, including after a CellEnvelope transport roundtrip.
 
@@ -1591,9 +1662,10 @@ Successful return yields `results… k' 1`; clean fall-through yields `0 1`.
 An entered child's failure rolls back effects and returns the original locked
 Contract followed by the explicit arguments, their original count `k`, and
 status zero. The Contract is not counted and its payload is not returned
-separately. Leftover child gas is refunded.
+separately. Unused child gas is refunded on both success and failure; consumed
+instruction, allocation and resolution work remains charged.
 
-Bad operands/proofs, missing pre-entry path data, non-portable arguments,
+Bad operands/commitments, missing or pruned executable roots, non-portable arguments,
 insufficient caller gas, and depth rejection hard-fail the current frame.
 Missing data after entry follows normal child-failure escrow recovery.
 
@@ -1679,8 +1751,9 @@ Creates an isolated `CallKind::ActorCall { actor, caller }` frame (the frame's s
 
 Successful return is `results… k' 1`; clean fall-through is `0 1`. Before
 entry, missing/empty actors, depth rejection, and a grant too small to activate
-the callee return the original `args… k 0`. Availability rejection refunds the
-grant; an undersized child grant is burned. After entry, every runtime failure
+the callee return the original `args… k 0`. Before or after entry, unused gas
+returns to the caller; pre-entry code-loading work remains charged. An undersized
+child grant or runtime exhaustion consumes the full grant. Every runtime failure
 rolls back the child and returns the same escrowed arguments and failure suffix;
 the failed child's current stack is discarded. `RegistryUnavailable`, malformed
 operands, non-portable arguments, or inability of the caller to fund the grant
@@ -1911,11 +1984,12 @@ bound. The logical allocation prices remain intentionally more conservative
 than measured allocator work.
 
 Call entry (`call` / `open` / `signcall`) debits the full gas grant from the
-caller. A caller that cannot afford the grant hard-fails; leftover gas is
-refunded on clean return and `gaslimit` remains the immutable creation cap. A
-failed entered call burns the grant. An actor call rejected for availability
-before entry refunds it, while a child grant too small to activate its code is
-burned. `send` debits its full grant from the sender and never refunds it;
+caller. A caller that cannot afford the grant hard-fails; unused gas is
+refunded on success **and failure**, and `gaslimit` remains the immutable creation
+cap. Consumed work is charged even when its effects roll back. Exhaustion leaves
+no refundable gas. An actor rejected before entry returns the unused portion,
+retaining charges for any code-loading work. A child grant too small to activate
+its code is consumed in full. `send` debits its full grant and never refunds it;
 delivery and every descendant send execute within that prepaid budget.
 
 ### usage

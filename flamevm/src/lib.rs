@@ -31,7 +31,7 @@ pub use cell_value::CellValue;
 pub use constraints::{
     Commitment, CommitmentWitness, Constraint, Expression, SecretConstraint, Variable,
 };
-pub use contract::{Contract, ContractID, Predicate, PredicateTree, TaprootProof};
+pub use contract::{Contract, ContractID, Predicate, PredicateTree, TaprootOpening};
 pub use crypto::{Merlin, Point};
 pub use dict::Dict;
 pub use errors::VMError;
@@ -52,6 +52,8 @@ pub use tx::{
     EffectID, ExternalTx, InternalTx, Limits, SigningInstructions, TxEntry, TxHeader, TxID, TxLog,
     TxMetrics, UnsignedTx,
 };
+#[cfg(feature = "debugger")]
+pub use vm::debugger;
 pub use vm::{Anchor, BlockContext};
 
 pub use cells::{

@@ -32,6 +32,7 @@ path = "../musig"
 
 [features]
 default = []
+debugger = []
 nightly = ["curve25519-dalek/alloc", "bulletproofs/nightly"]
 
 [dev-dependencies]

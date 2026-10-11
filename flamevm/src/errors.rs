@@ -140,8 +140,8 @@ pub enum VMError {
     #[error("Item is not a Contract")]
     TypeNotContract,
 
-    /// This error occurs when a TaprootProof does not verify against the contract's predicate.
-    #[error("TaprootProof does not match the contract's predicate")]
+    /// The supplied program's level-zero hash and inner key do not match the predicate.
+    #[error("Taproot commitment does not match the contract's predicate")]
     TaprootProofMismatch,
 
     /// This error occurs when `contract` or `output` is invoked without a seeded anchor.
@@ -168,10 +168,6 @@ pub enum VMError {
     /// This error occurs when an instruction requires a Point.
     #[error("Item is not a Point")]
     TypeNotPoint,
-
-    /// This error occurs when a TaprootProof's wire pieces are malformed.
-    #[error("Malformed TaprootProof")]
-    MalformedTaprootProof,
 
     /// This error occurs when `PredicateTree::new` is called with zero programs.
     #[error("PredicateTree must have at least one program")]

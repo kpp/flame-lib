@@ -58,6 +58,9 @@ const OP_APPENDREFS: u8 = 0x4e;
 const OP_BUILDER: u8 = 0x4f;
 const OP_SLICE: u8 = 0xa8;
 const OP_ENDCELL: u8 = 0xa9;
+const OP_LOADREF: u8 = 0xaa;
+const OP_CELLINFO: u8 = 0xab;
+const OP_RUNSLICE: u8 = 0xac;
 const OP_WRITEZEROS: u8 = 0x47;
 const OP_BITNOT: u8 = 0x48;
 const OP_BITOR: u8 = 0x49;
@@ -198,6 +201,9 @@ pub enum Instruction {
     Builder,          // ø builder → b
     Slice,            // c slice → s
     EndCell,          // b endcell → c
+    LoadRef,          // s index loadref → s' c
+    CellInfo,         // c cellinfo → c bytes refs depth level pruned
+    RunSlice,         // ø runslice → slice (unread current program bytes/refs)
     WriteZeros,       // s n writezeros → s'
     BitNot,           // b bitnot → b'
     BitOr,            // b s bitor → b'
@@ -260,7 +266,7 @@ pub enum Instruction {
     Input,        // s input → contract
     Contract,     // payload pred contract → contract
     Output,       // payload pred output → ø
-    Open,         // contract ik nbrs pos script gas portable-args… k open → results… k'
+    Open,         // contract ik program gas portable-args… k open → results… k'
     Send,         // portable-args… k refund gas addr send → ø (anonymous outside actor frames)
     Call,         // portable-args… k gas addr call → results… k' 1 | args… k 0 (actor-only)
     Load,         // ø load → value (actor-only)
@@ -322,6 +328,9 @@ impl Instruction {
             Instruction::Builder => op(w, OP_BUILDER),
             Instruction::Slice => op(w, OP_SLICE),
             Instruction::EndCell => op(w, OP_ENDCELL),
+            Instruction::LoadRef => op(w, OP_LOADREF),
+            Instruction::CellInfo => op(w, OP_CELLINFO),
+            Instruction::RunSlice => op(w, OP_RUNSLICE),
             Instruction::WriteZeros => op(w, OP_WRITEZEROS),
             Instruction::BitNot => op(w, OP_BITNOT),
             Instruction::BitOr => op(w, OP_BITOR),
@@ -522,6 +531,9 @@ impl Instruction {
             OP_BUILDER => Ok(Instruction::Builder),
             OP_SLICE => Ok(Instruction::Slice),
             OP_ENDCELL => Ok(Instruction::EndCell),
+            OP_LOADREF => Ok(Instruction::LoadRef),
+            OP_CELLINFO => Ok(Instruction::CellInfo),
+            OP_RUNSLICE => Ok(Instruction::RunSlice),
             OP_WRITEZEROS => Ok(Instruction::WriteZeros),
             OP_BITNOT => Ok(Instruction::BitNot),
             OP_BITOR => Ok(Instruction::BitOr),
@@ -753,6 +765,30 @@ fn parse_pushint_full(reader: &mut &[u8]) -> Result<Instruction, VMError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loadref_has_one_byte_encoding_without_inline_operands() {
+        assert_eq!(Instruction::LoadRef.encode_to_vec(), vec![0xaa]);
+        assert_eq!(Instruction::LoadRef.encoded_size(), 1);
+        let mut input = &[0xaa, OP_NOP][..];
+        assert!(matches!(
+            Instruction::parse(&mut input).unwrap(),
+            Instruction::LoadRef
+        ));
+        assert_eq!(input, &[OP_NOP]);
+    }
+
+    #[test]
+    fn cellinfo_has_one_byte_encoding_without_inline_operands() {
+        assert_eq!(Instruction::CellInfo.encode_to_vec(), vec![0xab]);
+        assert_eq!(Instruction::CellInfo.encoded_size(), 1);
+        let mut input = &[0xab, OP_NOP][..];
+        assert!(matches!(
+            Instruction::parse(&mut input).unwrap(),
+            Instruction::CellInfo
+        ));
+        assert_eq!(input, &[OP_NOP]);
+    }
 
     #[test]
     fn bytecode_subvarints_are_canonical_and_bounded() {

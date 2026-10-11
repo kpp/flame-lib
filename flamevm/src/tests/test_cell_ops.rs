@@ -27,6 +27,393 @@ fn slice_value(cell: Cell) -> Value {
 }
 
 #[test]
+fn runslice_snapshots_after_instruction_with_independent_byte_and_ref_cursors() {
+    let children = [bytes(&[1]), bytes(&[2]), bytes(&[3])];
+    let program = ScriptBuilder::new()
+        .push_int(300u64)
+        .drop_()
+        .push_cell(children[0].clone())
+        .drop_()
+        .run_slice()
+        .dup_k(0)
+        .push_int(1u64)
+        .load_ref()
+        .push_cell(children[1].clone())
+        .push_cell(children[2].clone());
+    let mut vm = vm_with_script(program);
+    for _ in 0..5 {
+        vm.step_internal().unwrap();
+    }
+    let snapshot_cursor = vm.current_call.cursor;
+    let Value::Slice(snapshot) = &vm.current_call.stack[0] else {
+        panic!()
+    };
+    let root = &vm.current_call.program.as_ref().unwrap().root;
+    assert_eq!(
+        snapshot.bytes().as_ptr(),
+        root.payload()[snapshot_cursor..].as_ptr()
+    );
+    assert_eq!(
+        snapshot.refs().map(CellRef::id).collect::<Vec<_>>(),
+        children[1..].iter().map(Cell::id).collect::<Vec<_>>()
+    );
+    assert!(!Value::Slice(snapshot.clone()).is_portable());
+    run_to_end(&mut vm).unwrap();
+    let Value::Slice(original) = &vm.current_call.stack[0] else {
+        panic!()
+    };
+    let Value::Slice(copy) = &vm.current_call.stack[1] else {
+        panic!()
+    };
+    assert_eq!(original.bytes(), copy.bytes());
+    assert_eq!(original.remaining_refs(), 2);
+    assert_eq!(copy.remaining_refs(), 1);
+    assert_eq!(copy.refs().next().unwrap().id(), children[1].id());
+    // loadref on the copy did not consume the actual program's refs.
+    for (actual, expected) in vm.current_call.stack[2..].iter().zip([2, 1, 2]) {
+        let Value::Cell(cell) = actual else { panic!() };
+        assert_eq!(cell.id(), children[expected].id());
+    }
+    assert_eq!(
+        original.bytes().as_ptr(),
+        vm.current_call.program.as_ref().unwrap().root.payload()[snapshot_cursor..].as_ptr()
+    );
+}
+
+#[test]
+fn runslice_uses_current_cell_after_exec_and_supports_empty_tail() {
+    let next = ScriptBuilder::new().run_slice().to_cell().unwrap();
+    let mut vm = vm_with_script(
+        ScriptBuilder::new()
+            .run_slice()
+            .push_cell(next.clone())
+            .exec(),
+    );
+    run_to_end(&mut vm).unwrap();
+    let Value::Slice(before) = &vm.current_call.stack[0] else {
+        panic!()
+    };
+    let Value::Slice(after) = &vm.current_call.stack[1] else {
+        panic!()
+    };
+    assert_eq!(before.refs().next().unwrap().id(), next.id());
+    assert_eq!(before.bytes(), &[0xa6, 0xa7]);
+    assert_eq!(after.remaining_bytes(), 0);
+    assert_eq!(after.remaining_refs(), 0);
+    let mut encoded = Vec::new();
+    Instruction::RunSlice.encode(&mut encoded);
+    assert_eq!(encoded, &[0xac]);
+    assert!(matches!(
+        Instruction::parse(&mut encoded.as_slice()),
+        Ok(Instruction::RunSlice)
+    ));
+}
+
+#[test]
+fn runslice_after_forward_jump_retains_skipped_references_at_empty_byte_tail() {
+    let child = bytes(&[9]);
+    let mut vm = vm_with_script(
+        ScriptBuilder::new()
+            .jump(0)
+            .push_cell(child.clone())
+            .drop_()
+            .label(0)
+            .run_slice(),
+    );
+    run_to_end(&mut vm).unwrap();
+    let Value::Slice(slice) = &vm.current_call.stack[0] else {
+        panic!()
+    };
+    assert_eq!(slice.remaining_bytes(), 0);
+    assert_eq!(slice.remaining_refs(), 1);
+    assert_eq!(slice.refs().next().unwrap().id(), child.id());
+    assert_eq!(vm.current_call.gas_used, 5); // jump + three scanned instructions + runslice
+}
+
+#[test]
+fn cellinfo_peeks_factual_record_stats_for_ordinary_and_pruned_cells() {
+    let leaf = bytes(&[9]);
+    let branch = Cell::new(vec![], vec![leaf.clone().into()]).unwrap();
+    let partial = Cell::new(vec![1, 2], vec![branch.prune(1).unwrap().into()]).unwrap();
+    assert_ne!(
+        partial.depth(0).unwrap(),
+        partial.depth(partial.level()).unwrap()
+    );
+    let sparse = partial.prune(4).unwrap();
+    assert_eq!(sparse.level_mask().count_ones(), 2);
+    for (cell, expected) in [
+        (bytes(&[]), [0, 0, 0, 0, 0]),
+        (
+            Cell::new(vec![0; cells::MAX_CELL_PAYLOAD], vec![branch.into(); 4]).unwrap(),
+            [4095, 4, 2, 0, 0],
+        ),
+        (partial, [2, 1, 1, 1, 0]),
+        (sparse, [68, 0, 0, 4, 1]),
+        (leaf.prune(15).unwrap(), [34, 0, 0, 15, 1]),
+    ] {
+        let id = cell.id();
+        let mut vm = operation(Instruction::CellInfo, vec![Value::Cell(cell.into())]);
+        run_to_end(&mut vm).unwrap();
+        assert_eq!(vm.current_call.stack.len(), 6);
+        let Value::Cell(original) = &vm.current_call.stack[0] else {
+            panic!()
+        };
+        assert_eq!(original.id(), id);
+        for (actual, expected) in vm.current_call.stack[1..].iter().zip(expected) {
+            assert_int(actual, Scalar::from(expected as u64));
+        }
+    }
+}
+
+#[test]
+fn cellinfo_resolves_only_its_own_record_with_equal_resident_and_unloaded_gas() {
+    let child: CellRef = bytes(&[9; 100]).into();
+    let root = Cell::new(vec![1, 2], vec![child.to_unloaded()]).unwrap();
+    let index = CellIndex::collect(Arc::new(root.clone())).unwrap();
+    assert!(index.get(&child.id()).is_none());
+    let reference: CellRef = root.clone().into();
+    for reference in [reference.clone(), reference.to_unloaded()] {
+        let unloaded = reference.is_unloaded();
+        let mut vm = operation(Instruction::CellInfo, vec![Value::Cell(reference.into())])
+            .with_cells(Arc::new(index.clone()))
+            .unwrap();
+        run_to_end(&mut vm).unwrap();
+        assert_eq!(vm.current_call.gas_used, 2 + root.record_size() as u64 + 1);
+        assert_int(&vm.current_call.stack[1], Scalar::from(2u64));
+        assert_int(&vm.current_call.stack[2], Scalar::ONE);
+        assert_int(&vm.current_call.stack[3], Scalar::ONE);
+        let Value::Cell(original) = &vm.current_call.stack[0] else {
+            panic!()
+        };
+        assert_eq!(original.is_unloaded(), unloaded);
+    }
+    let mut missing = operation(
+        Instruction::CellInfo,
+        vec![Value::Cell(reference.to_unloaded().into())],
+    );
+    assert!(matches!(
+        run_to_end(&mut missing),
+        Err(VMError::Cell(CellError::MissingCell(_)))
+    ));
+    assert_eq!(missing.current_call.stack.len(), 1);
+
+    let forged = cells::CellCommitment::new(0, vec![root.id()], vec![2]).unwrap();
+    let mut mismatch = operation(
+        Instruction::CellInfo,
+        vec![Value::Cell(CellRef::Unloaded(Arc::new(forged)).into())],
+    )
+    .with_cells(Arc::new(index))
+    .unwrap();
+    assert!(matches!(
+        run_to_end(&mut mismatch),
+        Err(VMError::Cell(CellError::CellCommitmentMismatch(_)))
+    ));
+    assert_eq!(mismatch.current_call.stack.len(), 1);
+
+    let mut exhausted = operation(Instruction::CellInfo, vec![Value::Cell(root.into())]);
+    exhausted.current_call.gas_limit = 2;
+    assert!(matches!(run_to_end(&mut exhausted), Err(VMError::OutOfGas)));
+    assert_eq!(exhausted.current_call.stack.len(), 1);
+}
+
+#[test]
+fn cellinfo_rejects_other_types_and_matches_public_verifier_stats_and_gas() {
+    assert!(matches!(
+        run_to_end(&mut operation(Instruction::CellInfo, vec![])),
+        Err(VMError::StackUnderflow)
+    ));
+    for value in [
+        Value::Scalar(Scalar::ZERO),
+        slice_value(bytes(&[])),
+        builder_value(&[], &[]),
+    ] {
+        let mut vm = operation(Instruction::CellInfo, vec![value]);
+        assert!(matches!(run_to_end(&mut vm), Err(VMError::TypeNotCell)));
+        assert_eq!(vm.current_call.stack.len(), 1);
+    }
+    let mut program = ScriptBuilder::new();
+    for (cell, expected) in [
+        (bytes(&[1, 2]), [2, 0, 0, 0, 0]),
+        (bytes(&[9]).prune(4).unwrap(), [34, 0, 0, 4, 1]),
+    ] {
+        program = program.push_cell(cell).cell_info();
+        for value in expected.iter().rev() {
+            program = program
+                .push_int(*value as u64)
+                .eq()
+                .verify()
+                .drop_()
+                .drop_();
+        }
+        program = program.drop_();
+    }
+    let unsigned = program
+        .build_tx(dummy_header(), crate::Limits { gas: 1_000_000 })
+        .unwrap();
+    let gas = unsigned.metrics().gas_used;
+    let tx = unsigned.without_signature().unwrap();
+    let decoded =
+        crate::ExternalTx::from_bytes_bounded(&tx.to_bytes().unwrap(), 1, 4095, 2497).unwrap();
+    let (_, metrics) = decoded
+        .verify_with_metrics(crate::Limits { gas: 1_000_000 })
+        .unwrap();
+    assert_eq!(metrics.gas_used, gas);
+}
+
+#[test]
+fn loadref_removes_any_remaining_ref_without_loading_or_advancing_bytes() {
+    let child = bytes(&[9]);
+    let unloaded = CellRef::from(child.clone()).to_unloaded();
+    let pruned: CellRef = child.prune(1).unwrap().into();
+    let source = Cell::new(
+        vec![1, 2],
+        vec![unloaded.clone(), pruned.clone(), child.clone().into()],
+    )
+    .unwrap();
+    let mut vm = operation(
+        Instruction::LoadRef,
+        vec![slice_value(source), Value::Scalar(Scalar::ONE)],
+    );
+    run_to_end(&mut vm).unwrap();
+    let Value::Slice(slice) = &vm.current_call.stack[0] else {
+        panic!()
+    };
+    assert_eq!(slice.bytes(), &[1, 2]);
+    assert_eq!(
+        slice.refs().map(CellRef::id).collect::<Vec<_>>(),
+        vec![unloaded.id(), child.id()]
+    );
+    let Value::Cell(loaded) = &vm.current_call.stack[1] else {
+        panic!()
+    };
+    assert_eq!(loaded.id(), pruned.id());
+    assert!(loaded.as_resident().unwrap().is_pruned());
+    assert!(matches!(
+        run_to_end(&mut operation(
+            Instruction::Slice,
+            vec![Value::Cell(loaded.clone())]
+        )),
+        Err(VMError::Cell(CellError::PrunedCell))
+    ));
+
+    let mut vm = operation(
+        Instruction::LoadRef,
+        vec![
+            slice_value(Cell::new(vec![], vec![unloaded.clone()]).unwrap()),
+            Value::Scalar(Scalar::ZERO),
+        ],
+    );
+    run_to_end(&mut vm).unwrap();
+    let Value::Cell(loaded) = &vm.current_call.stack[1] else {
+        panic!()
+    };
+    assert!(loaded.reference.is_unloaded());
+    assert_eq!(loaded.id(), unloaded.id());
+}
+
+#[test]
+fn loadref_checks_types_indexes_and_instruction_gas() {
+    for (count, index) in [
+        (0, Scalar::ZERO),
+        (1, Scalar::ONE),
+        (4, Scalar::from(4u64)),
+        (1, Scalar::from(-1i64)),
+        (1, Scalar::from(u64::MAX)),
+    ] {
+        let refs = vec![bytes(&[]).into(); count];
+        let mut vm = operation(
+            Instruction::LoadRef,
+            vec![
+                slice_value(Cell::new(vec![], refs).unwrap()),
+                Value::Scalar(index),
+            ],
+        );
+        assert!(matches!(run_to_end(&mut vm), Err(VMError::IndexOutOfRange)));
+    }
+    assert!(matches!(
+        run_to_end(&mut operation(
+            Instruction::LoadRef,
+            vec![Value::Scalar(Scalar::ZERO), Value::Scalar(Scalar::ZERO)]
+        )),
+        Err(VMError::TypeNotSlice)
+    ));
+    assert!(matches!(
+        run_to_end(&mut operation(
+            Instruction::LoadRef,
+            vec![slice_value(bytes(&[])), Value::Cell(bytes(&[]).into())]
+        )),
+        Err(VMError::TypeNotScalar)
+    ));
+    assert!(matches!(
+        run_to_end(&mut operation(Instruction::LoadRef, vec![])),
+        Err(VMError::StackUnderflow)
+    ));
+    let mut vm = operation(
+        Instruction::LoadRef,
+        vec![
+            slice_value(Cell::new(vec![1], vec![bytes(&[9]).into()]).unwrap()),
+            Value::Scalar(Scalar::ZERO),
+        ],
+    );
+    vm.current_call.gas_limit = 0;
+    assert!(matches!(run_to_end(&mut vm), Err(VMError::OutOfGas)));
+    assert_eq!(vm.current_call.stack.len(), 2);
+    let Value::Slice(slice) = &vm.current_call.stack[0] else {
+        panic!()
+    };
+    assert_eq!(slice.remaining_refs(), 1);
+}
+
+#[test]
+fn loadref_composes_with_reads_appends_and_public_verification() {
+    let a: CellRef = bytes(&[7]).into();
+    let b: CellRef = bytes(&[8]).into();
+    let c: CellRef = bytes(&[9]).into();
+    let root = Cell::new(vec![5, 6], vec![a.clone(), b, c.clone()]).unwrap();
+    let expected = Cell::new(vec![6], vec![a, c]).unwrap();
+    let program = ScriptBuilder::new()
+        .push_cell(root)
+        .slice()
+        .push_int(1u64)
+        .read_uint()
+        .verify()
+        .drop_()
+        .push_int(1u64)
+        .load_ref()
+        .slice()
+        .push_int(1u64)
+        .read_uint()
+        .verify()
+        .push_int(8u64)
+        .eq()
+        .verify()
+        .drop_()
+        .drop_()
+        .drop_()
+        .builder()
+        .append_refs()
+        .append_bytes()
+        .endcell()
+        .push_cell(expected)
+        .eq()
+        .verify()
+        .drop_()
+        .drop_()
+        .drop_();
+    let unsigned = program
+        .build_tx(dummy_header(), crate::Limits { gas: 1_000_000 })
+        .unwrap();
+    let gas = unsigned.metrics().gas_used;
+    let tx = unsigned.without_signature().unwrap();
+    let decoded =
+        crate::ExternalTx::from_bytes_bounded(&tx.to_bytes().unwrap(), 1, 4095, 2497).unwrap();
+    let (_, metrics) = decoded
+        .verify_with_metrics(crate::Limits { gas: 1_000_000 })
+        .unwrap();
+    assert_eq!(metrics.gas_used, gas);
+}
+
+#[test]
 fn unsigned_reads_and_writes_use_byte_widths_including_zero_and_32() {
     for count in 0..=32 {
         let value = Scalar::from(0x12345678u64);

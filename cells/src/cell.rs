@@ -173,11 +173,13 @@ impl Cell {
         })
     }
 
-    /// Hashes a borrowed ordinary Cell body without copying it or loading children.
-    pub fn compute_commitment(
-        payload: &[u8],
-        refs: &[CellRef],
-    ) -> Result<CellCommitment, CellError> {
+    /// Hashes borrowed bytes and ordered references without copying or loading children.
+    pub fn compute_commitment<'a, R>(payload: &[u8], refs: R) -> Result<CellCommitment, CellError>
+    where
+        R: IntoIterator<Item = &'a CellRef>,
+        R::IntoIter: ExactSizeIterator + Clone,
+    {
+        let refs = refs.into_iter();
         if payload.len() > MAX_CELL_PAYLOAD {
             return Err(CellError::PayloadTooLarge {
                 actual: payload.len(),
@@ -191,7 +193,7 @@ impl Cell {
             });
         }
         let mut mask = 0;
-        for reference in refs {
+        for reference in refs.clone() {
             reference.validate_child()?;
             mask |= reference.commitment().mask;
         }
@@ -199,10 +201,10 @@ impl Cell {
         let mut depths = Vec::with_capacity(hashes.capacity());
         for level in significant_levels(mask) {
             let mut depth = 0;
-            for reference in refs {
+            for reference in refs.clone() {
                 depth = depth.max(reference.commitment().depth(level)? + 1);
             }
-            let preimage = ordinary_preimage(payload, refs, mask, level, hashes.last())?;
+            let preimage = ordinary_preimage(payload, refs.clone(), mask, level, hashes.last())?;
             hashes.push(Sha256::digest(preimage).into());
             depths.push(depth);
         }
@@ -490,18 +492,23 @@ fn hash_index(mask: u16, level: u8) -> Result<usize, CellError> {
     }
     Ok(apply_mask(mask, level).count_ones() as usize)
 }
-fn ordinary_preimage(
+fn ordinary_preimage<'a, R>(
     payload: &[u8],
-    refs: &[CellRef],
+    refs: R,
     mask: u16,
     level: u8,
     previous: Option<&CellID>,
-) -> Result<Vec<u8>, CellError> {
+) -> Result<Vec<u8>, CellError>
+where
+    R: IntoIterator<Item = &'a CellRef>,
+    R::IntoIter: ExactSizeIterator + Clone,
+{
+    let refs = refs.into_iter();
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&descriptor(payload.len(), refs.len()).to_le_bytes());
     bytes.extend_from_slice(&apply_mask(mask, level).to_le_bytes());
     bytes.extend_from_slice(previous.map_or(payload, |hash| hash.as_slice()));
-    for reference in refs {
+    for reference in refs.clone() {
         bytes.extend_from_slice(&reference.commitment().depth(level)?.to_le_bytes());
     }
     for reference in refs {

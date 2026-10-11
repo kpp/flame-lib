@@ -604,10 +604,9 @@ fn setcode_upgrade_end_to_end() {
     );
 }
 
-/// A failed sub-call burns the entire gas grant (spec §gas): the parent
-/// gets no refund when the child fails mid-execution.
+/// Failure refunds unused gas, but not work performed before the failure.
 #[test]
-fn failed_call_burns_full_grant() {
+fn failed_call_refunds_unused_grant() {
     let mut reg = MemRegistry::new();
     // B: runs a couple of instructions, then fails.
     let b_code = ScriptBuilder::new()
@@ -626,19 +625,56 @@ fn failed_call_burns_full_grant() {
     let a = deploy_recv(&mut reg, a_script.clone(), 10_000);
     let mut vm = vm_for_actor(a, a_script);
     while vm.step_internal_with_registry(&mut reg).expect("step ok") {}
-    // Parent budget 1_000_000 (vm_for_actor): the full 5_000 grant is
-    // burned (no refund on failure) plus a handful of own instructions.
     let remaining = vm.current_call.gas_limit - vm.current_call.gas_used;
     assert!(
-        remaining <= 1_000_000 - 5_000,
-        "grant must not be refunded: {}",
+        remaining < 1_000_000,
+        "actual work must stay charged: {}",
         remaining
     );
     assert!(
-        remaining > 1_000_000 - 5_100,
-        "only the grant + own instrs spent: {}",
+        remaining > 1_000_000 - 5_000,
+        "unused grant must be refunded: {}",
         remaining
     );
+}
+
+#[test]
+fn nested_failures_refund_unused_grants_without_creating_gas() {
+    let mut spent = Vec::new();
+    for grant in [5_000, 10_000] {
+        let mut reg = MemRegistry::new();
+        let leaf = deploy_recv(
+            &mut reg,
+            ScriptBuilder::new().push_int(0u64).verify().to_bytecode(),
+            10_000,
+        );
+        let middle = deploy_recv(
+            &mut reg,
+            ScriptBuilder::parse(&call_script(&leaf, 1_000))
+                .unwrap()
+                .drop_()
+                .drop_()
+                .push_int(0u64)
+                .verify()
+                .to_bytecode(),
+            10_000,
+        );
+        let caller_code = ScriptBuilder::parse(&call_script(&middle, grant))
+            .unwrap()
+            .drop_()
+            .drop_()
+            .to_bytecode();
+        let caller = deploy_recv(&mut reg, caller_code.clone(), 10_000);
+        let mut vm = vm_for_actor(caller, caller_code);
+        let mut depth = 0;
+        while vm.step_internal_with_registry(&mut reg).unwrap() {
+            depth = depth.max(vm.call_stack.len());
+        }
+        assert_eq!(depth, 2);
+        assert!(vm.current_call.gas_used > 0 && vm.current_call.gas_used < 1_000);
+        spent.push(vm.current_call.gas_used);
+    }
+    assert_eq!(spent[0], spent[1]);
 }
 
 /// The recursion cap binds at exactly MAX_CALL_DEPTH parents on the

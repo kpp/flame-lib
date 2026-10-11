@@ -241,16 +241,16 @@ fn verify_msm_identity_succeeds_end_to_end() {
         .verify();
     let result = Prover::prove(&pc_gens, prog, dummy_header(), 1_000_000).expect("prove succeeds");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = result;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -279,16 +279,16 @@ fn verify_msm_negation_sum_identity_succeeds() {
         .verify();
     let result = Prover::prove(&pc_gens, prog, dummy_header(), 1_000_000).expect("prove");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = result;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -315,16 +315,16 @@ fn verify_msm_nonidentity_rejected_at_batch() {
     let result = Prover::prove(&pc_gens, prog, dummy_header(), 1_000_000)
         .expect("prover produces proof regardless of MSM correctness");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = result;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    let err = Verifier::verify_with_cells(
+    let err = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -353,16 +353,16 @@ fn verify_msm_invalid_point_rejected_at_batch() {
         .verify();
     let result = Prover::prove(&pc_gens, prog, dummy_header(), 1_000_000).expect("prove");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = result;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    let err = Verifier::verify_with_cells(
+    let err = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -460,7 +460,7 @@ fn failed_call_msm_does_not_pollute_parent_batch() {
         .verify();
     let result = Prover::prove(&pc_gens, outer, dummy_header(), 1_000_000).expect("prove ok");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -471,9 +471,9 @@ fn failed_call_msm_does_not_pollute_parent_batch() {
     // (identity) contribution from its own clean execution; the
     // child's polluting 1·G never reaches the global batch.
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -508,7 +508,7 @@ fn clean_call_msm_propagates_to_parent_batch() {
     let result = Prover::prove(&pc_gens, outer, dummy_header(), 1_000_000)
         .expect("prove ok (prover always builds something)");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -516,9 +516,9 @@ fn clean_call_msm_propagates_to_parent_batch() {
     let proof = proof.expect("proof set");
 
     let pc_gens_v = PedersenGens::default();
-    let err = Verifier::verify_with_cells(
+    let err = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,

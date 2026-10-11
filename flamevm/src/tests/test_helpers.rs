@@ -17,8 +17,8 @@ pub(crate) use super::mem_registry::MemRegistry;
 
 pub use crate::{
     CheckedFee, CommitmentWitness, Constraint, Expression, Instruction, PredicateTree, Prover,
-    Script, ScriptBuilder, SecretConstraint, Token, Value, Variable, Verifier, WideToken,
-    FLAME_FLAVOR, MAX_FEE,
+    Script, ScriptBuilder, SecretConstraint, TaprootOpening, Token, Value, Variable, Verifier,
+    WideToken, FLAME_FLAVOR, MAX_FEE,
 };
 pub use bulletproofs::PedersenGens;
 pub use cells::{
@@ -62,25 +62,11 @@ pub(crate) fn fixture_vm(program: impl TestProgram, kind: CallKind) -> VM {
     vm
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct TestTaprootProof {
-    pub proof: TaprootProof,
-    pub cells: CellIndex,
-}
-
-impl std::ops::Deref for TestTaprootProof {
-    type Target = TaprootProof;
-    fn deref(&self) -> &Self::Target {
-        &self.proof
-    }
-}
-
 pub(crate) fn test_taproot_proof(
     tree: &PredicateTree,
     index: usize,
-) -> Result<TestTaprootProof, VMError> {
-    let (proof, cells) = tree.witness_for(index)?;
-    Ok(TestTaprootProof { proof, cells })
+) -> Result<TaprootOpening, VMError> {
+    tree.opening_for(index)
 }
 
 pub(crate) fn test_payload(values: Vec<Value>) -> Value {
@@ -99,11 +85,8 @@ pub(crate) fn open_with_test_inner(inner: ScriptBuilder, recover: bool) -> Scrip
         branch.push_instr(instruction.clone());
     }
     let recovery = ScriptBuilder::new().drop_().push_int(0u64).return_();
-    let tree = PredicateTree::scripts_only(
-        vec![branch.to_bytecode(), recovery.to_bytecode()],
-        TEST_BLINDING_KEY,
-    )
-    .unwrap();
+    let tree = PredicateTree::from_scripts(None, vec![branch.clone(), recovery], TEST_BLINDING_KEY)
+        .unwrap();
     let cp = test_taproot_proof(&tree, 0).unwrap();
     let recovery_cp = test_taproot_proof(&tree, 1).unwrap();
     let contract = Contract::new(
@@ -547,11 +530,11 @@ pub(crate) fn hex_to_bytes(h: &str) -> Vec<u8> {
 pub(crate) const TEST_BLINDING_KEY: [u8; 32] = [0u8; 32];
 
 /// Helper: builds a single-leaf `PredicateTree` from a program and a
-/// known internal-key scalar, plus the `TaprootProof` that opens it.
+/// known internal-key scalar, plus the Cell-based opening.
 pub(crate) fn build_predicate_with_program(
     program: &[u8],
     internal_secret: u64,
-) -> (PredicateTree, TestTaprootProof) {
+) -> (PredicateTree, TaprootOpening) {
     let secret = DalekScalar::from(internal_secret);
     let x_point = RISTRETTO_BASEPOINT_TABLE * &secret;
     let internal_key = x_point.compress();
@@ -566,12 +549,12 @@ pub(crate) fn build_predicate_with_program(
 }
 
 /// Helper: builds a `PredicateTree` with multiple programs and the
-/// `TaprootProof` that opens the `program_index`-th one.
+/// opening that supplies the `program_index`-th one.
 pub(crate) fn build_multi_leaf_predicate(
     programs: Vec<Vec<u8>>,
     program_index: usize,
     internal_secret: u64,
-) -> (PredicateTree, TestTaprootProof) {
+) -> (PredicateTree, TaprootOpening) {
     let secret = DalekScalar::from(internal_secret);
     let x_point = RISTRETTO_BASEPOINT_TABLE * &secret;
     let internal_key = x_point.compress();
@@ -982,20 +965,17 @@ pub(crate) fn open_commitments_for_output(out: &NMOutputSpec) -> (Commitment, Co
     (q, f)
 }
 
-/// Like `push_taproot_proof_pieces` but emits Instructions into a
-/// ScriptBuilder (so the prover keeps witness-bearing variants).
+/// Push the inner Point and partial program graph into the ScriptBuilder.
 pub(crate) fn push_taproot_proof_to_program(
     program: ScriptBuilder,
-    cp: &TestTaprootProof,
+    cp: &TaprootOpening,
 ) -> ScriptBuilder {
     program
-        .with_cells(cp.cells.clone())
         .push_point(*cp.internal_key.as_bytes())
-        .push_str(String::from(cp.root.to_vec()))
-        .push_int(cp.index)
+        .push_cell(cp.root.clone())
 }
 
-/// Build the input contract + the matching `TaprootProof` for an input
+/// Build the input contract + the matching Cell-based opening for an input
 /// spec. Used by both `build_confidential_nm_program` (to
 /// produce the contract bytes pushed onto the stack) and
 /// `assert_nm_txlog` (to compute the expected `contract_id` for the
@@ -1009,7 +989,7 @@ pub(crate) fn push_taproot_proof_to_program(
 /// harness would only exercise the "all inputs locked under
 /// the same predicate" shape, which doesn't match real
 /// transactions where each input comes from its own keypair.
-pub(crate) fn build_input_contract(inp: &NMInputSpec) -> (Contract, TestTaprootProof) {
+pub(crate) fn build_input_contract(inp: &NMInputSpec) -> (Contract, TaprootOpening) {
     let (q_open, f_open) = open_commitments(inp);
     let token = Token::new(q_open, f_open);
     // Leaf script `push:1, return` — under ADR 0013 the opened contract
@@ -1179,16 +1159,16 @@ pub(crate) fn run_confidential_nm(inputs: &[NMInputSpec], outputs: &[NMOutputSpe
     // verifier views is independently visible.
     assert_nm_txlog(&prover_result, inputs, outputs);
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = prover_result;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    let result = Verifier::verify_with_cells(
+    let result = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,

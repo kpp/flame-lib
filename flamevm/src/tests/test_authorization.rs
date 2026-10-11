@@ -186,6 +186,10 @@ fn failed_signcall_restores_contract_and_argument_and_signature_checkpoint() {
     ));
     assert_int(&vm.current_call.stack[2], Scalar::ONE);
     assert_int(&vm.current_call.stack[3], Scalar::ZERO);
+    assert!(
+        vm.current_call.gas_used < 10_000,
+        "unused signcall gas returns on failure"
+    );
 }
 
 #[test]

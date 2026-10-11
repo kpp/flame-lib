@@ -5,6 +5,236 @@
 use super::test_helpers::*;
 use crate::state_root;
 
+#[test]
+fn open_executes_direct_policy_cell_with_semantic_authentication_and_bytecode_dispatch() {
+    let selected = ScriptBuilder::new()
+        .push_int(1u64)
+        .return_()
+        .to_cell()
+        .unwrap();
+    let hidden = ScriptBuilder::new()
+        .push_int(0u64)
+        .verify()
+        .to_cell()
+        .unwrap();
+    let dispatch = ScriptBuilder::new()
+        .run_slice()
+        .push_int(1u64)
+        .load_ref()
+        .roll_k(1)
+        .drop_()
+        .exec()
+        .to_cell()
+        .unwrap();
+    let full = Cell::new(
+        dispatch.payload().to_vec(),
+        vec![hidden.clone().into(), selected.clone().into()],
+    )
+    .unwrap();
+    let partial = Cell::new(
+        dispatch.payload().to_vec(),
+        vec![hidden.prune(1).unwrap().into(), selected.into()],
+    )
+    .unwrap();
+    assert_eq!(full.hash(0).unwrap(), partial.hash(0).unwrap());
+    assert_ne!(full.id(), partial.id());
+    let key = Predicate::unspendable_key();
+    let predicate = Predicate::taproot(key, &full).unwrap();
+    let contract = Contract::new(
+        predicate.clone(),
+        Anchor([7; 32]),
+        Value::ClearToken(ClearToken::new(Scalar::from(42u64), FLAME_FLAVOR)),
+    )
+    .unwrap();
+    let program = ScriptBuilder::new()
+        .push_str(String::contract(contract))
+        .input()
+        .push_point(*key.as_bytes())
+        .push_cell(partial)
+        .push_int(10_000u64)
+        .push_int(0u64)
+        .open()
+        .verify()
+        .drop_()
+        .push_point(*key.as_bytes())
+        .output();
+    let tx = program
+        .build_tx(dummy_header(), crate::Limits { gas: 1_000_000 })
+        .unwrap()
+        .without_signature()
+        .unwrap();
+    let decoded = crate::ExternalTx::from_bytes_bounded(
+        &tx.to_bytes().unwrap(),
+        1,
+        tx.script.len(),
+        tx.proof_bytes().len(),
+    )
+    .unwrap();
+    decoded.verify(crate::Limits { gas: 1_000_000 }).unwrap();
+    assert!(!decoded.witnesses().contains(&hidden.id()));
+    // No native branch lookup: a single program Cell works without a tree builder.
+    let direct = ScriptBuilder::new()
+        .drop_()
+        .push_int(0u64)
+        .return_()
+        .to_cell()
+        .unwrap();
+    let direct_predicate = Predicate::taproot(key, &direct).unwrap();
+    let mut vm = vm_with_script(
+        ScriptBuilder::new()
+            .push_int(7u64)
+            .push_point(*direct_predicate.to_point().as_bytes())
+            .contract()
+            .push_point(*key.as_bytes())
+            .push_cell(direct.clone())
+            .push_int(10_000u64)
+            .push_int(0u64)
+            .open(),
+    );
+    run_to_end(&mut vm).unwrap();
+    assert_int(&vm.current_call.stack[1], Scalar::ONE);
+    let mut pruned = vm_with_script(
+        ScriptBuilder::new()
+            .push_int(7u64)
+            .push_point(*direct_predicate.to_point().as_bytes())
+            .contract()
+            .push_point(*key.as_bytes())
+            .push_cell(direct.prune(1).unwrap())
+            .push_int(10_000u64)
+            .push_int(0u64)
+            .open(),
+    );
+    assert!(matches!(
+        run_to_end(&mut pruned),
+        Err(VMError::Cell(CellError::PrunedCell))
+    ));
+}
+
+#[test]
+fn open_pruned_exec_target_restores_contract_and_portable_linear_argument() {
+    let branch = ScriptBuilder::new()
+        .push_int(2u64)
+        .return_()
+        .to_cell()
+        .unwrap();
+    let full = ScriptBuilder::new()
+        .push_cell(branch.clone())
+        .exec()
+        .to_cell()
+        .unwrap();
+    let partial = Cell::new(
+        full.payload().to_vec(),
+        vec![branch.prune(1).unwrap().into()],
+    )
+    .unwrap();
+    let key = Predicate::unspendable_key();
+    let predicate = Predicate::taproot(key, &full).unwrap();
+    let contract = Contract::new(
+        predicate,
+        Anchor([11; 32]),
+        Value::ClearToken(ClearToken::new(Scalar::from(42u64), FLAME_FLAVOR)),
+    )
+    .unwrap();
+    let id = contract.id();
+    let mut vm = vm_with_script(ScriptBuilder::new().open());
+    vm.current_call.stack = vec![
+        Value::Contract(Box::new(contract)),
+        Value::Point(Point::from_compressed(key)),
+        Value::Cell(partial.into()),
+        Value::Scalar(Scalar::from(10_000u64)),
+        Value::ClearToken(ClearToken::new(Scalar::from(9u64), FLAME_FLAVOR)),
+        Value::Scalar(Scalar::ONE),
+    ];
+    run_to_end(&mut vm).unwrap();
+    assert!(matches!(&vm.current_call.stack[0], Value::Contract(c) if c.id() == id));
+    assert!(
+        matches!(&vm.current_call.stack[1], Value::ClearToken(t) if t.qty() == Scalar::from(9u64))
+    );
+    assert_int(&vm.current_call.stack[2], Scalar::ONE);
+    assert_int(&vm.current_call.stack[3], Scalar::ZERO);
+    assert!(vm.current_call.gas_used < 10_000);
+}
+
+#[test]
+fn open_refunds_unused_gas_on_success_or_failure_but_not_exhaustion() {
+    let key = Predicate::unspendable_key();
+    for (code, success, exhausts) in [
+        (
+            ScriptBuilder::new().drop_().push_int(0u64).return_(),
+            true,
+            false,
+        ),
+        (ScriptBuilder::new().push_int(0u64).verify(), false, false),
+        (ScriptBuilder::new().label(0).jump(0), false, true),
+    ] {
+        let code = code.to_cell().unwrap();
+        let contract = Contract::new(
+            Predicate::taproot(key, &code).unwrap(),
+            Anchor([1; 32]),
+            Value::Scalar(Scalar::ONE),
+        )
+        .unwrap();
+        let mut spent = Vec::new();
+        for grant in [1_000, 2_000] {
+            let mut vm = vm_with_script(ScriptBuilder::new().open());
+            vm.current_call.stack = vec![
+                Value::Contract(Box::new(contract.clone())),
+                Value::Point(Point::from_compressed(key)),
+                Value::Cell(code.clone().into()),
+                Value::Scalar(Scalar::from(grant as u64)),
+                Value::Scalar(Scalar::ZERO),
+            ];
+            run_to_end(&mut vm).unwrap();
+            assert_int(
+                vm.current_call.stack.last().unwrap(),
+                Scalar::from(success as u64),
+            );
+            spent.push(vm.current_call.gas_used);
+        }
+        if exhausts {
+            assert_eq!(spent[1] - spent[0], 1_000);
+        } else {
+            assert_eq!(spent[0], spent[1]);
+            assert!(spent[0] > 0);
+            assert!(spent[0] < 1_000);
+        }
+    }
+}
+
+#[test]
+fn executable_predicate_helper_dispatches_all_branches_in_multilevel_trees() {
+    for count in [1, 2, 4, 5, 17] {
+        let programs = (0..count)
+            .map(|index| {
+                ScriptBuilder::new()
+                    .drop_()
+                    .push_int(index as u64)
+                    .push_int(1u64)
+                    .return_()
+            })
+            .collect();
+        let tree = PredicateTree::from_scripts(None, programs, [4; 32]).unwrap();
+        for index in 0..count {
+            let mut vm = vm_with_script(
+                ScriptBuilder::new()
+                    .push_int(7u64)
+                    .push_point(*tree.point.as_bytes())
+                    .contract()
+                    .push_taproot_proof(&tree, index)
+                    .unwrap()
+                    .push_int(10_000u64)
+                    .push_int(0u64)
+                    .open(),
+            );
+            run_to_end(&mut vm).unwrap();
+            assert_eq!(vm.current_call.stack.len(), 3);
+            assert_int(&vm.current_call.stack[0], Scalar::from(index as u64));
+            assert_int(&vm.current_call.stack[1], Scalar::ONE);
+            assert_int(&vm.current_call.stack[2], Scalar::ONE);
+        }
+    }
+}
+
 // A hostile Dict count must not cause count-sized allocation.
 #[test]
 fn contract_decode_rejects_payload_count_bomb() {
@@ -199,7 +429,7 @@ fn taproot_program_larger_than_runtime_string_opens_through_cells() {
     assert!(branch.len() > String::MAX_LEN);
 
     // The program is a Cell-backed predicate with explicit exec continuations, not a String
-    // literal. Only its short root/index selector appears in the outer code.
+    // literal. Its native graph is carried by the outer program's references.
     let tree = PredicateTree::scripts_only(vec![branch], TEST_BLINDING_KEY).unwrap();
     let proof = test_taproot_proof(&tree, 0).unwrap();
     let contract = Contract::new(
@@ -220,9 +450,9 @@ fn taproot_program_larger_than_runtime_string_opens_through_cells() {
 
     let gens = PedersenGens::default();
     let result = Prover::prove(&gens, outer, dummy_header(), 1_000_000).unwrap();
-    let verified = Verifier::verify_with_cells(
+    let verified = Verifier::verify_cell_with_cells(
         &gens,
-        result.bytecode.clone(),
+        result.program.clone(),
         result.proof.as_ref().unwrap(),
         dummy_header(),
         1_000_000,
@@ -297,9 +527,9 @@ fn open_preserves_alloc_witnesses_from_predicate_builder() {
         .drop_();
     let gens = bulletproofs::PedersenGens::default();
     let result = Prover::prove(&gens, outer, dummy_header(), 1_000_000).unwrap();
-    let verified = Verifier::verify_with_cells(
+    let verified = Verifier::verify_cell_with_cells(
         &gens,
-        result.bytecode.clone(),
+        result.program.clone(),
         result.proof.as_ref().unwrap(),
         dummy_header(),
         1_000_000,
@@ -365,13 +595,12 @@ fn failed_open_restores_contract_and_explicit_bearers() {
     dict.insert(Scalar::ZERO, Value::Token(dict_token.clone()));
     let expected_dict_root = state_root(&Value::Dict(dict.clone()));
 
-    let mut vm = vm_with_script(ScriptBuilder::new().with_cells(proof.cells.clone()).open());
+    let mut vm = vm_with_script(ScriptBuilder::new().open());
     vm.last_anchor = Some(Anchor([0x42; 32]));
     vm.current_call.stack = vec![
         Value::Contract(Box::new(contract)),
         Value::Point(Point::from_compressed(proof.internal_key)),
-        Value::String(String::from(proof.root.to_vec())),
-        Value::Scalar(Scalar::from(proof.index)),
+        Value::Cell(proof.root.clone().into()),
         Value::Scalar(Scalar::from(10_000u64)),
         Value::ClearToken(clear),
         Value::Dict(dict),
@@ -494,15 +723,14 @@ fn multi_leaf_predicate_each_program_unlocks_via_its_path() {
 }
 
 #[test]
-fn multi_leaf_predicate_blinding_leaf_cannot_be_opened() {
+fn multi_leaf_predicate_tampered_dispatcher_cannot_be_opened() {
     let program = ScriptBuilder::new()
         .drop_()
         .push_int(0u64)
         .return_()
         .to_bytecode();
     let (tree, mut proof) = build_multi_leaf_predicate(vec![program.clone(), program], 0, 7);
-    proof.proof.index ^= 1; // Each program is paired with one non-program blinding leaf.
-    proof.cells = CellIndex::collect(Arc::new(tree.root().as_resident().unwrap().clone())).unwrap();
+    proof.root = Cell::new(vec![0], proof.root.refs().to_vec()).unwrap();
     let p = ScriptBuilder::new()
         .push_int(5u64)
         .push_point(*tree.point.as_bytes())

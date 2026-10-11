@@ -35,8 +35,9 @@ layout.
 The crate implements explicit pruning, significant-level hashing, and
 read-only `CellView` virtualization. VM codecs continue using physical Cells
 and the signed execution-witness snapshot; they do not automatically virtualize
-Taproot roots or accept virtual views as typed values. Selecting logical versus
-factual roots in those higher-level protocols is a separate integration step.
+whole Taproot graphs or accept virtual views as typed values. `open` explicitly
+authenticates the supplied policy Cell's hash(0), but executes its factual graph
+with pruning intact; transaction IDs commit the supplied highest-level hash.
 
 This format is consensus-breaking: descriptors, reference depths/summaries,
 payload limits, and hash preimages change downstream identities and require
@@ -64,6 +65,14 @@ the next ref without loading its body. `exec` (0xa7) consumes a stack Cell,
 reads it through the metered execution context, and replaces the current code
 Cell. It resets cursors and Cell-local labels, but preserves stack, identity,
 permissions, gas, anchor and call failure escrow. It is not a nested call.
+
+`runslice` (0xac) snapshots unread bytes and refs after its instruction into a
+copyable, non-portable VM Slice. It shares the current Cell allocation and has
+independent cursors; `loadref` on the snapshot never consumes the program's own
+ref stream. Committed Taproot policy code can use this for arbitrary branch
+selection followed by `exec`. `open` accepts that root Cell and its inner Point,
+authenticates hash(0), and enters an isolated call without native Trie dispatch.
+Unused synchronous-call gas returns on success or failure; consumed work does not.
 
 Programs choose when to continue: `pushcell exec`. Reaching the end of payload
 does not read a child implicitly. Missing or pruned execution targets fail at
@@ -626,7 +635,7 @@ An illustrative runtime layout is:
 ```text
 Cell value:     CellRef + optional shared private prover annotation
 Builder value: owned CellBuilder — payload buffer and reference buffer
-Slice value:   Arc<Cell> + byte cursor + reference cursor
+Slice value:   Arc<Cell> + byte cursor + ordered remaining reference indexes
 
 new builder --store bytes/refs--> builder --finalize--> immutable Cell
 immutable Cell --resolve/open--> Slice --load bytes/refs--> advanced Slice
@@ -634,8 +643,9 @@ immutable Cell --resolve/open--> Slice --load bytes/refs--> advanced Slice
 
 `CellSlice<'a>` borrows a Cell and therefore cannot itself live on
 the VM stack independently of that borrow. The VM Slice owns an `Arc<Cell>`
-and its offsets; it should not use self-referential pointers or unsafe lifetime
-extensions. Offset updates can reuse the existing checked parsing logic.
+and its byte offset plus four inline reference indexes and a count. This allows
+arbitrary reference removal without rebuilding a Cell or copying its payload.
+It does not use self-referential pointers or unsafe lifetime extensions.
 Small cursor fields fit the established payload/ref limits; the canonical
 encoding has no cursor fields.
 
@@ -660,7 +670,7 @@ actually require a byte chain.
 | Proposed Value | Copyable | Droppable | Portable |
 | --- | --- | --- | --- |
 | Raw immutable Cell/reference | Yes; share the graph, not its bodies | Yes | Yes |
-| Slice | Yes; independent offsets over shared immutable data | Yes | No; transient execution state |
+| Slice | Yes; independent byte cursor and remaining refs over shared immutable data | Yes | No; transient execution state |
 | Builder | No initially; moves avoid implicit buffer copies | Yes | No; finalize before crossing a storage/call boundary |
 
 These are plain binary-data capabilities, **not ownership of whatever their
@@ -694,8 +704,19 @@ child Cell, not in an inline string operand.
 The stack effects retain the read-success convention (`1` on success, `0` on
 short input or a noncanonical scalar). `builder` (0x4f) creates an empty Builder;
 `slice` (0xa8) opens an ordinary Cell through the current metered resolver;
-`endcell` (0xa9) consumes a Builder and produces an immutable Cell. The renamed
+`endcell` (0xa9) consumes a Builder and produces an immutable Cell;
+`loadref` (0xaa) removes any indexed remaining reference from a Slice. The renamed
 operations retain 0x40/41/42/44/45/46, and `appendrefs` uses 0x4e.
+
+`cellinfo` (0xab) peeks a Cell: `c -> c bytes refs depth level pruned`.
+It reads the Cell's own record through the metered resolver, without loading
+descendants; an unavailable unloaded record hard-fails. The results are its own
+payload bytes, immediate refs, highest-level factual depth, highest significant
+level, and explicit-pruning flag (`0`/`1`). A pruned record reports
+`34 * popcount(mask)` bytes, zero refs and factual depth zero; its retained
+semantic depths are not returned. An ordinary Cell with pruned descendants has
+flag zero even when its level is nonzero. `size` is unchanged. Slices/Builders
+are not accepted by `cellinfo`, and the original Cell handle is preserved.
 
 | Previous instruction | Replacement | Stack effect | Behavior |
 | --- | --- | --- | --- |
@@ -707,6 +728,15 @@ operations retain 0x40/41/42/44/45/46, and `appendrefs` uses 0x4e.
 | `writeint` | `writescalar` | `b x -> b'` | Append the full canonical 32-byte little-endian Scalar; equivalent to `writeuint` with `n = 32`. |
 | Byte concatenation (`append`) | `appendbytes` | `s b -> s' b'` | Copy all remaining payload bytes into the Builder; exhaust the byte cursor but preserve the reference cursor. |
 | No previous equivalent | `appendrefs` | `s b -> s' b'` | Append all remaining reference handles to the Builder; exhaust the reference cursor but preserve the byte cursor. Do not resolve child bodies. |
+| No previous equivalent | `loadref` | `s index -> s' c` | Remove one zero-based remaining reference and push its Cell handle; later refs shift down and bytes stay unchanged. |
+
+`loadref` has no success flag: invalid or absent indexes hard-fail with
+`IndexOutOfRange`. It does not load the child body, so unloaded and explicitly
+pruned references are valid results. A separate `slice` conversion resolves the
+child and rejects explicit pruning. Removal changes only the current Slice's
+inline indexes, not its shared Cell or other Slice copies; no heap allocation,
+payload copy or child lookup is needed. Equality and `appendrefs` observe only
+the remaining references in order.
 
 Reads never automatically descend to child Cells. For `readbytes`, short
 source input restores both operands and yields `0`; insufficient Builder
@@ -951,10 +981,10 @@ the Trie encoding.
 
 `Trie::lookup(root, key, resolver)` needs no cached count or envelope. Its key
 width comes from the key supplied by the owning schema, and it validates node
-shape and content identity along the requested path. Predicate branch opening
-uses this API: the Taproot commitment is directly to the raw eight-byte-key
-Trie root, not an intermediate count Cell. Membership lookup does not need to
-assert the total size or validate unvisited siblings.
+shape and content identity along the requested path. Membership lookup does not
+need to assert the total size or validate unvisited siblings. Taproot no longer
+uses this API: its root is executable bytecode, and any branch selection happens
+within that committed program through ordinary Slice/ref instructions.
 
 `get`, `insert`, and `remove` take a `CellReader`. They resolve only the path
 being traversed. Mutations rebuild the affected path and swap the root only
@@ -1573,7 +1603,7 @@ because those sets are now committed by ordinary snapshot Cell roots.
 | Trie | `cells/src/trie.rs`: one radix-4 Patricia format; resolver-backed get/insert/remove/ordered navigation; raw root wrapping/unwrapping |
 | Dict | `flamevm/src/dict.rs`: one Trie index, typed runtime witness cache, sticky summaries, lazy authenticated reads; no Dict2 |
 | VM codecs | `flamevm/src/encoding.rs` plus type-owned codecs: fixed scalars/points/tokens, tagged Values, single-Value Contracts, actors, messages, scripts |
-| Predicates | `flamevm/src/contract.rs`: program Trie, index selector, path-only witness collection and resolver-based branch opening |
+| Predicates | `flamevm/src/contract.rs`: hash(0) authentication of executable policy Cells; optional salted bytecode-dispatch trees and partial openings |
 | Execution | `flamevm/src/vm.rs`: fixed Cell hierarchy before proving, scoped and metered resolution, public-path validation before restoring private witnesses |
 | Transactions | `flamevm/tx.ctl`, `build.rs`, `src/tx.rs`: generated Tx/body codecs, inline authorization, pruned log, body TxID, factual WitnessID, and program-scoped execution index |
 | Actor storage | `flamechain/src/storage.rs`: content roots plus retained availability CellID, leases Trie, freeze instead of bulk destruction, explicit persistence only |
@@ -1590,7 +1620,7 @@ stored in script Cells, not routed through a generic serialization facade.
 
 - Explicit VM operations to prune selected Dict branches or persist selected
   witness bodies. Existing `save`/`setcode` are the persistence boundary.
-- Integration of explicit virtualized proof views into Taproot/Trie and
+- Integration of explicit virtualized proof views into Trie and
   transaction/block proof consumers. The crate's `CellView` is not an implicit
   replacement for physical typed decoding or the current signed execution index.
 - Database adapters and archival retrieval outside consensus execution.
