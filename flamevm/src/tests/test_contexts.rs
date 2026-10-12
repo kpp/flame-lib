@@ -231,7 +231,7 @@ fn callerid_reports_attribution_without_granting_actor_context() {
             vm.step_internal_with_registry(&mut MemRegistry::new())
                 .unwrap();
         }
-        assert_str(vm.current_call.stack.last().unwrap(), &expected);
+        assert_bytes(vm.current_call.stack.last().unwrap(), &expected);
     }
 
     assert!(matches!(
@@ -313,7 +313,7 @@ fn contractopen_call_rejects_before_consuming_operands() {
         Value::Scalar(Scalar::from(7u64)),
         Value::Scalar(Scalar::ONE),
         Value::Scalar(Scalar::from(100u64)),
-        Value::String(String::from(vec![0x44; 32])),
+        Value::Cell(CellValue::from_bytes(vec![0x44; 32]).unwrap()),
     ];
 
     assert!(matches!(
@@ -329,7 +329,7 @@ fn issuepub_is_available_in_actorcall() {
     let actor = ActorID::Hash([0x11; 32]);
     let script = ScriptBuilder::new()
         .push_int(7u64)
-        .push_str(String::from(b"tag".to_vec()))
+        .push_literal(CellValue::from_bytes(b"tag".to_vec()).unwrap())
         .issuepub()
         .to_bytecode();
     let frame = CallFrame::new(
@@ -355,9 +355,9 @@ fn issuepub_is_available_in_actorcall() {
 fn send_is_available_everywhere_but_contractopen_never_delegates_its_caller() {
     let script = ScriptBuilder::new()
         .push_int(0u64)
-        .push_str(String::from(vec![0; 32]))
+        .push_literal(CellValue::from_bytes(vec![0; 32]).unwrap())
         .push_int(0u64)
-        .push_str(String::from(vec![0x77; 32]))
+        .push_literal(CellValue::from_bytes(vec![0x77; 32]).unwrap())
         .send()
         .to_bytecode();
 

@@ -4,15 +4,15 @@
 
 use super::test_helpers::*;
 
-/// Regression: in external context, `eq` of two Strings (or Points) must
+/// Regression: in external context, `eq` of two Cells (or Points) must
 /// cleartext peek-compare, not route into the CS branch and hard-fail
 /// `to_expression()`. Guards the spec's `anchor … eq verify` binding idiom.
 #[test]
-fn eq_external_strings_peek_compare_not_cs_lift() {
+fn eq_external_cells_peek_compare_not_cs_lift() {
     let pc_gens = PedersenGens::default();
     let prog = ScriptBuilder::new()
-        .push_str(String::from(b"abcd".to_vec()))
-        .push_str(String::from(b"abcd".to_vec()))
+        .push_literal(CellValue::from_bytes(b"abcd".to_vec()).unwrap())
+        .push_literal(CellValue::from_bytes(b"abcd".to_vec()).unwrap())
         .eq();
     let mut vm = VM::new(
         dummy_header(),
@@ -439,9 +439,9 @@ fn failed_call_rolls_back_every_state_lane() {
         .output()
         // ── lane 2: TxLog (Send) ────────────────────────────────
         .push_int(0u64) // k=0 args
-        .push_str(String::from(vec![0u8; 32])) // refund (32 B)
+        .push_literal(CellValue::from_bytes(vec![0u8; 32]).unwrap()) // refund (32 B)
         .push_int(1u64) // gas
-        .push_str(String::from(vec![0xcc; 32])) // addr (32 B)
+        .push_literal(CellValue::from_bytes(vec![0xcc; 32]).unwrap()) // addr (32 B)
         .send()
         // ── lane 3: deferred_sigs (signtx records TxBound) ──────
         .push_int(0u64)

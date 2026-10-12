@@ -561,8 +561,8 @@ fn a_memo_of_memo_max_bytes_builds_and_opens_and_one_more_does_not() {
     let (_, note) = output_to(&log, &address);
     assert_eq!(
         note.expect("a note").len(),
-        flamevm::String::MAX_LEN,
-        "the longest note fills one VM String"
+        cells::MAX_CELL_PAYLOAD,
+        "the longest note fills one Cell payload"
     );
     let (_, received) = receive(&log, &account, util::RECEIVING, 1);
     assert_eq!(received.memo, memo);

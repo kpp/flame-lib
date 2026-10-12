@@ -6,10 +6,10 @@ use super::test_helpers::*;
 
 #[test]
 fn op_scalar_pushes_constant_expression() {
-    // Pre-load a 32-byte String on the stack, dispatch `scalar`,
+    // Pre-load a 32-byte CellValue on the stack, dispatch `scalar`,
     // confirm the result is Expression::Constant.
     let mut vm = vm_external_with_script(ScriptBuilder::new().scalar().to_bytecode());
-    let s = String::scalar(Scalar::from(99u64));
+    let s = CellValue::scalar(Scalar::from(99u64));
     vm.push_value(witness_cell(s));
     let mut delegate = StubDelegate::new();
     vm.step_external(&mut delegate).expect("scalar ok");
@@ -24,12 +24,12 @@ fn op_scalar_pushes_constant_expression() {
 
 #[test]
 fn op_commit_pushes_variable() {
-    // Pre-load a witness-bearing String::Commitment, dispatch
+    // Pre-load a Cell carrying an open Commitment witness, dispatch
     // `commit`, confirm the result is a Variable with the open
     // commitment preserved.
     let mut vm = vm_external_with_script(ScriptBuilder::new().commit().to_bytecode());
     let c = Commitment::unblinded(Scalar::from(42u64));
-    vm.push_value(witness_cell(String::commitment(c.clone())));
+    vm.push_value(witness_cell(CellValue::commitment(c.clone())));
     let mut delegate = StubDelegate::new();
     vm.step_external(&mut delegate).expect("commit ok");
     assert_eq!(vm.current_call.stack.len(), 1);
@@ -50,17 +50,17 @@ fn prove_then_verify_with_commit_expr_eq() {
     let pc_gens = PedersenGens::default();
     let witness_int = Scalar::from(42u64);
     // Use a blinding factor that we'll need to encode into the
-    // ScriptBuilder as a witness-bearing String.
+    // ScriptBuilder as a witness-bearing CellValue.
     let blinding = curve25519_dalek::scalar::Scalar::from(7u64);
     let c = Commitment::blinded_with_factor(witness_int, blinding);
     let program = ScriptBuilder::new()
-        // Push the witness-bearing Commitment String. The bytecode
+        // Push the witness-bearing Commitment CellValue. The bytecode
         // will encode it as 32 bytes (the point); the prover's
         // Run::Queue preserves the witness; the verifier walks
-        // bytecode and sees String::Opaque, which downcasts to
+        // bytecode and sees a public Cell, which downcasts to
         // Commitment::Closed(point) — sufficient for the CS to
         // bind to the same point the prover used.
-        .push_str(String::commitment(c))
+        .push_literal(CellValue::commitment(c))
         .commit()
         .expr()
         .alloc(Some(witness_int))

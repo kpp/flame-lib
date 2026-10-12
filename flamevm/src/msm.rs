@@ -8,6 +8,7 @@
 //! `sum(s_i · P_i) == identity` — verified in one batched
 //! multi-scalar multiplication (Strauss/Pippenger) along with the
 //! signature batch.
+//! `evalpoint` instead computes the public sum immediately into an ordinary Point.
 //!
 //! Construction is implicit via the existing arithmetic opcodes:
 //!
@@ -20,9 +21,12 @@
 //! [`Expression`]: crate::Expression
 
 use curve25519_dalek::ristretto::CompressedRistretto;
+use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar as DalekScalar;
+use curve25519_dalek::traits::VartimeMultiscalarMul;
 
 use crate::crypto::Point;
+use crate::errors::VMError;
 
 /// Lazy multi-scalar multiplication: a deferred assertion
 /// `sum(scalar_i · point_i) == identity` that the VM appends to the
@@ -31,6 +35,7 @@ use crate::crypto::Point;
 /// Non-copyable, droppable, and stack-only — like
 /// [`Expression`](crate::Expression) and [`Constraint`](crate::Constraint).
 /// Dropping abandons the proposed assertion; only `verify` schedules it.
+/// `evaluate` consumes the accumulator without an assertion, returning its public sum.
 /// Points are stored compressed. `verify` attempts decompression while
 /// appending the statement and retains failures as `None`; acceptance remains
 /// deferred until final batch verification, where any `None` rejects the batch.
@@ -40,7 +45,7 @@ use crate::crypto::Point;
 /// (Opaque / Commitment / Predicate) is irrelevant — only the
 /// canonical compressed bytes matter for the verification equation,
 /// so the prover-side witness is not preserved past the MSM boundary.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MultiscalarMul {
     /// `(scalar, point)` terms whose weighted sum must equal the
     /// Ristretto identity point. Empty MSM trivially verifies (sum
@@ -71,6 +76,22 @@ impl MultiscalarMul {
     /// Returns true when the MSM has no terms.
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty()
+    }
+
+    /// Evaluate public operands; validate even zero-coefficient terms.
+    /// Empty sums return the identity. VM callers precharge gas before this allocation.
+    /// Variable-time: host callers must not supply secret coefficients.
+    pub fn evaluate(self) -> Result<Point, VMError> {
+        let points = self
+            .terms
+            .iter()
+            .map(|(_, point)| point.decompress().ok_or(VMError::InvalidPoint))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sum = RistrettoPoint::vartime_multiscalar_mul(
+            self.terms.iter().map(|(scalar, _)| scalar),
+            points.iter(),
+        );
+        Ok(Point::from_compressed(sum.compress()))
     }
 
     /// Appends another MSM's terms (consumes both).

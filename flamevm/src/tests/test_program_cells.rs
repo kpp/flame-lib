@@ -124,8 +124,8 @@ fn exec_preserves_stack_identity_budget_and_anchor_and_discards_old_code() {
     let mut vm = native_vm(original.clone());
     run_to_end(&mut vm).unwrap();
     assert_int(&vm.current_call.stack[0], Scalar::from(16u64));
-    assert_str(&vm.current_call.stack[1], &[1; 32]);
-    assert_str(&vm.current_call.stack[2], &[2; 32]);
+    assert_bytes(&vm.current_call.stack[1], &[1; 32]);
+    assert_bytes(&vm.current_call.stack[2], &[2; 32]);
     assert_int(&vm.current_call.stack[3], Scalar::from(1_000_000u64));
     assert_eq!(
         vm.current_call.program.as_ref().unwrap().root.id(),
@@ -251,7 +251,7 @@ fn taproot_exec_failure_returns_the_contract_and_cell_argument() {
     .unwrap();
     let arg = Cell::new(vec![9], vec![]).unwrap();
     let source = ScriptBuilder::new()
-        .push_str(String::contract(contract))
+        .push_literal(CellValue::contract(contract))
         .input()
         .push_taproot_proof(&tree, 0)
         .unwrap()
@@ -342,9 +342,8 @@ fn compiler_does_not_split_jump_scopes_or_instructions() {
         labeled = labeled.nop();
     }
     assert!(matches!(labeled.to_cell(), Err(CellError::InvalidFormat)));
-    let oversized = ScriptBuilder::new().push_str(String::from(vec![0; String::MAX_LEN + 1]));
     assert!(matches!(
-        oversized.to_cell(),
+        CellValue::from_bytes(vec![0; cells::MAX_CELL_PAYLOAD + 1]),
         Err(CellError::PayloadTooLarge { .. })
     ));
     let mut many_refs = ScriptBuilder::new();
@@ -440,17 +439,28 @@ fn exec_cannot_create_gas_or_execute_other_value_types() {
 }
 
 #[test]
-fn script_cell_codec_preserves_refs_and_string_execution_rejects_hidden_refs() {
+fn script_cell_codec_preserves_refs_and_source_execution_rejects_hidden_refs() {
     let cell = Cell::new(vec![9], vec![]).unwrap();
-    let instructions = vec![Instruction::PushCell(Some(cell.into()))];
-    let script = Script::Transparent(instructions.clone());
-    let encoded = script.to_cell().unwrap();
-    let decoded = Script::from_cell(&encoded, &mut ()).unwrap();
-    assert_eq!(decoded.to_cell().unwrap().id(), encoded.id());
-    assert!(matches!(
-        String::script(instructions).into_script(),
-        Err(VMError::Cell(CellError::InvalidFormat))
-    ));
+    let graph = Cell::new(vec![8], vec![cell.clone().into()]).unwrap();
+    for instruction in [
+        Instruction::PushCell(Some(cell.into())),
+        Instruction::CellLiteral(Arc::new(graph.into())),
+    ] {
+        let instructions = vec![instruction];
+        let script = Script::Transparent(instructions.clone());
+        let encoded = script.to_cell().unwrap();
+        let decoded = Script::from_cell(&encoded, &mut ()).unwrap();
+        assert_eq!(decoded.to_cell().unwrap().id(), encoded.id());
+        assert!(matches!(
+            CellValue::script(instructions)
+                .unwrap()
+                .witness()
+                .unwrap()
+                .clone()
+                .into_script(),
+            Err(VMError::Cell(CellError::InvalidFormat))
+        ));
+    }
 }
 
 #[test]

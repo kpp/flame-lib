@@ -269,7 +269,7 @@ fn transcripts_accept_byte_containers_and_append_challenges_without_losing_refs(
 }
 
 #[test]
-fn remaining_plain_byte_consumers_reject_graphs_and_legacy_string_values() {
+fn remaining_plain_byte_consumers_reject_graphs_and_non_byte_values() {
     let graph = Cell::new(vec![0; 32], vec![bytes(&[9]).into()]).unwrap();
     for instruction in [
         Instruction::Transcript,
@@ -289,7 +289,7 @@ fn remaining_plain_byte_consumers_reject_graphs_and_legacy_string_values() {
         assert!(matches!(
             run_to_end(&mut operation(
                 instruction,
-                vec![Value::String(String::from(vec![]))]
+                vec![Value::Scalar(Scalar::ZERO)]
             )),
             Err(VMError::TypeNotByteSource)
         ));
@@ -320,10 +320,10 @@ fn remaining_plain_byte_consumers_reject_graphs_and_legacy_string_values() {
 
 #[test]
 fn forged_private_commitment_annotations_cannot_replace_public_bytes() {
-    let literal = String::commitment(Commitment::unblinded(Scalar::from(7u64)));
+    let literal = CellValue::commitment(Commitment::unblinded(Scalar::from(7u64)));
     let forged = crate::CellValue {
         reference: bytes(&[9; 32]).into(),
-        witness: Some(Arc::new(literal)),
+        witness: literal.witness.clone(),
     };
     let mut vm = vm_external_with_script(ScriptBuilder::new().commit());
     vm.current_call.stack = vec![Value::Cell(forged)];
@@ -337,12 +337,12 @@ fn forged_private_commitment_annotations_cannot_replace_public_bytes() {
 fn unrelated_annotations_do_not_change_public_commitment_parsing_or_gas() {
     let mut results = Vec::new();
     for literal in [
-        String::scalar(Scalar::ZERO),
-        String::point(Point::from_bytes([0; 32])),
-        String::predicate(Predicate::opaque(CompressedRistretto([0; 32]))),
+        CellValue::scalar(Scalar::ZERO),
+        CellValue::point(Point::from_bytes([0; 32])),
+        CellValue::predicate(Predicate::opaque(CompressedRistretto([0; 32]))),
     ] {
         let tx = ScriptBuilder::new()
-            .push_str(literal)
+            .push_literal(literal)
             .commit()
             .drop_()
             .build_tx(dummy_header(), crate::Limits { gas: 1_000_000 })
@@ -758,7 +758,7 @@ fn unsigned_reads_and_writes_use_byte_widths_including_zero_and_32() {
             .read_uint();
         let mut vm = vm_with_script(program);
         run_to_end(&mut vm).unwrap();
-        assert_str(&vm.current_call.stack[0], &[]);
+        assert_bytes(&vm.current_call.stack[0], &[]);
         let mut expected = [0; 32];
         expected[..count].copy_from_slice(&value.to_bytes()[..count]);
         assert_int(
@@ -790,7 +790,7 @@ fn scalar_reads_soft_fail_without_advancing_on_short_or_noncanonical_input() {
         let mut vm = operation(Instruction::ReadScalar, vec![slice_value(bytes(&data))]);
         run_to_end(&mut vm).unwrap();
         assert_eq!(vm.current_call.stack.len(), 2);
-        assert_str(&vm.current_call.stack[0], &data);
+        assert_bytes(&vm.current_call.stack[0], &data);
         assert_int(&vm.current_call.stack[1], Scalar::ZERO);
     }
     for instruction in [Instruction::ReadUint, Instruction::WriteUint] {
@@ -814,7 +814,7 @@ fn readbytes_copies_requested_bytes_and_preserves_refs_and_failure_operands() {
         ],
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[3]);
+    assert_bytes(&vm.current_call.stack[0], &[3]);
     let Value::Slice(slice) = &vm.current_call.stack[0] else {
         panic!()
     };
@@ -834,7 +834,7 @@ fn readbytes_copies_requested_bytes_and_preserves_refs_and_failure_operands() {
         ],
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[1, 2, 3]);
+    assert_bytes(&vm.current_call.stack[0], &[1, 2, 3]);
     let Value::Builder(builder) = &vm.current_call.stack[1] else {
         panic!()
     };
@@ -916,9 +916,9 @@ fn cells_and_slices_dup_but_builders_are_transient_and_not_copyable() {
             .read_uint(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[7, 8]);
-    assert_str(&vm.current_call.stack[1], &[7, 8]);
-    assert_str(&vm.current_call.stack[2], &[8]);
+    assert_bytes(&vm.current_call.stack[0], &[7, 8]);
+    assert_bytes(&vm.current_call.stack[1], &[7, 8]);
+    assert_bytes(&vm.current_call.stack[2], &[8]);
     assert!(vm.current_call.stack[0].is_copyable());
     assert!(!vm.current_call.stack[1].is_portable());
     let builder = builder_value(&[], &[]);
@@ -960,7 +960,8 @@ fn slice_access_rejects_missing_or_pruned_bodies_and_old_pushstr_is_not_an_opcod
         run_to_end(&mut vm),
         Err(VMError::UnknownOpcode(0x19))
     ));
-    let program = ScriptBuilder::new().push_str(String::from(vec![0; cells::MAX_CELL_PAYLOAD]));
+    let program = ScriptBuilder::new()
+        .push_literal(CellValue::from_bytes(vec![0; cells::MAX_CELL_PAYLOAD]).unwrap());
     let root = program.to_cell().unwrap();
     assert_eq!(root.payload(), &[0xa6]);
     assert_eq!(
@@ -1068,8 +1069,8 @@ fn byte_copy_is_charged_before_mutation_and_zero_length_read_preserves_streams()
 #[test]
 fn equal_cell_bytes_do_not_overwrite_per_value_private_annotations() {
     let program = ScriptBuilder::new()
-        .push_str(String::scalar(Scalar::ZERO))
-        .push_str(String::point(Point::from_bytes([0; 32])))
+        .push_literal(CellValue::scalar(Scalar::ZERO))
+        .push_literal(CellValue::point(Point::from_bytes([0; 32])))
         .drop_()
         .scalar()
         .push_int(0u64)

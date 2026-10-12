@@ -221,7 +221,7 @@ fn issuepub_clear_path_emits_txlog_and_returns_cleartoken() {
     let actor = ActorID::Hash([0x55; 32]);
     let script = ScriptBuilder::new()
         .push_int(7u64)
-        .push_str(String::from(b"gold".to_vec()))
+        .push_literal(CellValue::from_bytes(b"gold".to_vec()).unwrap())
         .issuepub()
         .to_bytecode();
     let mut vm = vm_internal_with_actor(script, actor.clone());
@@ -258,7 +258,7 @@ fn issuepub_with_point_qty_errors_typenotscalar() {
     let actor = ActorID::Hash([0x55; 32]);
     let script = ScriptBuilder::new()
         .push_point([0u8; 32])
-        .push_str(String::from(b"gold".to_vec()))
+        .push_literal(CellValue::from_bytes(b"gold".to_vec()).unwrap())
         .issuepub()
         .to_bytecode();
     let mut vm = vm_internal_with_actor(script, actor);
@@ -271,7 +271,7 @@ fn issuepub_at_external_root_errors_actor_context() {
     // ExternalRoot has no actor identity.
     let script = ScriptBuilder::new()
         .push_int(7u64)
-        .push_str(String::from(b"gold".to_vec()))
+        .push_literal(CellValue::from_bytes(b"gold".to_vec()).unwrap())
         .issuepub()
         .to_bytecode();
     let mut vm = VM::new(
@@ -294,7 +294,7 @@ fn issuepub_at_external_root_errors_actor_context() {
 #[test]
 fn issuepriv_emits_token_with_predicate_bound_flavor() {
     // Inside a ContractOpen frame in external context: push a blinded
-    // commitment as a witness-bearing String, lift it to a Variable
+    // commitment as a witness-bearing CellValue, lift it to a Variable
     // via `commit`, push a tag, run `issuepriv`. Then `push:1 return`
     // so the Token returns to the parent frame cleanly. The opcode
     // does:
@@ -308,18 +308,18 @@ fn issuepriv_emits_token_with_predicate_bound_flavor() {
     let qty_int = Scalar::from(42u64);
     let qty_blind = curve25519_dalek::scalar::Scalar::from(11u64);
     let qty_commit = Commitment::blinded_with_factor(qty_int, qty_blind);
-    let tag_str = String::from(b"gold".to_vec());
+    let tag_str = CellValue::from_bytes(b"gold".to_vec()).unwrap();
 
     // Build the VM by hand instead of going through bytecode — the
     // bytecode roundtrip would strip the prover-side commitment
-    // witness from `String::commitment(...)`, leaving a `Closed`
+    // witness from `CellValue::commitment(...)`, leaving a `Closed`
     // commitment that `Prover::commit_variable` rejects with
     // `WitnessMissing`. Same pattern as the encrypted-borrow test.
     use curve25519_dalek::ristretto::CompressedRistretto;
     let program = ScriptBuilder::new()
-        .push_str(String::commitment(qty_commit.clone()))
+        .push_literal(CellValue::commitment(qty_commit.clone()))
         .commit()
-        .push_str(tag_str.clone())
+        .push_literal(tag_str.clone())
         .issuepriv()
         .push_int(1u64)
         .return_();
@@ -341,7 +341,7 @@ fn issuepriv_emits_token_with_predicate_bound_flavor() {
 
     // After `return k=1`: parent stack = [Token, k=1, success=1].
     let predicate = Predicate::opaque(curve25519_dalek::ristretto::CompressedRistretto([0u8; 32]));
-    let expected_flv = flavor_from_predicate(&predicate, &tag_str.to_bytes_vec());
+    let expected_flv = flavor_from_predicate(&predicate, tag_str.payload().unwrap());
     assert_eq!(vm.current_call.stack.len(), 3);
     match &vm.current_call.stack[0] {
         Value::Token(t) => {
@@ -450,11 +450,11 @@ fn issuepriv_prove_then_verify_end_to_end() {
     let qty_int = Scalar::from(42u64);
     let qty_blind = curve25519_dalek::scalar::Scalar::from(11u64);
     let qty_commit = Commitment::blinded_with_factor(qty_int, qty_blind);
-    let tag_str = String::from(b"gold".to_vec());
+    let tag_str = CellValue::from_bytes(b"gold".to_vec()).unwrap();
 
     // Leaf script — runs inside the isolated ContractOpen frame on open:
     //   stack at entry: [qty_witness_string]  (k=1 arg from `open`)
-    //   commit:    pop String → Variable
+    //   commit:    pop CellValue → Variable
     //   pushstr:   tag
     //   issuepriv: Variable + tag → Token  (TxEntry::IssuePriv)
     //   retire:    Token → ø                 (TxEntry::Retire)
@@ -463,7 +463,7 @@ fn issuepriv_prove_then_verify_end_to_end() {
         .roll_k(1)
         .drop_() // discard the empty Contract payload below the argument
         .commit()
-        .push_str(tag_str.clone())
+        .push_literal(tag_str.clone())
         .issuepriv()
         .retire()
         .push_int(0u64)
@@ -493,13 +493,13 @@ fn issuepriv_prove_then_verify_end_to_end() {
     //   pushstr(qty_witness); k=1; open;
     //   verify; drop  (consume the success + count markers)
     let outer = ScriptBuilder::new()
-        .push_str(String::contract(contract))
+        .push_literal(CellValue::contract(contract))
         .input()
         .with_script_witness(inner)
         .unwrap();
     let outer = push_taproot_proof_to_program(outer, &cp)
         .push_int(20_000u64) // gas
-        .push_str(String::commitment(qty_commit.clone())) // qty witness arg
+        .push_literal(CellValue::commitment(qty_commit.clone())) // qty witness arg
         .push_int(1u64) // k = 1 arg
         .open()
         .verify() // pops success marker (1)
@@ -537,7 +537,7 @@ fn issuepriv_prove_then_verify_end_to_end() {
     // result.txid as ground truth — the verifier reconstructs the
     // identical txlog by replaying the bytecode.
     let predicate = Predicate::opaque(pred_point);
-    let expected_flv = flavor_from_predicate(&predicate, &tag_str.to_bytes_vec());
+    let expected_flv = flavor_from_predicate(&predicate, tag_str.payload().unwrap());
     let expected_flv_pt = Commitment::unblinded(expected_flv).to_point();
     let expected_qty_pt = qty_commit.to_point();
     let has_issue = verified.txlog.iter().any(|e| {
@@ -566,7 +566,7 @@ fn issuepriv_with_int_qty_yields_failure_marker() {
     // `issuepriv_in_internal_context_yields_failure_marker`).
     let script = ScriptBuilder::new()
         .push_int(7u64)
-        .push_str(String::from(b"gold".to_vec()))
+        .push_literal(CellValue::from_bytes(b"gold".to_vec()).unwrap())
         .issuepriv()
         .to_bytecode();
     let mut vm = vm_with_nested_child_script(script);
@@ -798,8 +798,8 @@ fn issuepubflv_pushes_correct_flavor() {
     // pushstr <32-byte cid>, pushstr "gold", issuepubflv.
     let actor_bytes = [0xab; 32];
     let script = ScriptBuilder::new()
-        .push_str(String::from(actor_bytes.to_vec()))
-        .push_str(String::from(b"gold".to_vec()))
+        .push_literal(CellValue::from_bytes(actor_bytes.to_vec()).unwrap())
+        .push_literal(CellValue::from_bytes(b"gold".to_vec()).unwrap())
         .issuepubflv()
         .to_bytecode();
     let mut vm = vm_with_script(script);
@@ -812,8 +812,8 @@ fn issuepubflv_pushes_correct_flavor() {
 #[test]
 fn issuepubflv_rejects_non_32_byte_cid() {
     let script = ScriptBuilder::new()
-        .push_str(String::from(vec![0xab; 16])) // bad 16-byte cid
-        .push_str(String::from(b"gold".to_vec()))
+        .push_literal(CellValue::from_bytes(vec![0xab; 16]).unwrap()) // bad 16-byte cid
+        .push_literal(CellValue::from_bytes(b"gold".to_vec()).unwrap())
         .issuepubflv()
         .to_bytecode();
     let mut vm = vm_with_script(script);
@@ -826,8 +826,8 @@ fn issueprivflv_pushes_correct_flavor() {
     // pushstr <32-byte predicate point>, pushstr "gold", issueprivflv.
     let pred_bytes = [0xcd; 32];
     let script = ScriptBuilder::new()
-        .push_str(String::from(pred_bytes.to_vec()))
-        .push_str(String::from(b"gold".to_vec()))
+        .push_literal(CellValue::from_bytes(pred_bytes.to_vec()).unwrap())
+        .push_literal(CellValue::from_bytes(b"gold".to_vec()).unwrap())
         .issueprivflv()
         .to_bytecode();
     let mut vm = vm_with_script(script);
@@ -841,8 +841,8 @@ fn issueprivflv_pushes_correct_flavor() {
 #[test]
 fn issueprivflv_rejects_non_32_byte_predicate() {
     let script = ScriptBuilder::new()
-        .push_str(String::from(vec![0xcd; 16])) // bad 16-byte predicate
-        .push_str(String::from(b"gold".to_vec()))
+        .push_literal(CellValue::from_bytes(vec![0xcd; 16]).unwrap()) // bad 16-byte predicate
+        .push_literal(CellValue::from_bytes(b"gold".to_vec()).unwrap())
         .issueprivflv()
         .to_bytecode();
     let mut vm = vm_with_script(script);

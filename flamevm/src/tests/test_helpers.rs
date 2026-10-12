@@ -16,9 +16,9 @@ pub use super::super::*;
 pub(crate) use super::mem_registry::MemRegistry;
 
 pub use crate::{
-    CheckedFee, CommitmentWitness, Constraint, Expression, Instruction, PredicateTree, Prover,
-    Script, ScriptBuilder, SecretConstraint, TaprootOpening, Token, Value, Variable, Verifier,
-    WideToken, FLAME_FLAVOR, MAX_FEE,
+    CellValue, CellWitness, CheckedFee, CommitmentWitness, Constraint, Expression, Instruction,
+    PredicateTree, Prover, Script, ScriptBuilder, SecretConstraint, TaprootOpening, Token, Value,
+    Variable, Verifier, WideToken, FLAME_FLAVOR, MAX_FEE,
 };
 pub use bulletproofs::PedersenGens;
 pub use cells::{
@@ -77,11 +77,8 @@ pub(crate) fn test_payload(values: Vec<Value>) -> Value {
     }
 }
 
-pub(crate) fn witness_cell(literal: String) -> Value {
-    Value::Cell(crate::CellValue {
-        reference: literal.to_cell().unwrap().into(),
-        witness: Some(Arc::new(literal)),
-    })
+pub(crate) fn witness_cell(literal: CellValue) -> Value {
+    Value::Cell(literal)
 }
 
 pub(crate) fn open_with_test_inner(inner: ScriptBuilder, recover: bool) -> ScriptBuilder {
@@ -103,7 +100,7 @@ pub(crate) fn open_with_test_inner(inner: ScriptBuilder, recover: bool) -> Scrip
     )
     .unwrap();
     let program = ScriptBuilder::new()
-        .push_str(String::contract(contract))
+        .push_literal(CellValue::contract(contract))
         .input()
         .with_script_witness(branch)
         .unwrap();
@@ -254,7 +251,6 @@ pub(crate) fn assert_int(v: &Value, expected: Scalar) {
 pub(crate) fn value_kind(v: &Value) -> &'static str {
     match v {
         Value::Scalar(_) => "Scalar",
-        Value::String(_) => "String",
         Value::Dict(_) => "Dict",
         Value::Point(_) => "Point",
         Value::Token(_) => "Token",
@@ -390,7 +386,7 @@ pub(crate) fn call_to(target: &ActorID) -> ScriptBuilder {
     ScriptBuilder::new()
         .push_int(0u64) // k = 0
         .push_int(50_000u64) // gas
-        .push_str(String::from(target.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(target.to_hash().to_vec()).unwrap())
         .call()
 }
 
@@ -401,7 +397,7 @@ pub(crate) fn call_with_sel(target: &ActorID, sel: u64) -> ScriptBuilder {
         .push_int(sel) // selector arg (top)
         .push_int(1u64) // k = 1
         .push_int(50_000u64) // gas
-        .push_str(String::from(target.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(target.to_hash().to_vec()).unwrap())
         .call()
 }
 
@@ -438,10 +434,10 @@ pub(crate) fn dispatch_code(arms: &[(u64, Vec<u8>)]) -> Vec<u8> {
             .expect("handler parses")
             .into_instructions()
         {
-            if let Instruction::BytesLiteral(bytes) = instruction {
+            if let Instruction::CellLiteral(bytes) = instruction {
                 // A skipped/repeated handler cannot consume a positional program ref.
                 p = p.builder();
-                for chunk in bytes.to_bytes_vec().chunks(31) {
+                for chunk in bytes.payload().unwrap().chunks(31) {
                     let mut scalar = [0; 32];
                     scalar[..chunk.len()].copy_from_slice(chunk);
                     p = p
@@ -484,9 +480,8 @@ pub(crate) fn vm_with_nested_child_script(script: Vec<u8>) -> VM {
     vm
 }
 
-pub(crate) fn assert_str(v: &Value, expected: &[u8]) {
+pub(crate) fn assert_bytes(v: &Value, expected: &[u8]) {
     match v {
-        Value::String(s) => assert_eq!(s.as_opaque().unwrap(), expected),
         Value::Cell(reference) => assert_eq!(
             reference
                 .as_resident()
@@ -496,7 +491,7 @@ pub(crate) fn assert_str(v: &Value, expected: &[u8]) {
         ),
         Value::Slice(slice) => assert_eq!(slice.bytes(), expected),
         Value::Builder(builder) => assert_eq!(builder.payload(), expected),
-        other => panic!("expected String, got {}", value_kind(other)),
+        other => panic!("expected byte source, got {}", value_kind(other)),
     }
 }
 
@@ -619,7 +614,7 @@ pub(crate) fn vm_external_with_script(script: impl TestProgram) -> VM {
 }
 
 /// Builds a wire-encoded contract as a `Vec<u8>` so tests can feed it
-/// to the `input` opcode (which pops a `String` and decodes it).
+/// to the `input` opcode (which pops a `CellValue` and decodes it).
 pub(crate) fn encode_contract_to_bytes(contract: &Contract) -> Vec<u8> {
     contract.to_envelope().unwrap().encode()
 }
@@ -639,7 +634,7 @@ pub(crate) fn fixture_contract() -> Contract {
     let anchor = Anchor([0x42; 32]);
     let payload = vec![
         Value::Scalar(Scalar::from(7u64)),
-        Value::String(String::from(b"hello".to_vec())),
+        Value::Cell(CellValue::from_bytes(b"hello".to_vec()).unwrap()),
     ];
     Contract::new(predicate, anchor, Value::Dict(Dict::from_values(payload)))
         .expect("fixture payload is portable")
@@ -756,7 +751,7 @@ pub(crate) fn make_signtx_script_with_contract(
     .expect("payload is portable");
     let contract_id = contract.id();
     let script = ScriptBuilder::new()
-        .push_str(String::contract(contract))
+        .push_literal(CellValue::contract(contract))
         .input()
         .signtx()
         .drop_(); // drop the single payload
@@ -765,7 +760,7 @@ pub(crate) fn make_signtx_script_with_contract(
 
 /// Helper: build a Token with `Commitment::Open` quantity and
 /// flavor (witness-bearing). The token can be embedded in a Contract
-/// and pushed via `String::contract(c)` so witnesses survive the trip
+/// and pushed via `CellValue::contract(c)` so witnesses survive the trip
 /// through `op_input` and into the downstream `mix` gadget.
 pub(crate) fn make_open_token(
     qty_value: u64,
@@ -801,7 +796,7 @@ pub(crate) fn make_open_token(
 //   ↓  stack now: [Token_0, Token_1, …, Token_{N-1}]
 //
 //   For each output j:
-//   ┌── push the (qty, flv) commitment Strings ─────────────┐
+//   ┌── push the (qty, flv) commitment Cells ───────────────┐
 //   │  pushstr <qty_open_j>                                  │
 //   │  pushstr <flv_open_j>                                  │
 //   └────────────────────────────────────────────────────────┘
@@ -894,10 +889,10 @@ pub(crate) fn build_confidential_nm_program(
     //                    taproot_proof pieces + push:0 + open. ──
     for inp in inputs {
         let (contract, cp) = build_input_contract(inp);
-        // pushstr String::contract(c) — prover-side witness carrier
+        // pushstr CellValue::contract(c) — prover-side witness carrier
         // (Token's open commitments ride along into op_input).
-        // The verifier-side equivalent is `String::from(contract.to_bytes())`.
-        program = program.push_str(String::contract(contract));
+        // The verifier-side equivalent is `CellValue::from_bytes(contract.to_bytes()).unwrap()`.
+        program = program.push_literal(CellValue::contract(contract));
         program = program.input();
         // taproot_proof pieces.
         program = push_taproot_proof_to_program(program, &cp);
@@ -913,12 +908,12 @@ pub(crate) fn build_confidential_nm_program(
             .drop_();
     }
 
-    //                    commit String (witness-bearing). ──
+    //                    commit CellValue (witness-bearing). ──
     for out in outputs {
         let (q_open, f_open) = open_commitments_for_output(out);
         program = program
-            .push_str(String::commitment(q_open))
-            .push_str(String::commitment(f_open));
+            .push_literal(CellValue::commitment(q_open))
+            .push_literal(CellValue::commitment(f_open));
     }
 
     //

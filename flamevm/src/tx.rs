@@ -956,7 +956,7 @@ impl CellEncode for UnsignedTx {
 #[cfg(test)]
 mod envelope_tests {
     use super::*;
-    use crate::{Anchor, Predicate, PredicateTree, String};
+    use crate::{Anchor, CellValue, Predicate, PredicateTree};
     use std::convert::TryInto;
 
     fn build(program: ScriptBuilder) -> ExternalTx {
@@ -1091,7 +1091,7 @@ mod envelope_tests {
         .unwrap();
         let tx = build(
             ScriptBuilder::new()
-                .push_str(String::contract(contract))
+                .push_literal(CellValue::contract(contract))
                 .input()
                 .push_taproot_proof(&tree, 0)
                 .unwrap()
@@ -1210,7 +1210,7 @@ mod envelope_tests {
         let inner_contract_id = inner_contract.id();
         let branch = ScriptBuilder::new()
             .drop_()
-            .push_str(String::contract(inner_contract))
+            .push_literal(CellValue::contract(inner_contract))
             .input()
             .push_taproot_proof(&inner, 0)
             .unwrap()
@@ -1228,7 +1228,7 @@ mod envelope_tests {
         let hidden_id = hidden_contract.id();
         let unused = ScriptBuilder::new()
             .drop_()
-            .push_str(String::contract(hidden_contract))
+            .push_literal(CellValue::contract(hidden_contract))
             .drop_();
         let outer = PredicateTree::from_scripts(None, vec![branch, unused], [4; 32]).unwrap();
         let contract = Contract::new(
@@ -1240,7 +1240,7 @@ mod envelope_tests {
         let contract_id = contract.id();
         let limits = Limits { gas: 1_000_000 };
         let program = ScriptBuilder::new()
-            .push_str(String::contract(contract))
+            .push_literal(CellValue::contract(contract))
             .input()
             .push_taproot_proof(&outer, 0)
             .unwrap()

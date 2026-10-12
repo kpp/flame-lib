@@ -6,7 +6,7 @@ use flamed_rpc::{
     ActorId, BlockId, BlockResult, BlocksResult, ClientError, ExecutionData, FlamedApiClient,
     HttpClientBuilder, TxId, MAX_PAGE_SIZE,
 };
-use flamevm::{ActorID, CellEncode, ScriptBuilder, String as VmString};
+use flamevm::{ActorID, CellEncode, CellValue, ScriptBuilder};
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use tempfile::TempDir;
 
@@ -131,7 +131,7 @@ pub(super) fn deploy(node: &mut Node, genesis: &GenesisFile) -> (ActorId, Contra
         .push_int(0u64)
         .push_int(2u64)
         .dict()
-        .push_str(counter_code())
+        .push_literal(CellValue::from_bytes(counter_code()).unwrap())
         .setcode()
         .load()
         .drop_()
@@ -139,15 +139,17 @@ pub(super) fn deploy(node: &mut Node, genesis: &GenesisFile) -> (ActorId, Contra
         .to_bytecode();
     let actor = ActorID::Constructor(constructor);
     let unsigned = ScriptBuilder::new()
-        .push_str(VmString::contract(input.clone()))
+        .push_literal(CellValue::contract(input.clone()))
         .input()
         .signtx()
         .push_int(20 * FLAME)
         .split()
         .push_int(1u64)
-        .push_str(input.predicate.to_point().to_bytes().to_vec())
+        .push_literal(
+            CellValue::from_bytes(input.predicate.to_point().to_bytes().to_vec()).unwrap(),
+        )
         .push_int(1_000_000u64)
-        .push_str(actor.to_envelope().unwrap().encode())
+        .push_literal(CellValue::from_bytes(actor.to_envelope().unwrap().encode()).unwrap())
         .send()
         .push_point(input.predicate.to_point().to_bytes())
         .output()
@@ -170,15 +172,17 @@ pub(super) fn send_messages(
 ) -> ContractID {
     let input = contract_of(node, &input_id);
     let mut script = ScriptBuilder::new()
-        .push_str(VmString::contract(input.clone()))
+        .push_literal(CellValue::contract(input.clone()))
         .input()
         .signtx();
     for gas in gas_limits {
         script = script
             .push_int(0u64)
-            .push_str(input.predicate.to_point().to_bytes().to_vec())
+            .push_literal(
+                CellValue::from_bytes(input.predicate.to_point().to_bytes().to_vec()).unwrap(),
+            )
             .push_int(*gas)
-            .push_str(actor.0.to_vec())
+            .push_literal(CellValue::from_bytes(actor.0.to_vec()).unwrap())
             .send();
     }
     let unsigned = script
@@ -308,15 +312,15 @@ fn failed_delivery_summary_matches_its_archived_refund() {
     let predicate = input.predicate.to_point().to_bytes();
     let missing = ActorId([0x77; 32]);
     let unsigned = ScriptBuilder::new()
-        .push_str(VmString::contract(input.clone()))
+        .push_literal(CellValue::contract(input.clone()))
         .input()
         .signtx()
         .push_int(20 * FLAME)
         .split()
         .push_int(1u64)
-        .push_str(predicate.to_vec())
+        .push_literal(CellValue::from_bytes(predicate.to_vec()).unwrap())
         .push_int(1_000_000u64)
-        .push_str(missing.0.to_vec())
+        .push_literal(CellValue::from_bytes(missing.0.to_vec()).unwrap())
         .send()
         .push_point(predicate)
         .output()

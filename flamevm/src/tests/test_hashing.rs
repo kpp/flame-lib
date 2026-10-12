@@ -4,9 +4,9 @@
 
 use super::test_helpers::*;
 
-/// Helper: makes a String from a byte slice (for `push_str` in tests).
-fn s(bytes: &[u8]) -> String {
-    String::from(bytes.to_vec())
+/// Helper: makes a CellValue from a byte slice (for `push_literal` in tests).
+fn s(bytes: &[u8]) -> CellValue {
+    CellValue::from_bytes(bytes.to_vec()).unwrap()
 }
 
 #[test]
@@ -15,7 +15,7 @@ fn transcript_is_noncopyable_but_droppable() {
     // wrt stack duplication — has internal CS-style state).
     let mut vm = vm_with_script(
         ScriptBuilder::new()
-            .push_str(s(b""))
+            .push_literal(s(b""))
             .transcript()
             .dup_k(0)
             .to_bytecode(),
@@ -30,7 +30,7 @@ fn transcript_is_noncopyable_but_droppable() {
     // `Value::is_droppable`.
     let mut vm = vm_with_script(
         ScriptBuilder::new()
-            .push_str(s(b""))
+            .push_literal(s(b""))
             .transcript()
             .drop_()
             .to_bytecode(),
@@ -44,8 +44,8 @@ fn twrite_requires_merlin_on_bottom() {
     // push:5 (wrong type), pushstr "lbl", pushstr "data", merlinwrite
     let script = ScriptBuilder::new()
         .push_int(5u64)
-        .push_str(s(b"lbl"))
-        .push_str(s(b"data"))
+        .push_literal(s(b"lbl"))
+        .push_literal(s(b"data"))
         .twrite()
         .to_bytecode();
     let mut vm = vm_with_script(script);
@@ -61,7 +61,7 @@ fn keccak256_differs_from_sha3() {
     // (FIPS-202 added a domain separator).
     let mut a = vm_with_script(
         ScriptBuilder::new()
-            .push_str(s(b"abc"))
+            .push_literal(s(b"abc"))
             .builder()
             .sha3()
             .to_bytecode(),
@@ -69,7 +69,7 @@ fn keccak256_differs_from_sha3() {
     run_to_end(&mut a).unwrap();
     let mut b = vm_with_script(
         ScriptBuilder::new()
-            .push_str(s(b"abc"))
+            .push_literal(s(b"abc"))
             .builder()
             .keccak256()
             .to_bytecode(),

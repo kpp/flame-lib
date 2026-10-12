@@ -47,7 +47,7 @@ fn open_executes_direct_policy_cell_with_semantic_authentication_and_bytecode_di
     )
     .unwrap();
     let program = ScriptBuilder::new()
-        .push_str(String::contract(contract))
+        .push_literal(CellValue::contract(contract))
         .input()
         .push_point(*key.as_bytes())
         .push_cell(partial)
@@ -302,7 +302,7 @@ fn contract_opcode_builds_a_contract_and_ratchets_anchor() {
 fn contract_opcode_rejects_non_portable_payload() {
     // Merlin is always non-portable.
     let script = ScriptBuilder::new()
-        .push_str(String::from(Vec::<u8>::new())) // empty label
+        .push_literal(CellValue::from_bytes(Vec::<u8>::new()).unwrap()) // empty label
         .transcript() // → Merlin (non-portable)
         .push_point([0xaa; 32])
         .contract()
@@ -420,16 +420,16 @@ fn open_with_valid_taproot_proof_runs_program() {
 }
 
 #[test]
-fn taproot_program_larger_than_runtime_string_opens_through_cells() {
+fn taproot_program_larger_than_one_cell_opens_through_continuations() {
     let mut branch = ScriptBuilder::new().drop_();
-    for _ in 0..=String::MAX_LEN {
+    for _ in 0..=cells::MAX_CELL_PAYLOAD {
         branch = branch.nop();
     }
     let branch = branch.push_int(0u64).return_().to_bytecode();
-    assert!(branch.len() > String::MAX_LEN);
+    assert!(branch.len() > cells::MAX_CELL_PAYLOAD);
 
-    // The program is a Cell-backed predicate with explicit exec continuations, not a String
-    // literal. Its native graph is carried by the outer program's references.
+    // The program is a Cell-backed predicate with explicit exec continuations.
+    // Its native graph is carried by the outer program's references.
     let tree = PredicateTree::scripts_only(vec![branch], TEST_BLINDING_KEY).unwrap();
     let proof = test_taproot_proof(&tree, 0).unwrap();
     let contract = Contract::new(
@@ -439,7 +439,7 @@ fn taproot_program_larger_than_runtime_string_opens_through_cells() {
     )
     .unwrap();
     let outer = ScriptBuilder::new()
-        .push_str(String::contract(contract))
+        .push_literal(CellValue::contract(contract))
         .input();
     let outer = push_taproot_proof_to_program(outer, &proof)
         .push_int(100_000u64)
@@ -516,7 +516,7 @@ fn open_preserves_alloc_witnesses_from_predicate_builder() {
     )
     .unwrap();
     let outer = ScriptBuilder::new()
-        .push_str(String::contract(contract))
+        .push_literal(CellValue::contract(contract))
         .input()
         .push_taproot_proof(&tree, 0)
         .unwrap()
@@ -883,7 +883,7 @@ fn input_pushes_contract_seeds_anchor_and_emits_txlog() {
     let expected_id = contract.id();
     let mut vm = vm_external_with_script(
         ScriptBuilder::new()
-            .push_str(String::contract(contract))
+            .push_literal(CellValue::contract(contract))
             .input(),
     );
     run_to_end(&mut vm).unwrap();
@@ -897,7 +897,7 @@ fn input_pushes_contract_seeds_anchor_and_emits_txlog() {
 
 #[test]
 fn input_requires_byte_source_on_top() {
-    // Non-String top → TypeNotString. (Use an Scalar.)
+    // A Scalar is not a byte source.
     let mut vm = vm_external_with_script(Vec::new());
     vm.push_value(Value::Scalar(Scalar::from(7u64)));
     let err = vm.op_input().unwrap_err();
@@ -908,7 +908,9 @@ fn input_requires_byte_source_on_top() {
 fn input_rejects_malformed_bytes() {
     // Random non-canonical bytes on the stack.
     let mut vm = vm_external_with_script(Vec::new());
-    vm.push_value(witness_cell(String::from(vec![0xffu8; 8])));
+    vm.push_value(witness_cell(
+        CellValue::from_bytes(vec![0xffu8; 8]).unwrap(),
+    ));
     let err = vm.op_input().unwrap_err();
     assert!(matches!(err, VMError::MalformedContractEncoding));
 }
@@ -918,7 +920,7 @@ fn input_rejects_trailing_bytes_after_contract_id() {
     let mut bytes = fixture_contract().id().to_vec();
     bytes.push(0);
     let mut vm = vm_external_with_script(Vec::new());
-    vm.push_value(witness_cell(String::from(bytes)));
+    vm.push_value(witness_cell(CellValue::from_bytes(bytes).unwrap()));
     assert!(matches!(
         vm.op_input(),
         Err(VMError::MalformedContractEncoding)
@@ -934,7 +936,7 @@ fn input_in_internal_context_errors_external_only() {
     // Even with a well-formed string on the stack, internal context
     // rejects the opcode before any decoding happens.
     let contract_bytes = fixture_contract().id().to_vec();
-    vm.push_value(witness_cell(String::from(contract_bytes)));
+    vm.push_value(witness_cell(CellValue::from_bytes(contract_bytes).unwrap()));
     let err = vm.step_internal().unwrap_err();
     assert!(matches!(err, VMError::ExternalOnly));
 }
@@ -945,7 +947,7 @@ fn input_then_output_anchor_chain() {
     let expected = Anchor(contract.id());
     let mut vm = vm_external_with_script(
         ScriptBuilder::new()
-            .push_str(String::contract(contract))
+            .push_literal(CellValue::contract(contract))
             .input(),
     );
     run_to_end(&mut vm).unwrap();
@@ -970,7 +972,9 @@ fn input_via_step_external_dispatch() {
             .with_cells(CellIndex::collect(Arc::new(contract.to_cell().unwrap())).unwrap())
             .input(),
     );
-    vm.push_value(witness_cell(String::from(expected.to_vec())));
+    vm.push_value(witness_cell(
+        CellValue::from_bytes(expected.to_vec()).unwrap(),
+    ));
     assert!(vm.step_external(&mut StubDelegate::new()).unwrap());
     assert!(matches!(&vm.current_call.stack[0], Value::Contract(c) if c.id() == expected));
     assert_eq!(vm.txlog.len(), 2);
@@ -984,7 +988,7 @@ fn external_tx_one_input_one_output_via_signtx() {
     let predicate = input.predicate.to_point();
     let (left, right) = Anchor(input_id).split();
     let program = ScriptBuilder::new()
-        .push_str(String::contract(input))
+        .push_literal(CellValue::contract(input))
         .input()
         .signtx()
         .drop_()
@@ -1033,7 +1037,7 @@ fn external_tx_two_inputs_two_outputs_via_open() {
     let id1 = contract1.id();
     let id2 = contract2.id();
     let p = ScriptBuilder::new()
-        .push_str(String::contract(contract1))
+        .push_literal(CellValue::contract(contract1))
         .input();
     let p = push_taproot_proof_to_program(p, &proof1)
         .push_int(10_000u64)
@@ -1041,7 +1045,7 @@ fn external_tx_two_inputs_two_outputs_via_open() {
         .open()
         .verify()
         .drop_()
-        .push_str(String::contract(contract2))
+        .push_literal(CellValue::contract(contract2))
         .input();
     let p = push_taproot_proof_to_program(p, &proof2)
         .push_int(10_000u64)

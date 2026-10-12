@@ -93,7 +93,7 @@ For a Contract protected by `tree`, the public workflow is:
 
 ```rust
 let unsigned = ScriptBuilder::new()
-    .push_str(String::contract(contract))
+    .push_literal(CellValue::contract(contract))
     .input()
     .push_taproot_proof(&tree, 0)?
     .push_int(child_gas)
@@ -166,26 +166,36 @@ Integers in payloads are little-endian unless explicitly stated otherwise.
 | Point / Predicate | 32-byte compressed Ristretto representation | — |
 | Token | qty commitment:32, flavor commitment:32 | — |
 | ClearToken | qty Scalar:32, flavor Scalar:32 | — |
-| String | raw bytes, 0..4095; no length prefix | — |
+| Raw Cell | ordinary payload: 0..4095 bytes; descriptor supplies its length | 0..4 child refs; explicit pruned Cells retain their hash/depth summaries |
 | Script | raw instruction bytes, 0..4095; no length prefix | literal refs, including explicit continuation targets |
 | Arbitrary blob field | snake: u32 LE total length followed by bytes | next continuation when needed |
 | Dict | count:u64 LE, flags:u8 | Trie root unless empty |
 
-Only `Value` adds a tag: Scalar=0, String=1, Dict=2, Point=3,
-Token=4, ClearToken=6, Cell=13. Fixed-width contents follow inline; String, Dict,
+Only `Value` adds a tag: Scalar=0, Dict=2, Point=3,
+Token=4, ClearToken=6, Cell=13. The removed String tag 1 is reserved and rejected;
+no existing tags are renumbered. Fixed-width contents follow inline; Dict
 and raw Cell contents are in one child reference. A raw Cell is serialized data,
 not authority to instantiate bearer assets. Other tags are rejected. WideToken, the
 Contract stack handle, Merlin, Variable, Expression, Constraint, and MSM
 have no Value encoding.
 
-The runtime String API is retained temporarily alongside the raw Cell value.
-Every String fits in one payload-only Cell: its descriptor
-supplies the length, and references or snake continuations are forbidden.
-The limit also applies to witness-bearing Strings' public bytes. Literal
-parsing and VM string growth reject lengths above 4095 with `StringTooLong`,
-before allocating the result. Native byte literals use `pushcell` and a child
-Cell with up to 4095 payload bytes; no inline string opcode remains. The temporary
-byte-only host-source format still has a literal marker, lowered before execution.
+`CellValue` is the sole immutable byte/graph container in the VM, holding its
+`CellRef` and optional `Arc<CellWitness>` directly. Private Point, Scalar,
+Script and Contract annotations are not encoded or included in Cell hashes.
+Consumers validate applicable annotations against the authenticated public
+bytes before using them. A Contract annotation's public payload remains its
+32-byte ContractID; its public body is collected separately into execution
+witnesses. A Script annotation retains the existing byte-only `signcall`
+source format, not a graph-aware signature-message redesign.
+
+Byte operations accept only zero-ref Cell/Slice/Builder payloads. Literal
+construction and Builder growth enforce the ordinary 4095-byte capacity.
+Native byte literals use `pushcell` and a child Cell; no inline string opcode
+remains. Host `push_literal(CellValue)` retains the byte-only source literal
+marker for ordinary zero-ref payloads, lowered before execution. Graph/pruned
+literals fall back to a bare `pushcell` in byte-source output; use `to_cell`
+or `build_tx` to retain their bodies and references. `push_cell` supports native
+graph references, including unloaded ones.
 Programs span Cells only by executing `pushcell exec`; instructions do not
 straddle Cells. Proofs and other schema-defined blob fields may still use Snakes.
 The external Tx's R1CS proof is the explicitly inline exception above.

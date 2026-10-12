@@ -75,9 +75,9 @@ memo; the builder derives the predicate, both blinding factors and the note
 from them. The script it emits:
 
 ```text
-per input:    push_str(String::contract(contract))  input  signtx
+per input:    push_literal(CellValue::contract(contract))  input  signtx
 fee > 0:      push_int(fee)  fee                     one more mix input
-per output:   push_str(commitment(qty))  push_str(commitment(flv))
+per output:   push_literal(CellValue::commitment(qty))  push_literal(CellValue::commitment(flv))
               push_int(m)  push_int(n)  mix
 per output i: roll_k(n-1-i) if > 0;  push_point(S_i)  output
               pushcell(note_i)  log
@@ -144,7 +144,7 @@ way is public on chain one hop after it was received, and the confidentiality
 the commitments bought is spent along with it. **This crate emits no
 `decrypt`.**
 
-The right way is the witness path. `String::contract(c)` takes a whole
+The right way is the witness path. `CellValue::contract(c)` takes a whole
 contract whose token halves are `Commitment::Open` — carrying the prover's
 value and blinding factor — and pushes it. The emitted bytecode contains only
 the contract's 32-byte id. `build_tx` collects the contract's *public* body

@@ -15,6 +15,7 @@ use merlin::Transcript;
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::actor::{empty_state, ActorID, ActorRegistry};
+use crate::cell_value::array32;
 use crate::constraints::Commitment;
 use crate::contract::{Contract, ContractID, Predicate};
 use crate::errors::VMError;
@@ -22,13 +23,12 @@ use crate::fees::CheckedFee;
 use crate::message::Message;
 use crate::ops::Instruction;
 use crate::script::{Program, Script, ScriptBuilder};
-use crate::string::array32;
 use crate::token::{flavor_from_actor, flavor_from_predicate, FLAME_FLAVOR};
 use crate::tx::TxHeader;
 use crate::tx::{TxEntry, TxID};
 use crate::{
-    ClearToken, Constraint, Dict, Expression, Merlin, Point, Scalar, String, Token, Value,
-    Variable, WideToken,
+    ClearToken, Constraint, Dict, Expression, Merlin, Point, Scalar, Token, Value, Variable,
+    WideToken,
 };
 
 #[cfg(feature = "debugger")]
@@ -191,6 +191,8 @@ const GAS_EXTERNAL_FINALIZE_BASE: u64 = 2_000;
 const GAS_R1CS_ITEM: u64 = 120;
 const GAS_MSM_VERIFY_BASE: u64 = 220;
 const GAS_MSM_VERIFY_TERM: u64 = 12 + GAS_POINT_DECOMPRESS;
+// Policy premium for non-batchable, data-dependent execution; not a measured timing ratio.
+const GAS_MSM_EVAL_FACTOR: u64 = 4;
 
 fn alloc_byte_gas(n: usize) -> Result<u64, VMError> {
     u64::try_from(n)
@@ -207,6 +209,21 @@ fn alloc_item_gas(n: usize) -> Result<u64, VMError> {
 fn linear_gas(base: u64, per_item: u64, n: usize) -> Result<u64, VMError> {
     let n = u64::try_from(n).map_err(|_| VMError::OutOfGas)?;
     base.checked_add(n.checked_mul(per_item).ok_or(VMError::OutOfGas)?)
+        .ok_or(VMError::OutOfGas)
+}
+
+/// Full opcode price: instruction, term traversal, crypto work and two batch vectors.
+fn msm_verify_gas(terms: usize) -> Result<u64, VMError> {
+    linear_gas(
+        GAS_PER_INSTRUCTION + GAS_MSM_VERIFY_BASE,
+        GAS_MSM_VERIFY_TERM + 1 + 2 * GAS_PER_ALLOC_ITEM,
+        terms,
+    )
+}
+
+fn msm_eval_gas(terms: usize) -> Result<u64, VMError> {
+    msm_verify_gas(terms)?
+        .checked_mul(GAS_MSM_EVAL_FACTOR)
         .ok_or(VMError::OutOfGas)
 }
 
@@ -527,7 +544,7 @@ impl CallFrame {
     }
 
     /// Compatibility source-bytecode entry. Production transaction and actor
-    /// entry points use `from_cell`; bounded String/signcall code also adapts here.
+    /// entry points use `from_cell`; bounded byte-source/signcall code also adapts here.
     pub(crate) fn from_bytecode(bytecode: Vec<u8>, kind: CallKind, gas_limit: u64) -> Self {
         Self::from_code(Script::Opaque(bytecode), kind, gas_limit)
     }
@@ -1301,16 +1318,12 @@ impl VM {
                 self.push_value(Value::Scalar(i));
                 Ok(())
             }
-            I::BytesLiteral(literal) => {
+            I::CellLiteral(literal) => {
                 let reference = self.current_call.program.as_mut().unwrap().load_ref()?;
-                let witness = if matches!(literal.as_ref(), String::Witness(_)) {
-                    if literal.to_cell()?.id() != reference.id() {
-                        return Err(VMError::TaprootProofMismatch);
-                    }
-                    Some(literal)
-                } else {
-                    None
-                };
+                if literal.id() != reference.id() {
+                    return Err(VMError::TaprootProofMismatch);
+                }
+                let witness = literal.witness.clone();
                 self.push_value(Value::Cell(crate::CellValue { reference, witness }));
                 Ok(())
             }
@@ -1321,9 +1334,17 @@ impl VM {
                 Ok(())
             }
             I::PushToken => self.op_pushtoken(),
-            I::PushCell(_) => {
+            I::PushCell(literal) => {
                 let reference = self.current_call.program.as_mut().unwrap().load_ref()?;
-                self.push_value(Value::Cell(reference.into()));
+                let witness = if let Some(literal) = literal {
+                    if literal.id() != reference.id() {
+                        return Err(VMError::TaprootProofMismatch);
+                    }
+                    literal.witness
+                } else {
+                    None
+                };
+                self.push_value(Value::Cell(crate::CellValue { reference, witness }));
                 Ok(())
             }
             I::Exec => self.op_exec(),
@@ -1406,6 +1427,7 @@ impl VM {
             I::Sha512 => self.op_hash::<sha2::Sha512>(128),
             I::Sha3 => self.op_hash::<sha3::Sha3_256>(136),
             I::CellHash => self.op_cell_hash(),
+            I::EvalPoint => self.op_eval_point(),
             I::Log => self.op_log(),
 
             I::Amount => self.op_amount(),
@@ -1685,7 +1707,6 @@ impl VM {
         }
         let idx = len - 1 - k;
         let bytes = match &self.current_call.stack[idx] {
-            Value::String(s) => s.len(),
             _ => 0,
         };
         self.charge_alloc_bytes(bytes)?;
@@ -1803,7 +1824,7 @@ impl VM {
     }
 
     /// Restore private annotations only after checking the authenticated public bytes.
-    fn pop_annotated_bytes(&mut self) -> Result<(Value, Option<Arc<String>>), VMError> {
+    fn pop_annotated_bytes(&mut self) -> Result<(Value, Option<Arc<crate::CellWitness>>), VMError> {
         let value = self.pop_value()?;
         let witness = match &value {
             Value::Cell(cell) => cell.witness.clone(),
@@ -1813,12 +1834,18 @@ impl VM {
         // Identical public charge with or without a private annotation.
         self.charge_alloc_bytes(source.byte_payload()?.len())?;
         if let Some(witness) = &witness {
-            witness.check_len()?;
+            if witness.len() > cells::MAX_CELL_PAYLOAD {
+                return Err(CellError::PayloadTooLarge {
+                    actual: witness.len(),
+                    max: cells::MAX_CELL_PAYLOAD,
+                }
+                .into());
+            }
             if witness.len() != source.byte_payload()?.len()
                 || witness.to_bytes_vec() != source.byte_payload()?
             {
                 return Err(VMError::Cell(CellError::CellCommitmentMismatch(
-                    witness.to_cell()?.id(),
+                    Cell::new(witness.to_bytes_vec(), vec![])?.id(),
                 )));
             }
         }
@@ -1829,10 +1856,8 @@ impl VM {
         let (source, witness) = self.pop_annotated_bytes()?;
         let bytes = array32(source.byte_payload()?).ok_or(VMError::TypeNotPoint)?;
         if let Some(witness) = witness {
-            if let String::Witness(value) = witness.as_ref() {
-                if let crate::StringWitness::Point(Point::Commitment(commitment)) = value.as_ref() {
-                    return Ok(commitment.as_ref().clone());
-                }
+            if let crate::CellWitness::Point(Point::Commitment(commitment)) = witness.as_ref() {
+                return Ok(commitment.as_ref().clone());
             }
         }
         Ok(Commitment::Closed(CompressedRistretto(bytes)))
@@ -1971,7 +1996,6 @@ impl VM {
         let copied = match dict.get_resolved(&k, &mut self.resolver())? {
             Some(v) => {
                 let bytes = match v {
-                    Value::String(s) => s.len(),
                     _ => 0,
                 };
                 self.charge_alloc_bytes(bytes)?;
@@ -2292,7 +2316,7 @@ impl VM {
             return Err(VMError::StackUnderflow);
         }
         // CS-lift only when an operand is actually a CS type (Variable /
-        // Expression). A "non-Scalar" test would wrongly route String /
+        // Expression). A "non-Scalar" test would wrongly route Cell /
         // Point comparisons (e.g. the `anchor … eq verify` binding idiom)
         // into `to_expression()` and hard-fail in external context.
         let cs_involved = matches!(
@@ -2509,12 +2533,10 @@ impl VM {
             Value::MultiscalarMul(m) => {
                 self.require_external()?;
                 let terms = m.into_terms();
-                self.current_call.charge_gas(linear_gas(
-                    GAS_MSM_VERIFY_BASE,
-                    GAS_MSM_VERIFY_TERM,
-                    terms.len(),
-                )?)?;
-                self.charge_alloc_items(terms.len().saturating_mul(2))?;
+                // Instruction and term traversal were already charged above.
+                self.current_call.charge_gas(
+                    msm_verify_gas(terms.len())? - GAS_PER_INSTRUCTION - terms.len() as u64,
+                )?;
                 let scalars: Vec<curve25519_dalek::scalar::Scalar> =
                     terms.iter().map(|(s, _)| *s).collect();
                 let points: Vec<Option<curve25519_dalek::ristretto::RistrettoPoint>> =
@@ -2543,7 +2565,22 @@ impl VM {
         }
     }
 
-    /// _prog_ **run** → _results…_
+    /// Public MSM evaluation is allowed in both execution contexts and never touches a batch.
+    fn op_eval_point(&mut self) -> Result<(), VMError> {
+        let terms = match self.current_call.stack.last() {
+            Some(Value::MultiscalarMul(msm)) => msm.len(),
+            Some(_) => return Err(VMError::TypeNotMultiscalarMul),
+            None => return Err(VMError::StackUnderflow),
+        };
+        self.current_call
+            .charge_gas(msm_eval_gas(terms)? - GAS_PER_INSTRUCTION)?;
+        let Value::MultiscalarMul(msm) = self.pop_value()? else {
+            unreachable!()
+        };
+        self.push_value(Value::Point(msm.evaluate()?));
+        Ok(())
+    }
+
     /// **label:n** → ø — record a jump target. See ADR 0015.
     fn op_label(&mut self, n: u32) -> Result<(), VMError> {
         self.current_call.record_label(n as usize)
@@ -2855,8 +2892,8 @@ impl VM {
 
     /// _cid tag_ **issuepubflv** → _int_
     ///
-    /// Consumer-side helper for `issuepub`: pops `tag` (String) and
-    /// `cid` (String, exactly 32 bytes — an actor id), pushes
+    /// Consumer-side helper for `issuepub`: pops `tag` (Cell/Slice/Builder) and
+    /// `cid` (Cell/Slice/Builder, exactly 32 bytes — an actor id), pushes
     /// `flavor_from_actor(cid, tag)` as `Scalar`. Pure helper: no CS,
     /// no txlog effect, no actor-context requirement. Use to
     /// recompute and verify a cleartext token's flavor without
@@ -2872,8 +2909,8 @@ impl VM {
 
     /// _pred tag_ **issueprivflv** → _int_
     ///
-    /// Consumer-side helper for `issuepriv`: pops `tag` (String) and
-    /// `pred` (String, exactly 32 bytes — a compressed Ristretto
+    /// Consumer-side helper for `issuepriv`: pops `tag` (Cell/Slice/Builder) and
+    /// `pred` (Cell/Slice/Builder, exactly 32 bytes — a compressed Ristretto
     /// predicate point), pushes `flavor_from_predicate(pred, tag)` as
     /// `Scalar`. Pure helper: no CS, no txlog effect, no
     /// predicate-context requirement. Use to recompute and verify a
@@ -3081,11 +3118,7 @@ impl VM {
         let msg = Self::signcall_message(program_bytes.byte_payload()?);
         self.charge_alloc_bytes(code_bytes)?;
         let code = match witness.as_deref() {
-            Some(value @ String::Witness(annotation))
-                if matches!(annotation.as_ref(), crate::StringWitness::Script(_)) =>
-            {
-                value.clone().into_script()?
-            }
+            Some(value @ crate::CellWitness::Script(_)) => value.clone().into_script()?,
             _ => Script::Opaque(program_bytes.byte_payload()?.to_vec()),
         };
         let verification_key = contract.predicate.verification_key();
@@ -3351,7 +3384,7 @@ impl VM {
     /// the current actor (which must be checked out by a prior `load` —
     /// else `SaveWithoutLoad`, since saving would clobber live state).
     /// Portability is the canonical storage gate — every inserted value
-    /// must be portable (`Scalar`, `String`, `Point`, `Dict` of
+    /// must be portable (`Scalar`, `Cell`, `Point`, `Dict` of
     /// portable, non-negative `ClearToken`, `Token`). Non-portable
     /// values (`Contract`, `Merlin`, `Variable`, `Expression`,
     /// `Constraint`, `MultiscalarMul`, `WideToken`, negative
@@ -3995,7 +4028,9 @@ mod cell_execution_tests {
             },
             frame,
         );
-        vm.push_value(Value::String(String::from(vec![7; 1000])));
+        vm.push_value(Value::Cell(
+            crate::CellValue::from_bytes(vec![7; 1000]).unwrap(),
+        ));
         let mut costs = Vec::new();
         for _ in 0..20 {
             vm.push_value(Value::Scalar(Scalar::ZERO));
@@ -4015,8 +4050,33 @@ mod cell_execution_tests {
     }
 
     #[test]
-    fn dictionary_insertion_rejects_unpaid_large_value_encoding() {
-        let frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 100);
+    fn dictionary_insertion_charges_for_a_cell_reference_not_its_body() {
+        let mut costs = Vec::new();
+        for length in [0, cells::MAX_CELL_PAYLOAD] {
+            let cell = crate::CellValue::from_bytes(vec![7; length]).unwrap();
+            let id = cell.id();
+            let frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 100);
+            let mut vm = VM::new(
+                TxHeader {
+                    version: 1,
+                    locktime: 0,
+                },
+                frame,
+            );
+            vm.push_value(Value::Dict(Dict::new()));
+            vm.push_value(Value::Scalar(Scalar::ZERO));
+            vm.push_value(Value::Cell(cell));
+            vm.op_put().unwrap();
+            costs.push(vm.current_call.gas_used);
+            let dict = vm.pop_value().unwrap().to_dict().unwrap();
+            assert!(
+                matches!(dict.get(&Scalar::ZERO), Some(Value::Cell(value)) if value.id() == id)
+            );
+        }
+        assert_eq!(costs[0], costs[1]);
+        assert!(costs[0] > 0);
+
+        let frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, costs[0] - 1);
         let mut vm = VM::new(
             TxHeader {
                 version: 1,
@@ -4026,7 +4086,7 @@ mod cell_execution_tests {
         );
         vm.push_value(Value::Dict(Dict::new()));
         vm.push_value(Value::Scalar(Scalar::ZERO));
-        vm.push_value(Value::String(String::from(vec![7; String::MAX_LEN])));
+        vm.push_value(Value::Cell(crate::CellValue::from_bytes(vec![]).unwrap()));
         assert!(matches!(vm.op_put(), Err(VMError::OutOfGas)));
     }
 
@@ -4131,7 +4191,7 @@ mod cell_execution_tests {
         let program = ScriptBuilder::new()
             .with_script_witness(branch)
             .unwrap()
-            .push_str(String::contract(contract))
+            .push_literal(crate::CellValue::contract(contract))
             .input()
             .push_point(*proof.internal_key.as_bytes())
             .push_cell(proof.root)

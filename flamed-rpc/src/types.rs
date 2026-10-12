@@ -415,12 +415,6 @@ pub enum TxValue {
         /// Exact scalar string.
         value: String,
     },
-    /// A byte string.
-    String {
-        /// All bytes, encoded as base64.
-        #[serde(with = "crate::codec::base64")]
-        bytes: Vec<u8>,
-    },
     /// A dictionary with all its values available.
     Dict {
         /// Entries in ascending scalar-key order.
@@ -448,7 +442,7 @@ pub enum TxValue {
         #[serde(with = "crate::codec::hex32")]
         flavor_commitment: [u8; 32],
     },
-    /// A value with missing bodies that prevent full decoding.
+    /// A Cell value, or a value with missing bodies that prevent full decoding.
     Cells {
         /// Value root hash. The root body can also be absent.
         root: CellId,
@@ -467,7 +461,7 @@ pub struct DictEntry {
     pub value: TxValue,
 }
 
-/// One available body from a partially archived value.
+/// One available body from a Cell value or partially archived value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValueCell {
     /// Cell identifier.

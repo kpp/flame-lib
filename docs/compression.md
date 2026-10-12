@@ -656,135 +656,55 @@ Only Utreexo retains the specialized `merkle` accumulator machinery. See
 
 ### Contract API
 
-Today `StringWitness::Contract(Contract)` emits the complete Contract serialization into
-`pushstr`, while the verifier decodes that string in `input`. The new prover
-view should retain the typed Contract but emit only its `ContractID`:
+The implemented carrier is `CellValue::contract(contract)`, whose public
+zero-ref Cell contains only the 32-byte ContractID. Its optional direct
+`CellWitness::Contract` retains private commitment openings; no separate
+String or ContractRef wrapper exists. `ScriptBuilder::push_literal` lowers
+this Cell to a program reference consumed by `pushcell`, while collecting the
+Contract's public bodies into the transaction's committed execution hierarchy.
 
-```rust
-enum ContractRef {
-    Resident(Contract), // prover-only body; public form is ContractID
-    Hash(ContractID),   // verifier bytecode view
-}
-
-impl ContractRef {
-    fn open_owned(self, cx: &mut dyn WitnessContext) -> Result<Contract, VMError>;
-}
-```
-
-This reference does not replace the full canonical `Contract::encode` used inside
-the witness blob. The smallest executable carrier is a transparent-only
-`StringWitness::ContractRef { id, contract }`: its public String bytes are always the
-32-byte ID, while it retains the Contract only in the prover's instruction. A
-builder helper `push_contract_ref(contract)` emits that witness-bearing `PushStr`; the
-decoded verifier instruction is the same `PushStr(String::Opaque(ContractID))`.
-This requires a new consuming `String::into_contract_ref`: it accepts the typed
-prover witness or an exact 32-byte opaque verifier value and rejects every
-other String. Every existing String byte-view/encoding arm must expose only the
-ID for this witness. `op_input` uses that method before calling `open_owned`;
-the current full-body `String::to_contract` path remains only for the old version.
-
-`open_owned` always requests `ContractBody(ContractID)`. The recording side serializes
-the resident Contract into the table, decodes and rechecks the public view, and
-returns the original Contract so open token assignments survive. The verifier
-loads the bytes, performs a bounded exact Contract decode, recomputes `ContractID`, and
-returns that Contract. `input` therefore becomes conceptually:
+`input` reads the exact ID from a zero-ref Cell/Slice/Builder payload, resolves
+and authenticates the public Contract body, and only then restores matching
+private atomic witnesses. A private annotation cannot replace missing public
+data. Dict branches may remain pruned and resolve lazily through the same
+execution context; raw Cell parsing never instantiates owned Tokens.
 
 ```text
-_contract_id_ input -> _contract_
+_contract_id:bytes32_ input -> _contract_
 ```
 
-The short operand reduces transaction script bytes, not execution cost:
-`input` charges the Contract witness bytes and bounded decode/materialization work
-before allocating the body.
-
-After `input`, the ordinary in-memory Contract is fully instantiated and its
-anchor, predicate, and payload are read normally. This first version does not
-partially hydrate the Contract header or payload itself, and every Dict in the
-current Contract encoding must be fully materialized. A later versioned Contract/Value
-encoding can commit the full Dict envelope and thereby permit witnessed nested
-Dict links without changing the contextual API.
-
-Resolving the Contract body is not proof that it is unspent. The existing Utreexo
-membership/delete proof remains a separate chain-layer check keyed by the
-current forest root and `ContractID`; it can move into the same table later without
-combining the two verification rules. Duplicate ContractIDs must be rejected by
-the transaction's Utreexo batch before any candidate effects commit, so two
-body resolutions cannot become two accepted spends.
+Resolution charges bounded lookup, decode and materialization work. It does
+not prove that the Contract is unspent: Utreexo membership/delete verification
+and duplicate-input rejection remain separate chain-layer checks. The
+Contract-ID operand format is unchanged by the CellValue migration.
 
 ### Predicate API
 
-A tree-backed Predicate can be treated as a committed list of programs even
-though its wire form is the tweaked point. Predicate also retains its key-path
-signature spend and may carry another `PredicateWitness`; the list abstraction
-applies specifically when its witness is a `PredicateTree`. That current tree
-can build a path for one selected program. Move the explicit internal-key,
-neighbors, position, and full-program operands behind one method:
-
-```rust
-struct ProgramID([u8; 32]);
-
-impl ProgramID {
-    // Exposes the same tagged transcript formula used by today's private
-    // program_leaf_hash helper.
-    fn from_bytecode(bytecode: &[u8]) -> Self;
-}
-
-struct TaprootOpening {
-    tree_len: u64,
-    leaf_rank: u64,
-    internal_key: [u8; 32],
-    program: Vec<u8>,
-    siblings: Vec<Hash>,
-}
-
-impl Predicate {
-    fn program(
-        &self,
-        program_id: ProgramID,
-        local_script: Option<Script>,
-        cx: &mut dyn WitnessContext,
-    ) -> Result<Script, VMError>;
-}
-```
-
-As with Contract input, transparent execution needs a carrier for the richer local
-script. A `StringWitness::ProgramRef { id, script }` can encode publicly as the
-32-byte `ProgramID`; verifier bytecode sees the opaque ID, while `op_open`
-passes the prover's `Script::Transparent` as `local_script`. This is distinct
-from the existing full-byte `StringWitness::Script` used where the script
-itself remains an operand. A matching `String::into_program_ref` handles the
-typed/opaque views and validates the exact ID length; all generic String byte
-views expose only `ProgramID`.
-
-The request subject is the opaque predicate point and the selector is
-`ProgramID`. The recording side asks the attached `PredicateTree` for only this
-opening. Both sides require the program leaf hash to equal `ProgramID`, require
-`leaf_rank < tree_len`, validate the exact sibling count and directions implied
-by the current uneven-tree split, and reconstruct the Taproot root and tweaked
-point. Duplicate identical program bytecode is intentionally equivalent; any
-valid occurrence may satisfy the same `ProgramID`. For deterministic
-construction the recorder chooses the lowest matching local rank on first
-access, commits that one opening, and reuses the same request mapping on every
-later access. Verification accepts the committed valid occurrence; it need not
-prove that no earlier duplicate exists because all occurrences commit identical
-bytecode. The prover returns its matching `Script::Transparent`; the verifier
-returns `Script::Opaque`.
-
-The resulting `open` stack can shrink to:
+The implemented Taproot opening uses an inner Point and a policy Cell root,
+not a ProgramID selector or a separate sibling-hash proof:
 
 ```text
-_contract program_id gas args... k_ open -> _results... k' 1 | contract args... k 0_
+_contract inner_key policy_cell gas args... k_ open
+    -> _results... k' 1 | contract args... k 0_
 ```
 
-After operand parsing has successfully moved the Contract and `k` arguments,
-`open` keeps them in local temporaries while resolving the witness. A missing
-or invalid opening restores those exact values and returns count `k`, status
-`0`; it must not lose the Contract or expose its payload. Stack/type/count errors,
-or inability to reserve the requested child gas, remain hard errors because no
-valid call entry was described. On a witness failure, refund the unused child
-grant while retaining the gas charged for lookup, decode, hashing, and proof
-verification. Only a successful entry creates the existing cloned failure
-escrow for errors inside the child frame.
+`open` authenticates the policy Cell's hash(0) under the tweaked predicate and
+executes its factual graph in an isolated frame. Explicit pruning stays
+visible. The policy author may place code directly in the root, or dispatch
+among child programs using `runslice`, `loadref` and `exec`. These are ordinary
+Cell paths; the VM does not separately select or decode a Taproot leaf.
+
+`PredicateTree::opening_for` and `ScriptBuilder::push_taproot_proof` are optional
+host helpers that produce an executable partial root and retain matching
+private instruction overlays outside its public identity. `CellWitness::Script`
+instead retains the existing bounded source-byte program operand for
+`signcall`; it is not a ProgramRef or a new graph-aware signature format.
+
+On entered-call failure, the original Contract and explicit arguments are
+restored, with count `k` excluding the Contract and status `0`. Unused child
+gas is refunded on success or failure; consumed resolution, verification and
+execution work remains charged. Invalid stack/type/count operands or inability
+to reserve a child grant are hard errors.
 
 ### Actor API
 

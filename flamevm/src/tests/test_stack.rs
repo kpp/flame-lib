@@ -89,10 +89,10 @@ fn pushtoken_zero_qty_with_flavor() {
 
 #[test]
 fn pushtoken_requires_int_flavor() {
-    // pushstr "x", pushtoken — top is String, not Scalar.
+    // pushstr "x", pushtoken — top is CellValue, not Scalar.
     let mut vm = vm_with_script(
         ScriptBuilder::new()
-            .push_str(String::from(b"x".to_vec()))
+            .push_literal(CellValue::from_bytes(b"x".to_vec()).unwrap())
             .pushtoken()
             .to_bytecode(),
     );

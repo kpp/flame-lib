@@ -5,6 +5,8 @@ use thiserror::Error;
 /// Represents an error in proof creation, verification, or parsing.
 #[derive(Error, Debug)]
 pub enum VMError {
+    #[error("Item is not a MultiscalarMul")]
+    TypeNotMultiscalarMul,
     #[error("Item is not a Cell")]
     TypeNotCell,
     #[error("Item is not a Slice")]
@@ -66,14 +68,6 @@ pub enum VMError {
     /// gas alone would otherwise be the only limit on a call cycle).
     #[error("call depth exceeded")]
     CallDepthExceeded,
-
-    /// This error occurs when an instruction requires a String.
-    #[error("Item is not a String")]
-    TypeNotString,
-
-    /// A VM String must fit in one Cell payload, without snake continuations.
-    #[error("String exceeds the single-Cell payload limit")]
-    StringTooLong,
 
     /// This error occurs when `verify` sees a zero value on top of the stack.
     #[error("verify failed: zero value")]

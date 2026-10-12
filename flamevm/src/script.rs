@@ -15,7 +15,7 @@ use crate::crypto::Point;
 use crate::errors::VMError;
 use crate::ops::Instruction;
 use crate::scalar::Scalar;
-use crate::string::{String, StringWitness};
+use crate::{CellValue, CellWitness};
 
 /// A program is a list of [`Instruction`]s. Build with the fluent
 /// methods (`alloc`, `add`, `eq`, `verify`, …) and call `build_tx` to package
@@ -77,7 +77,7 @@ impl ScriptBuilder {
             bag.extend(cells)?;
         }
         for witness in self.witnesses() {
-            if let StringWitness::Contract(contract) = witness {
+            if let CellWitness::Contract(contract) = witness {
                 bag.extend(&CellIndex::collect(Arc::new(contract.to_cell()?))?)?;
             }
         }
@@ -89,7 +89,7 @@ impl ScriptBuilder {
         self.witnesses()
             .into_iter()
             .filter_map(|witness| match witness {
-                StringWitness::Contract(contract) => Some((contract.id(), contract.clone())),
+                CellWitness::Contract(contract) => Some((contract.id(), contract.clone())),
                 _ => None,
             })
             .collect()
@@ -100,25 +100,27 @@ impl ScriptBuilder {
     pub fn script_witnesses(&self) -> Result<BTreeMap<CellID, Vec<Instruction>>, CellError> {
         let mut scripts = self.scripts.clone();
         for witness in self.witnesses() {
-            if let StringWitness::Script(instructions) = witness {
+            if let CellWitness::Script(instructions) = witness {
                 scripts.extend(compile_program(instructions)?.1);
             }
         }
         Ok(scripts)
     }
 
-    fn witnesses(&self) -> Vec<&StringWitness> {
+    fn witnesses(&self) -> Vec<&CellWitness> {
         let mut pending = vec![self.instructions.as_slice()];
         pending.extend(self.scripts.values().map(Vec::as_slice));
         let mut witnesses = Vec::new();
         while let Some(instructions) = pending.pop() {
             for instruction in instructions {
-                if let Instruction::BytesLiteral(literal) = instruction {
-                    let String::Witness(witness) = literal.as_ref() else {
-                        continue;
-                    };
-                    witnesses.push(witness.as_ref());
-                    if let StringWitness::Script(nested) = witness.as_ref() {
+                let literal = match instruction {
+                    Instruction::CellLiteral(literal) => Some(literal.as_ref()),
+                    Instruction::PushCell(Some(literal)) => Some(literal),
+                    _ => None,
+                };
+                if let Some(witness) = literal.and_then(CellValue::witness) {
+                    witnesses.push(witness);
+                    if let CellWitness::Script(nested) = witness {
                         pending.push(nested);
                     }
                 }
@@ -215,15 +217,15 @@ impl ScriptBuilder {
         self
     }
 
-    /// Compatibility host helper: compile bytes into a literal Cell and `pushcell`.
-    pub fn push_str<T: Into<String>>(mut self, s: T) -> Self {
+    /// Host literal: native `pushcell`, with payload-only Cells retained in byte-source APIs.
+    pub fn push_literal(mut self, cell: CellValue) -> Self {
         self.instructions
-            .push(Instruction::BytesLiteral(Arc::new(s.into())));
+            .push(Instruction::CellLiteral(Arc::new(cell)));
         self
     }
 
     /// `pushcell` (0xa6): consumes the next literal ref of the executing program.
-    pub fn push_cell(mut self, cell: impl Into<CellRef>) -> Self {
+    pub fn push_cell(mut self, cell: impl Into<CellValue>) -> Self {
         self.instructions
             .push(Instruction::PushCell(Some(cell.into())));
         self
@@ -235,21 +237,15 @@ impl ScriptBuilder {
         self
     }
 
-    /// Host byte literal carrying a witness-bearing compatibility sub-script. The
-    /// prover pushes the inner ScriptBuilder's instructions (witness
-    /// slots intact) wrapped in `String::Witness(StringWitness::Script)`;
-    /// downstream `op_signcall` walks those
-    /// instructions directly. Verifier-side bytecode encodes to
-    /// the compiled bytes of `inner.to_bytecode()`, so both sides
-    /// see the same wire form.
-    pub fn push_script(mut self, inner: ScriptBuilder) -> Self {
+    /// Cell literal carrying a private source-byte script annotation for `signcall`.
+    pub fn push_script(mut self, inner: ScriptBuilder) -> Result<Self, CellError> {
         self.cells.extend(inner.cells);
         self.scripts.extend(inner.scripts);
         self.instructions
-            .push(Instruction::BytesLiteral(Arc::new(String::script(
+            .push(Instruction::CellLiteral(Arc::new(CellValue::script(
                 inner.instructions,
-            ))));
-        self
+            )?)));
+        Ok(self)
     }
 
     /// `pushpoint` (0x1a) from raw 32 bytes (the verifier-style
@@ -482,14 +478,14 @@ impl ScriptBuilder {
         self
     }
 
-    /// `scalar` (0x5a) — `string → expr`. Lifts a 32-byte String
+    /// `scalar` (0x5a) — `cell/slice/builder → expr`. Lifts 32 payload bytes
     /// (parsed as `Scalar`) into a constant Expression.
     pub fn scalar(mut self) -> Self {
         self.instructions.push(Instruction::Scalar);
         self
     }
 
-    /// `commit` (0x5b) — `string → var`. Promotes a 32-byte String
+    /// `commit` (0x5b) — `cell/slice/builder → var`. Promotes 32 payload bytes
     /// (parsed as a Pedersen commitment) into a Variable.
     pub fn commit(mut self) -> Self {
         self.instructions.push(Instruction::Commit);
@@ -558,6 +554,11 @@ impl ScriptBuilder {
     }
     pub fn cell_hash(mut self) -> Self {
         self.instructions.push(Instruction::CellHash);
+        self
+    }
+    /// `msm evalpoint → point`: evaluate public group arithmetic immediately.
+    pub fn eval_point(mut self) -> Self {
+        self.instructions.push(Instruction::EvalPoint);
         self
     }
     pub fn sha512(mut self) -> Self {
@@ -824,9 +825,9 @@ impl ScriptBuilder {
     // ── Contract + I/O ───────────────────────────────────
 
     /// `input`. Witness data (open commitments on Token
-    /// payloads) rides on the pushed String value — call
-    /// `push_str(String::contract(c))` before this on the prover side;
-    /// verifiers push `String::Opaque(contract.id().to_vec())` and resolve
+    /// payloads) rides on the pushed CellValue — call
+    /// `push_literal(CellValue::contract(c))` before this on the prover side;
+    /// verifiers push `CellValue::from_bytes(contract.id().to_vec())?` and resolve
     /// the body from the transaction's public witness Cell hierarchy.
     pub fn input(mut self) -> Self {
         self.instructions.push(Instruction::Input);
@@ -998,7 +999,7 @@ impl Script {
                 let mut refs = cell.refs().iter();
                 for instruction in &mut instructions {
                     if matches!(instruction, Instruction::PushCell(_)) {
-                        *instruction = Instruction::PushCell(refs.next().cloned());
+                        *instruction = Instruction::PushCell(refs.next().cloned().map(Into::into));
                     }
                 }
                 if refs.next().is_some() {
@@ -1085,7 +1086,7 @@ pub(crate) fn compile_program(
         .filter(|instruction| {
             matches!(
                 instruction,
-                Instruction::PushCell(Some(_)) | Instruction::BytesLiteral(_)
+                Instruction::PushCell(Some(_)) | Instruction::CellLiteral(_)
             )
         })
         .count();
@@ -1102,7 +1103,7 @@ pub(crate) fn compile_program(
             let size = instruction.encoded_size();
             let count = usize::from(matches!(
                 instruction,
-                Instruction::PushCell(Some(_)) | Instruction::BytesLiteral(_)
+                Instruction::PushCell(Some(_)) | Instruction::CellLiteral(_)
             ));
             let mut continues = bytes + remaining_bytes > cells::MAX_CELL_PAYLOAD
                 || refs + remaining_refs > cells::MAX_CELL_REFS;
@@ -1151,19 +1152,19 @@ pub(crate) fn compile_program(
     for mut group in groups.into_iter().rev() {
         let mut refs = group
             .iter()
-            .map(|instruction| match instruction {
-                Instruction::PushCell(Some(reference)) => Ok(Some(reference.clone())),
-                Instruction::BytesLiteral(value) => value.to_cell().map(|cell| Some(cell.into())),
-                _ => Ok(None),
+            .filter_map(|instruction| match instruction {
+                Instruction::PushCell(Some(value)) => Some(value.reference.clone()),
+                Instruction::CellLiteral(value) => Some(value.reference.clone()),
+                _ => None,
             })
-            .collect::<Result<Vec<_>, CellError>>()?
-            .into_iter()
-            .flatten()
             .collect::<Vec<_>>();
         if let Some(cell) = next {
             let reference: CellRef = cell.into();
             refs.push(reference.clone());
-            group.extend([Instruction::PushCell(Some(reference)), Instruction::Exec]);
+            group.extend([
+                Instruction::PushCell(Some(reference.into())),
+                Instruction::Exec,
+            ]);
         }
         let mut bytecode = Vec::new();
         for instruction in &group {
@@ -1237,18 +1238,25 @@ mod witness_tests {
         )
         .unwrap();
         let id = contract.id();
-        let reference = String::contract(contract);
-        assert_eq!(reference.to_bytes_vec(), id);
-        assert_eq!(reference.len(), 32);
-        assert!(String::from(id.to_vec()).to_contract().is_err());
+        let reference = CellValue::contract(contract);
+        assert_eq!(reference.payload().unwrap(), id);
+        assert!(matches!(
+            reference.witness(),
+            Some(CellWitness::Contract(_))
+        ));
+        assert!(CellValue::from_bytes(id.to_vec())
+            .unwrap()
+            .witness()
+            .is_none());
 
         let branch = ScriptBuilder::new()
-            .push_str(reference)
+            .push_literal(reference)
             .input()
             .alloc(Some(Scalar::from(9u64)));
         let branch_id = script_cell(&branch.to_bytecode()).unwrap().id();
         let program = ScriptBuilder::new()
             .push_script(branch.clone())
+            .unwrap()
             .with_script_witness(branch)
             .unwrap();
         let bag = program.cell_witnesses().unwrap();
@@ -1267,5 +1275,27 @@ mod witness_tests {
         assert_eq!(public.to_bytecode(), bytecode);
         assert!(public.contract_witnesses().is_empty());
         assert!(public.script_witnesses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn literals_reuse_resident_and_unloaded_cell_references() {
+        let child = Arc::new(Cell::new(vec![1], vec![]).unwrap());
+        let graph = Arc::new(Cell::new(vec![2], vec![child.into()]).unwrap());
+        let resident = CellValue::from(graph.clone());
+        let compiled = ScriptBuilder::new()
+            .push_literal(resident.clone())
+            .to_cell()
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            compiled.refs()[0].as_resident_arc().unwrap(),
+            &graph
+        ));
+
+        let unloaded = resident.reference.to_unloaded();
+        let program = ScriptBuilder::new().push_literal(unloaded.clone().into());
+        let compiled = program.to_cell().unwrap();
+        assert!(compiled.refs()[0].is_unloaded());
+        assert_eq!(compiled.refs()[0].id(), graph.id());
+        assert_eq!(program.to_bytecode(), vec![0xa6]);
     }
 }

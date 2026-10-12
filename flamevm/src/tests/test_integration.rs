@@ -31,7 +31,8 @@ fn data_trace(log: &[TxEntry]) -> Vec<Vec<u8>> {
 
 /// `log "<s>"` as a builder step — emits one `TxEntry::Data`.
 fn log_str(p: ScriptBuilder, s: &str) -> ScriptBuilder {
-    p.push_str(String::from(s.as_bytes().to_vec())).log()
+    p.push_literal(CellValue::from_bytes(s.as_bytes().to_vec()).unwrap())
+        .log()
 }
 
 // ── Loops ────────────────────────────────────────────────────────────
@@ -40,7 +41,7 @@ fn log_str(p: ScriptBuilder, s: &str) -> ScriptBuilder {
 fn while_loop_emits_one_effect_per_iteration() {
     // recv: n=3; while (n) { log "x"; n-- }; drop n.
     let recv = b()
-        .push_str(String::from(b"x".to_vec()))
+        .push_literal(CellValue::from_bytes(b"x".to_vec()).unwrap())
         .push_int(3u64)
         .build_while(|p| p.dup_k(0), |p| p.dup_k(1).log().push_int(-1i64).add())
         .drop_()
@@ -99,8 +100,8 @@ fn continue_skips_rest_of_body_each_iteration() {
 fn if_else_takes_branch_by_selector_arg() {
     // recv reads its top-of-stack arg: if truthy log "then" else "else".
     let recv = b()
-        .push_str(String::from(b"then".to_vec()))
-        .push_str(String::from(b"else".to_vec()))
+        .push_literal(CellValue::from_bytes(b"then".to_vec()).unwrap())
+        .push_literal(CellValue::from_bytes(b"else".to_vec()).unwrap())
         .roll_k(2)
         .build_if_else(|p| p.drop_().log(), |p| p.roll_k(1).drop_().log())
         .to_bytecode();
@@ -211,7 +212,7 @@ fn setcode_upgrade_changes_dispatched_behavior() {
     let recv_v1 = log_str(b(), "v1").to_bytecode();
     // Method 1: push the new code string, setcode.
     let upgrade = b()
-        .push_str(String::from(c2.clone()))
+        .push_literal(CellValue::from_bytes(c2.clone()).unwrap())
         .setcode()
         .to_bytecode();
     let id = ActorID::Hash([0xcc; 32]);

@@ -9,9 +9,9 @@ fn send_script(target: &ActorID, refund: [u8; 32], selector: u64, gas: u64) -> V
     ScriptBuilder::new()
         .push_int(selector)
         .push_int(1u64)
-        .push_str(String::from(refund.to_vec()))
+        .push_literal(CellValue::from_bytes(refund.to_vec()).unwrap())
         .push_int(gas)
-        .push_str(String::from(target.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(target.to_hash().to_vec()).unwrap())
         .send()
         .to_bytecode()
 }
@@ -87,9 +87,9 @@ fn send_rejects_malformed_addresses() {
     ] {
         let code = ScriptBuilder::new()
             .push_int(0u64)
-            .push_str(String::from(refund))
+            .push_literal(CellValue::from_bytes(refund).unwrap())
             .push_int(1u64)
-            .push_str(String::from(target))
+            .push_literal(CellValue::from_bytes(target).unwrap())
             .send()
             .to_bytecode();
         let mut reg = MemRegistry::new();
@@ -118,9 +118,9 @@ fn send_rejects_nested_nonportable_payload() {
     vm.current_call.stack = vec![
         Value::Dict(outer),
         Value::Scalar(Scalar::ONE),
-        witness_cell(String::from(vec![0u8; 32])),
+        witness_cell(CellValue::from_bytes(vec![0u8; 32]).unwrap()),
         Value::Scalar(Scalar::ONE),
-        witness_cell(String::from(vec![0u8; 32])),
+        witness_cell(CellValue::from_bytes(vec![0u8; 32]).unwrap()),
     ];
     assert!(matches!(
         vm.step_internal(),
@@ -134,9 +134,9 @@ fn send_rejects_widetoken_payload() {
         .push_int(1u64)
         .fee()
         .push_int(1u64)
-        .push_str(String::from(vec![0u8; 32]))
+        .push_literal(CellValue::from_bytes(vec![0u8; 32]).unwrap())
         .push_int(1u64)
-        .push_str(String::from(vec![0u8; 32]))
+        .push_literal(CellValue::from_bytes(vec![0u8; 32]).unwrap())
         .send()
         .to_bytecode();
     let mut vm = vm_external_with_script(script);
@@ -177,9 +177,9 @@ fn send_preserves_constructor_code_for_first_delivery() {
     let target = ActorID::Constructor(ScriptBuilder::new().nop().to_bytecode());
     let script = ScriptBuilder::new()
         .push_int(0u64)
-        .push_str(String::from(vec![0; 32]))
+        .push_literal(CellValue::from_bytes(vec![0; 32]).unwrap())
         .push_int(0u64)
-        .push_str(String::from(target.to_envelope().unwrap().encode()))
+        .push_literal(CellValue::from_bytes(target.to_envelope().unwrap().encode()).unwrap())
         .send()
         .to_bytecode();
     let mut vm = vm_external_with_script(script);

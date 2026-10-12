@@ -83,8 +83,14 @@ fn disassemble(code: &[u8]) -> (Vec<InstructionView>, Option<String>) {
         };
         let text = match op {
             Instruction::PushInt(n) => format!("push {}", scalar(n)),
-            Instruction::BytesLiteral(s) => {
-                format!("pushcell bytes 0x{}", hex::encode(s.to_bytes_vec()))
+            Instruction::CellLiteral(cell) => {
+                format!(
+                    "pushcell bytes 0x{}",
+                    hex::encode(
+                        cell.payload()
+                            .expect("parsed literal has a resident byte payload")
+                    )
+                )
             }
             Instruction::PushPoint(p) => format!("pushpoint 0x{}", hex::encode(p.to_bytes())),
             Instruction::DupK(k) => format!("dup:{k}"),
@@ -346,9 +352,6 @@ fn render_effect(entry: &TxEntry, envelope: &mut CellEnvelope) -> Result<RpcTxEn
 fn render_value(value: &Value, envelope: &mut CellEnvelope) -> Result<TxValue, CellError> {
     Ok(match value {
         Value::Scalar(n) => TxValue::Scalar { value: scalar(*n) },
-        Value::String(s) => TxValue::String {
-            bytes: s.clone().to_bytes(),
-        },
         Value::Cell(cell) => available_cells(cell, envelope)?,
         Value::Point(p) => TxValue::Point { hex: p.to_bytes() },
         Value::ClearToken(t) => TxValue::ClearToken {
@@ -430,9 +433,7 @@ mod tests {
             .any(|cell| cell.id == CellId(child.id()) && cell.data == [9]));
     }
     use curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED;
-    use flamevm::{
-        CellBuilder, CellIndex, ClearToken, Dict, Message, String as VmString, TxHeader, TxLog,
-    };
+    use flamevm::{CellBuilder, CellIndex, CellValue, ClearToken, Dict, Message, TxHeader, TxLog};
     use serde_json::json;
 
     #[test]
@@ -621,7 +622,7 @@ mod tests {
         let predicate = Predicate::opaque(point);
         let token = Value::ClearToken(ClearToken::new(Scalar::from(7u64), Scalar::from(8u64)));
         let dict = Value::Dict(Dict::from_values(vec![
-            Value::String(VmString::Opaque(vec![0xab; 257])),
+            Value::Cell(CellValue::from_bytes(vec![0xab; 257]).unwrap()),
             token.clone(),
         ]));
         let target = ActorID::Constructor(vec![0xcd; 257]);
@@ -677,7 +678,7 @@ mod tests {
         let json = serde_json::to_value(&decoded).unwrap();
         assert_eq!(json[3]["data"]["anchor"], "55".repeat(32));
         assert_eq!(
-            json[3]["data"]["payload"]["entries"][0]["value"]["bytes"],
+            json[3]["data"]["payload"]["entries"][0]["value"]["cells"][0]["data"],
             "q6ur".repeat(85) + "q6s="
         );
         assert_eq!(json[4]["data"]["code"], "7+/v".repeat(85) + "7+8=");

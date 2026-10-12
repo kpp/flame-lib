@@ -165,8 +165,8 @@ pub fn code_from_cell<R: CellReader + ?Sized>(
                 if literal.is_pruned() || !literal.refs().is_empty() {
                     return Err(CellError::InvalidFormat);
                 }
-                crate::Instruction::BytesLiteral(std::sync::Arc::new(crate::String::from(
-                    literal.payload().to_vec(),
+                crate::Instruction::CellLiteral(std::sync::Arc::new(crate::CellValue::from(
+                    literal,
                 )))
                 .encode_source(&mut encoded);
             } else {

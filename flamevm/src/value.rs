@@ -5,10 +5,8 @@ use crate::Merlin;
 use crate::MultiscalarMul;
 use crate::Point;
 use crate::Scalar;
-use crate::String;
 use crate::{ClearToken, Token, WideToken};
 use crate::{Constraint, Expression, SecretConstraint, Variable};
-use cells::CellEncode;
 
 /// Possible values on the stack machine.
 ///
@@ -19,7 +17,6 @@ use cells::CellEncode;
 #[derive(Clone, Debug)]
 pub enum Value {
     Scalar(Scalar),
-    String(String),
     Dict(Dict),
     Point(Point),
     Token(Token),
@@ -46,7 +43,6 @@ impl Value {
     pub fn try_clone(&self) -> Result<Value, VMError> {
         match self {
             Value::Scalar(i) => Ok(Value::Scalar(*i)),
-            Value::String(s) => Ok(Value::String(s.clone())),
             Value::Point(p) => Ok(Value::Point(p.clone())),
             Value::Dict(d) => Ok(Value::Dict(d.try_clone()?)),
             Value::Token(_)
@@ -68,7 +64,7 @@ impl Value {
     /// Plain-data and copyable containers; never linear types.
     pub fn is_copyable(&self) -> bool {
         match self {
-            Value::Scalar(_) | Value::String(_) | Value::Point(_) | Value::Cell(_) | Value::Slice(_) => true,
+            Value::Scalar(_) | Value::Point(_) | Value::Cell(_) | Value::Slice(_) => true,
             Value::Dict(d) => d.is_copyable(),
             _ => false,
         }
@@ -85,7 +81,7 @@ impl Value {
     /// placed into another contract's payload (sealing a contract-in-a-contract).
     pub fn is_portable(&self) -> bool {
         match self {
-            Value::Scalar(_) | Value::String(_) | Value::Point(_) | Value::Cell(_) => true,
+            Value::Scalar(_) | Value::Point(_) | Value::Cell(_) => true,
             Value::Dict(d) => d.is_portable(),
             Value::ClearToken(t) => t.is_portable(),
             // `Token` is portable by construction: public cleartext
@@ -101,7 +97,7 @@ impl Value {
     ///
     /// - **Every copyable type is droppable.** Discarding it is a strict
     ///   subset of duplicate-then-discard, and the type holds no
-    ///   exclusive content. Plain-data: `Scalar`, `String`, `Point`.
+    ///   exclusive content. Plain-data: `Scalar`, `Cell`, `Point`.
     ///   Dicts: droppable iff their sticky `droppable` flag is set.
     /// - **Zero-quantity `ClearToken`** is droppable. It's a flavor
     ///   nameplate with no balance attached.
@@ -115,7 +111,7 @@ impl Value {
     pub fn is_droppable(&self) -> bool {
         match self {
             // Plain data; Cell handles are consuming but hold no bearer asset.
-            Value::Scalar(_) | Value::String(_) | Value::Point(_) | Value::Cell(_) | Value::Slice(_) | Value::Builder(_) => true,
+            Value::Scalar(_) | Value::Point(_) | Value::Cell(_) | Value::Slice(_) | Value::Builder(_) => true,
             // Dict: droppable iff its sticky flag is set (every value
             // ever inserted was droppable).
             Value::Dict(d) => d.is_droppable(),
@@ -135,8 +131,8 @@ impl Value {
     /// Equality across two stack values.
     ///
     /// - Cell/Slice/Builder pairs may match across variants; other mixed types
-    ///   are unequal except the transitional String/byte-Cell pair.
-    /// - Same-variant for plain-data types (`Scalar`, `String`, `Point`):
+    ///   are unequal.
+    /// - Same-variant for plain-data types (`Scalar`, `Cell`, `Point`):
     ///   bitwise / by-value comparison.
     /// - Cell/Slice/Builder pairs compare factual hashes of their current contents.
     /// - Dicts are not comparable.
@@ -149,13 +145,8 @@ impl Value {
         }
         match (self, other) {
             (Value::Scalar(a), Value::Scalar(b)) => Ok(a == b),
-            // Compare by canonical wire bytes so witness-bearing
-            // variants (Point / Scalar / Script / Contract) match the
-            // verifier's view of the same string.
-            (Value::String(a), Value::String(b)) => Ok(a.to_bytes_vec() == b.to_bytes_vec()),
+            // Point annotations do not affect public equality.
             (Value::Point(a), Value::Point(b)) => Ok(a.to_bytes() == b.to_bytes()),
-            // Transitional byte consumers still produce String results.
-            (Value::Cell(cell), Value::String(bytes)) | (Value::String(bytes), Value::Cell(cell)) => Ok(cell.id() == bytes.to_cell()?.id()),
             // Cross-variant always unequal.
             (sa, sb) if core::mem::discriminant(sa) != core::mem::discriminant(sb) => Ok(false),
             // Same-variant non-primitives (Dict, tokens, contracts, linear types):
@@ -201,7 +192,6 @@ impl Value {
     pub fn type_code(&self) -> u8 {
         match self {
             Value::Scalar(_) => 0,
-            Value::String(_) => 1,
             Value::Dict(_) => 2,
             Value::Point(_) => 3,
             Value::Token(_) => 4,
@@ -248,7 +238,6 @@ impl Value {
 
         match self {
             Value::Scalar(_) | Value::ClearToken(_) | Value::Variable(_) => 0,
-            Value::String(s) => s.len() as u64,
             Value::Dict(d) => d.clone_gas(),
             Value::Point(_) | Value::Token(_) | Value::Merlin(_) => 1,
             Value::Cell(_) | Value::Slice(_) => 1,
@@ -268,8 +257,6 @@ impl Value {
 
     /// Downcast to Scalar.
     pub fn to_scalar(self)      -> Result<Scalar, VMError>     { match self { Value::Scalar(x) => Ok(x),     _ => Err(VMError::TypeNotScalar) } }
-    /// Downcast to String.
-    pub fn to_string(self)      -> Result<String, VMError>     { match self { Value::String(x) => { x.check_len()?; Ok(x) }, _ => Err(VMError::TypeNotString) } }
     /// Downcast to Dict.
     pub fn to_dict(self)        -> Result<Dict, VMError>       { match self { Value::Dict(x) => Ok(x),       _ => Err(VMError::TypeNotDict) } }
     /// Downcast to Point.
@@ -409,12 +396,15 @@ mod layout_tests {
     use core::mem::size_of;
 
     use super::Value;
-    use crate::{Merlin, SecretConstraint, String, Token, WideToken};
+    use crate::{CellValue, Merlin, SecretConstraint, Token, WideToken};
 
     #[test]
     fn large_value_variants_stay_indirect() {
         assert_eq!(size_of::<Merlin>(), size_of::<Box<()>>());
-        assert_eq!(size_of::<String>(), size_of::<Vec<u8>>());
+        assert_eq!(
+            size_of::<CellValue>(),
+            size_of::<cells::CellRef>() + size_of::<usize>()
+        );
         assert!(size_of::<SecretConstraint>() <= 3 * size_of::<usize>());
         assert_eq!(size_of::<WideToken>(), 40);
         assert_eq!(size_of::<Value>(), size_of::<Token>());

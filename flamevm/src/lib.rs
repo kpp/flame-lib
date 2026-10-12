@@ -15,7 +15,6 @@ mod prover;
 mod scalar;
 mod script;
 mod slice;
-mod string;
 mod token;
 mod tx;
 mod value;
@@ -27,7 +26,7 @@ pub use actor::{
     ActorRegistry, StoragePurchase,
 };
 pub use address::Address;
-pub use cell_value::CellValue;
+pub use cell_value::{CellValue, CellWitness};
 pub use constraints::{
     Commitment, CommitmentWitness, Constraint, Expression, SecretConstraint, Variable,
 };
@@ -43,7 +42,6 @@ pub use prover::Prover;
 pub use scalar::Scalar;
 pub use script::{Script, ScriptBuilder};
 pub use slice::Slice;
-pub use string::{String, StringWitness};
 pub use token::{flavor_from_actor, ClearToken, Token, WideToken, FLAME_FLAVOR};
 pub use value::Value;
 pub use verifier::Verifier;

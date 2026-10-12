@@ -41,7 +41,7 @@ fn vm_external(script: Vec<u8>) -> VM {
 }
 
 #[test]
-fn selfid_in_internal_root_pushes_hash_string() {
+fn selfid_in_internal_root_pushes_hash_cell() {
     let id = ActorID::Hash([0xab; 32]);
     let mut vm = vm_internal_with(
         id.clone(),
@@ -51,7 +51,7 @@ fn selfid_in_internal_root_pushes_hash_string() {
     );
     vm.step_internal().expect("step ok");
     match vm.current_call.stack.last().expect("stack non-empty") {
-        value @ Value::Cell(_) => assert_str(value, &[0xab; 32]),
+        value @ Value::Cell(_) => assert_bytes(value, &[0xab; 32]),
         _ => panic!("expected Cell"),
     }
 }
@@ -78,7 +78,7 @@ fn selfid_in_constructor_form_uses_canonical_hash_seed() {
     );
     vm.step_internal().expect("step ok");
     match vm.current_call.stack.last().expect("stack non-empty") {
-        value @ Value::Cell(_) => assert_str(value, &expected[..]),
+        value @ Value::Cell(_) => assert_bytes(value, &expected[..]),
         _ => panic!("expected Cell"),
     }
 }
@@ -90,7 +90,7 @@ fn anchor_in_internal_root_pushes_frame_anchor() {
     let mut vm = vm_internal_with(id, None, anc, ScriptBuilder::new().anchor().to_bytecode());
     vm.step_internal().expect("step ok");
     match vm.current_call.stack.last().expect("stack non-empty") {
-        value @ Value::Cell(_) => assert_str(value, &[0xff; 32]),
+        value @ Value::Cell(_) => assert_bytes(value, &[0xff; 32]),
         _ => panic!("expected Cell"),
     }
 }
@@ -107,7 +107,7 @@ fn anchor_in_external_root_errors_anchor_missing() {
 }
 
 #[test]
-fn callerid_with_some_caller_pushes_hash_string() {
+fn callerid_with_some_caller_pushes_hash_cell() {
     let caller = ActorID::Hash([0x33; 32]);
     let mut vm = vm_internal_with(
         ActorID::Hash([0x44; 32]),
@@ -117,13 +117,13 @@ fn callerid_with_some_caller_pushes_hash_string() {
     );
     vm.step_internal().expect("step ok");
     match vm.current_call.stack.last().expect("stack non-empty") {
-        value @ Value::Cell(_) => assert_str(value, &[0x33; 32]),
+        value @ Value::Cell(_) => assert_bytes(value, &[0x33; 32]),
         _ => panic!("expected Cell"),
     }
 }
 
 #[test]
-fn callerid_with_none_caller_pushes_zero_string() {
+fn callerid_with_none_caller_pushes_zero_cell() {
     // External originator → caller None → push zeros (not error).
     let mut vm = vm_internal_with(
         ActorID::Hash([0x44; 32]),
@@ -133,7 +133,7 @@ fn callerid_with_none_caller_pushes_zero_string() {
     );
     vm.step_internal().expect("step ok");
     match vm.current_call.stack.last().expect("stack non-empty") {
-        value @ Value::Cell(_) => assert_str(value, &[0u8; 32]),
+        value @ Value::Cell(_) => assert_bytes(value, &[0u8; 32]),
         _ => panic!("expected Cell"),
     }
 }

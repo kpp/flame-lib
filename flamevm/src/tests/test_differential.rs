@@ -83,9 +83,9 @@ fn backends_agree_across_sample_programs() {
             .push_int(7u64)
             .push_int(8u64)
             .label(0),
-        // String growth (charges allocation gas identically) + type probe.
+        // CellValue growth (charges allocation gas identically) + type probe.
         ScriptBuilder::new()
-            .push_str(String::from(b"ab".to_vec()))
+            .push_literal(CellValue::from_bytes(b"ab".to_vec()).unwrap())
             .slice()
             .builder()
             .append_bytes()

@@ -1,18 +1,18 @@
-//! Tests for string ops.
+//! Tests for Cell byte operations.
 
 #![allow(unused_imports)]
 
 use super::test_helpers::*;
 
-/// Convenience for `push_str(String::from(bytes.to_vec()))` — every
+/// Convenience for `push_literal(CellValue::from_bytes(bytes.to_vec()).unwrap())` — every
 /// test here pushes a fixed byte string as the operand under test.
-fn s(bytes: &[u8]) -> String {
-    String::from(bytes.to_vec())
+fn s(bytes: &[u8]) -> CellValue {
+    CellValue::from_bytes(bytes.to_vec()).unwrap()
 }
 
 fn builder_bytes(bytes: &[u8]) -> ScriptBuilder {
     ScriptBuilder::new()
-        .push_str(s(bytes))
+        .push_literal(s(bytes))
         .slice()
         .builder()
         .append_bytes()
@@ -26,13 +26,13 @@ fn read_point_success() {
     bytes.push(0xaa);
     let mut vm = vm_with_script(
         ScriptBuilder::new()
-            .push_str(s(&bytes))
+            .push_literal(s(&bytes))
             .slice()
             .read_point()
             .to_bytecode(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0xaa]);
+    assert_bytes(&vm.current_call.stack[0], &[0xaa]);
     match &vm.current_call.stack[1] {
         Value::Point(p) => assert_eq!(p.to_bytes(), [0x55u8; 32]),
         other => panic!("expected Point, got {}", value_kind(other)),
@@ -44,7 +44,7 @@ fn read_point_success() {
 fn read_point_too_short() {
     let mut vm = vm_with_script(
         ScriptBuilder::new()
-            .push_str(s(&[0; 31]))
+            .push_literal(s(&[0; 31]))
             .slice()
             .read_point()
             .to_bytecode(),
@@ -62,57 +62,57 @@ fn write_zeros_appends_n_zero_bytes() {
             .to_bytecode(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0xaa, 0, 0, 0]);
+    assert_bytes(&vm.current_call.stack[0], &[0xaa, 0, 0, 0]);
 }
 
 #[test]
 fn bit_not_inverts() {
     let mut vm = vm_with_script(builder_bytes(&[0x00, 0xff, 0xa5]).bit_not().to_bytecode());
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0xff, 0x00, 0x5a]);
+    assert_bytes(&vm.current_call.stack[0], &[0xff, 0x00, 0x5a]);
 }
 
 #[test]
 fn bit_or_basic() {
     let mut vm = vm_with_script(
         builder_bytes(&[0xa0, 0x0f])
-            .push_str(s(&[0x05, 0xf0]))
+            .push_literal(s(&[0x05, 0xf0]))
             .bit_or()
             .to_bytecode(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0xa5, 0xff]);
+    assert_bytes(&vm.current_call.stack[0], &[0xa5, 0xff]);
 }
 
 #[test]
 fn bit_and_basic() {
     let mut vm = vm_with_script(
         builder_bytes(&[0xff, 0xf0])
-            .push_str(s(&[0xa5, 0xa5]))
+            .push_literal(s(&[0xa5, 0xa5]))
             .bit_and()
             .to_bytecode(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0xa5, 0xa0]);
+    assert_bytes(&vm.current_call.stack[0], &[0xa5, 0xa0]);
 }
 
 #[test]
 fn bit_xor_basic() {
     let mut vm = vm_with_script(
         builder_bytes(&[0xff, 0x00])
-            .push_str(s(&[0xa5, 0xa5]))
+            .push_literal(s(&[0xa5, 0xa5]))
             .bit_xor()
             .to_bytecode(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0x5a, 0xa5]);
+    assert_bytes(&vm.current_call.stack[0], &[0x5a, 0xa5]);
 }
 
 #[test]
 fn bit_or_size_mismatch_errors() {
     let mut vm = vm_with_script(
         builder_bytes(&[0xa0])
-            .push_str(s(&[0x05, 0xf0]))
+            .push_literal(s(&[0x05, 0xf0]))
             .bit_or()
             .to_bytecode(),
     );
@@ -131,7 +131,7 @@ fn shift_left_by_byte() {
             .to_bytecode(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0xb1, 0xc2, 0xd3, 0x00]);
+    assert_bytes(&vm.current_call.stack[0], &[0xb1, 0xc2, 0xd3, 0x00]);
 }
 
 #[test]
@@ -143,7 +143,7 @@ fn shift_left_by_4_bits_discards_removed() {
             .to_bytecode(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0xb0]);
+    assert_bytes(&vm.current_call.stack[0], &[0xb0]);
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn shift_left_zero_is_noop() {
             .to_bytecode(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0xab, 0xcd]);
+    assert_bytes(&vm.current_call.stack[0], &[0xab, 0xcd]);
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn shift_right_by_byte() {
             .to_bytecode(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0x00, 0xa0, 0xb1, 0xc2]);
+    assert_bytes(&vm.current_call.stack[0], &[0x00, 0xa0, 0xb1, 0xc2]);
 }
 
 #[test]
@@ -179,7 +179,7 @@ fn shift_right_by_4_bits_discards_removed() {
             .to_bytecode(),
     );
     run_to_end(&mut vm).unwrap();
-    assert_str(&vm.current_call.stack[0], &[0x0a]);
+    assert_bytes(&vm.current_call.stack[0], &[0x0a]);
 }
 
 #[test]

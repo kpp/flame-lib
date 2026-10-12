@@ -1,7 +1,7 @@
 //! Building, signing, and packaging a transfer.
 //!
 //! The one rule this module exists to enforce: a confidential input travels
-//! as a **private witness**. The prover pushes `String::contract(c)` over a
+//! as a **private witness**. The prover pushes `CellValue::contract(c)` over a
 //! contract whose `Token` payload carries [`Commitment::Open`] halves; the
 //! emitted bytecode holds only the contract id, `build_tx` collects the
 //! public body into the transaction's bag, and `input` restores the private
@@ -27,8 +27,8 @@ use flamechain::utreexo::Proof;
 use flamechain::BlockTx;
 use flamekd::ReceivingAddress;
 use flamevm::{
-    Commitment, Contract, ExternalTx, Limits, Scalar, ScriptBuilder, String as VmString, Token,
-    TxHeader, UnsignedTx, VMError, Value,
+    CellValue, Commitment, Contract, ExternalTx, Limits, Scalar, ScriptBuilder, Token, TxHeader,
+    UnsignedTx, VMError, Value,
 };
 use merlin::Transcript;
 use musig::{Multisignature, MusigError};
@@ -173,9 +173,9 @@ pub struct OutputSpec {
 /// The script, in order:
 ///
 /// ```text
-/// per input:    push_str(String::contract(contract))  input  signtx
+/// per input:    push_literal(CellValue::contract(contract))  input  signtx
 /// fee > 0:      push_int(fee)  fee                    one more mix input
-/// per output:   push_str(commitment(qty))  push_str(commitment(flv))
+/// per output:   push_literal(CellValue::commitment(qty))  push_literal(CellValue::commitment(flv))
 ///               push_int(m)  push_int(n)  mix
 /// per output i: roll_k(n-1-i) if > 0;  push_point(S_i)  output
 ///               pushcell(note_i)  log
@@ -230,7 +230,7 @@ pub fn build_transfer<R: RngCore + CryptoRng>(
     let mut program = ScriptBuilder::new();
     for input in inputs {
         program = program
-            .push_str(VmString::contract(input.contract.clone()))
+            .push_literal(CellValue::contract(input.contract.clone()))
             .input()
             .signtx();
     }
@@ -244,8 +244,8 @@ pub fn build_transfer<R: RngCore + CryptoRng>(
 
     for (qty, flv) in commitments {
         program = program
-            .push_str(VmString::commitment(qty))
-            .push_str(VmString::commitment(flv));
+            .push_literal(CellValue::commitment(qty))
+            .push_literal(CellValue::commitment(flv));
     }
     program = program
         .push_int(mix_inputs as u64)

@@ -122,21 +122,38 @@ fn depth(cell: &Cell) -> u16 {
 }
 
 #[test]
-fn golden_string_is_raw_bytes_in_one_cell() {
-    let string = String::from(b"abc".to_vec());
-    let cell = string.to_cell().unwrap();
+fn golden_cell_value_is_a_reference_to_raw_bytes() {
+    let bytes = CellValue::from_bytes(b"abc".to_vec()).unwrap();
+    let cell = bytes.as_resident().unwrap();
     assert_eq!(cell.encode_record(), record(b"abc", &[]));
     assert_eq!(hex(&cell.encode_record()), "0300616263");
     assert_eq!(
         hex(&cell.id()),
         "3da9865b43fa2ec490f78da9db16acd5638704dbce5cc7b3df2e3c7a23addf19"
     );
-    let value = Value::String(string).to_cell().unwrap();
-    assert_eq!(value.encode_record(), record(&[1], &[(cell.id(), 0)]));
+    let value = Value::Cell(bytes.clone()).to_cell().unwrap();
+    assert_eq!(value.encode_record(), record(&[13], &[(cell.id(), 0)]));
+    // Hashing places the root mask before its payload, then depths before hashes.
+    let mut preimage = vec![1, 0x10, 0, 0, 13, 0, 0];
+    preimage.extend_from_slice(&cell.id());
+    assert_eq!(value.hash_preimage(0).unwrap(), preimage);
     assert_eq!(
         hex(&value.id()),
-        "9148045685ff8f24d5a306e327717912730bd3a741306ab3affc59d61c55db93"
+        "fcf99950da2237a4b452b62159bde6b96d3f2f0c7f13809f44a9dcd66796da7a"
     );
+}
+
+#[test]
+fn retired_string_value_tag_is_not_reinterpreted_as_cell() {
+    let cell = Cell::new(
+        vec![1],
+        vec![Cell::new(b"abc".to_vec(), vec![]).unwrap().into()],
+    )
+    .unwrap();
+    assert!(matches!(
+        Value::from_cell(&cell, &mut ()),
+        Err(CellError::InvalidFormat)
+    ));
 }
 
 #[test]

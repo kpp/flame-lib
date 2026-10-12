@@ -599,9 +599,9 @@ fn phase21_txlog_ordering_in_txresult() {
     // TxResult shape, easier setup. Build a script that pushes a
     // string and logs it twice.
     let script = ScriptBuilder::new()
-        .push_str(String::from(b"a".to_vec()))
+        .push_literal(CellValue::from_bytes(b"a".to_vec()).unwrap())
         .log()
-        .push_str(String::from(b"b".to_vec()))
+        .push_literal(CellValue::from_bytes(b"b".to_vec()).unwrap())
         .log()
         .to_bytecode();
     let delegate = StubDelegate::new();

@@ -339,7 +339,7 @@ fn allocation_gas_trips_on_pushstr_append_and_tread() {
     // pushstr: a 60-byte literal against a 50-byte cap.
     let s = run_metered(
         ScriptBuilder::new()
-            .push_str(String::from(vec![7u8; 60]))
+            .push_literal(CellValue::from_bytes(vec![7u8; 60]).unwrap())
             .slice()
             .to_bytecode(),
         50,
@@ -353,7 +353,7 @@ fn allocation_gas_trips_on_pushstr_append_and_tread() {
     // pushes the high-water to 120.
     let s = run_metered(
         ScriptBuilder::new()
-            .push_str(String::from(vec![1u8; 40]))
+            .push_literal(CellValue::from_bytes(vec![1u8; 40]).unwrap())
             .slice()
             .builder()
             .append_bytes()
@@ -368,9 +368,9 @@ fn allocation_gas_trips_on_pushstr_append_and_tread() {
     // tread: a 200-byte challenge squeeze against a 100 cap.
     let s = run_metered(
         ScriptBuilder::new()
-            .push_str(String::from(b"L".to_vec()))
+            .push_literal(CellValue::from_bytes(b"L".to_vec()).unwrap())
             .transcript()
-            .push_str(String::from(b"x".to_vec()))
+            .push_literal(CellValue::from_bytes(b"x".to_vec()).unwrap())
             .builder()
             .push_int(200u64)
             .tread()

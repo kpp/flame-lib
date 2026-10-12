@@ -225,21 +225,20 @@ The note is:
 
 A note is `89 + N` bytes, and the memo's length is public: `N` is the note's
 length minus 89. The memo MUST be at most 4006 bytes (4095 minus 89). The note
-travels as a single VM `String`, whose limit is one Cell payload, 4095 bytes
-(`String::MAX_LEN` in `flamevm/src/string.rs`, which flamevm marks as
-temporary).
+travels as a single zero-ref VM Cell, bounded by `cells::MAX_CELL_PAYLOAD`
+(4095 bytes). No separate VM String type or Snake continuation is involved.
 
 ## Building the transaction
 
 The script extends the transfer in
 [`flamepayments.md`](../flamepayments/flamepayments.md#a-transfer) by one
-`push_str` and one `log` after each `output`:
+`pushcell` and one `log` after each `output`:
 
 ```text
-per input:    push_str(String::contract(c))  input  signtx
+per input:    push_literal(CellValue::contract(c))  input  signtx
 fee > 0:      push_int(fee)  fee
-per output:   push_str(commitment(qty, qty_blinding))
-              push_str(commitment(flv, flv_blinding))
+per output:   push_literal(CellValue::commitment(commitment(qty, qty_blinding)))
+              push_literal(CellValue::commitment(commitment(flv, flv_blinding)))
               push_int(m)  push_int(n)  mix
 per output i: roll_k(n-1-i) if > 0
               push_point(enc(S_i))  output
@@ -275,7 +274,7 @@ relies on an output's position.
 
 An `ExternalTx` carries a pruned `TxLog`
 ([`encoding.md`](encoding.md#transactions-and-execution-witnesses)). The note
-travels once, as the `push_str` literal in the script, and its `Data` entry
+travels once, as the `pushcell` literal in the script, and its `Data` entry
 is derived again when a verifier executes the script. The TxID covers the
 `Data` entry, so the `signtx` signature covers the note: nobody but the
 signer can alter it. `log` charges gas for every byte it writes: a note is
@@ -358,7 +357,7 @@ path described in
    `Token::from_opening(qty, flv, qty_blinding, flv_blinding)` inside
    `Contract::new(opaque(S_n), anchor, …)`. Its id MUST equal the published
    id.
-2. Push it with `push_str(String::contract(c))`, then `input` and `signtx`.
+2. Push it with `push_literal(CellValue::contract(c))`, then `input` and `signtx`.
    The bytecode holds only the 32-byte contract id; the contract's public
    body goes into the transaction's witness bag, where its token is two
    points again; the openings stay with the prover.

@@ -202,7 +202,7 @@ Storage-purchase pricing and issuance are specified in
 
 Ownership: every type on the stack is always owned. FlameVM does not allow reference-counting, borrowing, read-only access or implicit copies.
 
-Plain data types: scalars, byte strings, Ristretto points. These can be copied and ported.
+Plain data types: scalars, immutable Cells, Ristretto points. These can be copied and ported.
 
 Structured data types: dicts that are used as lists, dictionaries and enum variants. Dicts are **never copyable** and cache sticky portability and droppability capabilities (see §Dict).
 
@@ -221,7 +221,7 @@ droppable, but non-copyable pure-computation values may be droppable too.
 
 | Type | Copyable | Droppable | Portable |
 | --- | --- | --- | --- |
-| Scalar, String, Point | yes | yes | yes |
+| Scalar, Point | yes | yes | yes |
 | Cell (raw serialized data) | yes | yes | yes |
 | Slice | yes | yes | no |
 | Builder | no | yes | no |
@@ -251,8 +251,8 @@ Optionals are not distinct types, but a convention to return tuple (values…, 1
 **Implementation layout (not consensus).** Heap-indirection keeps the Rust
 `Value` enum compact without changing VM semantics: `Merlin` boxes its
 `Transcript`, `Value::Contract` boxes the otherwise unchanged `Contract`, secret
-equality constraints box both `Expression`s, and `String` boxes all typed
-`StringWitness` variants while leaving `Opaque(Vec<u8>)` inline, and
+equality constraints box both `Expression`s, `CellValue` keeps its optional
+private `CellWitness` behind a shared `Arc`, and
 `spacesuit::AllocatedValue` boxes its optional cleartext assignment. On the
 current 64-bit build this makes `Value` 80 bytes, equal to its largest remaining
 inline variant (`Token`), while `WideToken` is 40 bytes. Rust layout and byte
@@ -264,14 +264,14 @@ Implemented generic `Value` Cell encodings:
 | Type | Tag | Representation after the tag |
 | --- | ---: | --- |
 | Scalar | 0 | canonical 32-byte LE residue |
-| String | 1 | one reference to a payload-only Cell of 0..4095 raw bytes |
 | Dict | 2 | one reference to count/flags/Trie envelope |
 | Point | 3 | compressed Ristretto:32 |
 | Token | 4 | qty commitment:32, flavor commitment:32 |
 | ClearToken | 6 | qty Scalar:32, flavor Scalar:32 |
 | Cell | 13 | one raw serialized Cell reference |
 
-Other Value tags are rejected. An expected concrete type does not repeat a tag.
+Other Value tags are rejected, including reserved tag 1 (the removed String
+variant). Existing tags are not renumbered. An expected concrete type does not repeat a tag.
 See [Data encoding](encoding.md) for the complete Cell layouts.
 
 Stack-only types (non-portable and without an implemented `Value` encoding):
@@ -292,8 +292,8 @@ Stack-only types (non-portable and without an implemented `Value` encoding):
 
 FlameVM values use `CellEncode` / `CellDecode`, not the flat Reader/Writer
 layer. Cell IDs commit payload and ordered child IDs, independently of
-residency. Expected types have no schema/version prefixes. A String occupies
-one Cell's raw payload, with no length prefix or references. Dict uses one fixed-width Trie format for all
+residency. Expected types have no schema/version prefixes. Byte data occupies
+ordinary Cell payloads; byte-only operands require zero references. Dict uses one fixed-width Trie format for all
 key patterns, with big-endian Scalar paths preserving numeric order.
 
 The encoder does not impose portability. Negative ClearTokens and Dicts with
@@ -378,32 +378,30 @@ The fixed-width Scalar Cell encoding is not wire-compatible with the former
 compact value-tag encoding. Existing state and
 bytecode must be regenerated or explicitly migrated before using this format.
 
-### String
+### Cell
 
-Binary byte-aligned strings of 0..4095 bytes (`String::MAX_LEN`).
+An immutable Cell handle, represented by `CellValue`. Its `CellRef` identifies
+the public graph and may be resident or unloaded; the handle can also point to
+an explicit pruning record. Ordinary Cells contain 0..4095 payload bytes and
+0..4 ordered child references. The descriptor supplies the payload length,
+without a separate byte-string prefix. Byte-only operations require zero refs;
+they do not flatten graphs. Reads use Slice and writes use Builder.
 
-The String Value and host-side witness carrier remain temporarily for stored
-format compatibility. VM byte operations now use Cells, Slices and Builders;
-they neither accept nor produce String Values.
-Its canonical encoding is one payload-only
-Cell: raw bytes, no length prefix, no references, no snake continuation. Strings
-can hold bounded data, short programs, signatures, and hashes. Schema-defined
-blob fields may use multi-Cell Snakes independently of this runtime limit;
-programs instead use explicit `pushcell exec` continuation.
+There is no separate VM String type. Bounded data, signatures and hashes use
+Cell payloads. Schema-defined blob fields may use multi-Cell Snakes; programs
+instead use explicit `pushcell exec` continuation. `CellValue::from_bytes` and
+`CellValue::script` are fallible, enforcing the single-payload capacity; fixed
+32-byte Point, Scalar and Contract-ID constructors are bounded by construction.
 
-Byte/ref reads use Slice and writes use Builder. Host `push_str` compiles a
-literal Cell; the VM sees a Cell handle, not a String Value.
+**Prover-side witness variants.** `CellValue` holds
+`CellRef + Option<Arc<CellWitness>>` directly, without another byte-container
+wrapper. The optional annotation preserves typed private data through copies
+and value transfers; it is never encoded and never affects Cell identity:
 
-Host literal parsing and stored-value encoding reject results over the limit with
-`StringTooLong` before allocating them. Witness-bearing Strings obey the same
-limit on their public bytes, before witness serialization.
-
-**Prover-side witness variants.** `String` has two in-memory shapes: `String::Opaque(Vec<u8>)` and `String::Witness(Box<StringWitness>)`. Boxing the uncommon witness shape keeps every `String` the size of a `Vec`. The witness encodes to the same canonical bytes the verifier sees while preserving typed data through `dup` / `open` / `signcall` / `call` / payload-pour boundaries:
-
-- `StringWitness::Point(Point)` — point-shaped witness; the inner [`Point`](#point) is `Opaque`, `Commitment(Open(value, blinding))` (used before `commit`, `scalar`, `expr`), or `Predicate(p)` (used before `signtx`, `signcall`, `contract`, `output`).
-- `StringWitness::Scalar(scalar)` — used before `scalar`.
-- `StringWitness::Script(instructions)` — bounded compatibility source programs used before `signcall`; predicate-branch overlays are supplied separately.
-- `StringWitness::Contract(c)` — used before `input`, carrying open commitments on Token payloads.
+- `CellWitness::Point(Point)` — point-shaped witness; the inner [`Point`](#point) is `Opaque`, `Commitment(Open(value, blinding))` (used before `commit`, `scalar`, `expr`), or `Predicate(p)` (used before `signtx`, `signcall`, `contract`, `output`).
+- `CellWitness::Scalar(scalar)` — used before `scalar`.
+- `CellWitness::Script(instructions)` — bounded compatibility source programs used before `signcall`; predicate-branch overlays are supplied separately.
+- `CellWitness::Contract(c)` — used before `input`, carrying open commitments on Token payloads.
 
 The verifier sees the literal's public Cell bytes, without annotations. A
 Contract witness emits its 32-byte ContractID; ScriptBuilder collects its public
@@ -411,9 +409,9 @@ bodies and keeps private openings separately. `input` resolves the authenticated
 public path before restoring private atomic witnesses. Commitment/script
 consumers validate per-value annotations against public bytes; unrelated hints
 do not change parsing semantics. Predicate overlays likewise require matching
-public code. String equality/storage compatibility remains until its removal.
+public code. Ordinary Cell equality uses factual identity and ignores annotations.
 
-**`pushpoint` also carries witnesses.** Because the `pushpoint` instruction's in-memory operand is a `Point` (not a raw `[u8; 32]`), the prover can attach a `Point::Commitment` / `Point::Predicate` witness to a literal point pushed via `pushpoint` — not only via `pushstr` + `String::point`. The wire encoding stays the canonical 32 bytes regardless.
+**`pushpoint` also carries witnesses.** Because the `pushpoint` instruction's in-memory operand is a `Point` (not a raw `[u8; 32]`), the prover can attach a `Point::Commitment` / `Point::Predicate` witness to a literal point pushed via `pushpoint` — not only via a literal `CellValue::point`. The wire encoding stays the canonical 32 bytes regardless.
 
 ### Point
 
@@ -430,6 +428,11 @@ A Point on the value stack downcasts via `to_commitment` / `to_predicate` to ext
 ### MultiscalarMul
 
 Lazy multi-scalar-multiplication: a vector of `(scalar_i, point_i)` pairs that the VM defers as the assertion `sum(s_i · P_i) == identity`. Non-copyable but droppable, stack-only, and **not** wire-encodable — exactly like [Expression](#types) and [Constraint](#types). Dropping it abandons an assertion that has not been scheduled; only `verify` commits it to the batch.
+
+`evalpoint` is the alternative consumer: compute the public sum immediately and
+return a copyable, portable opaque Point, without asserting identity or adding
+anything to the verification batch. It is available in external and actor
+execution; secret R1CS Expressions are not its operands.
 
 **Purpose: custom Sigma-protocols.** Together with [Merlin](#cryptography-instructions) transcripts (Fiat–Shamir challenges), `MultiscalarMul` lets contract authors express any Schnorr-style relation over Pedersen-committed data — proof of knowledge of discrete log, equality of two encryptions, proof of correct re-encryption, etc. The verification equation always reduces to "this weighted sum of group elements is the identity point".
 
@@ -521,7 +524,7 @@ An actor is **`(code, state)`**:
 
 - **code** — a single bytecode blob, set at deploy and replaced by [`setcode`](#setcode). Dispatch is selector-agnostic: the registry returns the blob (`load_code`); by convention the blob dispatches on its **top-of-stack argument**. The VM imposes **no method layout** and reserves nothing.
 
-- **state** — **any portable `Value`** (Scalar, String, Point, Token, Dict, …), with no mandated shape and no methods-in-state. [`load`](#load) checks it out, [`save`](#save) moves it back; the author structures it however they like.
+- **state** — **any portable `Value`** (Scalar, Cell, Point, Token, Dict, …), with no mandated shape and no methods-in-state. [`load`](#load) checks it out, [`save`](#save) moves it back; the author structures it however they like.
 
 Each actor is identified by a unique Actor ID derived from its constructor
 script. `Hash(h)` and `Constructor(bytes)` route to the same registry key when
@@ -534,9 +537,10 @@ Constructor(code)  = payload: 0x01; refs: [program Cell]
 ```
 
 The constructor form carries the code needed for deployment; the hash form is
-the compact address used afterward. A VM actor-destination operand is a String
-containing a CellEnvelope for either form, subject to String's 4095-byte limit.
-It also accepts a bare 32-byte String as `Hash(bytes)`.
+the compact address used afterward. A VM actor-destination operand is a zero-ref
+Cell/Slice/Builder payload containing a CellEnvelope for either form. The
+single-payload limit is 4095 bytes. It also accepts a bare 32-byte payload as
+`Hash(bytes)`; this byte-oriented address format is unchanged by removing String.
 
 **Deploy-on-first-delivery.** The first message delivered to a not-yet-deployed
 `Constructor`-form target instantiates a provisional actor: code is the
@@ -719,6 +723,7 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | 86 | [keccak256](#keccak256) | | s b → b' | Append a 32-byte Keccak-256 payload digest into the provided Builder. |
 | 87 | [log](#log) | | bytes → ø | Emit a zero-ref Cell/Slice/Builder payload as a transaction-log data entry. |
 | 88 | [cellhash](#cellhash) | | c level b → b' | Append the cached Cell hash at an explicit level; no body read. |
+| 89 | [evalpoint](#evalpoint) | | msm → point | Compute public group arithmetic immediately, at 4× its batched-verification gas price. |
 |    | **Tokens** | | | |
 | 90 | [amount](#amount) | | t → t qty flv | Peek the quantity and flavor of a token without consuming it. |
 | 91 | [issuepriv](#issuepriv) | pred.ext. | qty tag → T | Mint a confidential token under the current predicate's identity + `tag`. |
@@ -821,7 +826,7 @@ Canonical failure-shape vectors (stack order is bottom-to-top):
 | failed entered `signcall`: `Contract, A, B` with `k=2` | `Contract, A, B, 2, 0` | script/signature/gas operands; Contract and arguments are restored, count excludes Contract |
 
 Thus count and lookup-key operands do not need restitution: they are copyable
-control data, not linear values. The source String, Dict, tokens, Contract, and call
+control data, not linear values. The source Slice, Dict, tokens, Contract, and call
 arguments follow the exact shapes above.
 
 ### Stack instructions
@@ -1084,10 +1089,9 @@ VM byte consumers accept zero-ref Cells, Slices with no remaining refs, or
 Builders with no refs. They consume the supplied container and use only its
 payload bytes: there is no implicit traversal, flattening or pruning hydration.
 Cell bodies are resolved through the metered context; existing Slices/Builders
-are read directly. Pruned Cells and remaining references hard-fail. Temporary
-String Values are not accepted by these operations; the type is retained only
-for stored-value and host/witness compatibility, pending its separate removal.
-The host `push_str` helper now compiles a child Cell and `pushcell`; 0x19 is only
+are read directly. Pruned Cells and remaining references hard-fail.
+There is no String Value or String witness wrapper.
+The host `push_literal(CellValue)` helper compiles a child Cell and `pushcell`; 0x19 is only
 a compatibility source marker for byte-only host APIs, never a native opcode.
 Private witnesses remain outside public Cell bytes. Load loop/branch constants
 once and duplicate them: program reference cursors do not rewind on jumps.
@@ -1171,7 +1175,7 @@ _a b_ **eq** → _a b {0|1}_ (cleartext) | → _constraint_ (CS branch)
 
 Two stack diagrams depending on operand types and context:
 
-1. **Cleartext branch.** When neither operand is a CS type (`Variable` / `Expression`), or in internal context, peeks at the top two values and pushes `1` if equal or `0` otherwise. Operands stay on the stack. `Scalar` / `String` / `Point` compare by value. Any Cell/Slice/Builder pair compares by factual (highest-level) hash: Cells use the cached ID, Slices hash only their unread bytes and refs as an ordinary Cell, and Builders hash their current bytes and refs without finalizing or copying their payload buffers. Child bodies are not loaded for hashing, and private annotations are ignored. Explicit pruning changes factual identity; use `cellhash` at the intended level for semantic comparison. During migration a String can equal its zero-ref byte Cell. **Dict and all linear types (`Token`, `ClearToken`, `Contract`, …) hard-fail `TypeNotComparable`** when compared with the same type.
+1. **Cleartext branch.** When neither operand is a CS type (`Variable` / `Expression`), or in internal context, peeks at the top two values and pushes `1` if equal or `0` otherwise. Operands stay on the stack. `Scalar` / `Point` compare by value. Any Cell/Slice/Builder pair compares by factual (highest-level) hash: Cells use the cached ID, Slices hash only their unread bytes and refs as an ordinary Cell, and Builders hash their current bytes and refs without finalizing or copying their payload buffers. Child bodies are not loaded for hashing, and private annotations are ignored. Explicit pruning changes factual identity; use `cellhash` at the intended level for semantic comparison. **Dict and all linear types (`Token`, `ClearToken`, `Contract`, …) hard-fail `TypeNotComparable`** when compared with the same type.
 2. **Lifted branch.** When at least one operand is `Expression` or `Variable` *and* the context is external, both operands are popped, lifted to `Expression` (Scalar → `Expression::Constant`), and the result is `Constraint::eq(a, b)`.
 
 ### neg
@@ -1310,7 +1314,7 @@ _x_ → _x n_
 
 Peek the Cell's own payload byte count, a Slice's unread byte count, a Builder's
 used byte count, or a Dict's entry count. References and descendant payloads are
-not counted. A Cell body must resolve and be non-pruned. String and other types
+not counted. A Cell body must resolve and be non-pruned. Other types
 hard-fail `TypeHasNoLength`; the inspected value stays on the stack.
 
 ### dict
@@ -1366,7 +1370,7 @@ Creates a fresh [Merlin transcript](#types) seeded with `label`. The transcript
 is never copyable but is droppable; `twrite` / `tread` consume and return it
 while building custom ZKP statements.
 Labels and absorbed data are zero-ref Cell/Slice/Builder payloads. Slices use
-only unread bytes. Containers are consumed; no temporary String is created.
+only unread bytes. Containers are consumed; no temporary byte container is created.
 
 ### twrite
 
@@ -1424,7 +1428,31 @@ persistent storage. Cells resolve through the metered read context before their
 payload is copied; Slices and Builders are read directly. Remaining references
 are not silently ignored and fail `InvalidFormat`.
 This permits `pushcell log` to publish all 4095 payload bytes without putting a
-large String operand into the instruction stream.
+large byte literal into the instruction stream.
+
+### evalpoint
+
+_msm_ → _point_
+
+Consumes a MultiscalarMul and immediately computes `Σ scalarᵢ·pointᵢ`, returning
+an ordinary compressed `Point::Opaque`. It makes no assertion and does not append
+to a batch. Available in both external and actor execution. The result can be
+compared, branched on, serialized with `writepoint`, stored or sent as plain data.
+It carries no private commitment/predicate annotation or asset ownership.
+
+Every point is decompressed, including terms with coefficient zero; an invalid
+encoding immediately fails `InvalidPoint`. Empty sums yield the identity. Term
+count, not coefficients, repetitions, cancellation, result, cache state or CPU
+core count, determines gas. The full price is precharged before allocation or
+group computation. Other operand types fail `TypeNotMultiscalarMul` and are
+not consumed; this cannot evaluate or disclose secret R1CS Expressions.
+
+Total price for `n` supplied terms is `4 × (221 + 40n) = 884 + 160n`, including
+the base instruction charge. Examples: one term 1044, two terms 1204, eight terms
+2164. This 4× VM price is a fixed policy premium for immediate, non-batchable
+execution, not a measured timing ratio or the asynchronous-send ordering weight.
+Use `evalpoint`, compare with the identity Point, then scalar `verify` for an
+immediate group assertion in actor code. MSM `verify` remains external-only.
 
 ## Token instructions
 
@@ -1550,6 +1578,24 @@ _x_ → ø
 - `MultiscalarMul`: appends `sum(s_i · P_i) == identity` to the delegate's `BatchVerifier` alongside any Schnorr/Musig sigs (external context only). Returns success immediately; the batched check runs at finalize and on failure surfaces as `BatchSignatureVerificationFailed`. See [MultiscalarMul](#multiscalarmul).
 - Other types hard-fail `TypeNotScalar`.
 
+**Type-dependent total gas** (including the one-gas instruction charge):
+
+| Operand | Total gas |
+| --- | ---: |
+| Scalar | `1` |
+| Cleartext Constraint | `1` |
+| Secret Constraint | `1 + C + 120m` |
+| MSM with `n` terms | `221 + 40n` |
+
+`C` is the existing structural copy/traversal estimate (`Value::clone_gas`);
+`m` counts multipliers newly introduced by flattening the Constraint. Equality
+and conjunction introduce none, secret OR introduces one, and secret NOT two.
+Previously charged allocations are not charged again as new multipliers.
+These existing verification prices are unchanged. The MSM price includes
+`n` term-traversal units, `220 + 37n` crypto work and `2n` batch-vector items.
+`evalpoint` uses exactly four times this full MSM price. All arithmetic is checked
+for overflow, and charges never depend on private assignments or batch contents.
+
 ### fee
 
 _qty_ → _−WT_
@@ -1621,12 +1667,12 @@ At the outermost call frame, `return` always errors regardless of `k`; a script 
 
 _x_ → _x typecode_
 
-Pushes the type code of the top value as `Scalar`, leaving the value on the stack. Type codes are a stable sequential enumeration of the value types — **independent of the wire-encoding tags** in [Types](#types), which keep their own compact scheme (so the `type` opcode also covers non-serializable stack-only types):
+Pushes the type code of the top value as `Scalar`, leaving the value on the stack. Type codes are stable — **independent of the wire-encoding tags** in [Types](#types), which keep their own compact scheme (so the `type` opcode also covers non-serializable stack-only types). Code 1 is reserved after removing String; all other codes are unchanged:
 
 | Code | Type | Code | Type |
 | --- | --- | --- | --- |
 | 0 | Scalar | 7 | Contract |
-| 1 | String | 8 | Merlin |
+| 1 | reserved | 8 | Merlin |
 | 2 | Dict | 9 | Variable |
 | 3 | Point | 10 | Expression |
 | 4 | Token | 11 | Constraint |
@@ -1647,7 +1693,7 @@ the authenticated Contract: predicate, anchor, and one payload Value. Dict
 branches can remain pruned. Sets `last_anchor = Anchor(contract_id)` and
 emits `TxEntry::Input(contract_id)`.
 
-A prover may use host `push_str(String::contract(c))`; this emits `pushcell`
+A prover may use host `push_literal(CellValue::contract(c))`; this emits `pushcell`
 with a child containing the 32-byte ID. Public bodies are collected before proving. Private atomic
 openings are restored only after the same public path/value has resolved.
 A private witness cannot supply a publicly missing branch. Generic untrusted
@@ -1840,7 +1886,7 @@ Pops the state `Value`, **validates portability**, measures the prospective acto
 
 **State is any portable Value.** The author structures state however they like (a Dict, a Scalar, a Token, …).
 
-**Portability is the canonical storage gate.** Portable values: `Scalar`, `String`, `Point`, `Dict` of portable, non-negative `ClearToken`, `Token`. Non-portable values (`Contract`, `Merlin`, `Variable`, `Expression`, `Constraint`, `MultiscalarMul`, `WideToken`, negative `ClearToken`) hard-fail `NonPortableInState`.
+**Portability is the canonical storage gate.** Portable values: `Scalar`, `Cell`, `Point`, `Dict` of portable, non-negative `ClearToken`, `Token`. Non-portable values (`Slice`, `Builder`, `Contract`, `Merlin`, `Variable`, `Expression`, `Constraint`, `MultiscalarMul`, `WideToken`, negative `ClearToken`) hard-fail `NonPortableInState`.
 
 The registry repeats this check on direct save and deploy entry points, so the
 actor-state invariant does not depend on `op_save` being the caller. As at the

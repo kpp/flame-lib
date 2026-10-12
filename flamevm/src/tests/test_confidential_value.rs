@@ -21,9 +21,9 @@ fn encrypted_borrow_produces_widetoken_and_token_pair() {
     let qty_commit = Commitment::blinded_with_factor(qty_int, qty_blind);
     let flv_commit = Commitment::blinded_with_factor(flv_int, flv_blind);
     let program = ScriptBuilder::new()
-        .push_str(String::commitment(qty_commit))
+        .push_literal(CellValue::commitment(qty_commit))
         .commit()
-        .push_str(String::commitment(flv_commit))
+        .push_literal(CellValue::commitment(flv_commit))
         .commit()
         .borrow();
     let mut prover = Prover::new(&pc_gens);
@@ -85,8 +85,8 @@ fn mix_with_single_in_single_out_balances() {
         // Output commitments (pushed deepest first per op_mix):
         // first qty, then flv. Mix pops them in reverse: first
         // pop flv (top), then qty.
-        .push_str(String::commitment(qty_commit))
-        .push_str(String::commitment(flv_commit))
+        .push_literal(CellValue::commitment(qty_commit))
+        .push_literal(CellValue::commitment(flv_commit))
         .push_int(1u64) // m (input count)
         .push_int(1u64) // n (output count)
         .mix();

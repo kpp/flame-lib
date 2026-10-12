@@ -31,8 +31,8 @@ use crate::builder::Opening;
 pub const NOTE_VERSION: u8 = 0x01;
 
 /// The longest memo a note carries: a note is `89 + N` bytes and travels as
-/// one VM `String`, whose limit is one Cell payload.
-pub const MEMO_MAX: usize = flamevm::String::MAX_LEN - NOTE_MIN;
+/// one Cell payload.
+pub const MEMO_MAX: usize = cells::MAX_CELL_PAYLOAD - NOTE_MIN;
 
 /// The version byte, `enc(R)` and the SIV tag: everything in front of the
 /// ciphertext.

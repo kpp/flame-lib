@@ -511,7 +511,7 @@ impl Default for Dict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClearToken, Merlin, String};
+    use crate::{CellValue, ClearToken, Merlin};
     use cells::{CellIndex, CellRef};
     use std::sync::Arc;
 
@@ -556,7 +556,7 @@ mod tests {
         let mut original = Dict::new();
         original.insert(
             Scalar::ONE,
-            Value::String(String::from(vec![9; String::MAX_LEN])),
+            Value::Cell(CellValue::from_bytes(vec![9; cells::MAX_CELL_PAYLOAD]).unwrap()),
         );
         original.insert(Scalar::from(2u64), v(2));
         let root = Arc::new(original.to_cell().unwrap());
@@ -572,14 +572,23 @@ mod tests {
                     cells: bag.clone(),
                     gas: 0,
                 };
-                assert!(
-                    matches!(dictionary.get_resolved(&Scalar::ONE, &mut meter).unwrap(), Some(Value::String(value)) if value.len() == String::MAX_LEN)
+                let Some(Value::Cell(value)) =
+                    dictionary.get_resolved(&Scalar::ONE, &mut meter).unwrap()
+                else {
+                    panic!("expected Cell");
+                };
+                assert_eq!(
+                    cells::read_cell(&mut meter, &value)
+                        .unwrap()
+                        .payload()
+                        .len(),
+                    cells::MAX_CELL_PAYLOAD
                 );
                 costs.push(meter.gas);
             }
         }
         assert!(costs.iter().all(|cost| *cost == costs[0]));
-        assert!(costs[0] >= String::MAX_LEN as u64);
+        assert!(costs[0] >= cells::MAX_CELL_PAYLOAD as u64);
     }
 
     fn v(n: u64) -> Value {
@@ -630,12 +639,12 @@ mod tests {
         d.insert(Scalar::from(1u64), v(10));
         d.insert(
             Scalar::from(99u64),
-            Value::String(String::from(b"hi".to_vec())),
+            Value::Cell(CellValue::from_bytes(b"hi".to_vec()).unwrap()),
         );
         assert!(d.get(&Scalar::from(50u64)).is_none());
         match d.get(&Scalar::from(99u64)) {
-            Some(Value::String(s)) => assert_eq!(s.as_opaque().unwrap(), b"hi"),
-            _ => panic!("expected String"),
+            Some(Value::Cell(cell)) => assert_eq!(cell.payload().unwrap(), b"hi"),
+            _ => panic!("expected Cell"),
         }
     }
 

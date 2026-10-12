@@ -197,7 +197,7 @@ fn pruning_changes_eq_but_explicit_level_hashes_can_compare_semantic_content() {
         .unwrap();
         let mut bytes = vec![7];
         bytes.extend_from_slice(&expected);
-        assert_str(&vm.current_call.stack[0], &bytes);
+        assert_bytes(&vm.current_call.stack[0], &bytes);
     }
     assert!(matches!(
         run(
@@ -233,10 +233,7 @@ fn size_peeks_payload_counts_and_dictionary_entries_without_flattening() {
     .unwrap();
     assert_int(&vm.current_call.stack[1], Scalar::ONE);
     assert!(matches!(
-        run(
-            Instruction::Size,
-            vec![Value::String(String::from(vec![1]))]
-        ),
+        run(Instruction::Size, vec![Value::Scalar(Scalar::ONE)]),
         Err(VMError::TypeHasNoLength)
     ));
 }
@@ -271,7 +268,7 @@ fn hash_sources_and_destinations_are_byte_oriented_and_capacity_checked() {
                 ],
             )
             .unwrap();
-            assert_str(&vm.current_call.stack[0], &bytes);
+            assert_bytes(&vm.current_call.stack[0], &bytes);
             let Value::Builder(destination) = &vm.current_call.stack[0] else {
                 panic!()
             };

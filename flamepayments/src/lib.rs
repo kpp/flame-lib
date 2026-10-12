@@ -7,7 +7,7 @@
 //! does the same from a view key without the spending keys, and a
 //! [`ReceiveAccount`] from a receiving key without the viewing keys either.
 //! The [`builder`] module assembles a transfer from those pieces: a
-//! confidential input travels as a private witness (`String::contract` over
+//! confidential input travels as a private witness (`CellValue::contract` over
 //! a token with open commitments), never as script literals, so a spend
 //! publishes nothing about the amount it spends. The [`note`] module seals the note every output carries and opens
 //! a received one, as `docs/payments.md` specifies. See `flamepayments.md`.

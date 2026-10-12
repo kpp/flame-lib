@@ -5,11 +5,9 @@ use std::time::Duration;
 
 use flamed_rpc::{
     ActorCode, ActorId, ActorResult, ActorStateEnvelope, BlockId, CellId, ClientError,
-    FlamedApiClient, HttpClientBuilder, TxValue,
+    FlamedApiClient, HttpClientBuilder, TxValue, ValueCell,
 };
-use flamevm::{
-    CellEncode, CellEnvelope, CellIndex, Dict, ScriptBuilder, String as VmString, Value,
-};
+use flamevm::{CellEncode, CellEnvelope, CellIndex, CellValue, Dict, ScriptBuilder, Value};
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use tempfile::TempDir;
 
@@ -140,17 +138,19 @@ async fn actor_tracks_updates_expiry_and_replay() {
 
 #[test]
 fn actor_keeps_full_data_and_reports_unavailable_or_malformed_bodies() {
-    let state = Value::Dict(Dict::from_values(vec![
-        Value::String(VmString::Opaque(
-            vec![0xab; 257]
-        ));
-        2_001
-    ]));
+    let literal = CellValue::from_bytes(vec![0xab; 257]).unwrap();
+    let state = Value::Dict(Dict::from_values(vec![Value::Cell(literal.clone()); 2_001]));
     let nop = ScriptBuilder::new().nop().to_bytecode();
     let mut code = nop.repeat(10_001);
-    code.extend(ScriptBuilder::new().push_str(vec![0xcd; 257]).to_bytecode());
+    code.extend(
+        ScriptBuilder::new()
+            .push_literal(CellValue::from_bytes(vec![0xcd; 257]).unwrap())
+            .to_bytecode(),
+    );
     let error_offset = code.len();
-    let mut incomplete = ScriptBuilder::new().push_str(vec![0xef]).to_bytecode();
+    let mut incomplete = ScriptBuilder::new()
+        .push_literal(CellValue::from_bytes(vec![0xef]).unwrap())
+        .to_bytecode();
     incomplete.pop();
     code.extend(incomplete);
     let state_cell = state.to_cell().unwrap();
@@ -179,8 +179,13 @@ fn actor_keeps_full_data_and_reports_unavailable_or_malformed_bodies() {
     };
     assert_eq!(entries.len(), 2_001);
     assert!(entries.iter().all(|entry| entry.value
-        == TxValue::String {
-            bytes: vec![0xab; 257]
+        == TxValue::Cells {
+            root: CellId(literal.id()),
+            cells: vec![ValueCell {
+                id: CellId(literal.id()),
+                data: vec![0xab; 257],
+                refs: vec![],
+            }]
         }));
     assert!(detail.state_error.is_none());
     assert_eq!(detail.instructions.len(), 10_002);

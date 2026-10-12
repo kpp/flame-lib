@@ -8,7 +8,7 @@ use flamed_rpc::{
     PendingTransaction, PendingTransactionsResult, TransactionResult, TransactionsResult,
     TxEntry as RpcTxEntry, TxId, MAX_PAGE_SIZE,
 };
-use flamevm::{ScriptBuilder, String as VmString};
+use flamevm::{CellValue, ScriptBuilder};
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use tempfile::TempDir;
 
@@ -57,7 +57,7 @@ async fn pending_transactions_are_bounded_and_disappear_after_confirmation() {
     }];
     for index in 0..MAX_PAGE_SIZE {
         let tx = ScriptBuilder::new()
-            .push_str(index.to_le_bytes().to_vec())
+            .push_literal(CellValue::from_bytes(index.to_le_bytes().to_vec()).unwrap())
             .log()
             .build_tx(header(), limits())
             .unwrap()
@@ -304,7 +304,7 @@ async fn transaction_rpc_checks_parameters_and_only_returns_confirmed_executions
         .collect();
     let input = contract_of(&node, &change);
     let unsigned = ScriptBuilder::new()
-        .push_str(VmString::contract(input.clone()))
+        .push_literal(CellValue::contract(input.clone()))
         .input()
         .signtx()
         .push_point(input.predicate.to_point().to_bytes())

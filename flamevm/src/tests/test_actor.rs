@@ -4,7 +4,7 @@ use cells::{Cell, CellDecode, CellError};
 
 use super::mem_registry::MemRegistry;
 use crate::{
-    code_state_bytes, empty_state, state_root, ActorID, ActorRegistry, Dict, Scalar, String,
+    code_state_bytes, empty_state, state_root, ActorID, ActorRegistry, CellValue, Dict, Scalar,
     VMError, Value,
 };
 
@@ -98,7 +98,10 @@ fn charged_usage_counts_state_and_code() {
     let code = fixture_code();
     let small = empty_state();
     let mut large = Dict::new();
-    large.insert(Scalar::ZERO, Value::String(String::from(vec![0u8; 100])));
+    large.insert(
+        Scalar::ZERO,
+        Value::Cell(CellValue::from_bytes(vec![0u8; 100]).unwrap()),
+    );
     let large = Value::Dict(large);
     let small_usage = code_state_bytes(&code, &small).unwrap();
     let large_usage = code_state_bytes(&code, &large).unwrap();

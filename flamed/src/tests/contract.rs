@@ -6,9 +6,9 @@ use std::time::Duration;
 use flamed_rpc::{
     BlockId, BlockTxEnvelope, CellId, ClientError, ContractEnvelope, ContractId, ContractResult,
     FlamedApiClient, FlamedApiServer, HttpClientBuilder, PredicatePoint, ProofResult, TipResult,
-    TxId, TxValue,
+    TxId, TxValue, ValueCell,
 };
-use flamevm::{Anchor, CellEncode, CellEnvelope, CellError, CellIndex, Dict, Value};
+use flamevm::{Anchor, CellEncode, CellEnvelope, CellError, CellIndex, CellValue, Dict, Value};
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use tempfile::TempDir;
 
@@ -132,12 +132,8 @@ async fn contract_tracks_spending_and_survives_replay() {
 
 #[test]
 fn contract_preserves_full_payloads_and_available_cells() {
-    let payload = Value::Dict(Dict::from_values(vec![
-        Value::String(
-            flamevm::String::Opaque(vec![0xab; 257])
-        );
-        2_001
-    ]));
+    let literal = CellValue::from_bytes(vec![0xab; 257]).unwrap();
+    let payload = Value::Dict(Dict::from_values(vec![Value::Cell(literal.clone()); 2_001]));
     let source = Contract::new(
         account(&SEED_A).predicate_at(util::RECEIVING, 0).unwrap(),
         Anchor([0x12; 32]),
@@ -171,8 +167,13 @@ fn contract_preserves_full_payloads_and_available_cells() {
     };
     assert_eq!(entries.len(), 2_001);
     assert!(entries.iter().all(|entry| entry.value
-        == TxValue::String {
-            bytes: vec![0xab; 257]
+        == TxValue::Cells {
+            root: CellId(literal.id()),
+            cells: vec![ValueCell {
+                id: CellId(literal.id()),
+                data: vec![0xab; 257],
+                refs: vec![],
+            }]
         }));
 
     let root = source.to_cell().unwrap();

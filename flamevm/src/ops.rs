@@ -4,8 +4,7 @@
 use crate::crypto::Point;
 use crate::errors::VMError;
 use crate::scalar::Scalar;
-use crate::string::String;
-use cells::CellRef;
+use crate::CellValue;
 use core::convert::TryFrom;
 use std::sync::Arc;
 
@@ -112,6 +111,7 @@ const OP_SHA3: u8 = 0x85;
 const OP_KECCAK256: u8 = 0x86;
 const OP_LOG: u8 = 0x87;
 const OP_CELLHASH: u8 = 0x88;
+const OP_EVALPOINT: u8 = 0x89;
 
 // 0x9X — Tokens. Mint opcodes and their consumer-side flavor helpers
 // are paired (priv ↔ privflv, pub ↔ pubflv) for adjacency.
@@ -180,11 +180,11 @@ const OP_HEIGHT: u8 = 0xf2;
 pub enum Instruction {
     PushInt(Scalar), // ø push → int
     /// Host-only byte literal, compiled to pushcell and a child Cell.
-    BytesLiteral(Arc<String>),
+    CellLiteral(Arc<CellValue>),
     PushPoint(Point), // ø pushpoint → point (witness-bearing on prover)
     PushToken,        // flv pushtoken → token
     /// The optional reference is compiler input, not an inline bytecode operand.
-    PushCell(Option<CellRef>), // ø pushcell → cell
+    PushCell(Option<CellValue>), // ø pushcell → cell
     Exec,             // cell exec → ø (tail execution in this frame)
     Drop,             // x drop → ø
     Nop,              // ø nop → ø
@@ -248,6 +248,7 @@ pub enum Instruction {
     Sha512,           // s b sha512 → b'
     Sha3,             // s b sha3 → b'
     CellHash,         // c level b cellhash → b'
+    EvalPoint,        // msm evalpoint → point (immediate public computation)
     Log,              // s log → ø
     Amount,           // t amount → t qty flv
     IssuePriv,        // qty:Variable tag issuepriv    → T  (predicate context)
@@ -299,7 +300,7 @@ impl Instruction {
         let op = |w: &mut Vec<u8>, b: u8| w.push(b);
         match self {
             Instruction::PushInt(i) => encode_push_int(i, w),
-            Instruction::BytesLiteral(_) => op(w, OP_PUSHCELL),
+            Instruction::CellLiteral(_) => op(w, OP_PUSHCELL),
             Instruction::PushPoint(p) => {
                 op(w, OP_PUSHPOINT);
                 // Always serializes the canonical 32-byte form;
@@ -377,6 +378,7 @@ impl Instruction {
             Instruction::Sha512 => op(w, OP_SHA512),
             Instruction::Sha3 => op(w, OP_SHA3),
             Instruction::CellHash => op(w, OP_CELLHASH),
+            Instruction::EvalPoint => op(w, OP_EVALPOINT),
             Instruction::Log => op(w, OP_LOG),
             Instruction::Amount => op(w, OP_AMOUNT),
             Instruction::IssuePriv => op(w, OP_ISSUEPRIV),
@@ -455,20 +457,24 @@ impl Instruction {
 
     pub(crate) fn source_size(&self) -> usize {
         match self {
-            Self::BytesLiteral(value) => 1 + subvarint_size(value.len() as u64) + value.len(),
+            Self::CellLiteral(value) => value.payload().map_or(1, |payload| {
+                1 + subvarint_size(payload.len() as u64) + payload.len()
+            }),
             _ => self.encoded_size(),
         }
     }
 
     /// Compatibility source for byte-only host APIs, never native execution.
     pub(crate) fn encode_source(&self, bytes: &mut Vec<u8>) {
-        if let Self::BytesLiteral(value) = self {
-            bytes.push(SOURCE_BYTES);
-            write_subvarint(bytes, value.len() as u64);
-            bytes.extend_from_slice(&value.to_bytes_vec());
-        } else {
-            self.encode(bytes);
+        if let Self::CellLiteral(value) = self {
+            if let Ok(payload) = value.payload() {
+                bytes.push(SOURCE_BYTES);
+                write_subvarint(bytes, payload.len() as u64);
+                bytes.extend_from_slice(payload);
+                return;
+            }
         }
+        self.encode(bytes);
     }
 
     /// Parses legacy host source; native VM execution uses `parse` instead.
@@ -481,10 +487,16 @@ impl Instruction {
         if length > reader.len() {
             return Err(VMError::UnexpectedEndOfScript);
         }
-        String::check_length(length)?;
-        Ok(Self::BytesLiteral(Arc::new(String::from(
+        if length > cells::MAX_CELL_PAYLOAD {
+            return Err(cells::CellError::PayloadTooLarge {
+                actual: length,
+                max: cells::MAX_CELL_PAYLOAD,
+            }
+            .into());
+        }
+        Ok(Self::CellLiteral(Arc::new(CellValue::from_bytes(
             take_bytes(reader, length)?.to_vec(),
-        ))))
+        )?)))
     }
 
     /// Reads exactly one Instruction (opcode + inline parameter bytes)
@@ -582,6 +594,7 @@ impl Instruction {
             OP_SHA512 => Ok(Instruction::Sha512),
             OP_SHA3 => Ok(Instruction::Sha3),
             OP_CELLHASH => Ok(Instruction::CellHash),
+            OP_EVALPOINT => Ok(Instruction::EvalPoint),
             OP_LOG => Ok(Instruction::Log),
             OP_AMOUNT => Ok(Instruction::Amount),
             OP_ISSUEPRIV => Ok(Instruction::IssuePriv),
@@ -822,7 +835,7 @@ mod tests {
         assert!(read_subvarint(&mut &[4][..]).is_err());
         assert!(read_subvarint(&mut &[3, 0][..]).is_err());
         for instruction in [
-            Instruction::BytesLiteral(Arc::new(String::from(vec![7; 256]))),
+            Instruction::CellLiteral(Arc::new(CellValue::from_bytes(vec![7; 256]).unwrap())),
             Instruction::Label(u32::MAX),
             Instruction::PushInt(Scalar::from(-256i64)),
             Instruction::Alloc(Some(Scalar::ONE)),

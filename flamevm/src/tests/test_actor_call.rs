@@ -43,7 +43,7 @@ fn call_script(target: &ActorID, gas: u64) -> Vec<u8> {
     ScriptBuilder::new()
         .push_int(0u64) // k = 0 args
         .push_int(gas) // gas
-        .push_str(String::from(target.to_hash().to_vec())) // addr (32-byte)
+        .push_literal(CellValue::from_bytes(target.to_hash().to_vec()).unwrap()) // addr (32-byte)
         .call()
         .to_bytecode()
 }
@@ -56,7 +56,7 @@ fn call_with_selector(target: &ActorID, sel: u64, gas: u64) -> Vec<u8> {
         .push_int(sel) // selector arg (top)
         .push_int(1u64) // k = 1 arg
         .push_int(gas)
-        .push_str(String::from(target.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(target.to_hash().to_vec()).unwrap())
         .call()
         .to_bytecode()
 }
@@ -99,7 +99,7 @@ fn failed_call_stack(
     let caller_script = ScriptBuilder::new()
         .push_int(1u64)
         .push_int(gas)
-        .push_str(String::from(callee.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(callee.to_hash().to_vec()).unwrap())
         .call()
         .to_bytecode();
     let caller = deploy_recv(&mut reg, caller_script.clone(), 10_000);
@@ -145,7 +145,7 @@ fn failed_internal_decrypt_restores_call_arguments() {
         .push_int(q_blind)
         .push_int(5u64)
         .push_int(100_000u64)
-        .push_str(String::from(callee.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(callee.to_hash().to_vec()).unwrap())
         .call()
         .to_bytecode();
     let caller = deploy_recv(&mut reg, caller_script.clone(), 10_000);
@@ -194,7 +194,7 @@ fn call_rejects_nested_nonportable_argument() {
         Value::Dict(outer),
         Value::Scalar(Scalar::ONE),
         Value::Scalar(Scalar::from(10_000u64)),
-        witness_cell(String::from(callee.to_hash().to_vec())),
+        witness_cell(CellValue::from_bytes(callee.to_hash().to_vec()).unwrap()),
     ];
 
     let err = vm.step_internal_with_registry(&mut reg).unwrap_err();
@@ -298,7 +298,7 @@ fn reentrant_call_succeeds_when_state_not_held() {
 
     // A.method1: emit a Data log entry, then return cleanly.
     let a_method1 = ScriptBuilder::new()
-        .push_str(String::from(b"reentered".to_vec()))
+        .push_literal(CellValue::from_bytes(b"reentered".to_vec()).unwrap())
         .log()
         .to_bytecode();
     // A.recv (method 0): call B, drop B's [count, success].
@@ -527,7 +527,7 @@ fn setcode_upgrade_end_to_end() {
         .nop()
         .nop()
         .nop()
-        .push_str(String::from(b"v2".to_vec()))
+        .push_literal(CellValue::from_bytes(b"v2".to_vec()).unwrap())
         .log()
         .push_int(0u64)
         .return_()
@@ -536,13 +536,13 @@ fn setcode_upgrade_end_to_end() {
 
     // C1: method 0 logs "v1"; method 1 replaces code with C2.
     let v1_handler = ScriptBuilder::new()
-        .push_str(String::from(b"v1".to_vec()))
+        .push_literal(CellValue::from_bytes(b"v1".to_vec()).unwrap())
         .log()
         .push_int(0u64)
         .return_()
         .to_bytecode();
     let upgrade_handler = ScriptBuilder::new()
-        .push_str(String::from(c2.clone()))
+        .push_literal(CellValue::from_bytes(c2.clone()).unwrap())
         .setcode()
         .push_int(0u64)
         .return_()
@@ -692,7 +692,7 @@ fn call_depth_caps_at_exactly_max() {
         .gas()
         .push_int(-200i64)
         .add() // grant = remaining − 200
-        .push_str(String::from(id.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(id.to_hash().to_vec()).unwrap())
         .call()
         .drop_()
         .drop_()
@@ -759,7 +759,7 @@ fn f1_failed_subcall_load_does_not_destroy_actor() {
     let a_recv = ScriptBuilder::new()
         .push_int(0u64) // k = 0 args
         .push_int(5_000u64) // gas
-        .push_str(String::from(x_id.to_hash().to_vec())) // addr
+        .push_literal(CellValue::from_bytes(x_id.to_hash().to_vec()).unwrap()) // addr
         .call()
         .drop_() // drop status = 0
         .drop_() // drop restored-value count = 0
@@ -832,7 +832,7 @@ fn f1_failed_subcall_save_rolls_back_state_mutation() {
     let a_recv = ScriptBuilder::new()
         .push_int(0u64)
         .push_int(5_000u64)
-        .push_str(String::from(x_id.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(x_id.to_hash().to_vec()).unwrap())
         .call()
         .drop_()
         .drop_()
@@ -900,7 +900,7 @@ fn f3_save_failure_rolls_back_and_preserves_actor() {
     let evil_recv = ScriptBuilder::new()
         .load() // check out state, [state]
         .drop_() // drop it (empty state is droppable)
-        .push_str(String::from(b"x".to_vec())) // ["x"]
+        .push_literal(CellValue::from_bytes(b"x".to_vec()).unwrap()) // ["x"]
         .transcript() // [Merlin] — non-portable
         .save() // NonPortableInState → frame fails
         .to_bytecode();
@@ -916,7 +916,7 @@ fn f3_save_failure_rolls_back_and_preserves_actor() {
     let a_recv = ScriptBuilder::new()
         .push_int(0u64)
         .push_int(5_000u64)
-        .push_str(String::from(x_id.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(x_id.to_hash().to_vec()).unwrap())
         .call()
         .drop_()
         .drop_()
@@ -994,7 +994,7 @@ fn call_to_unknown_actor_rejected_with_marker() {
     let a_script = ScriptBuilder::new()
         .push_int(1u64)
         .push_int(10_000u64)
-        .push_str(String::from(ghost.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(ghost.to_hash().to_vec()).unwrap())
         .call()
         .to_bytecode();
     let a = deploy_recv(&mut reg, a_script.clone(), 10_000);
@@ -1071,14 +1071,14 @@ fn nested_call_failure_restores_one_original_bearer() {
     let b_script = ScriptBuilder::new()
         .push_int(1u64)
         .push_int(5_000u64)
-        .push_str(String::from(c.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(c.to_hash().to_vec()).unwrap())
         .call()
         .to_bytecode();
     let b = deploy_recv(&mut reg, b_script, 10_000);
     let a_script = ScriptBuilder::new()
         .push_int(1u64)
         .push_int(100_000u64)
-        .push_str(String::from(b.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(b.to_hash().to_vec()).unwrap())
         .call()
         .to_bytecode();
     let a = deploy_recv(&mut reg, a_script.clone(), 10_000);
@@ -1117,7 +1117,7 @@ fn successful_call_discards_escrow_copy() {
     let caller_script = ScriptBuilder::new()
         .push_int(1u64)
         .push_int(5_000u64)
-        .push_str(String::from(callee.to_hash().to_vec()))
+        .push_literal(CellValue::from_bytes(callee.to_hash().to_vec()).unwrap())
         .call()
         .to_bytecode();
     let caller = deploy_recv(&mut reg, caller_script.clone(), 10_000);

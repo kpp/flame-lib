@@ -64,7 +64,7 @@ impl Token {
     /// received. The published Contract holds only the two commitment
     /// points; the recipient, who kept the openings, rebuilds the same
     /// Contract with open commitments and pushes it as a private witness
-    /// through `String::contract`. The alternative — opening the token
+    /// through `CellValue::contract`. The alternative — opening the token
     /// on the stack with `decrypt` — puts the quantity and both blinding
     /// factors into the bytecode, where every verifier reads them.
     ///

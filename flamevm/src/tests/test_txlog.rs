@@ -8,7 +8,7 @@ use super::test_helpers::*;
 fn log_opcode_emits_txentry_data() {
     // pushstr "hello", log → txlog has Header + TxEntry::Data(b"hello").
     let script = ScriptBuilder::new()
-        .push_str(String::from(b"hello".to_vec()))
+        .push_literal(CellValue::from_bytes(b"hello".to_vec()).unwrap())
         .log()
         .to_bytecode();
     let mut vm = vm_with_script(script);

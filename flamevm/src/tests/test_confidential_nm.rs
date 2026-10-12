@@ -485,9 +485,9 @@ fn confidential_1_to_1_with_fee() {
     let (q_out, f_out) = open_commitments_for_output(&out);
 
     let mut program = ScriptBuilder::new();
-    // Consume the input contract — push the witness-bearing StringWitness::Contract
+    // Consume the input contract — push the witness-bearing CellWitness::Contract
     // so the Token's open commitments survive into the CS.
-    program = program.push_str(String::contract(contract));
+    program = program.push_literal(CellValue::contract(contract));
     program = program.input();
     program = push_taproot_proof_to_program(program, &cp);
     program = program
@@ -498,12 +498,12 @@ fn confidential_1_to_1_with_fee() {
         .drop_(); // discard count
                   // Fee opcode: pushes WideToken(-3, FLAME_FLAVOR).
     program = program.push_int(3u64).fee();
-    // Output commitment Strings (witness-bearing prover-side).
+    // Output commitment Cells (witness-bearing prover-side).
     // Clone so the post-prove assertion can still read the
     // expected points off the local Open commitments.
     program = program
-        .push_str(String::commitment(q_out.clone()))
-        .push_str(String::commitment(f_out.clone()));
+        .push_literal(CellValue::commitment(q_out.clone()))
+        .push_literal(CellValue::commitment(f_out.clone()));
     // mix: m=2 (real Token + fee WideToken), n=1 (output).
     program = program.push_int(2u64).push_int(1u64).mix();
     // Emit the output contract.
@@ -697,7 +697,7 @@ fn confidential_with_fee_undersupply_rejected() {
     // the unbalanced output qty.
     let out_pred = output_predicate_point(out.predicate_tag);
     let mut program = ScriptBuilder::new();
-    program = program.push_str(String::contract(contract));
+    program = program.push_literal(CellValue::contract(contract));
     program = program.input();
     program = push_taproot_proof_to_program(program, &cp);
     program = program
@@ -708,8 +708,8 @@ fn confidential_with_fee_undersupply_rejected() {
         .drop_();
     program = program.push_int(3u64).fee();
     program = program
-        .push_str(String::commitment(q_out))
-        .push_str(String::commitment(f_out));
+        .push_literal(CellValue::commitment(q_out))
+        .push_literal(CellValue::commitment(f_out));
     program = program.push_int(2u64).push_int(1u64).mix();
     program = program.push_point(*out_pred.as_bytes()).output();
 

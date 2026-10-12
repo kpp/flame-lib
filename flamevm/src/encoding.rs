@@ -5,7 +5,7 @@ use cells::{
 };
 use curve25519_dalek::ristretto::CompressedRistretto;
 
-use crate::{ClearToken, Commitment, Dict, Point, Scalar, String, Token, Value};
+use crate::{ClearToken, Commitment, Dict, Point, Scalar, Token, Value};
 
 /// Bound recursive typed decoding independently of witness availability or gas.
 pub(crate) const MAX_VALUE_DEPTH: usize = 128;
@@ -106,39 +106,6 @@ impl CellDecode for ClearToken {
     }
 }
 
-impl CellEncode for String {
-    fn encode(&self, builder: &mut CellBuilder) -> Result<(), CellError> {
-        let len = self.len();
-        if len > Self::MAX_LEN {
-            return Err(CellError::PayloadTooLarge {
-                actual: len,
-                max: Self::MAX_LEN,
-            });
-        }
-        if let Some(bytes) = self.as_opaque() {
-            builder.store_bytes(bytes)?;
-        } else {
-            // Check the size before compiling/copying private witness bytes.
-            builder.store_bytes(&self.to_bytes_vec())?;
-        }
-        Ok(())
-    }
-}
-
-impl CellDecode for String {
-    fn decode<R: CellReader + ?Sized>(
-        slice: &mut CellSlice<'_>,
-        _resolver: &mut R,
-    ) -> Result<Self, CellError> {
-        if slice.remaining_refs() != 0 {
-            return Err(CellError::InvalidFormat);
-        }
-        Ok(Self::from(
-            slice.load_bytes(slice.remaining_bytes())?.to_vec(),
-        ))
-    }
-}
-
 impl CellEncode for Value {
     fn encode(&self, builder: &mut CellBuilder) -> Result<(), CellError> {
         encode_value_at(self, builder, 0)
@@ -156,11 +123,6 @@ fn encode_value_at(
     match value {
         Value::Scalar(value) => {
             builder.store_u8(0)?.store(value)?;
-        }
-        Value::String(value) => {
-            builder
-                .store_u8(1)?
-                .store_ref(CellRef::resident(value.to_cell()?))?;
         }
         Value::Dict(value) => {
             let mut child = CellBuilder::new();
@@ -223,12 +185,6 @@ impl Value {
                     Value::Scalar(_) | Value::Point(_) => 35,
                     Value::Token(_) | Value::ClearToken(_) => 67,
                     Value::Cell(_) => 35,
-                    Value::String(string) => {
-                        string.check_len()?;
-                        // Copy/hash one raw String Cell, plus the tagged Value
-                        // Cell containing its single reference.
-                        2 * (string.len() as u64 + 2) + 35
-                    }
                     Value::Dict(dict) if depth < MAX_VALUE_DEPTH => {
                         pending.extend(dict.cached_values().map(|value| (value, depth + 1)));
                         dict.encoding_path_gas()?
@@ -286,10 +242,6 @@ fn decode_value_at<R: CellReader + ?Sized>(
     slice.try_load(|slice| {
         Ok(match slice.load_u8()? {
             0 => Value::Scalar(Scalar::decode(slice, resolver)?),
-            1 => {
-                let cell = read_cell(resolver, &slice.load_ref()?)?;
-                Value::String(String::from_cell(&cell, resolver)?)
-            }
             2 => {
                 let cell = read_cell(resolver, &slice.load_ref()?)?;
                 let mut child = CellSlice::new(&cell);
@@ -348,14 +300,14 @@ mod tests {
 
     #[test]
     fn encoding_work_counts_nested_values_and_stops_at_the_format_depth() {
-        let small = Value::Dict(Dict::from_values(vec![Value::Scalar(Scalar::ONE)]));
-        let large = Value::Dict(Dict::from_values(vec![Value::String(String::from(
-            vec![7; MAX_CELL_PAYLOAD],
-        ))]));
-        assert!(
-            large.encoding_gas().unwrap()
-                > small.encoding_gas().unwrap() + 2 * MAX_CELL_PAYLOAD as u64
-        );
+        let small = Value::Dict(Dict::from_values(vec![Value::Cell(
+            crate::CellValue::from_bytes(vec![]).unwrap(),
+        )]));
+        let large = Value::Dict(Dict::from_values(vec![Value::Cell(
+            crate::CellValue::from_bytes(vec![7; MAX_CELL_PAYLOAD]).unwrap(),
+        )]));
+        // Encoding an existing Cell attaches a reference without copying its body.
+        assert_eq!(large.encoding_gas().unwrap(), small.encoding_gas().unwrap());
         let mut nested = Value::Scalar(Scalar::ONE);
         for _ in 0..=MAX_VALUE_DEPTH {
             nested = Value::Dict(Dict::from_values(vec![nested]));
@@ -383,41 +335,41 @@ mod tests {
     }
 
     #[test]
-    fn strings_use_one_raw_payload_cell_and_load_from_index() {
+    fn cell_values_encode_references_without_private_annotations() {
         for length in [0, 1, MAX_CELL_PAYLOAD - 1, MAX_CELL_PAYLOAD] {
             let bytes = vec![0xa5; length];
-            let string_cell = String::from(bytes.clone()).to_cell().unwrap();
-            assert_eq!(string_cell.payload(), bytes);
-            assert!(string_cell.refs().is_empty());
-            assert_eq!(string_cell.record_size(), length + 2);
-            let cell = Value::String(String::from(bytes.clone()))
+            let data_cell = crate::CellValue::from_bytes(bytes.clone())
+                .unwrap()
                 .to_cell()
                 .unwrap();
-            assert_eq!(cell.payload(), &[1]);
+            assert_eq!(data_cell.payload(), bytes);
+            assert!(data_cell.refs().is_empty());
+            assert_eq!(data_cell.record_size(), length + 2);
+            let cell = Value::Cell(data_cell.clone().into()).to_cell().unwrap();
+            assert_eq!(cell.payload(), &[13]);
             assert_eq!(cell.refs().len(), 1);
-            assert_eq!(cell.refs()[0].id(), string_cell.id());
+            assert_eq!(cell.refs()[0].id(), data_cell.id());
             let mut bag = CellIndex::collect(Arc::new(cell.clone())).unwrap();
             let root = Cell::decode_record_exact(&cell.encode_record()).unwrap();
-            assert!(
-                matches!(Value::from_cell(&root, &mut bag).unwrap(), Value::String(s) if s.to_bytes_vec() == bytes)
-            );
+            let value = Value::from_cell(&root, &mut bag)
+                .unwrap()
+                .into_cell_ref()
+                .unwrap();
+            assert_eq!(read_cell(&mut bag, &value).unwrap().payload(), bytes);
         }
-        let witness = String::scalar(Scalar::ONE).to_cell().unwrap();
+        let witness = crate::CellValue::scalar(Scalar::ONE).to_cell().unwrap();
         assert_eq!(witness.payload(), Scalar::ONE.as_bytes());
         assert!(witness.refs().is_empty());
     }
 
     #[test]
-    fn strings_reject_oversized_payloads_and_all_references() {
-        let oversized = String::from(vec![0; MAX_CELL_PAYLOAD + 1]);
+    fn cell_values_reject_oversized_payloads_but_allow_graphs() {
         assert!(matches!(
-            oversized.to_cell(),
+            crate::CellValue::from_bytes(vec![0; MAX_CELL_PAYLOAD + 1]),
             Err(CellError::PayloadTooLarge { .. })
         ));
-        assert!(Value::String(oversized).encoding_gas().is_err());
-        let script = String::script(vec![crate::ops::Instruction::Nop; MAX_CELL_PAYLOAD + 1]);
         assert!(matches!(
-            script.to_cell(),
+            crate::CellValue::script(vec![crate::ops::Instruction::Nop; MAX_CELL_PAYLOAD + 1]),
             Err(CellError::PayloadTooLarge { .. })
         ));
 
@@ -426,18 +378,12 @@ mod tests {
             CellRef::resident(Cell::new(vec![], vec![]).unwrap()),
         ] {
             let cell = Cell::new(vec![0xaa], vec![reference]).unwrap();
-            let mut slice = CellSlice::new(&cell);
-            assert!(matches!(
-                String::decode(&mut slice, &mut ()),
-                Err(CellError::InvalidFormat)
-            ));
-            assert_eq!(slice.remaining_bytes(), 1);
-            assert_eq!(slice.remaining_refs(), 1);
-            let wrapped = Cell::new(vec![1], vec![CellRef::resident(cell)]).unwrap();
-            assert!(matches!(
-                Value::from_cell(&wrapped, &mut ()),
-                Err(CellError::InvalidFormat)
-            ));
+            let value = crate::CellValue::from(cell.clone());
+            assert!(matches!(value.payload(), Err(CellError::InvalidFormat)));
+            let wrapped = Value::Cell(value).to_cell().unwrap();
+            assert!(
+                matches!(Value::from_cell(&wrapped, &mut ()).unwrap(), Value::Cell(reference) if reference.id() == cell.id())
+            );
         }
     }
 

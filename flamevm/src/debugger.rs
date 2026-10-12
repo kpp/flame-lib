@@ -301,11 +301,6 @@ fn view(value: &Value, cells: &mut BTreeMap<CellID, CellView>) -> ValueView {
             result.kind = "Slice";
             bytes(&mut result, slice.bytes(), slice.refs());
         }
-        Value::String(string) => {
-            result.kind = "String (legacy)";
-            result.byte_len = string.len();
-            result.summary = format!("{} bytes", string.len());
-        }
         Value::Point(point) => {
             result.kind = "Point";
             result.summary = hex(&point.to_bytes());

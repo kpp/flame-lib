@@ -38,10 +38,10 @@ fn signcall_ignores_unrelated_annotations_on_authenticated_source_bytes() {
     .unwrap();
     let point = Point::from_bytes(source.try_into().unwrap());
     let tx = ScriptBuilder::new()
-        .push_str(String::contract(contract))
+        .push_literal(CellValue::contract(contract))
         .input()
-        .push_str(String::point(point))
-        .push_str(signature.to_vec())
+        .push_literal(CellValue::point(point))
+        .push_literal(CellValue::from_bytes(signature.to_vec()).unwrap())
         .push_int(10_000u64)
         .push_int(0u64)
         .signcall()
@@ -64,8 +64,8 @@ fn internal_signcall_code(
         .dict()
         .push_point(*verification_key.as_bytes())
         .contract()
-        .push_str(String::from(program))
-        .push_str(String::from(signature.to_vec()))
+        .push_literal(CellValue::from_bytes(program).unwrap())
+        .push_literal(CellValue::from_bytes(signature.to_vec()).unwrap())
         .push_int(10_000u64)
         .push_int(0u64)
         .signcall()
@@ -152,8 +152,8 @@ fn signcall_records_explicit_sig_and_runs_program() {
         .push_int(5u64) // payload [5]
         .push_point([0xaa; 32])
         .contract()
-        .push_str(String::from(prog)) // inner script
-        .push_str(String::from(sig_bytes.to_vec())) // 64-byte sig
+        .push_literal(CellValue::from_bytes(prog).unwrap()) // inner script
+        .push_literal(CellValue::from_bytes(sig_bytes.to_vec()).unwrap()) // 64-byte sig
         .push_int(1024u64) // gas
         .push_int(0u64) // m = 0 args
         .signcall()
@@ -198,8 +198,8 @@ fn failed_signcall_restores_contract_and_argument_and_signature_checkpoint() {
     vm.last_anchor = Some(Anchor([0x42; 32]));
     vm.current_call.stack = vec![
         Value::Contract(Box::new(contract)),
-        witness_cell(String::from(program)),
-        witness_cell(String::from(signature.to_vec())),
+        witness_cell(CellValue::from_bytes(program).unwrap()),
+        witness_cell(CellValue::from_bytes(signature.to_vec()).unwrap()),
         Value::Scalar(Scalar::from(10_000u64)),
         Value::Token(token.clone()),
         Value::Scalar(Scalar::ONE),
@@ -241,8 +241,8 @@ fn signcall_message_binds_only_to_program_not_to_contract() {
             .push_int(5u64)
             .push_point([predicate_byte; 32])
             .contract()
-            .push_str(String::from(prog))
-            .push_str(String::from(sig.to_vec()))
+            .push_literal(CellValue::from_bytes(prog).unwrap())
+            .push_literal(CellValue::from_bytes(sig.to_vec()).unwrap())
             .push_int(1024u64)
             .push_int(0u64)
             .signcall()
@@ -276,8 +276,8 @@ fn signcall_rejects_wrong_signature_length() {
         .push_int(5u64)
         .push_point([0xaa; 32])
         .contract()
-        .push_str(String::from(prog))
-        .push_str(String::from(vec![0u8; 63])) // bad: 63-byte sig
+        .push_literal(CellValue::from_bytes(prog).unwrap())
+        .push_literal(CellValue::from_bytes(vec![0u8; 63]).unwrap()) // bad: 63-byte sig
         .push_int(1024u64)
         .push_int(0u64)
         .signcall()
@@ -356,8 +356,8 @@ fn signcall_rejects_widetoken_argument() {
         .dict()
         .push_point([0xaa; 32])
         .contract()
-        .push_str(String::from(Vec::new()))
-        .push_str(String::from(vec![0u8; 64]))
+        .push_literal(CellValue::from_bytes(Vec::new()).unwrap())
+        .push_literal(CellValue::from_bytes(vec![0u8; 64]).unwrap())
         .push_int(1_024u64)
         .push_int(1u64)
         .fee()
@@ -581,11 +581,11 @@ fn phase20_two_txbound_verifies_with_multisig() {
     // Script: input contract1, signtx (drop payload), input contract2,
     // signtx (drop payload).
     let program = ScriptBuilder::new()
-        .push_str(String::contract(contract1))
+        .push_literal(CellValue::contract(contract1))
         .input()
         .signtx()
         .drop_()
-        .push_str(String::contract(contract2))
+        .push_literal(CellValue::contract(contract2))
         .input()
         .signtx()
         .drop_();
@@ -829,8 +829,8 @@ fn signcall_selfid_errors_no_actor_context() {
         .push_int(5u64)
         .push_point([0xaa; 32])
         .contract()
-        .push_str(String::from(prog))
-        .push_str(String::from(sig_bytes.to_vec()))
+        .push_literal(CellValue::from_bytes(prog).unwrap())
+        .push_literal(CellValue::from_bytes(sig_bytes.to_vec()).unwrap())
         .push_int(1024u64)
         .push_int(0u64)
         .signcall()

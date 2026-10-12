@@ -1876,7 +1876,7 @@ mod tests {
 
         let send = |input: &Contract| {
             ScriptBuilder::new()
-                .push_str(flamevm::String::contract(input.clone()))
+                .push_literal(flamevm::CellValue::contract(input.clone()))
                 .input()
                 .push_point(*opening.internal_key.as_bytes())
                 .push_cell(opening.root.clone())
@@ -1886,9 +1886,14 @@ mod tests {
                 .verify()
                 .drop_()
                 .push_int(0u64)
-                .push_str(refund_predicate().to_point().as_bytes().to_vec())
+                .push_literal(
+                    flamevm::CellValue::from_bytes(
+                        refund_predicate().to_point().as_bytes().to_vec(),
+                    )
+                    .unwrap(),
+                )
                 .push_int(20_000u64)
-                .push_str(actor.to_hash().to_vec())
+                .push_literal(flamevm::CellValue::from_bytes(actor.to_hash().to_vec()).unwrap())
                 .send()
         };
         let mut first = external_tx(send(&inputs[0]), 0);
@@ -2054,7 +2059,7 @@ mod tests {
     fn failed_constructor_rolls_back_actor_storage_and_effects() {
         let code = ScriptBuilder::new()
             .push_int(5u64)
-            .push_str(b"mint".to_vec())
+            .push_literal(flamevm::CellValue::from_bytes(b"mint".to_vec()).unwrap())
             .issuepub()
             .retire()
             .push_int(1_024u64)
@@ -2121,7 +2126,7 @@ mod tests {
             .merge()
             .drop_()
             .drop_()
-            .push_str(replacement_code.clone())
+            .push_literal(flamevm::CellValue::from_bytes(replacement_code.clone()).unwrap())
             .setcode()
             .load()
             .drop_()
@@ -2293,7 +2298,7 @@ mod tests {
             .save()
             .push_int(0u64)
             .push_int(100_000u64)
-            .push_str(child.to_hash().to_vec())
+            .push_literal(flamevm::CellValue::from_bytes(child.to_hash().to_vec()).unwrap())
             .call()
             .drop_()
             .drop_()
