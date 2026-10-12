@@ -269,7 +269,7 @@ fn issuepub_clear_path_emits_txlog_and_returns_cleartoken() {
     // Script: push:7, pushstr "gold", issuepub.
     // Run under InternalRoot with a known actor identity so
     // `op_issuepub` can resolve a flavor.
-    let actor = ActorID::Hash([0x55; 32]);
+    let actor = ActorID::from([0x55; 32]);
     let script = ScriptBuilder::new()
         .push_int(7u64)
         .push_literal(CellValue::from_bytes(b"gold".to_vec()).unwrap())
@@ -306,7 +306,7 @@ fn issuepub_with_point_qty_errors_typenotscalar() {
     // `issuepub` is cleartext-only; non-Scalar qty hard-fails. Under
     // the new design (spec.md §issuepub), the confidential variant
     // lives in `issuepriv`, not in dispatch-peek on this opcode.
-    let actor = ActorID::Hash([0x55; 32]);
+    let actor = ActorID::from([0x55; 32]);
     let script = ScriptBuilder::new()
         .push_point([0u8; 32])
         .push_literal(CellValue::from_bytes(b"gold".to_vec()).unwrap())
@@ -855,7 +855,7 @@ fn issuepubflv_pushes_correct_flavor() {
         .to_bytecode();
     let mut vm = vm_with_script(script);
     run_to_end(&mut vm).expect("issuepubflv ok");
-    let expected = test_flavor_from_actor(&ActorID::Hash(actor_bytes), b"gold");
+    let expected = test_flavor_from_actor(&ActorID::from(actor_bytes), b"gold");
     assert_eq!(vm.current_call.stack.len(), 1);
     assert_int(&vm.current_call.stack[0], expected);
 }

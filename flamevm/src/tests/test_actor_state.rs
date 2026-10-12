@@ -11,7 +11,7 @@ use crate::{empty_state, ActorID, Dict, Scalar, StoragePurchase};
 fn deploy_with_recv(reg: &mut MemRegistry, recv: Vec<u8>, capacity: u64) -> ActorID {
     // The recv bytes ARE the actor's code; state starts empty. Id is
     // derived from the code (stand-in for the real constructor).
-    let id = ActorID::Hash(ActorID::Constructor(recv.clone()).to_hash());
+    let id = ActorID::from(crate::code_cell(&recv).unwrap().id());
     reg.deploy(id.clone(), recv, empty_state(), capacity)
         .expect("deploy");
     id
@@ -85,8 +85,10 @@ fn constructor_buys_storage_and_is_reused() {
         .drop_()
         .drop_()
         .to_bytecode();
-    let target = ActorID::Constructor(code.clone());
-    let canonical = target.to_canonical();
+    let target = ActorAddress::Init {
+        ctor: crate::code_cell(&code).unwrap().into(),
+    };
+    let canonical = target.to_actor_id();
     let mk = || {
         Message::new(
             target.clone(),
@@ -200,7 +202,7 @@ fn load_against_checked_out_actor_errors() {
     let mut reg = MemRegistry::new();
     let id = deploy_with_recv(&mut reg, ScriptBuilder::new().nop().to_bytecode(), 1_000);
     // Simulate a sibling frame having checked out the state.
-    reg.actor_mut(&id).expect("present").state = None;
+    drop(reg.load_state(&id).unwrap());
 
     let mut vm = vm_for(id, ScriptBuilder::new().load().to_bytecode());
     let err = vm
@@ -245,7 +247,7 @@ fn save_accepts_arbitrary_portable_dict_shape() {
     let id = deploy_with_recv(&mut reg, ScriptBuilder::new().nop().to_bytecode(), 1_000);
     // Check the state out (as a prior op_load would) so save can move
     // a fresh Dict back in.
-    reg.actor_mut(&id).expect("present").state = None;
+    drop(reg.load_state(&id).unwrap());
 
     // Script: push:0; dict; save. Empty Dict, no wrapper shape.
     let script = ScriptBuilder::new()
@@ -270,7 +272,7 @@ fn save_accepts_arbitrary_portable_dict_shape() {
 fn save_rejects_nested_nonportable_state() {
     let mut reg = MemRegistry::new();
     let id = deploy_with_recv(&mut reg, ScriptBuilder::new().nop().to_bytecode(), 1_000);
-    reg.actor_mut(&id).expect("present").state = None;
+    drop(reg.load_state(&id).unwrap());
 
     let mut inner = Dict::new();
     inner.insert(
@@ -335,7 +337,7 @@ fn token_survives_load_save_roundtrip_exactly_once() {
     );
     let state = Value::Dict(d);
     let recv = ScriptBuilder::new().load().save().to_bytecode();
-    let id = ActorID::Hash(ActorID::Constructor(recv.clone()).to_hash());
+    let id = ActorID::from(crate::code_cell(&recv).unwrap().id());
     reg.deploy(id.clone(), recv, state, 10_000).expect("deploy");
 
     let msg = Message::new(
@@ -392,7 +394,7 @@ fn dismantle_token_bearing_state_requires_retire() {
         Value::ClearToken(ClearToken::new(Scalar::from(5u64), Scalar::from(9u64))),
     );
     let state = Value::Dict(state_dict);
-    let id = ActorID::Hash([0x09; 32]);
+    let id = ActorID::from([0x09; 32]);
     reg.deploy(id.clone(), recv, state, 10_000).expect("deploy");
 
     let block = BlockContext { height: 100 };

@@ -11,7 +11,7 @@ fn hex(bytes: &[u8]) -> std::string::String {
 #[test]
 fn golden_consensus_hashes() {
     let header = || TxEntry::Header(dummy_header());
-    let actor = ActorID::Hash([7; 32]);
+    let actor = ActorID::from([7; 32]);
     let samples = [
         (
             vec![header()],
@@ -71,7 +71,7 @@ fn golden_consensus_hashes() {
         "7e72188b8144c3677a63d3f2c2d70e33934c7a6767a55b81bf639bd1467c48ed"
     );
     assert_eq!(
-        hex(&ActorID::Constructor(vec![1, 2, 3]).to_hash()),
+        hex(&crate::code_cell(&[1, 2, 3]).unwrap().id()),
         "98cf202457011106ee0345b2b2b5cd239ce36b57997d4398614c03211139dfde"
     );
     let contract = Contract::new(
@@ -176,7 +176,7 @@ fn golden_txlog_wire_encoding() {
         (TxEntry::Receive([0x22; 32]), 3, [0x22; 32]),
         (
             TxEntry::ActorDestroy {
-                actor: ActorID::Hash([7; 32]),
+                actor: ActorID::from([7; 32]),
             },
             13,
             [7; 32],
@@ -227,7 +227,7 @@ fn golden_txlog_wire_encoding() {
         record(&[&[8][..], &1000u64.to_le_bytes()].concat(), &[])
     );
 
-    let actor = ActorID::Hash([7; 32]);
+    let actor = ActorID::from([7; 32]);
     for (entry, tag, child) in [
         (
             TxEntry::Data(vec![1, 2, 3]),
@@ -293,7 +293,7 @@ fn golden_txlog_wire_encoding() {
 #[test]
 fn golden_storage_effect_wire_encoding() {
     let purchase = TxEntry::StoragePurchase {
-        actor: ActorID::Hash([7; 32]),
+        actor: ActorID::from([7; 32]),
         bytes: 1024,
         expiry_height: 52_500,
         fee_sparks: Scalar::from(1_000_007_630u64),

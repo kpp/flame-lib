@@ -108,7 +108,7 @@ impl CellIndex {
             for _ in 0..count {
                 let k = key.take().ok_or(CellError::InvalidFormat)?;
                 let body = trie.get(&k, resolver)?.ok_or(CellError::InvalidFormat)?;
-                let original = project(&body, cap)?;
+                let original = project_cell(&body, cap)?;
                 if original.id().as_slice() != k.as_slice() {
                     return Err(CellError::InvalidFormat);
                 }
@@ -198,7 +198,9 @@ fn prove(
     Ok(done[&root_id].clone())
 }
 
-fn project(cell: &Cell, cap: u8) -> Result<Cell, CellError> {
+/// Reconstructs an available record at a proof's original level cap. New cuts
+/// fail; surviving child commitments become unloaded references.
+pub fn project_cell(cell: &Cell, cap: u8) -> Result<Cell, CellError> {
     if cap > MAX_CELL_LEVEL {
         return Err(CellError::InvalidLevel);
     }
@@ -305,7 +307,7 @@ impl CellEnvelope {
                 (cell.payload().len() as u64 + cell.refs().len() as u64 * 34 + 36)
                     * (u64::from(cell.level_mask().count_ones()) + 1),
             )?;
-            cells.insert(Arc::new(project(&cell, cap)?))?;
+            cells.insert(Arc::new(project_cell(&cell, cap)?))?;
             for r in cell.refs() {
                 pending.push(read_cell(&mut (), r)?);
             }
@@ -333,6 +335,55 @@ mod tests {
     use super::*;
     fn leaf(n: u8) -> Cell {
         Cell::new(vec![n], vec![]).unwrap()
+    }
+
+    #[test]
+    fn projection_recovers_the_record_but_not_newly_omitted_contents() {
+        let old_cut = leaf(1).prune(1).unwrap();
+        let data = leaf(2);
+        let original =
+            Cell::new(vec![3], vec![old_cut.clone().into(), data.clone().into()]).unwrap();
+        let new_cut = data.prune(2).unwrap();
+        let proof = Cell::new(
+            vec![3],
+            vec![old_cut.clone().into(), new_cut.clone().into()],
+        )
+        .unwrap();
+        let record = project_cell(&proof, 1).unwrap();
+        assert_eq!(record.commitment(), original.commitment());
+        assert!(record.refs().iter().all(CellRef::is_unloaded));
+        assert_eq!(
+            project_cell(&old_cut, 1).unwrap().commitment(),
+            old_cut.commitment()
+        );
+        assert_eq!(
+            project_cell(&new_cut, 1).unwrap_err(),
+            CellError::PrunedCell
+        );
+        assert_eq!(
+            project_cell(&proof, MAX_CELL_LEVEL + 1).unwrap_err(),
+            CellError::InvalidLevel
+        );
+    }
+
+    #[test]
+    fn projection_preserves_sparse_levels_and_their_depths() {
+        let old_cut = leaf(1).prune(1).unwrap().prune(3).unwrap();
+        let data = Cell::new(vec![2], vec![leaf(3).into()]).unwrap();
+        let original =
+            Cell::new(vec![4], vec![old_cut.clone().into(), data.clone().into()]).unwrap();
+        assert_eq!(original.level_mask(), 0b101);
+        let proof = Cell::new(
+            original.payload().to_vec(),
+            vec![old_cut.into(), data.prune(4).unwrap().into()],
+        )
+        .unwrap();
+        let projected = project_cell(&proof, 3).unwrap();
+        assert_eq!(projected.commitment(), original.commitment());
+        for level in 0..=3 {
+            assert_eq!(projected.hash(level), original.hash(level));
+            assert_eq!(projected.depth(level), original.depth(level));
+        }
     }
 
     #[test]

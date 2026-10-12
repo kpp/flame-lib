@@ -1094,7 +1094,7 @@ fn slice_access_rejects_missing_or_pruned_bodies_and_old_pushstr_is_not_an_opcod
         CallFrame::from_cell(
             bytes(&[0x19]),
             CallKind::InternalRoot {
-                actor: ActorID::Hash([0; 32]),
+                actor: ActorID::from([0; 32]),
                 caller: None,
             },
             1_000_000,
@@ -1171,7 +1171,7 @@ fn cursor_and_builder_values_can_return_upward_but_cannot_be_call_arguments() {
     let mut registry = StubRegistry {
         script: branch.to_bytecode(),
     };
-    let mut vm = vm_with_script(call_to(&ActorID::Hash([9; 32])).verify().drop_());
+    let mut vm = vm_with_script(call_to(&ActorID::from([9; 32])).verify().drop_());
     vm.last_anchor = Some(Anchor([3; 32]));
     while !vm.current_call.is_finished() || !vm.call_stack.is_empty() {
         vm.step_internal_with_registry(&mut registry).unwrap();

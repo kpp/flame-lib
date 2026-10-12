@@ -137,7 +137,9 @@ pub(super) fn deploy(node: &mut Node, genesis: &GenesisFile) -> (ActorId, Contra
         .drop_()
         .save()
         .to_bytecode();
-    let actor = ActorID::Constructor(constructor);
+    let actor = flamevm::ActorAddress::Init {
+        ctor: flamevm::code_cell(&constructor).unwrap().into(),
+    };
     let unsigned = ScriptBuilder::new()
         .push_literal(CellValue::contract(input.clone()).unwrap())
         .input()
@@ -149,7 +151,7 @@ pub(super) fn deploy(node: &mut Node, genesis: &GenesisFile) -> (ActorId, Contra
             CellValue::from_bytes(input.predicate.to_point().to_bytes().to_vec()).unwrap(),
         )
         .push_int(1_000_000u64)
-        .push_literal(CellValue::from_bytes(actor.to_envelope().unwrap().encode()).unwrap())
+        .push_cell(actor.to_cell().unwrap())
         .send()
         .push_point(input.predicate.to_point().to_bytes())
         .output()
@@ -182,7 +184,11 @@ pub(super) fn send_messages(
                 CellValue::from_bytes(input.predicate.to_point().to_bytes().to_vec()).unwrap(),
             )
             .push_int(*gas)
-            .push_literal(CellValue::from_bytes(actor.0.to_vec()).unwrap())
+            .push_cell(
+                flamevm::ActorAddress::from(ActorID::from(actor.0))
+                    .to_cell()
+                    .unwrap(),
+            )
             .send();
     }
     let unsigned = script
@@ -320,7 +326,11 @@ fn failed_delivery_summary_matches_its_archived_refund() {
         .push_int(1u64)
         .push_literal(CellValue::from_bytes(predicate.to_vec()).unwrap())
         .push_int(1_000_000u64)
-        .push_literal(CellValue::from_bytes(missing.0.to_vec()).unwrap())
+        .push_cell(
+            flamevm::ActorAddress::from(ActorID::from(missing.0))
+                .to_cell()
+                .unwrap(),
+        )
         .send()
         .push_point(predicate)
         .output()

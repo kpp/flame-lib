@@ -44,7 +44,7 @@ writer knew `V`, and anyone given the address knows `V`.
 ## Notation
 
 This document uses the notation and the transcript conventions of
-[`flamekd.md`](../flamekd/flamekd.md#transcript-conventions): `G` is the
+[`flamekd.md`](flamekd.md#transcript-conventions): `G` is the
 ristretto255 generator, `x*P` is scalar multiplication, `enc(x)` and `enc(P)`
 are the canonical 32-byte encodings of a scalar and a compressed point, `++`
 is concatenation, and `Transcript(domain)`, `P.append(label, bytes)` and
@@ -68,7 +68,7 @@ to the quantity and one to the flavor.
 ## Overview
 
 A Receiving Address is two public keys, `(S, V)`
-([`flamekd.md`](../flamekd/flamekd.md#key-types-and-capabilities)). `S` locks
+([`flamekd.md`](flamekd.md#key-types-and-capabilities)). `S` locks
 the payment: it becomes the output's predicate, and only its secret `s` can
 authorize a spend. `V` encrypts the payment: the sender runs a
 Diffie-Hellman exchange against it, and only its secret `v` recovers the
@@ -439,7 +439,7 @@ it does not know keeps the output as **unknown version**.
 
 `flamekd.md` leaves token encryption to another specification and sets its
 requirements in
-[Compromise boundaries](../flamekd/flamekd.md#compromise-boundaries):
+[Compromise boundaries](flamekd.md#compromise-boundaries):
 
 > An encryption protocol SHOULD use fresh sender randomness per output,
 > validated group inputs, and a domain-separated KDF bound to the output and

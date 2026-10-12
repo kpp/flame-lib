@@ -230,7 +230,7 @@ fn build_continue_skips_rest_of_body() {
 fn infinite_loop_exhausts_gas() {
     let script = ScriptBuilder::new().build_loop(|p| p.nop()).to_bytecode();
     let kind = CallKind::InternalRoot {
-        actor: ActorID::Hash([0u8; 32]),
+        actor: ActorID::from([0u8; 32]),
         caller: None,
     };
     let mut vm = VM::new(
@@ -259,7 +259,7 @@ fn skip_scan_charges_gas() {
     }
     let script = p.label(0).to_bytecode();
     let kind = CallKind::InternalRoot {
-        actor: ActorID::Hash([0u8; 32]),
+        actor: ActorID::from([0u8; 32]),
         caller: None,
     };
     let mut vm = VM::new(
@@ -298,7 +298,7 @@ fn gas_bounds_cumulative_builder_growth() {
         .write_zeros()
         .to_bytecode();
     let kind = CallKind::InternalRoot {
-        actor: ActorID::Hash([0u8; 32]),
+        actor: ActorID::from([0u8; 32]),
         caller: None,
     };
     let mut vm = VM::new(
@@ -321,7 +321,7 @@ fn gas_bounds_cumulative_builder_growth() {
 fn allocation_gas_trips_on_pushstr_append_and_tread() {
     let run_metered = |script: Vec<u8>, gas: u64| {
         let kind = CallKind::InternalRoot {
-            actor: ActorID::Hash([0u8; 32]),
+            actor: ActorID::from([0u8; 32]),
             caller: None,
         };
         let mut vm = VM::new(

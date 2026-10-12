@@ -14,7 +14,7 @@ use curve25519_dalek::scalar::Scalar as DalekScalar;
 use merlin::Transcript;
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::actor::{empty_state, ActorID, ActorRegistry};
+use crate::actor::{empty_state, ActorAddress, ActorID, ActorRegistry};
 use crate::cell_value::array32;
 use crate::constraints::Commitment;
 use crate::contract::{Contract, ContractID, Predicate};
@@ -744,6 +744,8 @@ pub(crate) struct VM {
 struct ExecutionCells<'a> {
     external: &'a CellIndex,
     actor: &'a CellIndex,
+    // Explicit address witnesses can use sender storage; callee execution cannot.
+    address_sender: Option<&'a CellIndex>,
     gas_used: &'a mut u64,
     gas_limit: u64,
 }
@@ -769,6 +771,7 @@ impl CellReader for ExecutionCells<'_> {
             None => self
                 .actor
                 .get(&id)
+                .or_else(|| self.address_sender.and_then(|sender| sender.get(&id)))
                 .or_else(|| self.external.get(&id))
                 .ok_or(CellError::MissingCell(id))?,
         };
@@ -794,11 +797,59 @@ impl CellReader for CodeCells<'_> {
     }
 }
 
+/// Called only under the transaction/call checkpoint, before actor execution.
+fn prepare_actor_address(
+    registry: &mut dyn ActorRegistry,
+    address: &ActorAddress,
+    external: &CellIndex,
+    sender: Option<&CellIndex>,
+    gas_used: &mut u64,
+    gas_limit: u64,
+) -> Result<Option<TxEntry>, VMError> {
+    let actor = address.to_actor_id();
+    let exists = registry.exists(&actor);
+    let actor_cells = if exists {
+        registry.actor_cells(&actor)?
+    } else {
+        Arc::new(CellIndex::new())
+    };
+    let mut reader = CodeCells(ExecutionCells {
+        external,
+        actor: &actor_cells,
+        address_sender: sender,
+        gas_used,
+        gas_limit,
+    });
+    match address {
+        ActorAddress::Init { ctor } if !exists => {
+            let root = cells::read_cell(&mut reader, ctor)?;
+            let code = root.load_graph_scoped(&mut reader)?;
+            Program::new(Arc::new(code.clone()))?;
+            registry.deploy(actor, code.clone(), empty_state())?;
+            Ok(Some(TxEntry::ActorDeploy { actor, code }))
+        }
+        ActorAddress::Restore { state, .. } if exists => {
+            reader.0.charge(actor_cells.len() as u64)?;
+            let root = cells::read_cell(&mut reader, state)?;
+            let proof = root.load_graph_scoped(&mut reader)?;
+            registry.restore_with_cells(&actor, &proof.clone().into(), &mut reader)?;
+            Ok(Some(TxEntry::ActorRestore {
+                actor,
+                state: proof,
+            }))
+        }
+        _ if !exists => Err(VMError::ActorNotFound),
+        _ if registry.is_frozen(&actor)? => Err(VMError::ActorFrozen),
+        _ => Ok(None),
+    }
+}
+
 impl VM {
     fn resolver(&mut self) -> ExecutionCells<'_> {
         ExecutionCells {
             external: &self.cells,
             actor: &self.current_call.actor_cells,
+            address_sender: None,
             gas_limit: self.current_call.gas_limit,
             gas_used: &mut self.current_call.gas_used,
         }
@@ -919,11 +970,9 @@ impl VM {
         block: &BlockContext,
         cells: Arc<CellIndex>,
     ) -> Result<TxResult, VMError> {
-        // Admission and MessageID/transport construction re-encode arguments.
-        // Price that work before cloning or traversing any of their Cell graphs.
-        let mut message_work = 0u64;
+        let mut initial_gas = 0u64;
         for value in message.payload() {
-            message_work = message_work
+            initial_gas = initial_gas
                 .checked_add(
                     value
                         .encoding_gas()?
@@ -933,160 +982,83 @@ impl VM {
                 .and_then(|gas| gas.checked_add(value.clone_gas().saturating_mul(2)))
                 .ok_or(VMError::OutOfGas)?;
         }
-        if let ActorID::Constructor(code) = &message.target {
-            message_work = message_work
-                .checked_add(alloc_byte_gas(code.len())?.saturating_mul(2))
-                .ok_or(VMError::OutOfGas)?;
-        }
-        if message_work > message.gas {
+        if initial_gas > message.gas {
             return Err(VMError::OutOfGas);
         }
-        registry.push_checkpoint();
-        let target = message.target.clone();
-        let message_bytes = message.encoded_size();
-
-        if let ActorID::Constructor(bytes) = &message.target {
-            if alloc_byte_gas(bytes.len())? > message.gas {
-                registry.pop_checkpoint_rollback();
-                return Err(VMError::OutOfGas);
-            }
-        }
-
-        // Deploy-on-first-delivery (spec §Actors): a Constructor-form
-        // target carries the actor's code on the wire and the id
-        // commits to it (`id = H(bytes)`), so the first message to a
-        // not-yet-deployed actor instantiates it — code = constructor
-        // bytes and empty state. The actor remains provisional until it buys
-        // enough storage during this transaction.
-        let mut deployed_code = None;
-        if !registry.exists(&message.target) {
-            if let ActorID::Constructor(bytes) = &message.target {
-                let code = match crate::code_cell(bytes) {
-                    Ok(code) => code,
-                    Err(error) => {
-                        registry.pop_checkpoint_rollback();
-                        return Err(error.into());
-                    }
-                };
-                if let Err(e) = registry.deploy(message.target.clone(), code.clone(), empty_state())
-                {
-                    registry.pop_checkpoint_rollback();
-                    return Err(e);
-                }
-                deployed_code = Some(code);
-            }
-        }
-        let code_bytes = match registry.actor_code_bytes(&message.target) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                registry.pop_checkpoint_rollback();
-                return Err(e);
-            }
-        };
-        let initial_gas = message_work
-            .saturating_add(alloc_byte_gas(message_bytes)?)
-            .saturating_add(code_bytes.saturating_mul(GAS_PER_ALLOC_BYTE))
+        let message_cell = message.to_cell()?;
+        initial_gas = initial_gas
+            .saturating_add(alloc_byte_gas(message_cell.record_size())?)
             .saturating_add(alloc_item_gas(message.payload().len())?);
         if initial_gas > message.gas {
-            registry.pop_checkpoint_rollback();
             return Err(VMError::OutOfGas);
         }
-        let actor_cells = match registry.actor_cells(&message.target) {
-            Ok(cells) => cells,
+
+        registry.push_checkpoint();
+        let result = (|| {
+            let target = message.target.to_actor_id();
+            let address_effect = prepare_actor_address(
+                registry,
+                &message.target,
+                &cells,
+                None,
+                &mut initial_gas,
+                message.gas,
+            )?;
+            initial_gas = initial_gas.saturating_add(
+                registry
+                    .actor_code_bytes(&target)?
+                    .saturating_mul(GAS_PER_ALLOC_BYTE),
+            );
+            if initial_gas > message.gas {
+                return Err(VMError::OutOfGas);
+            }
+            let actor_cells = registry.actor_cells(&target)?;
+            let mut reader = ExecutionCells {
+                external: &cells,
+                actor: &actor_cells,
+                address_sender: None,
+                gas_used: &mut initial_gas,
+                gas_limit: message.gas,
+            };
+            let script = registry.load_program_with_cells(&target, &mut reader)?;
+            let kind = CallKind::InternalRoot {
+                actor: target,
+                caller: message.caller,
+            };
+            let mut frame =
+                CallFrame::from_cell(script, kind, message.gas)?.with_anchor(message.anchor);
+            frame.actor_cells = actor_cells;
+            frame.charge_gas(initial_gas)?;
+            frame.stack.extend(message.into_payload());
+            let mut vm = Self::new(header, frame).with_cells(cells)?;
+            vm.block_height = block.height;
+            vm.txlog.push(TxEntry::Receive(message_cell.id()));
+            if let Some(effect) = address_effect {
+                vm.txlog.push(effect);
+            }
+
+            while vm.step_internal_with_registry(registry)? {}
+            for actor in registry.commit_tx_destructions() {
+                vm.txlog.push(TxEntry::ActorDestroy { actor });
+            }
+            if registry.exists(&target) {
+                registry.validate_actor_storage(&target, block.height)?;
+            }
+            vm.into_result(Vec::new(), None)
+        })();
+        match result {
+            Ok(result) => {
+                registry.pop_checkpoint_commit();
+                Ok(result)
+            }
             Err(error) => {
                 registry.pop_checkpoint_rollback();
-                return Err(error);
-            }
-        };
-        let mut initial_gas = initial_gas;
-        let mut resolver = ExecutionCells {
-            external: &cells,
-            actor: &actor_cells,
-            gas_used: &mut initial_gas,
-            gas_limit: message.gas,
-        };
-        let script = match registry.load_program_with_cells(&message.target, &mut resolver) {
-            Ok(script) => script,
-            Err(e) => {
-                registry.pop_checkpoint_rollback();
-                return Err(match e {
+                Err(match error {
                     VMError::Cell(CellError::ResourceExhausted) => VMError::OutOfGas,
                     other => other,
-                });
-            }
-        };
-        // MessageID is the canonical hash of the whole send (anchor,
-        // target, caller, payload, gas, refund
-        // predicate) — analogous to ContractID for Output. Capture
-        // before the move below.
-        let send_id = *message.id().as_bytes();
-        let anchor = message.anchor;
-        let caller = message.caller.clone();
-        let gas = message.gas;
-        let payload = message.into_payload();
-        let kind = CallKind::InternalRoot {
-            actor: target.clone(),
-            caller,
-        };
-        let mut frame = match CallFrame::from_cell(script, kind, gas) {
-            Ok(frame) => frame.with_anchor(anchor),
-            Err(error) => {
-                registry.pop_checkpoint_rollback();
-                return Err(error);
-            }
-        };
-        frame.actor_cells = actor_cells;
-        if let Err(e) = frame.charge_gas(initial_gas) {
-            registry.pop_checkpoint_rollback();
-            return Err(e);
-        }
-        // Deliver the message payload onto the recv's stack (in payload
-        // order) before dispatch runs — symmetric with `op_call`, which
-        // pushes its args. The dispatch selector (ADR 0020) rides as the
-        // topmost payload arg.
-        for v in payload {
-            frame.stack.push(v);
-        }
-        let mut vm = Self::new(header, frame).with_cells(cells)?;
-        vm.block_height = block.height;
-        // Commit the triggering MessageID into the Internal TxID merkle
-        // root. Symmetric with `op_input` for external txs: the first
-        // post-Header effect identifies *what consumed-once entity*
-        // brought this tx into existence.
-        vm.txlog.push(TxEntry::Receive(send_id));
-        if let Some(code) = deployed_code {
-            vm.txlog.push(TxEntry::ActorDeploy {
-                actor: ActorID::Hash(target.to_hash()),
-                code,
-            });
-        }
-
-        let mut run_err: Option<VMError> = None;
-        loop {
-            match vm.step_internal_with_registry(registry) {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(e) => {
-                    run_err = Some(e);
-                    break;
-                }
+                })
             }
         }
-        if let Some(e) = run_err {
-            registry.pop_checkpoint_rollback();
-            return Err(e);
-        }
-        for actor in registry.commit_tx_destructions() {
-            vm.txlog.push(TxEntry::ActorDestroy { actor });
-        }
-        if registry.exists(&target) {
-            if let Err(e) = registry.validate_actor_storage(&target, block.height) {
-                registry.pop_checkpoint_rollback();
-                return Err(e);
-            }
-        }
-        registry.pop_checkpoint_commit();
-        vm.into_result(Vec::new(), None)
     }
 
     fn new(header: TxHeader, initial_call: CallFrame) -> Self {
@@ -1292,8 +1264,11 @@ impl VM {
                     // the checked-out state, so the actor isn't
                     // spuriously self-destructed) — closes F1 of the
                     // op_save audit.
-                    if let Some(r) = registry.as_mut() {
-                        r.push_checkpoint();
+                    // ActorCall already checkpoints its address resolution.
+                    if !matches!(self.current_call.kind, CallKind::ActorCall { .. }) {
+                        if let Some(r) = registry.as_mut() {
+                            r.push_checkpoint();
+                        }
                     }
                 } else if depth_after < depth_before {
                     // Clean exit: keep effects, drop the snapshot.
@@ -1360,7 +1335,7 @@ impl VM {
             self.program_scope_ready = true;
         }
         let Some(instr) = self.current_call.next_instruction()? else {
-            return self.finish_call();
+            return self.finish_call(registry);
         };
         use Instruction as I;
         match instr {
@@ -1502,7 +1477,7 @@ impl VM {
             I::Label(n) => self.op_label(n),
             I::Jump(n) => self.op_jump(n),
             I::JumpIf(n) => self.op_jumpif(n),
-            I::Return => self.op_return(),
+            I::Return => self.op_return(registry),
             I::Type => self.op_type(),
 
             I::Input => self.op_input(),
@@ -1566,10 +1541,27 @@ impl VM {
         self.current_call.snap_failure_arg_count = 0;
     }
 
-    fn finish_call(&mut self) -> Result<bool, VMError> {
+    fn validate_actor_call_storage(
+        &self,
+        registry: Option<&dyn ActorRegistry>,
+    ) -> Result<(), VMError> {
+        let CallKind::ActorCall { actor, .. } = &self.current_call.kind else {
+            return Ok(());
+        };
+        let registry = registry.ok_or(VMError::RegistryUnavailable)?;
+        match registry.actor_code_bytes(actor) {
+            // Checked-out state is dismantled at transaction completion.
+            Err(VMError::ActorEmpty) => Ok(()),
+            Ok(_) => registry.validate_actor_storage(actor, self.block_height),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn finish_call(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<bool, VMError> {
         if !self.current_call.stack.is_empty() {
             return Err(VMError::StackNotClean);
         }
+        self.validate_actor_call_storage(registry.as_deref())?;
         let leftover_gas = self
             .current_call
             .gas_limit
@@ -2664,7 +2656,7 @@ impl VM {
     /// then `k` then `1` (success marker) onto the caller's stack.
     /// Stack on parent after the call: `… values… k 1` (top = 1).
     /// Errors `ReturnAtRoot` at the outermost frame.
-    fn op_return(&mut self) -> Result<(), VMError> {
+    fn op_return(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
         let k_int = self.pop_value()?.to_scalar()?;
         let k_u64 = k_int.to_u64().ok_or(VMError::BadReturnArity)?;
         let k = usize::try_from(k_u64).map_err(|_| VMError::BadReturnArity)?;
@@ -2683,6 +2675,7 @@ impl VM {
             return Err(VMError::StackNotClean);
         }
 
+        self.validate_actor_call_storage(registry.as_deref())?;
         let return_values: Vec<Value> = self.current_call.stack.drain(..).collect();
         let leftover_gas = self
             .current_call
@@ -2727,25 +2720,10 @@ impl VM {
         Ok(())
     }
 
-    /// Existing destinations remain a bare hash or a byte-encoded ActorID envelope.
-    fn pop_actor_id(&mut self) -> Result<ActorID, VMError> {
-        let source = self.pop_byte_source()?;
-        let bytes = source.byte_payload()?;
-        if let Some(hash) = array32(bytes) {
-            return Ok(ActorID::Hash(hash));
-        }
-        let envelope = cells::CellEnvelope::decode(bytes, bytes.len(), &mut self.current_call)?;
-        let root = envelope
-            .cells()
-            .get(&envelope.root())
-            .ok_or(VMError::MalformedAddress)?;
-        let mut resolver = ExecutionCells {
-            external: envelope.cells(),
-            actor: &self.current_call.actor_cells,
-            gas_limit: self.current_call.gas_limit,
-            gas_used: &mut self.current_call.gas_used,
-        };
-        ActorID::from_cell(&root, &mut resolver).map_err(VMError::from)
+    fn pop_actor_address(&mut self) -> Result<ActorAddress, VMError> {
+        let reference = self.pop_value()?.into_cell_ref()?;
+        let root = cells::read_cell(&mut self.resolver(), &reference)?;
+        ActorAddress::from_cell(&root, &mut self.resolver()).map_err(VMError::from)
     }
 
     fn op_nop(&mut self) -> Result<(), VMError> {
@@ -2962,7 +2940,7 @@ impl VM {
         let tag = self.pop_byte_source()?;
         let cid = self.pop_byte_source()?;
         let bytes = array32(cid.byte_payload()?).ok_or(VMError::IndexOutOfRange)?;
-        let flv = flavor_from_actor(&ActorID::Hash(bytes), tag.byte_payload()?);
+        let flv = flavor_from_actor(&ActorID::from(bytes), tag.byte_payload()?);
         self.push_value(Value::Scalar(flv));
         Ok(())
     }
@@ -3303,7 +3281,7 @@ impl VM {
     /// is no VM-level method operand; a selector, when used, is an
     /// ordinary payload argument (ADR 0020).
     fn op_send(&mut self) -> Result<(), VMError> {
-        let target = self.pop_actor_id()?;
+        let mut target = self.pop_actor_address()?;
         let gas = self
             .pop_value()?
             .to_scalar()?
@@ -3315,10 +3293,26 @@ impl VM {
         let k = self.pop_byte_count(usize::MAX)?;
         let args = self.pop_n_values(k)?;
 
+        if args.iter().any(|value| !value.is_portable()) {
+            return Err(VMError::NonPortableInSend);
+        }
         for value in &args {
             self.charge_value_encoding(value, 4)?;
         }
         self.charge_clone_values(&args)?;
+        if let ActorAddress::Init { ctor: witness }
+        | ActorAddress::Restore { state: witness, .. } = &mut target
+        {
+            let mut reader = CodeCells(self.resolver());
+            match cells::read_cell(&mut reader, witness)
+                .and_then(|root| root.load_graph_scoped(&mut reader))
+            {
+                Ok(root) => *witness = root.into(),
+                // An existing Init destination can execute without its constructor.
+                Err(CellError::MissingCell(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let anchor = self.consume_anchor()?;
         let caller = self.current_call.kind.actor().cloned();
         // Single source of truth: the full Message lives in the
@@ -3338,71 +3332,66 @@ impl VM {
 
     /// _portable-args… k gas addr_ **call** → _results… k' 1 | args… k 0_
     ///
-    /// Synchronous actor-to-actor call. Re-entry is gated by actor-state
-    /// presence: a checked-out callee returns its arguments and `k 0`; otherwise
-    /// re-entry is permitted. There is no VM-level method operand
-    /// (ADR 0020). Calls emit no txlog entry; a callee state mutation is
-    /// recorded later by `op_save`.
+    /// Canonical actor routing, initialization/restoration and execution share
+    /// one checkpoint. A failed call restores its arguments and all mutations.
     fn op_call(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
-        // ContractOpen caller attribution is not actor authority: only an actor
-        // frame may originate a synchronous actor call.
-        let caller = ActorID::Hash(self.require_actor()?.to_hash());
+        let caller = *self.require_actor()?;
         let registry = registry.ok_or(VMError::RegistryUnavailable)?;
-        let callee = self.pop_actor_id()?.to_canonical();
-        let gas = self
-            .pop_value()?
-            .to_scalar()?
-            .to_u64()
-            .ok_or(VMError::InvalidBitrange)?;
-        // Debit the grant from the caller (see op_open). A caller that
-        // can't afford the grant hard-fails OutOfGas — its own budget
-        // is exhausted, not a soft "callee unavailable" marker.
+        let address = self.pop_actor_address()?;
+        let callee = address.to_actor_id();
+        let gas = self.pop_gas_limit()?;
         self.current_call.charge_gas(gas)?;
         let k = self.pop_byte_count(usize::MAX)?;
         let args = self.pop_n_values(k)?;
         Self::require_portable_call_args(&args)?;
 
-        // Pre-frame setup. Any failure here ("cannot enter callee")
-        // converts to the restored arguments plus `k 0` —
-        // the call simply "did not happen" from the caller's POV. A
-        // re-entrant call into an actor that's mid-update lands here
-        // too: its state is checked out, so `resolve_method` returns
-        // `ActorEmpty` (ADR 0017 — the state is the re-entrancy lock).
+        registry.push_checkpoint();
         let mut initial_gas = 0;
-        let pre_frame: Result<(CallFrame, Arc<CellIndex>), VMError> = (|| {
+        let pre_frame: Result<(CallFrame, Arc<CellIndex>, Option<TxEntry>), VMError> = (|| {
             if self.call_stack.len() >= MAX_CALL_DEPTH {
                 return Err(VMError::CallDepthExceeded);
             }
-            let code_bytes = registry.actor_code_bytes(&callee)?;
-            initial_gas = code_bytes
-                .saturating_mul(GAS_PER_ALLOC_BYTE)
+            let effect = prepare_actor_address(
+                registry,
+                &address,
+                &self.cells,
+                Some(&self.current_call.actor_cells),
+                &mut initial_gas,
+                gas,
+            )?;
+            initial_gas = initial_gas
+                .saturating_add(
+                    registry
+                        .actor_code_bytes(&callee)?
+                        .saturating_mul(GAS_PER_ALLOC_BYTE),
+                )
                 .saturating_add(alloc_item_gas(args.len())?);
             if initial_gas > gas {
                 return Err(VMError::OutOfGas);
             }
             let actor_cells = registry.actor_cells(&callee)?;
-            let mut resolver = ExecutionCells {
+            let mut reader = ExecutionCells {
                 external: &self.cells,
                 actor: &actor_cells,
+                address_sender: None,
                 gas_used: &mut initial_gas,
                 gas_limit: gas,
             };
-            let script = registry.load_program_with_cells(&callee, &mut resolver)?;
+            let script = registry.load_program_with_cells(&callee, &mut reader)?;
             let frame = CallFrame::from_cell(
                 script,
                 CallKind::ActorCall {
-                    actor: callee.clone(),
+                    actor: callee,
                     caller,
                 },
                 gas,
             )?;
-            Ok((frame, actor_cells))
+            Ok((frame, actor_cells, effect))
         })();
-        let (mut frame, actor_cells) = match pre_frame {
-            Ok(v) => v,
+        let (mut frame, actor_cells, effect) = match pre_frame {
+            Ok(value) => value,
             Err(error) => {
-                // Pre-frame failure (reentrancy, missing actor, etc.):
-                // Restore arguments and unused gas; code-loading work remains charged.
+                registry.pop_checkpoint_rollback();
                 if !matches!(
                     error,
                     VMError::OutOfGas | VMError::Cell(CellError::ResourceExhausted)
@@ -3412,35 +3401,35 @@ impl VM {
                         .gas_used
                         .saturating_sub(gas.saturating_sub(initial_gas));
                 }
-                let arg_count = args.len();
-                self.push_failed_values(args, arg_count);
+                let count = args.len();
+                self.push_failed_values(args, count);
                 return Ok(());
             }
         };
-
-        self.charge_alloc_items(args.len())?;
-        self.charge_clone_values(&args)?;
-        self.current_call.snap_failure_values = args.clone();
-        self.current_call.snap_failure_arg_count = args.len();
-
-        // Split the parent's anchor: `left` (callee_anchor) seeds
-        // the callee's `last_anchor`; `right` is stashed on the
-        // parent frame's `post_call_anchor` for restoration on
-        // return (success or failure). Also snapshots side-effect
-        // cursors so we can roll back if the child errors out.
-        let callee_anchor = self.split_anchor_for_call()?;
-
+        let enter = (|| {
+            self.charge_alloc_items(args.len())?;
+            self.charge_clone_values(&args)?;
+            self.current_call.snap_failure_values = args.clone();
+            self.current_call.snap_failure_arg_count = args.len();
+            self.split_anchor_for_call()
+        })();
+        let callee_anchor = match enter {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                registry.pop_checkpoint_rollback();
+                return Err(error);
+            }
+        };
         frame.anchor = Some(callee_anchor);
         frame.gas_used = initial_gas;
         frame.actor_cells = actor_cells;
-        for v in args {
-            frame.stack.push(v);
-        }
-
+        frame.stack.extend(args);
         let parent = core::mem::replace(&mut self.current_call, frame);
         self.call_stack.push(parent);
-        // Switch the active anchor to the callee's half.
         self.last_anchor = Some(callee_anchor);
+        if let Some(effect) = effect {
+            self.txlog.push(effect);
+        }
         Ok(())
     }
 
@@ -3479,7 +3468,7 @@ impl VM {
     /// `Constraint`, `MultiscalarMul`, `WideToken`, negative
     /// `ClearToken`) hard-fail `NonPortableInState`.
     fn op_save(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
-        let actor = ActorID::Hash(self.require_actor()?.to_hash());
+        let actor = *self.require_actor()?;
         let registry = registry.ok_or(VMError::RegistryUnavailable)?;
         let state = self.pop_value()?;
         // Portability is the canonical storage gate — checked here
@@ -3520,7 +3509,7 @@ impl VM {
     /// `callerid` — actors authenticate by identity, not signatures.
     /// See ADR 0018.
     fn op_setcode(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
-        let actor = ActorID::Hash(self.require_actor()?.to_hash());
+        let actor = *self.require_actor()?;
         let registry = registry.ok_or(VMError::RegistryUnavailable)?;
         let reference = self.pop_value()?.into_cell_ref()?;
         let code = cells::read_cell(&mut self.resolver(), &reference)?;
@@ -3540,7 +3529,7 @@ impl VM {
     /// _q_ **addstorage** → _debt 1 | 0_. Invalid market requests are
     /// soft failures; type, context, and host invariant errors are hard.
     fn op_addstorage(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
-        let actor = ActorID::Hash(self.require_actor()?.to_hash());
+        let actor = *self.require_actor()?;
         let request = self.pop_value()?.to_scalar()?;
         let Some(bytes) = request.to_u64() else {
             self.push_value(Value::Scalar(Scalar::ZERO));
@@ -4377,25 +4366,29 @@ mod cell_execution_tests {
         let bag = CellIndex::collect(cell.clone()).unwrap();
         let empty = CellIndex::new();
         let mut costs = Vec::new();
-        for (reference, actor, external) in [
-            (Some(CellRef::Resident(cell.clone())), &empty, &empty),
+        for (reference, actor, external, address_sender) in [
+            (Some(CellRef::Resident(cell.clone())), &empty, &empty, None),
             (
                 Some(CellRef::resident(cell.clone()).to_unloaded()),
                 &bag,
                 &empty,
+                None,
             ),
             (
                 Some(CellRef::resident(cell.clone()).to_unloaded()),
                 &empty,
                 &bag,
+                None,
             ),
-            (None, &bag, &empty),
-            (None, &empty, &bag),
+            (None, &bag, &empty, None),
+            (None, &empty, &bag, None),
+            (None, &empty, &empty, Some(&bag)),
         ] {
             let mut gas = 0;
             let mut resolver = ExecutionCells {
                 external,
                 actor,
+                address_sender,
                 gas_used: &mut gas,
                 gas_limit: 1000,
             };
@@ -4406,7 +4399,7 @@ mod cell_execution_tests {
             assert_eq!(read.unwrap().id(), cell.id());
             costs.push(gas);
         }
-        assert_eq!(costs, vec![131; 5]);
+        assert_eq!(costs, vec![131; 6]);
     }
 
     #[test]
@@ -4417,6 +4410,7 @@ mod cell_execution_tests {
         let mut reader = ExecutionCells {
             external: &empty,
             actor: &empty,
+            address_sender: None,
             gas_used: &mut gas,
             gas_limit: 1000,
         };
@@ -4432,6 +4426,7 @@ mod cell_execution_tests {
             let mut reader = ExecutionCells {
                 external: &empty,
                 actor: &empty,
+                address_sender: None,
                 gas_used: &mut gas,
                 gas_limit: 0,
             };

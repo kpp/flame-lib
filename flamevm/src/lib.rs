@@ -22,8 +22,8 @@ mod verifier;
 mod vm;
 
 pub use actor::{
-    code_cell, code_from_cell, code_root, code_state_bytes, empty_state, state_root, ActorID,
-    ActorRegistry, StoragePurchase,
+    code_cell, code_from_cell, code_root, code_state_bytes, empty_state, state_root, ActorAddress,
+    ActorID, ActorRegistry, StoragePurchase,
 };
 pub use address::Address;
 pub use cell_value::{CellValue, CellWitness};

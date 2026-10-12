@@ -110,8 +110,9 @@ Transport normalization keeps `load_graph`'s resident-frontier union; that
 unmetered transport prepass is not used inside VM execution.
 Actor registry APIs, storage effects and RPC code transport preserve this graph.
 Root code-byte limits still count only root payload bytes; rent counts unique
-retained Cell records throughout the code/state graph. Actor addressing remains
-on its existing byte-oriented interface pending a separate redesign.
+retained Cell records throughout the code/state graph. Actor addressing uses
+the canonical ActorAddress Cell schema described in
+[encoding.md](encoding.md#actor-addresses-state-and-messages).
 At a complete transaction transport boundary, `Cell::load_graph(reader)` restores
 resident refs from the supplied body table, preserving every hash/depth and
 explicit prune. It shares already resident nodes and does not materialize actors
@@ -1495,27 +1496,25 @@ duplicate the record.
 
 ### Persistent actor storage
 
-Actor storage must commit both content and availability:
+Actor content is one empty-payload root with two ordered refs: executable
+code and a tagged portable data Value. Registry rows commit that whole image
+and their exact retained Cell hierarchy, alongside sizes and lease metadata.
+The availability CellID says which bodies remain resident and rent-bearing.
 
-```rust
-pub struct StoredGraph {
-    pub root: CellID,
-    pub cells: CellIndex,
-}
-
-// Actor commitment includes (stored.root, stored.cells.id()).
-```
-
-The actor-state commitment includes both fields. The root says *what* the
-state is; the availability CellID says *which bodies remain resident and rent-bearing*.
-Evicting a branch's body changes the stored Cell hierarchy and storage charge but not the
-content root. This is residency pruning, not construction of an explicit
-pruning Cell, which would change the factual root. A fully frozen actor can
-retain its code/state commitments while retaining no corresponding bodies.
+Evicting an ordinary branch body can preserve its content commitment while
+changing availability. Whole-actor freezing instead constructs one explicit
+pruned ActorState root, preserving the original snapshot's hashes and depths
+through its factual level. Code and data are not frozen separately. Actor
+content reserves one of the fifteen available levels for this outer cut.
 
 Resolving a body from a transaction witness hierarchy only puts it in the execution cache.
-It does not silently add it to actor storage or increase rent. A persistent
-restore must be an explicit high-level operation. New or modified Trie paths
+It does not silently add it to actor storage or increase rent. Persistent
+restoration is explicit through the canonical ActorAddress Restore variant:
+its partial proof authenticates the registered image, projects the original
+view and merges bodies without erasing previous availability. Restoration,
+execution and purchases share a checkpoint; failure rolls all of them back.
+The actor buys its own capacity, which must cover retained usage on success.
+New or modified Trie paths
 are resident because the actor created their Cell bodies; untouched unloaded
 siblings remain unloaded.
 
@@ -1656,11 +1655,10 @@ execution IDs retain their factual effect-log root. See [encoding](encoding.md).
 
 Do not mechanically hash an enum's encoded view when the type already has a
 normalized identity. In particular,
-`ActorID::Constructor(code).to_hash() == ActorID::Hash(h).to_hash()` must remain
-true when `h` is the canonical code-root CellID. The constructor form carries
-the code graph as a preimage; the hash form carries only that same root ID.
-Their field encodings differ, but their actor identity does not. Apply the same
-rule to any later preimage/hash pair.
+`ActorAddress::Init { ctor }.to_actor_id()` equals the raw ActorID
+contained by Address or Restore when it is the constructor's factual CellID.
+Their tagged encodings differ, but routing identity is the same. Current
+code/data mutations never change that ID. See [the canonical schema](encoding.md#actor-addresses-state-and-messages).
 
 Merlin remains where it is cryptographically meaningful: signature challenge
 transcripts, Bulletproof/R1CS transcripts, and other interactive protocol
@@ -1717,8 +1715,8 @@ stored in script Cells, not routed through a generic serialization facade.
 - Database adapters and archival retrieval outside consensus execution.
 - Utreexo forest, proof, and path encoding. Keep its current serialization
   until that separate migration is requested.
-- A more compact frozen-actor registry layout. The current implementation
-  retains code/state IDs, sizes, and lease metadata rather than just one hash.
+- Further frozen-registry compaction. Code/data now share one explicit pruned
+  image root; sizes and lease metadata still remain in the registry row.
 - A coordinated deployment/activation strategy for the changed consensus
   identities; the code does not provide automatic legacy-state migration.
 

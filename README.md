@@ -17,7 +17,11 @@ The project is a work-in-progress, many parts are changing and breaking all the 
 ### Documentation
 
 - [FlameVM Specification](docs/flamevm.md)
-- [Key Derivation and Bech32f](flamekd/flamekd.md)
+- [Key Derivation](docs/flamekd.md)
+- [Address Formats](docs/address.md)
+- [Bech32f](docs/bech32f.md)
+- [Cell-based Encoding](docs/encoding.md)
+- [Merkle Compression](docs/compression.md)
 - [Payment Keys and Transfers](flamepayments/flamepayments.md)
 - [Confidential Payments](docs/payments.md)
 - [Native Wallet Bindings](flamewallet-ffi/flamewallet-ffi.md)

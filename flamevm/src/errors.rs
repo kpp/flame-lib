@@ -200,6 +200,14 @@ pub enum VMError {
     #[error("Actor not found in registry")]
     ActorNotFound,
 
+    /// The actor's combined state root is pruned and requires explicit Restore.
+    #[error("Actor is frozen")]
+    ActorFrozen,
+
+    /// This host does not implement authenticated actor-state restoration.
+    #[error("Actor restoration is unsupported by this registry")]
+    ActorRestoreUnsupported,
+
     /// A negative clear token is a liability and cannot be destroyed to
     /// satisfy balance. It must be matched by an equal positive token.
     #[error("negative token quantity cannot be retired")]

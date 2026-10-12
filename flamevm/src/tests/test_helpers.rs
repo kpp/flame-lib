@@ -16,9 +16,9 @@ pub use super::super::*;
 pub(crate) use super::mem_registry::{MemRegistry, TestCode};
 
 pub use crate::{
-    CellValue, CellWitness, CheckedFee, CommitmentWitness, Constraint, Expression, Instruction,
-    PredicateTree, Prover, Script, ScriptBuilder, SecretConstraint, TaprootOpening, Token, Value,
-    Variable, Verifier, WideToken, FLAME_FLAVOR, MAX_FEE,
+    ActorAddress, CellValue, CellWitness, CheckedFee, CommitmentWitness, Constraint, Expression,
+    Instruction, PredicateTree, Prover, Script, ScriptBuilder, SecretConstraint, TaprootOpening,
+    Token, Value, Variable, Verifier, WideToken, FLAME_FLAVOR, MAX_FEE,
 };
 pub use bulletproofs::PedersenGens;
 pub use cells::{
@@ -208,7 +208,7 @@ pub(crate) fn dummy_header() -> TxHeader {
 
 pub(crate) fn dummy_message(gas: u64) -> Message {
     Message::new(
-        ActorID::Hash([0u8; 32]),
+        ActorID::from([0u8; 32]),
         None,
         Anchor([0u8; 32]),
         Vec::new(),
@@ -224,7 +224,7 @@ pub(crate) fn dummy_message(gas: u64) -> Message {
 /// Builds a VM running `script` as the entry Run of an InternalRoot.
 pub(crate) fn vm_with_script(script: impl TestProgram) -> VM {
     let kind = CallKind::InternalRoot {
-        actor: ActorID::Hash([0u8; 32]),
+        actor: ActorID::from([0u8; 32]),
         caller: None,
     };
     let mut vm = fixture_vm(script, kind);
@@ -343,7 +343,7 @@ pub(crate) fn deliver_err(reg: &mut MemRegistry, msg: Message) -> VMError {
 
 /// Builds a minimal internal `Message` targeting `actor` with no
 /// payload — the common Bucket-C delivery fixture.
-pub(crate) fn msg_to(actor: ActorID) -> Message {
+pub(crate) fn msg_to(actor: impl Into<ActorAddress>) -> Message {
     Message::new(
         actor,
         None,
@@ -357,7 +357,7 @@ pub(crate) fn msg_to(actor: ActorID) -> Message {
 
 /// Like [`msg_to`] but carries a single top-of-stack selector arg
 /// (ADR 0020 dispatch convention).
-pub(crate) fn msg_with_sel(actor: ActorID, sel: u64) -> Message {
+pub(crate) fn msg_with_sel(actor: impl Into<ActorAddress>, sel: u64) -> Message {
     Message::new(
         actor,
         None,
@@ -374,7 +374,7 @@ pub(crate) fn msg_with_sel(actor: ActorID, sel: u64) -> Message {
 /// Bucket-C fixture: deploy, then `deliver` and read the effect log.
 pub(crate) fn deploy_actor(reg: &mut MemRegistry, recv: impl TestCode) -> ActorID {
     let recv = recv.into_code().expect("actor code compiles");
-    let id = ActorID::Hash(recv.id());
+    let id = ActorID::from(recv.id());
     reg.deploy(id.clone(), recv, empty_state(), 1_000_000)
         .expect("deploy");
     id
@@ -383,11 +383,15 @@ pub(crate) fn deploy_actor(reg: &mut MemRegistry, recv: impl TestCode) -> ActorI
 /// A `call` to `target` with `k=0` args (plain single-action callee).
 /// Returns the builder *after* the `call` so the caller chains the
 /// result handling (`.drop_().drop_()` for the `[count, success]`).
+pub(crate) fn actor_address(id: &ActorID) -> CellValue {
+    CellValue::from(ActorAddress::from(*id).to_cell().unwrap())
+}
+
 pub(crate) fn call_to(target: &ActorID) -> ScriptBuilder {
     ScriptBuilder::new()
         .push_int(0u64) // k = 0
         .push_int(50_000u64) // gas
-        .push_literal(CellValue::from_bytes(target.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(target))
         .call()
 }
 
@@ -398,7 +402,7 @@ pub(crate) fn call_with_sel(target: &ActorID, sel: u64) -> ScriptBuilder {
         .push_int(sel) // selector arg (top)
         .push_int(1u64) // k = 1
         .push_int(50_000u64) // gas
-        .push_literal(CellValue::from_bytes(target.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(target))
         .call()
 }
 
@@ -606,22 +610,15 @@ pub(crate) fn make_cleartext_token(qty: u64, flv: u64) -> Token {
 
 /// Builds a VM running `script` under InternalRoot with a specific
 /// actor identity (so `op_issue` has actor context).
-pub(crate) fn vm_internal_with_actor(script: Vec<u8>, actor: ActorID) -> VM {
+pub(crate) fn vm_internal_with_actor(script: impl TestProgram, actor: ActorID) -> VM {
     let kind = CallKind::InternalRoot {
         actor,
         caller: None,
     };
-    VM::new(
-        dummy_header(),
-        CallFrame::new(
-            ScriptBuilder::parse(&script)
-                .expect("script parses")
-                .into_instructions(),
-            kind,
-            1_000_000,
-        )
-        .with_anchor(Anchor([0u8; 32])),
-    )
+    let mut vm = fixture_vm(script, kind);
+    vm.last_anchor = Some(Anchor([0; 32]));
+    vm.current_call.anchor = vm.last_anchor;
+    vm
 }
 
 /// Quick helper: builds a stub delegate for external-context tests

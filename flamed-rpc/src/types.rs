@@ -109,12 +109,14 @@ pub struct ActorResult {
     pub height: u64,
     /// The block hash at that height.
     pub block: BlockId,
-    /// Code root cell hash, retained even if the body is unavailable.
-    #[serde(with = "crate::codec::hex32")]
-    pub code_hash: [u8; 32],
-    /// State root cell hash, retained even if the body is unavailable.
-    #[serde(with = "crate::codec::hex32")]
-    pub state_hash: [u8; 32],
+    /// Combined code/data root, including a whole-root cut when frozen.
+    pub root_hash: CellId,
+    /// Whether the whole actor content root is pruned.
+    pub frozen: bool,
+    /// Code child commitment; unavailable while the whole root is frozen.
+    pub code_hash: Option<CellId>,
+    /// Data child commitment; unavailable while the whole root is frozen.
+    pub state_hash: Option<CellId>,
     /// Root program payload length; descendants are read on demand.
     pub code_size: u64,
     /// Logical state size in encoded cell bytes.
@@ -307,6 +309,15 @@ pub enum TxEntry {
         /// Saved state, including available cells.
         state: TxValue,
     },
+    /// Authenticated hydration of the actor's complete code/data image.
+    ActorRestore {
+        /// Actor identifier.
+        actor: ActorId,
+        /// Factual root of the supplied partial image.
+        state_hash: CellId,
+        /// Supplied native Cell graph, encoded as base64.
+        state: ActorStateEnvelope,
+    },
     /// An actor code update.
     SetCode {
         /// Actor identifier.
@@ -389,18 +400,26 @@ pub enum TxEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActorTarget {
-    /// An actor addressed by hash.
-    Hash {
+    /// An existing actor addressed by its immutable ID.
+    Address {
         /// Actor identifier.
         actor: ActorId,
     },
-    /// An actor addressed by its constructor code.
-    Constructor {
+    /// An actor addressed with its native constructor graph.
+    Init {
         /// Actor identifier, equal to the code root hash.
         actor: ActorId,
-        /// Complete constructor code, encoded as base64.
-        #[serde(with = "crate::codec::base64")]
-        code: Vec<u8>,
+        /// Available constructor graph; absent if even its root is unavailable.
+        ctor: Option<ActorCode>,
+    },
+    /// An actor addressed with an authenticated partial state image.
+    Restore {
+        /// Actor identifier.
+        actor: ActorId,
+        /// Factual root of the supplied image.
+        state_hash: CellId,
+        /// Available image; absent if even its root is unavailable.
+        state: Option<ActorStateEnvelope>,
     },
 }
 

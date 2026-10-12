@@ -8,8 +8,8 @@ fn native_vm(program: Cell) -> VM {
         CallFrame::from_cell(
             program,
             CallKind::InternalRoot {
-                actor: ActorID::Hash([1; 32]),
-                caller: Some(ActorID::Hash([2; 32])),
+                actor: ActorID::from([1; 32]),
+                caller: Some(ActorID::from([2; 32])),
             },
             1_000_000,
         )

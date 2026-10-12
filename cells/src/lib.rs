@@ -19,7 +19,7 @@ pub use cell::{
 };
 pub use codec::{CellDecode, CellEncode};
 pub use error::CellError;
-pub use index::{CellEnvelope, CellIndex};
+pub use index::{CellEnvelope, CellIndex, project_cell};
 pub use slice::CellSlice;
 pub use transport::GasMeter;
 pub use trie::{MAX_TRIE_KEY_BYTES, Trie};

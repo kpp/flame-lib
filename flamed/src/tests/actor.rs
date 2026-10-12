@@ -7,7 +7,7 @@ use flamed_rpc::{
     ActorCode, ActorId, ActorResult, ActorStateEnvelope, BlockId, CellId, ClientError,
     FlamedApiClient, HttpClientBuilder, TxValue, ValueCell,
 };
-use flamevm::{CellEncode, CellEnvelope, CellIndex, CellValue, Dict, ScriptBuilder, Value};
+use flamevm::{Cell, CellEncode, CellEnvelope, CellIndex, CellValue, Dict, ScriptBuilder, Value};
 use jsonrpsee::{core::client::ClientT, rpc_params};
 use tempfile::TempDir;
 
@@ -44,11 +44,11 @@ async fn actor_tracks_updates_expiry_and_replay() {
     let code = &deployed.code.as_ref().unwrap().0;
     let mut code_gas = u64::MAX;
     let code_envelope = CellEnvelope::decode(code, code.len(), &mut code_gas).unwrap();
-    assert_eq!(code_envelope.root(), deployed.code_hash);
+    assert_eq!(code_envelope.root(), deployed.code_hash.unwrap().0);
     assert_eq!(
         code_envelope
             .cells()
-            .get(&deployed.code_hash)
+            .get(&deployed.code_hash.unwrap().0)
             .unwrap()
             .payload()
             .len() as u64,
@@ -57,7 +57,7 @@ async fn actor_tracks_updates_expiry_and_replay() {
     let state = &deployed.state.as_ref().unwrap().0;
     let mut gas = state.len() as u64 * 1024;
     let envelope = CellEnvelope::decode(state, state.len(), &mut gas).unwrap();
-    assert_eq!(envelope.root(), deployed.state_hash);
+    assert_eq!(envelope.root(), deployed.state_hash.unwrap().0);
     let Some(TxValue::Dict { entries }) = &deployed.decoded_state else {
         panic!("expected a decoded dictionary")
     };
@@ -111,8 +111,10 @@ async fn actor_tracks_updates_expiry_and_replay() {
     shared.lock().unwrap().mint_block().unwrap();
     let frozen = client.actor(actor).await.unwrap();
     assert_eq!(frozen.height, 4);
-    assert_eq!(frozen.code_hash, updated.code_hash);
-    assert_eq!(frozen.state_hash, updated.state_hash);
+    assert!(frozen.frozen);
+    assert_ne!(frozen.root_hash, updated.root_hash);
+    assert_eq!(frozen.code_hash, None);
+    assert_eq!(frozen.state_hash, None);
     assert_eq!(frozen.code_size, updated.code_size);
     assert_eq!(frozen.state_size, updated.state_size);
     assert_eq!(frozen.storage_capacity, 0);
@@ -168,8 +170,14 @@ fn actor_keeps_full_data_and_reports_unavailable_or_malformed_bodies() {
         id: ActorId([1; 32]),
         height: 1,
         block: BlockId([2; 32]),
-        code_hash: code.id(),
-        state_hash: state_cell.id(),
+        root_hash: CellId(
+            Cell::new(vec![], vec![code.clone().into(), state_cell.clone().into()])
+                .unwrap()
+                .id(),
+        ),
+        frozen: false,
+        code_hash: Some(CellId(code.id())),
+        state_hash: Some(CellId(state_cell.id())),
         code_size: code.payload().len() as u64,
         state_size: 0,
         storage_used: 0,
@@ -211,7 +219,7 @@ fn actor_keeps_full_data_and_reports_unavailable_or_malformed_bodies() {
     let mut cells = CellIndex::new();
     cells.insert(state_cell.into()).unwrap();
     snapshot.state = Some(ActorStateEnvelope(
-        CellEnvelope::new(snapshot.state_hash, cells)
+        CellEnvelope::new(snapshot.state_hash.unwrap().0, cells)
             .unwrap()
             .encode(),
     ));
@@ -219,7 +227,7 @@ fn actor_keeps_full_data_and_reports_unavailable_or_malformed_bodies() {
     let Some(TxValue::Cells { root, cells }) = partial.decoded_state else {
         panic!("expected available cells")
     };
-    assert_eq!(root, CellId(snapshot.state_hash));
+    assert_eq!(root, snapshot.state_hash.unwrap());
     assert_eq!(cells.len(), 1);
     assert!(!cells[0].refs.is_empty());
     assert!(partial.state_error.is_none());

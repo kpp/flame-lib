@@ -105,7 +105,7 @@ Internal transactions do not have a pre-determined effect and therefore do not s
 Like external, internal transactions produce effects:
 
 1. `Receive(MessageID)` (txlog variant `TxEntry::Receive`) — the consumed Send's id. Emitted automatically as the first effect after `Header` by `VM::execute_internal`, committing the originating `MessageID` (canonical 32-byte hash of the whole Send: anchor, target, caller, payload, gas, refund predicate — analogous to `ContractID` for contracts) into the Internal TxID merkle root. Symmetric with `Input` for external transactions. The message **payload is delivered onto the recv frame's stack** in payload order before code runs — symmetric with `op_call` pushing its args; a conventional dispatch selector rides as the topmost payload arg.
-2. Actor deployment — successful first delivery to a constructor-form target emits an immediate `ActorDeploy { actor, code }`; replay starts it with the canonical empty state.
+2. Actor activation — first use of `Init` emits `ActorDeploy { actor, code }` with empty initial data; authenticated `Restore` emits `ActorRestore { actor, state }` with the supplied partial code/data proof. Both effects commit only with successful execution and sufficient storage.
 3. Outputs — creation of new entries in the Utreexo.
 4. Sends — messages sent to actors that produce other internal transactions.
 5. Issuance and retirement — creation and removal of tokens to/from circulation.
@@ -114,10 +114,10 @@ Like external, internal transactions produce effects:
 8. Storage purchases — `addstorage` records the actor, purchased bytes, expiry
    height, and burned sparks.
 
-Lease expiry freezes actor code/state bodies instead of destroying their
-linear contents. Actor roots and lease metadata survive. A later execution
-may recover data from its committed Cell hierarchy; reading does not implicitly persist
-it. Explicit dismantling can still emit `ActorDestroy`. See
+Lease expiry freezes the entire actor code/data root instead of destroying its
+linear contents. Actor identity and lease metadata survive. A later explicit
+`Restore` may recover part of the committed tree; ordinary witness reads do not
+implicitly persist it. Explicit dismantling can still emit `ActorDestroy`. See
 [Actor storage](storage.md#global-state-and-block-order).
 
 Each external transaction immediately drains its FIFO message descendants
@@ -126,9 +126,9 @@ Witness bodies from another external transaction are never added to that bag.
 
 Calls themselves are intra-transaction control flow, not effects. Anything a callee does that the outer world cares about appears through one of the effects above.
 
-Canonical internal log shapes are enforced by the state machine. Success is `Header, Receive, [ActorDeploy], effects...`, where deployment is permitted only immediately after `Receive` and any `ActorDestroy` entries form a suffix. Failed delivery is exactly `Header, Receive, Output(refund)`. Lease expiry freezes bodies without emitting retirement/destruction effects. External logs start with `Header` and cannot contain internal-only actor effects.
+Canonical internal log shapes are enforced by the state machine. Success is `Header, Receive, effects...`; `ActorDeploy` and `ActorRestore` appear when address resolution performs them, including synchronous callees. Any `ActorDestroy` entries form a suffix. Failed delivery is exactly `Header, Receive, Output(refund)`. Lease expiry freezes the actor image without emitting retirement/destruction effects. External logs start with `Header` and cannot contain internal-only actor effects.
 
-**TxLog transport.** Effects are **re-derived by re-executing** the bytecode under the proof/signature binding; a supplied log does not authorize effects. External TxBody carries only its canonical 36-byte pruning record. `TxEntry` and `TxLog` implement `CellEncode` and `CellDecode` for archival and light-client transport. The log envelope holds a u64-LE count and a Trie of consecutive u64 big-endian indices, whose leaves reference tagged TxEntry Cells (tags 0–14). Blob fields use snakes; typed fields use their expected Cell layouts. `TxLog::effect_id()` returns its level-zero hash, not the external TxID. See [Data encoding](encoding.md#txlog).
+**TxLog transport.** Effects are **re-derived by re-executing** the bytecode under the proof/signature binding; a supplied log does not authorize effects. External TxBody carries only its canonical 36-byte pruning record. `TxEntry` and `TxLog` implement `CellEncode` and `CellDecode` for archival and light-client transport. The log envelope holds a u64-LE count and a Trie of consecutive u64 big-endian indices, whose leaves reference tagged TxEntry Cells (tags 0–15). Blob fields use snakes; typed fields use their expected Cell layouts. `TxLog::effect_id()` returns its level-zero hash, not the external TxID. See [Data encoding](encoding.md#txlog).
 
 Internal transactions do not pay transaction-prioritization fees. Actors may
 nevertheless burn Flame for storage through `addstorage`. Internal transactions
@@ -524,37 +524,61 @@ point as `Commitment::Closed`.
 
 ## Actors
 
-An actor is **`(code, state)`**:
+An actor's content is one empty-payload root Cell with two ordered references:
+**code** and **data**. Freezing always prunes this whole root.
+The total actor record references that content root and a separate protocol
+Cell holding size metadata and leases; freezing retains the protocol Cell.
 
 - **code** — a native executable Cell graph, set at deploy and replaced by [`setcode`](#setcode). Dispatch is selector-agnostic: the registry returns its root (`load_code`); by convention code dispatches on its **top-of-stack argument**. The VM imposes **no method layout** and reserves nothing. Root payload bytes are accounted on frame entry; nested bodies are independently metered when read. Persistent storage accounts for the retained graph.
 
-- **state** — **any portable `Value`** (Scalar, Cell, Point, Token, Dict, …), with no mandated shape and no methods-in-state. [`load`](#load) checks it out, [`save`](#save) moves it back; the author structures it however they like.
+- **data** — **any portable `Value`** (Scalar, Cell, Point, Token, Dict, …), encoded in the second child Cell. [`load`](#load) checks it out, [`save`](#save) moves it back; the author structures it however they like.
 
-Each actor is identified by a unique Actor ID derived from its constructor
-script. `Hash(h)` and `Constructor(bytes)` route to the same registry key when
-`h = code_root(bytes)`, so the identity commits to the initial executable
-Cell. Their expected ActorID Cell layouts are distinct:
+The immutable ActorID is the constructor's factual CellID, encoded as raw
+32 bytes. The canonical destination throughout the VM is an ActorAddress Cell:
 
-```text
-Hash(h)            = payload: 0x00 || h[32]; refs: none
-Constructor(code)  = payload: 0x01; refs: [program Cell]
+```ctl
+type ActorID = [U8; 32];
+enum ActorAddress: U8 {
+    Init { ctor: ^Cell } = 0,
+    Address { addr: ActorID } = 1,
+    Restore { addr: ActorID, state: ^Cell } = 2,
+}
+struct ActorState { code: ^Cell, data: ^Cell }
 ```
 
-The constructor form carries the code needed for deployment; the hash form is
-the compact address used afterward. A VM actor-destination operand is a zero-ref
-Cell/Slice/Builder payload containing a CellEnvelope for either form. The
-single-payload limit is 4095 bytes. It also accepts a bare 32-byte payload as
-`Hash(bytes)`; this byte-oriented address format is unchanged by removing String.
+The Restore field is the combined ActorState image, not just its data Value.
+Human-readable ActorIDs and other address forms are in [address.md](address.md).
+Bare 32-byte payloads and byte-encoded CellEnvelopes are not VM destinations.
 
-**Deploy-on-first-delivery.** The first message delivered to a not-yet-deployed
-`Constructor`-form target instantiates a provisional actor: code is the
-constructor bytes (self-authorized because the id commits to them) and state is
-empty. Its constructor may use `addstorage` to buy its first lease. The actor is
-committed only if its storage capacity covers its usage when the transaction
-ends. A `Hash`-form target that does not exist fails `ActorNotFound` because the
-hash alone carries no code. Deployment occurs only on asynchronous delivery;
-`call` canonicalizes a constructor-form destination for lookup but never deploys
-it.
+| Lifecycle | Init | Address | Restore |
+| --- | --- | --- | --- |
+| Uninitialized: no actor record | Provision code and empty Dict data, then execute | ActorNotFound | ActorNotFound |
+| Initialized: ordinary ActorState root, possibly partial | Execute current code; never reinstall/reset | Execute current code | Authenticate against current image, merge bodies, execute current code |
+| Frozen: entire ActorState root pruned | ActorFrozen | ActorFrozen | Authenticate against frozen image, restore selected bodies, execute available code |
+
+The same resolution rules apply to asynchronous delivery and actor-to-actor
+`call`. Init creation and Restore are provisional within the execution
+checkpoint: the actor must buy enough leased capacity for retained bodies.
+Successful restoration records `ActorRestore` before subsequent effects;
+failed resolution or code rolls back restored bodies, purchases and effects.
+
+Explicit Init/Restore witness graphs can be materialized from the caller's
+storage for `call`, or the sender's storage when queued by `send`. These reads
+are metered and do not grant the callee access to unrelated sender storage.
+`send` leaves an unavailable witness reference for delivery to resolve; an
+existing Init destination does not need its original constructor body.
+
+Restoration checks the original factual snapshot level and all corresponding
+hash/depth commitments, preserving older intentional cuts. Additional proofs
+merge monotonically: omitting a previously retained body never erases it.
+Unknown, stale or checked-out actors cannot be restored. An actor may accept a
+partial proof and buy storage without reading its still-missing data; later
+transactions can reveal further branches. Reading an unavailable branch fails
+that execution. Restoring witness bodies alone creates no new asset ownership.
+
+An exclusive checkout lock is independent of availability: missing/pruned data
+does not mean the actor's state has been checked out. The complete image
+reserves one of Cells' fifteen pruning levels for whole-root freezing.
 
 ## Messages
 
@@ -578,18 +602,10 @@ Not only users, but also actors can send async messages to each other. This allo
 
 ## Addresses
 
-Address is an entity that supports sending funds to predicates or actors.
-
-```rust
-Address = enum {
-   0: Predicate,
-   1: Message = struct {
-      dst#0: ActorID,
-      args: struct{0:...,1:...},   // selector (if any) rides as the top arg — the design
-      gas: Scalar,
-   }
-}
-```
+Human-readable wallet/actor address formatting is specified in
+[address.md](address.md), using [Bech32f](bech32f.md). Key derivation is separate
+in [FlameKD](flamekd.md). VM routing uses the ActorAddress schema above;
+payment formatting does not add another instruction-level destination format.
 
 ## Storage
 
@@ -1807,8 +1823,8 @@ _args… k refund gas addr_ → ø
 
 Asynchronous message-send. Pops operands top-first:
 
-1. `addr` (zero-ref byte source) — a bare 32-byte hash or byte-encoded CellEnvelope for ActorID.
-   The constructor variant has a reference to its native executable code.
+1. `addr` (Cell) — exactly one canonical ActorAddress; Init and Restore carry
+   their native constructor/state reference.
 2. `gas` (`Scalar`) — gas allotment.
 3. `refund` (32-byte zero-ref payload) — bounce predicate point.
 4. `k` (`Scalar`) — args count.
@@ -1835,14 +1851,14 @@ The payload is admitted by `Message::new`, not by `Message::encode`.
 nested checks; once constructed, the payload cannot be replaced.
 
 The send's identity is the canonical Message root CellID. Its payload contains
-anchor:32, ActorID, caller-presence:u8 and optional caller hash:32,
+anchor:32, ActorAddress, caller-presence:u8 and optional raw ActorID:32,
 refund Predicate:32, and gas:u64 LE. Its argument list is a referenced Dict
-with consecutive keys; constructor code, when present, uses an earlier ref.
+with consecutive keys; constructor or restoration data uses an earlier ref.
 The Send TxEntry references that Message Cell. Anchor ratcheting makes every
 distinct send unique by construction. See [Data encoding](encoding.md).
-Available in both contexts. Hard-fails `MalformedAddress` when `addr` is neither
-a bare hash nor one complete canonical `ActorID`, or when `refund` has the wrong
-size; `NonPortableInSend` on non-portable args; and `InvalidBitrange` on a
+Available in both contexts. Hard-fails with a Cell decoding error when `addr`
+is not a complete canonical `ActorAddress`, or `MalformedAddress` when `refund`
+has the wrong size; `NonPortableInSend` on non-portable args; and `InvalidBitrange` on a
 gas allotment outside the `u64` range. It hard-fails `OutOfGas` when the active
 frame cannot prepay the requested grant.
 
@@ -1855,9 +1871,9 @@ _args… k gas addr_ → _{results… k' 1 | args… k 0}_
 Synchronous actor-to-actor call. Same operand shape as [`send`](#send) minus
 `refund` and, likewise, no method selector. A caller that wants the callee to
 purchase storage passes Flame among the ordinary arguments; allocation remains
-the callee's explicit decision. A constructor-form address is accepted but
-canonicalized to its hash for lookup: unlike first `send` delivery, `call` does
-not deploy an absent actor.
+the callee's explicit decision. Init may provision an absent actor; Restore may
+authenticate and retain a partial state tree. Both commit only if the callee
+succeeds and retained usage fits its own leases. See [Actors](#actors).
 
 Only `InternalRoot` and `ActorCall` may invoke `call`. `ExternalRoot` and
 `ContractOpen` hard-fail `OpcodeRequiresActorContext` before consuming operands;
@@ -1877,12 +1893,13 @@ interaction's status and effects is ordinary actor logic rather than a
 concurrency guarantee the VM can infer. Nested call depth is capped at
 `MAX_CALL_DEPTH` (64).
 
-**Emits no txlog entry.** Calls are intra-tx control flow; the structural effects produced inside the callee (`Output`, `Send`, `ActorSave`, `SetCode`, `StoragePurchase`, `Issue`, `Retire`, `Fee`, `Data`, and actor destruction) are what the state machine reads. External TxID commits the body and its pruned effect claim; internal TxID commits the computed effects — see the effect model above.
+**No Call entry.** Calls are intra-tx control flow; Init/Restore resolution may emit `ActorDeploy`/`ActorRestore`, and the callee emits ordinary structural effects. External TxID commits the body and its pruned effect claim; internal TxID commits the computed effects — see the effect model above.
 
 Creates an isolated `CallKind::ActorCall { actor, caller }` frame (the frame's starting anchor lives in `CallFrame.anchor` — todo #4) with the popped gas allotment. The frame has the callee's actor identity — `op_load`/`op_save`/`op_call`/`op_send` operate on the callee.
 
 Successful return is `results… k' 1`; clean fall-through is `0 1`. Before
-entry, missing/empty actors, depth rejection, and a grant too small to activate
+entry, missing/frozen/checked-out actors, invalid restoration proofs, depth
+rejection, and a grant too small to activate
 the callee return the original `args… k 0`. Before or after entry, unused gas
 returns to the caller; pre-entry code-loading work remains charged. An undersized
 child grant or runtime exhaustion consumes the full grant. Every runtime failure
@@ -1895,10 +1912,11 @@ hard-fail the current frame before this soft boundary.
 
 ø → _value_
 
-**Checks out** the current actor's state: moves the state `Value` out of the registry (the actor goes empty/`None`) and pushes it onto the stack. State is **any portable `Value`** — the author chooses its structure; the VM imposes no shape . Code is separate (`setcode`) and stays put during the call.
+**Checks out** the current actor's data: moves its portable `Value` out of the registry and pushes it onto the stack. The author chooses its structure. Code stays in the combined actor image; `setcode` replaces its code reference.
 
 While checked out, synchronous `call` and `load` against the actor fail
-`ActorEmpty` — the **state's presence is the re-entrancy lock**. `send` is
+`ActorEmpty` — an **explicit checkout lock** guards ownership, independently
+of whether bodies are available. `send` is
 asynchronous and does not inspect recipient state when queued; availability is
 resolved later during delivery. The state is a linear resource: `load` moves it
 (no copy); the frame must discharge it before returning, per the frame-end
@@ -2232,4 +2250,4 @@ Pushes a Dict of block stats at height `n`.
 
 **Contract-open trust model.** `open`, `signcall`, and `call` all create isolated call frames: the unlocked / signed / called script runs in its own stack, gas budget, and identity scope, with no implicit access to the host's actor state, gas pool, or identity. This eliminates the confused-deputy class of bugs — an actor accepting an untrusted-source contract need not audit the predicate as a global authorization filter, because the script cannot reach the actor's state regardless of what the predicate authorizes .
 
-**`signcall` binding policy.** The `signcall` signature commits to the script bytes only, whether it is verified immediately in internal execution or deferred in external execution. The script binds itself to further context (anchor, actor identity, tx-level data) via explicit checks such as `anchor <expected> eq verify`. Binding policy lives in the author's hands — flexibility at the price of footgun.
+**`signcall` binding policy.** The `signcall` signature commits to the policy Cell's factual highest-level hash, including its referenced graph, whether verified immediately in internal execution or deferred in external execution. The program binds further context (anchor, actor identity, transaction data) through explicit checks such as `anchor <expected> eq verify`.

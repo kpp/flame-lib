@@ -1,12 +1,16 @@
 //! Routing addresses encoded as an expected Cell sum type.
 
-use crate::{ActorID, Dict, Predicate};
+use crate::{ActorAddress, Dict, Predicate};
 use cells::{CellBuilder, CellDecode, CellEncode, CellError, CellReader, CellRef, CellSlice};
 
 #[derive(Debug)]
 pub enum Address {
     Predicate(Predicate),
-    MessageTarget { dst: ActorID, args: Dict, gas: u64 },
+    MessageTarget {
+        dst: ActorAddress,
+        args: Dict,
+        gas: u64,
+    },
 }
 
 impl Address {
@@ -44,7 +48,7 @@ impl CellDecode for Address {
         match slice.load_u8()? {
             Self::TAG_PREDICATE => Ok(Self::Predicate(Predicate::decode(slice, cells)?)),
             Self::TAG_MESSAGE_TARGET => {
-                let dst = ActorID::decode(slice, cells)?;
+                let dst = ActorAddress::decode(slice, cells)?;
                 let gas = slice.load_u64()?;
                 let cell = cells::read_cell(cells, &slice.load_ref()?)?;
                 let args = Dict::from_cell(&cell, cells)?;
@@ -63,14 +67,21 @@ mod tests {
     #[test]
     fn routing_roundtrip_and_invalid_tags() {
         let address = Address::MessageTarget {
-            dst: ActorID::Constructor(vec![1, 2, 3]),
+            dst: ActorAddress::Init {
+                ctor: Cell::new(vec![1, 2, 3], vec![]).unwrap().into(),
+            },
             args: Dict::new(),
             gas: 42,
         };
         let cell = address.to_cell().unwrap();
         match Address::from_cell(&cell, &mut ()).unwrap() {
             Address::MessageTarget { dst, args, gas } => {
-                assert_eq!(dst, ActorID::Constructor(vec![1, 2, 3]));
+                match dst {
+                    ActorAddress::Init { ctor } => {
+                        assert_eq!(ctor.as_resident().unwrap().payload(), &[1, 2, 3]);
+                    }
+                    _ => panic!("wrong actor address variant"),
+                }
                 assert!(args.is_empty());
                 assert_eq!(gas, 42);
             }

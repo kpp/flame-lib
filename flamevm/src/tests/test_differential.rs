@@ -10,7 +10,7 @@ use crate::tx::TxID;
 
 fn internal_kind() -> CallKind {
     CallKind::InternalRoot {
-        actor: ActorID::Hash([0u8; 32]),
+        actor: ActorID::from([0u8; 32]),
         caller: None,
     }
 }

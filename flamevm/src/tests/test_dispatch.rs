@@ -86,7 +86,7 @@ fn dirty_stack_at_call_exit_is_an_error() {
     let block = BlockContext { height: 0 };
     // Re-create what `execute_internal` would, but pre-load the stack.
     let kind = CallKind::InternalRoot {
-        actor: ActorID::Hash([0u8; 32]),
+        actor: ActorID::from([0u8; 32]),
         caller: None,
     };
     let mut vm = VM::new(

@@ -3,11 +3,14 @@
 use std::collections::HashSet;
 
 use flamed_rpc::{
-    ActorId, ActorResult, ActorTarget, CellId, ContractId, ContractResult, DictEntry,
-    InstructionView, PredicatePoint, TxEntry as RpcTxEntry, TxValue, ValueCell,
+    ActorCode, ActorId, ActorResult, ActorStateEnvelope, ActorTarget, CellId, ContractId,
+    ContractResult, DictEntry, InstructionView, PredicatePoint, TxEntry as RpcTxEntry, TxValue,
+    ValueCell,
 };
+#[cfg(test)]
+use flamevm::ActorID;
 use flamevm::{
-    read_cell, resolve_cell, ActorID, Anchor, Cell, CellDecode, CellEncode, CellEnvelope,
+    read_cell, resolve_cell, ActorAddress, Anchor, Cell, CellDecode, CellEncode, CellEnvelope,
     CellError, CellIndex, CellRef, CellSlice, Contract, Instruction, Predicate, Scalar, Trie,
     TxEntry, Value,
 };
@@ -189,6 +192,18 @@ fn effect_from_cell(cell: &Cell, envelope: &mut CellEnvelope) -> Result<RpcTxEnt
                 state: available_cells(&state, envelope)?,
             }
         }
+        TxEntry::TAG_ACTOR_RESTORE => {
+            let actor = ActorId(<[u8; 32]>::decode(&mut slice, envelope)?);
+            let reference = slice.load_ref()?;
+            RpcTxEntry::ActorRestore {
+                actor,
+                state_hash: CellId(reference.id()),
+                state: ActorStateEnvelope(
+                    available_envelope(&reference, envelope)?
+                        .ok_or(CellError::MissingCell(reference.id()))?,
+                ),
+            }
+        }
         TxEntry::TAG_OUTPUT => {
             let contract = read_cell(envelope, &slice.load_ref()?)?;
             let contract = Contract::from_trusted_cell(&contract, envelope)?;
@@ -214,7 +229,7 @@ fn effect_from_cell(cell: &Cell, envelope: &mut CellEnvelope) -> Result<RpcTxEnt
 fn message_effect(cell: &Cell, envelope: &mut CellEnvelope) -> Result<RpcTxEntry, CellError> {
     let mut slice = CellSlice::new(cell);
     let anchor = Anchor::decode(&mut slice, envelope)?.0;
-    let target = actor_target(&ActorID::decode(&mut slice, envelope)?);
+    let target = actor_target(&ActorAddress::decode(&mut slice, envelope)?, envelope)?;
     let caller = match slice.load_u8()? {
         0 => None,
         1 => Some(ActorId(<[u8; 32]>::decode(&mut slice, envelope)?)),
@@ -289,15 +304,23 @@ fn scalar(n: Scalar) -> String {
         .unwrap_or_else(|| format!("0x{}", hex::encode(n.to_bytes())))
 }
 
-fn actor_target(actor: &ActorID) -> ActorTarget {
+fn actor_target(
+    actor: &ActorAddress,
+    envelope: &mut CellEnvelope,
+) -> Result<ActorTarget, CellError> {
     let id = ActorId(actor.to_hash());
-    match actor {
-        ActorID::Hash(_) => ActorTarget::Hash { actor: id },
-        ActorID::Constructor(code) => ActorTarget::Constructor {
+    Ok(match actor {
+        ActorAddress::Address { .. } => ActorTarget::Address { actor: id },
+        ActorAddress::Init { ctor } => ActorTarget::Init {
             actor: id,
-            code: code.clone(),
+            ctor: available_envelope(ctor, envelope)?.map(ActorCode),
         },
-    }
+        ActorAddress::Restore { state, .. } => ActorTarget::Restore {
+            actor: id,
+            state_hash: CellId(state.id()),
+            state: available_envelope(state, envelope)?.map(ActorStateEnvelope),
+        },
+    })
 }
 
 fn render_effect(entry: &TxEntry, envelope: &mut CellEnvelope) -> Result<RpcTxEntry, CellError> {
@@ -330,6 +353,14 @@ fn render_effect(entry: &TxEntry, envelope: &mut CellEnvelope) -> Result<RpcTxEn
             state_hash: flamevm::state_root(state),
             state: render_value(state, envelope)?,
         },
+        TxEntry::ActorRestore { actor, state } => RpcTxEntry::ActorRestore {
+            actor: ActorId(actor.to_hash()),
+            state_hash: CellId(state.id()),
+            state: ActorStateEnvelope(
+                available_envelope(&state.clone().into(), envelope)?
+                    .ok_or(CellError::MissingCell(state.id()))?,
+            ),
+        },
         TxEntry::SetCode { actor, code } => RpcTxEntry::SetCode {
             actor: ActorId(actor.to_hash()),
             code: CellEnvelope::new(code.id(), available_index(&code.clone().into(), envelope)?)?
@@ -341,7 +372,7 @@ fn render_effect(entry: &TxEntry, envelope: &mut CellEnvelope) -> Result<RpcTxEn
         },
         TxEntry::Send(m) => RpcTxEntry::Send {
             message: m.id().0,
-            target: actor_target(&m.target),
+            target: actor_target(&m.target, envelope)?,
             caller: m.caller.as_ref().map(|a| ActorId(a.to_hash())),
             anchor: m.anchor.0,
             payload: m
@@ -432,6 +463,17 @@ fn available_index(
     Ok(cells)
 }
 
+fn available_envelope(
+    reference: &CellRef,
+    envelope: &mut CellEnvelope,
+) -> Result<Option<Vec<u8>>, CellError> {
+    let cells = available_index(reference, envelope)?;
+    if cells.get(&reference.id()).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(CellEnvelope::new(reference.id(), cells)?.encode()))
+}
+
 fn available_cells(reference: &CellRef, envelope: &mut CellEnvelope) -> Result<TxValue, CellError> {
     let cells = available_index(reference, envelope)?
         .iter()
@@ -478,7 +520,7 @@ mod tests {
         let child = Cell::new(vec![9], vec![]).unwrap();
         let root = Cell::new(vec![7], vec![child.clone().into()]).unwrap();
         let log = flamevm::TxLog::from(vec![flamevm::TxEntry::ActorSave {
-            actor: flamevm::ActorID::Hash([1; 32]),
+            actor: flamevm::ActorID::from([1; 32]),
             state: Value::Cell(root.clone().into()),
         }]);
         let entries = effects(&log.to_envelope().unwrap().encode()).unwrap();
@@ -524,7 +566,7 @@ mod tests {
         let state = Value::Dict(dict);
         let state_cell = state.to_cell().unwrap();
         let expected_cells = CellIndex::collect(state_cell.clone().into()).unwrap();
-        let actor = ActorID::Hash([0x11; 32]);
+        let actor = ActorID::from([0x11; 32]);
         let predicate = Predicate::opaque(RISTRETTO_BASEPOINT_COMPRESSED);
         let entries = vec![
             TxEntry::ActorSave {
@@ -537,7 +579,7 @@ mod tests {
             TxEntry::Send(
                 Message::new(
                     actor,
-                    Some(ActorID::Hash([0x33; 32])),
+                    Some(ActorID::from([0x33; 32])),
                     Anchor([0x44; 32]),
                     vec![state],
                     u64::MAX,
@@ -644,7 +686,7 @@ mod tests {
             TxEntry::Data(vec![0xab; 257]),
             TxEntry::Fee(u64::MAX),
             TxEntry::SetCode {
-                actor: ActorID::Hash([0x11; 32]),
+                actor: ActorID::from([0x11; 32]),
                 code: code.clone(),
             },
         ]);
@@ -683,8 +725,79 @@ mod tests {
     }
 
     #[test]
+    fn restoration_effects_and_addresses_preserve_native_partial_state_graphs() {
+        let actor = ActorID::from([0x91; 32]);
+        let code = Cell::new(vec![0x1d], vec![]).unwrap();
+        let data = Value::Scalar(Scalar::from(42u64))
+            .to_cell()
+            .unwrap()
+            .prune(1)
+            .unwrap();
+        let state = Cell::new(vec![], vec![code.into(), data.into()]).unwrap();
+        let target = ActorAddress::Restore {
+            addr: actor,
+            state: state.clone().into(),
+        };
+        let message = flamevm::Message::new(
+            target,
+            None,
+            Anchor([0x92; 32]),
+            vec![],
+            1_000,
+            Predicate::opaque(Predicate::unspendable_key()),
+        )
+        .unwrap();
+        let log = flamevm::TxLog::from(vec![
+            TxEntry::ActorRestore {
+                actor,
+                state: state.clone(),
+            },
+            TxEntry::Send(message),
+        ]);
+        let decoded = effects(&log.to_envelope().unwrap().encode()).unwrap();
+        let RpcTxEntry::ActorRestore {
+            actor: restored,
+            state_hash,
+            state: bytes,
+        } = &decoded[0]
+        else {
+            panic!("expected restoration effect");
+        };
+        assert_eq!(*restored, ActorId(actor.to_hash()));
+        assert_eq!(*state_hash, CellId(state.id()));
+        let mut gas = u64::MAX;
+        let mut graph = CellEnvelope::decode(&bytes.0, bytes.0.len(), &mut gas).unwrap();
+        assert_eq!(graph.root(), state.id());
+        let root = graph.cells().get(&graph.root()).unwrap();
+        assert_eq!(root.refs().len(), 2);
+        assert!(read_cell(&mut graph, &root.refs()[1]).unwrap().is_pruned());
+        let RpcTxEntry::Send {
+            target:
+                ActorTarget::Restore {
+                    actor: target,
+                    state_hash: hash,
+                    state: Some(supplied),
+                },
+            ..
+        } = &decoded[1]
+        else {
+            panic!("expected restoration address");
+        };
+        assert_eq!(*target, ActorId(actor.to_hash()));
+        assert_eq!(*hash, CellId(state.id()));
+        assert_eq!(supplied, bytes);
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(encoded[0]["kind"], "actor_restore");
+        assert_eq!(encoded[1]["data"]["target"]["kind"], "restore");
+        assert_eq!(
+            serde_json::from_value::<Vec<RpcTxEntry>>(encoded).unwrap(),
+            decoded
+        );
+    }
+
+    #[test]
     fn full_effects_include_payloads_state_and_message_fields() {
-        let actor = ActorID::Hash([0x11; 32]);
+        let actor = ActorID::from([0x11; 32]);
         let point = RISTRETTO_BASEPOINT_COMPRESSED;
         let predicate = Predicate::opaque(point);
         let token = Value::ClearToken(ClearToken::new(Scalar::from(7u64), Scalar::from(8u64)));
@@ -692,7 +805,18 @@ mod tests {
             Value::Cell(CellValue::from_bytes(vec![0xab; 257]).unwrap()),
             token.clone(),
         ]));
-        let target = ActorID::Constructor(vec![0xcd; 257]);
+        let target = ActorAddress::Init {
+            ctor: Cell::new(vec![0xcd; 257], vec![]).unwrap().into(),
+        };
+        let ctor = match &target {
+            ActorAddress::Init { ctor } => ctor.as_resident().unwrap(),
+            _ => unreachable!(),
+        };
+        let ctor = ActorCode(
+            CellEnvelope::new(ctor.id(), CellIndex::collect(ctor.clone().into()).unwrap())
+                .unwrap()
+                .encode(),
+        );
         let entries = vec![
             TxEntry::Header(TxHeader {
                 version: 1,
@@ -764,9 +888,9 @@ mod tests {
             json!({
                 "message": json[6]["data"]["message"],
                 "target": {
-                    "kind": "constructor",
+                    "kind": "init",
                     "actor": hex::encode(target.to_hash()),
-                    "code": "zc3N".repeat(85) + "zc0=",
+                    "ctor": ctor,
                 },
                 "caller": "11".repeat(32),
                 "anchor": "66".repeat(32),

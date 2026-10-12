@@ -11,7 +11,7 @@ fn send_script(target: &ActorID, refund: [u8; 32], selector: u64, gas: u64) -> V
         .push_int(1u64)
         .push_literal(CellValue::from_bytes(refund.to_vec()).unwrap())
         .push_int(gas)
-        .push_literal(CellValue::from_bytes(target.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&target))
         .send()
         .to_bytecode()
 }
@@ -27,7 +27,7 @@ fn sends(log: &[TxEntry]) -> Vec<&Message> {
 
 #[test]
 fn send_commits_message_fields() {
-    let target = ActorID::Hash([0xbb; 32]);
+    let target = ActorID::from([0xbb; 32]);
     let refund = [0x77; 32];
     let mut reg = MemRegistry::new();
     let sender = deploy_actor(&mut reg, send_script(&target, refund, 3, 10_000));
@@ -36,7 +36,7 @@ fn send_commits_message_fields() {
     let messages = sends(&log);
     assert_eq!(messages.len(), 1);
     let message = messages[0];
-    assert_eq!(message.target, target);
+    assert_eq!(message.target, ActorAddress::from(target));
     assert_eq!(message.gas, 10_000);
     assert_eq!(message.caller, Some(sender));
     assert_eq!(message.refund_predicate.to_point().as_bytes(), &refund);
@@ -49,7 +49,7 @@ fn send_commits_message_fields() {
 
 #[test]
 fn sequential_sends_get_distinct_anchors_and_ids() {
-    let target = ActorID::Hash([0xcc; 32]);
+    let target = ActorID::from([0xcc; 32]);
     let mut code = send_script(&target, [0; 32], 0, 1);
     code.extend(send_script(&target, [0; 32], 0, 1));
     let mut reg = MemRegistry::new();
@@ -65,7 +65,7 @@ fn sequential_sends_get_distinct_anchors_and_ids() {
 
 #[test]
 fn send_payload_changes_transaction_id() {
-    let target = ActorID::Hash([0xee; 32]);
+    let target = ActorID::from([0xee; 32]);
     let mut reg = MemRegistry::new();
     let first = deploy_actor(&mut reg, send_script(&target, [0; 32], 7, 1));
     let second = deploy_actor(&mut reg, send_script(&target, [0; 32], 9, 1));
@@ -82,8 +82,19 @@ fn send_payload_changes_transaction_id() {
 #[test]
 fn send_rejects_malformed_addresses() {
     for (refund, target, malformed_refund) in [
-        (vec![0; 16], vec![0; 32], true),
+        (vec![0; 16], [&[1][..], &[0; 32][..]].concat(), true),
         (vec![0; 32], vec![0; 16], false),
+        (vec![0; 32], vec![0; 32], false),
+        (vec![0; 32], vec![1; 32], false),
+        (vec![0; 32], vec![2; 32], false),
+        (
+            vec![0; 32],
+            ActorAddress::from(ActorID::from([0x53; 32]))
+                .to_envelope()
+                .unwrap()
+                .encode(),
+            false,
+        ),
     ] {
         let code = ScriptBuilder::new()
             .push_int(0u64)
@@ -98,15 +109,14 @@ fn send_rejects_malformed_addresses() {
         if malformed_refund {
             assert!(matches!(error, VMError::MalformedAddress));
         } else {
-            // Non-hash destinations use rooted packets; zero cells is invalid.
-            assert!(matches!(error, VMError::Cell(CellError::InvalidFormat)));
+            assert!(matches!(error, VMError::Cell(_)));
         }
     }
 }
 
 #[test]
 fn send_rejects_nested_nonportable_payload() {
-    let actor = ActorID::Hash([0x11; 32]);
+    let actor = ActorID::from([0x11; 32]);
     let mut vm = vm_internal_with_actor(ScriptBuilder::new().send().to_bytecode(), actor);
     let mut inner = Dict::new();
     inner.insert(
@@ -120,7 +130,7 @@ fn send_rejects_nested_nonportable_payload() {
         Value::Scalar(Scalar::ONE),
         witness_cell(CellValue::from_bytes(vec![0u8; 32]).unwrap()),
         Value::Scalar(Scalar::ONE),
-        witness_cell(CellValue::from_bytes(vec![0u8; 32]).unwrap()),
+        witness_cell(actor_address(&ActorID::from([0; 32]))),
     ];
     assert!(matches!(
         vm.step_internal(),
@@ -136,9 +146,8 @@ fn send_rejects_widetoken_payload() {
         .push_int(1u64)
         .push_literal(CellValue::from_bytes(vec![0u8; 32]).unwrap())
         .push_int(1u64)
-        .push_literal(CellValue::from_bytes(vec![0u8; 32]).unwrap())
-        .send()
-        .to_bytecode();
+        .push_literal(actor_address(&ActorID::from([0; 32])))
+        .send();
     let mut vm = vm_external_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
     let pc_gens = PedersenGens::default();
@@ -156,7 +165,7 @@ fn send_rejects_widetoken_payload() {
 
 #[test]
 fn external_send_has_no_caller() {
-    let target = ActorID::Hash([0xdd; 32]);
+    let target = ActorID::from([0xdd; 32]);
     let script = send_script(&target, [0; 32], 0, 1);
     let mut vm = VM::new(
         dummy_header(),
@@ -174,14 +183,15 @@ fn external_send_has_no_caller() {
 
 #[test]
 fn send_preserves_constructor_code_for_first_delivery() {
-    let target = ActorID::Constructor(ScriptBuilder::new().nop().to_bytecode());
+    let target = ActorAddress::Init {
+        ctor: ScriptBuilder::new().nop().to_cell().unwrap().into(),
+    };
     let script = ScriptBuilder::new()
         .push_int(0u64)
         .push_literal(CellValue::from_bytes(vec![0; 32]).unwrap())
         .push_int(0u64)
-        .push_literal(CellValue::from_bytes(target.to_envelope().unwrap().encode()).unwrap())
-        .send()
-        .to_bytecode();
+        .push_cell(target.to_cell().unwrap())
+        .send();
     let mut vm = vm_external_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
 
@@ -193,10 +203,10 @@ fn send_preserves_constructor_code_for_first_delivery() {
 #[test]
 fn send_debits_its_full_grant() {
     fn gas_used(grant: u64) -> u64 {
-        let target = ActorID::Hash([0x61; 32]);
+        let target = ActorID::from([0x61; 32]);
         let mut vm = vm_internal_with_actor(
             send_script(&target, [0; 32], 0, grant),
-            ActorID::Hash([0x60; 32]),
+            ActorID::from([0x60; 32]),
         );
         run_to_end(&mut vm).expect("send succeeds");
         vm.current_call.gas_used
@@ -208,10 +218,10 @@ fn send_debits_its_full_grant() {
 #[test]
 fn send_cannot_reserve_more_than_the_remaining_frame_gas() {
     let grant = 100;
-    let target = ActorID::Hash([0x63; 32]);
+    let target = ActorID::from([0x63; 32]);
     let mut vm = vm_internal_with_actor(
         send_script(&target, [0; 32], 0, grant),
-        ActorID::Hash([0x62; 32]),
+        ActorID::from([0x62; 32]),
     );
 
     // Execute the five operand pushes, then leave enough gas for the send
@@ -227,7 +237,7 @@ fn send_cannot_reserve_more_than_the_remaining_frame_gas() {
 
 #[test]
 fn internal_send_cannot_mint_a_larger_descendant_budget() {
-    let target = ActorID::Hash([0x65; 32]);
+    let target = ActorID::from([0x65; 32]);
     let mut reg = MemRegistry::new();
     let sender = deploy_actor(&mut reg, send_script(&target, [0; 32], 0, 500));
     let message = Message::new(

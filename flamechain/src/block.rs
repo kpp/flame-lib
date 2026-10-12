@@ -8,6 +8,8 @@ use cells::{
     CellReader, CellRef, CellSlice, GasMeter, Trie, read_cell,
 };
 
+#[cfg(test)]
+use flamevm::ActorAddress;
 use flamevm::{
     ActorID, ActorRegistry, BlockContext, Contract, ContractID, Dict, ExternalTx, Limits, Message,
     TxEntry, TxHeader, TxID, TxLog, VMError, Value,
@@ -857,7 +859,9 @@ impl Blockchain {
 
             observe(record, &log, None)?;
 
-            self.apply_log(
+            let execution_cells = block_tx.tx.execution_cells()?;
+            let mut replay_cells = execution_cells.as_ref().clone();
+            self.apply_log_with_cells(
                 &mut work,
                 &hasher,
                 ExecutionKind::External,
@@ -866,11 +870,11 @@ impl Blockchain {
                 &mut sends,
                 &mut seen_outputs,
                 block.header.height,
+                &mut replay_cells,
             )?;
             records.push(record);
             // Finish this external transaction's complete FIFO message closure
             // before advancing; every descendant sees only this execution Cell hierarchy.
-            let execution_cells = block_tx.tx.execution_cells()?;
             while let Some(message) = sends.pop_front() {
                 if message_count >= self.params.limits.max_messages {
                     return Err(ChainError::LimitExceeded);
@@ -914,7 +918,8 @@ impl Blockchain {
                 let record = ExecutionRecord { kind, txid };
                 observe(record, &log, error.as_deref())?;
 
-                self.apply_log(
+                let mut replay_cells = execution_cells.as_ref().clone();
+                self.apply_log_with_cells(
                     &mut work,
                     &hasher,
                     kind,
@@ -923,6 +928,7 @@ impl Blockchain {
                     &mut sends,
                     &mut seen_outputs,
                     block.header.height,
+                    &mut replay_cells,
                 )?;
                 if let Some(expected) = executed_actor_state {
                     let replayed = (self.actors.actor_root()?, self.actors.available_units());
@@ -973,6 +979,7 @@ impl Blockchain {
     }
 
     // Keep the separately journaled state lanes explicit at this replay boundary.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn apply_log(
         &mut self,
@@ -984,6 +991,32 @@ impl Blockchain {
         sends: &mut VecDeque<Message>,
         seen_outputs: &mut BTreeSet<ContractID>,
         height: u64,
+    ) -> Result<(), ChainError> {
+        self.apply_log_with_cells(
+            work,
+            hasher,
+            kind,
+            log,
+            proofs,
+            sends,
+            seen_outputs,
+            height,
+            &mut (),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_log_with_cells(
+        &mut self,
+        work: &mut utreexo::WorkForest,
+        hasher: &merkle::Hasher<ContractLeaf>,
+        kind: ExecutionKind,
+        log: TxLog,
+        proofs: &[Proof],
+        sends: &mut VecDeque<Message>,
+        seen_outputs: &mut BTreeSet<ContractID>,
+        height: u64,
+        cells: &mut dyn CellReader,
     ) -> Result<(), ChainError> {
         Self::validate_log_shape(kind, &log, height)?;
         let expected = log
@@ -1024,6 +1057,11 @@ impl Blockchain {
                     TxEntry::ActorSave { actor, state } => {
                         let actor = Self::canonical_effect_actor(&actor)?;
                         self.actors.replay_save(&actor, state, height)?;
+                    }
+                    TxEntry::ActorRestore { actor, state } => {
+                        self.actors
+                            .restore_with_cells(&actor, &state.into(), cells)?;
+                        new_actors.push(actor);
                     }
                     TxEntry::SetCode { actor, code } => {
                         let actor = Self::canonical_effect_actor(&actor)?;
@@ -1074,10 +1112,7 @@ impl Blockchain {
     }
 
     fn canonical_effect_actor(actor: &ActorID) -> Result<ActorID, ChainError> {
-        match actor {
-            ActorID::Hash(id) => Ok(ActorID::Hash(*id)),
-            ActorID::Constructor(_) => Err(ChainError::InvalidEffectLog),
-        }
+        Ok(*actor)
     }
 
     fn validate_log_shape(
@@ -1105,6 +1140,7 @@ impl Blockchain {
                             | TxEntry::ActorDeploy { .. }
                             | TxEntry::IssuePub(..)
                             | TxEntry::ActorSave { .. }
+                            | TxEntry::ActorRestore { .. }
                             | TxEntry::SetCode { .. }
                             | TxEntry::StoragePurchase { .. }
                             | TxEntry::ActorDestroy { .. }
@@ -1121,14 +1157,12 @@ impl Blockchain {
                     return Err(ChainError::InvalidEffectLog);
                 }
                 let mut destroying = false;
-                for (index, entry) in entries.iter().enumerate().skip(2) {
+                for entry in entries.iter().skip(2) {
                     if destroying && !matches!(entry, TxEntry::ActorDestroy { .. }) {
                         return Err(ChainError::InvalidEffectLog);
                     }
                     match entry {
-                        TxEntry::ActorDeploy { .. } if index == 2 => {}
-                        TxEntry::ActorDeploy { .. }
-                        | TxEntry::Receive(_)
+                        TxEntry::Receive(_)
                         | TxEntry::Input(_)
                         | TxEntry::IssuePriv(..)
                         | TxEntry::Fee(_) => return Err(ChainError::InvalidEffectLog),
@@ -1336,7 +1370,12 @@ mod tests {
         Predicate::opaque(Predicate::unspendable_key())
     }
 
-    fn message(target: ActorID, payload: Vec<Value>, gas: u64, anchor: u8) -> Message {
+    fn message(
+        target: impl Into<ActorAddress>,
+        payload: Vec<Value>,
+        gas: u64,
+        anchor: u8,
+    ) -> Message {
         Message::new(
             target,
             None,
@@ -1839,7 +1878,7 @@ mod tests {
     }
 
     #[test]
-    fn descendants_run_immediately_with_only_the_initiating_witness_bag() {
+    fn address_cannot_restore_frozen_actors_even_with_transaction_witnesses() {
         let mut params = ChainParams::default();
         params.storage.lease_duration_blocks = 1;
         let mut chain = Blockchain::new(params).unwrap();
@@ -1893,7 +1932,9 @@ mod tests {
                     .unwrap(),
                 )
                 .push_int(20_000u64)
-                .push_literal(flamevm::CellValue::from_bytes(actor.to_hash().to_vec()).unwrap())
+                .push_literal(flamevm::CellValue::from(
+                    ActorAddress::from(actor).to_cell().unwrap(),
+                ))
                 .send()
         };
         let mut first = external_tx(send(&inputs[0]), 0);
@@ -1923,13 +1964,120 @@ mod tests {
                 ExecutionKind::External,
                 ExecutionKind::InternalFailed,
                 ExecutionKind::External,
-                ExecutionKind::Internal
+                ExecutionKind::InternalFailed
             ]
         );
         assert_eq!(
             chain.actor_storage(&actor).unwrap().cells.id().unwrap(),
             frozen
         );
+    }
+
+    #[test]
+    fn frozen_actor_restore_executes_and_replays_with_its_initiating_cell_graph() {
+        let mut params = ChainParams::default();
+        params.storage.lease_duration_blocks = 1;
+        let mut chain = Blockchain::new(params).unwrap();
+        let code = ScriptBuilder::new()
+            .load()
+            .push_int(1_024u64)
+            .addstorage()
+            .verify()
+            .merge()
+            .verify()
+            .save()
+            .to_cell()
+            .unwrap();
+        let actor = ActorID::from(code.id());
+        chain
+            .actors
+            .deploy(
+                actor,
+                code,
+                Value::ClearToken(ClearToken::new(
+                    Scalar::from(1_000_000_000_000u64),
+                    FLAME_FLAVOR,
+                )),
+            )
+            .unwrap();
+        chain
+            .actors
+            .purchase_storage(&actor, 1_024, 0)
+            .unwrap()
+            .unwrap();
+        let archive = chain.actor_storage(&actor).unwrap();
+        let slot = archive.cells.get(&archive.root).unwrap();
+        let image = read_cell(&mut archive.cells.as_ref().clone(), &slot.refs()[0]).unwrap();
+        let proof = Cell::new(
+            Vec::new(),
+            image.refs().iter().map(CellRef::to_unloaded).collect(),
+        )
+        .unwrap();
+
+        let tree = flamevm::PredicateTree::scripts_only(
+            vec![ScriptBuilder::new().drop_().to_bytecode()],
+            [0x81; 32],
+        )
+        .unwrap();
+        let opening = tree.opening_for(0).unwrap();
+        let input =
+            Contract::new(Predicate::tree(tree), Anchor([0x82; 32]), empty_state()).unwrap();
+        let hasher = utreexo::utreexo_hasher::<ContractLeaf>();
+        let mut work = chain.contracts.work_forest();
+        work.insert(&ContractLeaf(input.id()), &hasher);
+        let (forest, catchup) = work.normalize(&hasher);
+        chain.contracts = forest;
+        let expiry = chain.build_block([0x83; 32], vec![]).unwrap();
+        chain.connect(&expiry).unwrap();
+        assert!(chain.actor_info(&actor).unwrap().frozen);
+        let frozen_root = chain.state_commitment();
+
+        let address = ActorAddress::Restore {
+            addr: actor,
+            state: proof.into(),
+        };
+        let script = ScriptBuilder::new()
+            .push_cell(flamevm::CellValue::contract(input.clone()).unwrap())
+            .input()
+            .push_point(*opening.internal_key.as_bytes())
+            .push_cell(opening.root)
+            .push_int(20_000u64)
+            .push_int(0u64)
+            .open()
+            .verify()
+            .drop_()
+            .push_int(0u64)
+            .push_literal(
+                flamevm::CellValue::from_bytes(refund_predicate().to_point().as_bytes().to_vec())
+                    .unwrap(),
+            )
+            .push_int(20_000u64)
+            .push_cell(address.to_cell().unwrap())
+            .send()
+            .with_cells(archive.cells.as_ref().clone());
+        let mut tx = external_tx(script, 0);
+        tx.proofs.push(
+            catchup
+                .update_proof(&ContractLeaf(input.id()), Proof::Transient, &hasher)
+                .unwrap(),
+        );
+        let block = chain.build_block([0x84; 32], vec![tx]).unwrap();
+        let decoded = Block::from_bytes_bounded(&block.to_bytes().unwrap(), params).unwrap();
+        let mut restoration_logged = false;
+        let applied = chain.connect_with_observer(&decoded, |_, log, _| {
+            restoration_logged |= log.iter().any(|entry| matches!(entry, TxEntry::ActorRestore { actor: id, .. } if id == &actor));
+            Ok(())
+        }).unwrap();
+        assert!(restoration_logged);
+        assert_eq!(
+            applied.records.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            [ExecutionKind::External, ExecutionKind::Internal]
+        );
+        assert!(!chain.actor_info(&actor).unwrap().frozen);
+        assert_eq!(chain.actor_info(&actor).unwrap().storage_capacity, 1_024);
+        chain.disconnect_tip(applied.id).unwrap();
+        assert_eq!(chain.state_commitment(), frozen_root);
+        assert!(chain.actor_info(&actor).unwrap().frozen);
     }
 
     #[test]
@@ -1975,7 +2123,7 @@ mod tests {
     }
 
     fn deploy_actor(store: &mut ActorStore, id: u8, code: Vec<u8>) -> ActorID {
-        let actor = ActorID::Hash([id; 32]);
+        let actor = ActorID::from([id; 32]);
         store
             .deploy(
                 actor.clone(),
@@ -2002,7 +2150,7 @@ mod tests {
         let mut missing = ActorStore::new(StorageParams::default()).unwrap();
         let (error, _) = fail_and_bounce(
             &mut missing,
-            message(ActorID::Hash([1; 32]), payload(), 1_000_000, 1),
+            message(ActorID::from([1; 32]), payload(), 1_000_000, 1),
             0,
         );
         assert!(matches!(error, VMError::ActorNotFound));
@@ -2075,18 +2223,20 @@ mod tests {
             .push_int(0u64)
             .verify()
             .to_bytecode();
-        let target = ActorID::Constructor(code.clone());
+        let target = ActorAddress::Init {
+            ctor: flamevm::code_cell(&code).unwrap().into(),
+        };
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
         let mut quote_store = store.clone();
         quote_store
             .deploy(
-                target.clone(),
+                target.to_actor_id(),
                 flamevm::code_cell(&code).unwrap(),
                 empty_state(),
             )
             .unwrap();
         let fee = quote_store
-            .quote_storage(&target, 1_024, 0)
+            .quote_storage(&target.to_actor_id(), 1_024, 0)
             .unwrap()
             .unwrap()
             .fee_sparks;
@@ -2102,7 +2252,7 @@ mod tests {
         let (error, bounce) = fail_and_bounce(&mut store, original, 0);
 
         assert!(matches!(error, VMError::VerifyFailed));
-        assert!(!store.exists(&target));
+        assert!(!store.exists(&target.to_actor_id()));
         assert_eq!(store.available_units(), pool);
         assert_eq!(store.actor_root().unwrap(), actors);
         store.assert_supply(0).unwrap();
@@ -2140,19 +2290,21 @@ mod tests {
             .drop_()
             .save()
             .to_bytecode();
-        let target = ActorID::Constructor(constructor_code.clone());
-        let actor = ActorID::Hash(target.to_hash());
+        let target = ActorAddress::Init {
+            ctor: flamevm::code_cell(&constructor_code).unwrap().into(),
+        };
+        let actor = ActorID::from(target.to_hash());
         let baseline = ActorStore::new(StorageParams::default()).unwrap();
         let mut quote_store = baseline.clone();
         quote_store
             .deploy(
-                target.clone(),
+                target.to_actor_id(),
                 flamevm::code_cell(&constructor_code).unwrap(),
                 empty_state(),
             )
             .unwrap();
         let fee = quote_store
-            .quote_storage(&target, 1_024, 0)
+            .quote_storage(&target.to_actor_id(), 1_024, 0)
             .unwrap()
             .unwrap()
             .fee_sparks;
@@ -2237,14 +2389,14 @@ mod tests {
         let mut sends = VecDeque::new();
         let mut seen_outputs = BTreeSet::new();
         let code = ScriptBuilder::new().nop().to_bytecode();
-        let actor = ActorID::Hash(ActorID::Constructor(code.clone()).to_hash());
+        let actor = ActorID::from(flamevm::code_cell(&code).unwrap().id());
         let invalid = TxLog::from(vec![
             TxEntry::Header(TxHeader {
                 version: 1,
                 locktime: 0,
             }),
             TxEntry::Receive([1; 32]),
-            TxEntry::Data(vec![0]),
+            TxEntry::Receive([3; 32]),
             TxEntry::ActorDeploy {
                 actor,
                 code: flamevm::code_cell(&code).unwrap(),
@@ -2271,7 +2423,7 @@ mod tests {
         assert!(seen_outputs.is_empty());
 
         let code = ScriptBuilder::new().nop().to_bytecode();
-        let actor = ActorID::Hash(ActorID::Constructor(code.clone()).to_hash());
+        let actor = ActorID::from(flamevm::code_cell(&code).unwrap().id());
         let underfunded = TxLog::from(vec![
             TxEntry::Header(TxHeader {
                 version: 1,
@@ -2319,7 +2471,9 @@ mod tests {
             .save()
             .push_int(0u64)
             .push_int(100_000u64)
-            .push_literal(flamevm::CellValue::from_bytes(child.to_hash().to_vec()).unwrap())
+            .push_literal(flamevm::CellValue::from(
+                ActorAddress::from(child).to_cell().unwrap(),
+            ))
             .call()
             .drop_()
             .drop_()
@@ -2436,7 +2590,7 @@ mod tests {
         )
         .unwrap();
         let output_id = output.id();
-        let outbound = message(ActorID::Hash([92; 32]), Vec::new(), 1_000, 92);
+        let outbound = message(ActorID::from([92; 32]), Vec::new(), 1_000, 92);
         let outbound_id = *outbound.id().as_bytes();
         let log = TxLog::from(vec![
             TxEntry::Header(TxHeader {
@@ -2518,7 +2672,7 @@ mod tests {
 
             let mut recovered = ActorStore::new(StorageParams::default()).unwrap();
             let original = message(
-                ActorID::Hash([40 + index as u8; 32]),
+                ActorID::from([40 + index as u8; 32]),
                 vec![value],
                 1_000_000,
                 40 + index as u8,
@@ -2541,7 +2695,7 @@ mod tests {
         let mut work = chain.contracts.work_forest();
         let mut sends = VecDeque::new();
         let mut seen_outputs = BTreeSet::new();
-        let original = message(ActorID::Hash([50; 32]), Vec::new(), 1_000, 50);
+        let original = message(ActorID::from([50; 32]), Vec::new(), 1_000, 50);
         let bounce = Blockchain::bounce_log(original).unwrap();
         let bounce_id = bounce
             .iter()
@@ -2569,7 +2723,7 @@ mod tests {
 
     #[test]
     fn expiry_freezes_tokens_without_retirement_and_disconnect_restores_bodies() {
-        let actor = ActorID::Hash([9; 32]);
+        let actor = ActorID::from([9; 32]);
         let state = Value::ClearToken(ClearToken::new(Scalar::from(7u64), FLAME_FLAVOR));
         let mut params = ChainParams::default();
         params.storage.lease_duration_blocks = 1;
@@ -2601,6 +2755,11 @@ mod tests {
 
         chain.actors.push_checkpoint();
         let mut witnesses = before.cells.as_ref().clone();
+        let slot = before.cells.get(&before.root).unwrap();
+        chain
+            .actors
+            .restore_with_cells(&actor, &slot.refs()[0], &mut witnesses)
+            .unwrap();
         let restored = chain
             .actors
             .load_state_with_cells(&actor, &mut witnesses)

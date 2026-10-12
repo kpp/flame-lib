@@ -424,6 +424,11 @@ fn effect(entry: &TxEntry) -> Effect {
         TxEntry::SetCode { actor, .. } => ("SetCode", hex(&actor.to_hash()), None),
         TxEntry::StoragePurchase { actor, .. } => ("StoragePurchase", hex(&actor.to_hash()), None),
         TxEntry::ActorDestroy { actor } => ("ActorDestroy", hex(&actor.to_hash()), None),
+        TxEntry::ActorRestore { actor, state } => (
+            "ActorRestore",
+            format!("{} → {}", hex(&actor.to_hash()), hex(&state.id())),
+            None,
+        ),
     };
     Effect {
         kind,

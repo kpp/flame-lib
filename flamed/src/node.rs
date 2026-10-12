@@ -265,7 +265,7 @@ impl Node {
     pub fn actor(&self, id: ActorId) -> Result<ActorResult, NodeError> {
         let info = self
             .chain
-            .actor_info(&ActorID::Hash(id.0))
+            .actor_info(&ActorID::from(id.0))
             .map_err(|error| match error {
                 ChainError::Vm(VMError::ActorNotFound) => {
                     NodeError::NotFound(format!("actor {id}"))
@@ -279,8 +279,10 @@ impl Node {
             id,
             height: tip.height,
             block: BlockId(tip.hash.into_bytes()),
-            code_hash: info.code_root,
-            state_hash: info.state_root,
+            root_hash: flamed_rpc::CellId(info.root),
+            frozen: info.frozen,
+            code_hash: info.code_root.map(flamed_rpc::CellId),
+            state_hash: info.state_root.map(flamed_rpc::CellId),
             code_size: info.code_size,
             state_size: info.state_size,
             storage_used: info.storage_used,

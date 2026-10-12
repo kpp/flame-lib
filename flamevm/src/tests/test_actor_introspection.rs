@@ -42,7 +42,7 @@ fn vm_external(script: Vec<u8>) -> VM {
 
 #[test]
 fn selfid_in_internal_root_pushes_hash_cell() {
-    let id = ActorID::Hash([0xab; 32]);
+    let id = ActorID::from([0xab; 32]);
     let mut vm = vm_internal_with(
         id.clone(),
         None,
@@ -68,7 +68,7 @@ fn selfid_in_constructor_form_uses_canonical_hash_seed() {
     // Constructor-form id surfaces as its deterministic hash seed
     // (per ActorID::to_hash) — the same byte sequence the
     // Hash-form variant would carry.
-    let ctor = ActorID::Constructor(vec![0x01, 0x02]);
+    let ctor = ActorID::from(crate::code_cell(&[0x01, 0x02]).unwrap().id());
     let expected = ctor.to_hash();
     let mut vm = vm_internal_with(
         ctor,
@@ -85,7 +85,7 @@ fn selfid_in_constructor_form_uses_canonical_hash_seed() {
 
 #[test]
 fn anchor_in_internal_root_pushes_frame_anchor() {
-    let id = ActorID::Hash([0u8; 32]);
+    let id = ActorID::from([0u8; 32]);
     let anc = Anchor([0xff; 32]);
     let mut vm = vm_internal_with(id, None, anc, ScriptBuilder::new().anchor().to_bytecode());
     vm.step_internal().expect("step ok");
@@ -108,9 +108,9 @@ fn anchor_in_external_root_errors_anchor_missing() {
 
 #[test]
 fn callerid_with_some_caller_pushes_hash_cell() {
-    let caller = ActorID::Hash([0x33; 32]);
+    let caller = ActorID::from([0x33; 32]);
     let mut vm = vm_internal_with(
-        ActorID::Hash([0x44; 32]),
+        ActorID::from([0x44; 32]),
         Some(caller),
         Anchor([0u8; 32]),
         ScriptBuilder::new().callerid().to_bytecode(),
@@ -126,7 +126,7 @@ fn callerid_with_some_caller_pushes_hash_cell() {
 fn callerid_with_none_caller_pushes_zero_cell() {
     // External originator → caller None → push zeros (not error).
     let mut vm = vm_internal_with(
-        ActorID::Hash([0x44; 32]),
+        ActorID::from([0x44; 32]),
         None,
         Anchor([0u8; 32]),
         ScriptBuilder::new().callerid().to_bytecode(),

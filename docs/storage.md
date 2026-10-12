@@ -87,15 +87,22 @@ pool immediately. This makes every quote a deterministic function of preceding
 block execution.
 
 At the end of the block, marked actors are frozen in lexicographic actor-ID
-order. Their resident code/state bodies are removed, but identity, code/state
-CellIDs, size metadata, and outstanding leases remain. No system internal
+order. Their entire two-reference ActorState root becomes one explicit pruned
+Cell; application bodies are removed, but identity, size metadata and
+outstanding leases remain. No system internal
 transaction is generated and no token or other linear value is retired.
 Unexpired leases recycle only at their original expiration heights.
 
-A later transaction can recover missing bodies from its committed execution
-Cell index. This is not redeployment: the existing actor identity and linear ownership
-remain intact. The current implementation retains registry metadata and both
-code/state roots, not literally one 32-byte record. Explicit self-destruction
+The total actor Cell holds two references: ActorState and a protocol Cell
+containing size metadata and the lease-list reference. Freezing replaces only
+the ActorState reference; protocol metadata remains available. The exact
+layouts are in [Cell-based encoding](encoding.md#actor-addresses-state-and-messages).
+
+A later transaction uses the canonical ActorAddress Restore variant with an
+authenticated partial image. This is not redeployment: actor identity and
+linear ownership remain intact. Code and data are committed by one root,
+not frozen independently; the registry still retains metadata, so the record
+is not literally only 32 bytes. Explicit self-destruction
 after dismantling checked-out state remains a separate operation.
 
 ## Actor usage and capacity
@@ -103,13 +110,14 @@ after dismantling checked-out state remains a separate operation.
 Actor usage is measured deterministically as:
 
 ```text
-usage = sum(canonical Cell record bytes in the resident code/state graph)
+usage = sum(canonical Cell record bytes in the resident ActorState/code/data graph)
       + LEASE_RECORD_BYTES * number_of_lease_records
 ```
 
-Shared resident bodies are counted once within one actor's code/state graph.
-Pruned descendants occupy only reference hashes in their resident parents;
-their absent bodies are not charged. A fully frozen actor with no remaining
+Shared resident bodies are counted once within one actor's graph, including
+the ordinary ActorState root. Unloaded ordinary descendants contribute only
+parent reference summaries, not missing body bytes; retained explicit pruning
+records count their own encoded bytes. A fully frozen actor with no remaining
 leases has zero charged usage, although its registry metadata remains.
 
 Each coalesced lease record retains the policy charge for two canonical `u64`
@@ -143,9 +151,12 @@ body into the current execution is not a storage purchase or persistent restore.
 ### Content, availability, and recovery
 
 Actor layouts and their ordered lease Tries are specified in
-[encoding.md](encoding.md). `code_root` and `state_root` are ordinary CellIDs
-for native executable code and one encoded Value. The actor registry commits
-both its actor-layout root and the exact resident graph's `snapshot CellID`.
+[encoding.md](encoding.md). The content image has empty payload and exactly
+two refs: native code and an encoded portable Value. The actor registry commits
+its whole image/lease layout and the exact retained graph's snapshot CellID.
+Initialized images can be partially available; frozen images contain one
+whole-root cut. Actor images reserve the outermost of fifteen pruning levels
+so expiry cannot fail because another proof level is unavailable.
 
 The VM resolver is scoped to the current actor's resident code/state body set
 and the initiating external transaction's frozen execution Cell index. Actor-layout
@@ -154,7 +165,11 @@ not this implicit execution source. Instruction-boundary scope refreshes share
 the immutable body set rather than copying or rebuilding it. Loaded bodies do not
 silently become rent-bearing. `save` and `setcode` retain newly constructed
 reachable bodies and previously owned reachable bodies; they do not union the
-external witness bag into actor storage. Removed branches cease to contribute
+external witness bag into actor storage. Restore explicitly authenticates a
+supplied partial image and merges its bodies without erasing prior retention.
+The actor buys any required capacity itself during execution. Restoration,
+method effects and purchases share one checkpoint and roll back on failure;
+partial progress is retained only by a successful transaction. Removed branches cease to contribute
 to stored availability or rent. Partial Dicts retain their authenticated
 portability and linearity metadata when their descendants are absent.
 

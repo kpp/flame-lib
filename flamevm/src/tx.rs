@@ -649,6 +649,10 @@ pub enum TxEntry {
     /// empty state.
     ActorDeploy { actor: ActorID, code: Cell },
 
+    /// Successful authenticated hydration, committed atomically with actor
+    /// execution. The supplied combined code/data tree may remain partial.
+    ActorRestore { actor: ActorID, state: Cell },
+
     /// Output: a newly sealed contract, emitted by the `output` opcode.
     Output(Contract),
 
@@ -769,6 +773,7 @@ impl TxEntry {
     pub const TAG_STORAGE_PURCHASE: u8 = 12;
     pub const TAG_ACTOR_DESTROY: u8 = 13;
     pub const TAG_ACTOR_DEPLOY: u8 = 14;
+    pub const TAG_ACTOR_RESTORE: u8 = 15;
 }
 
 impl CellEncode for TxEntry {
@@ -841,6 +846,11 @@ impl CellEncode for TxEntry {
                 b.store_u8(Self::TAG_ACTOR_DESTROY)?
                     .store_bytes(&actor.to_hash())?;
             }
+            Self::ActorRestore { actor, state } => {
+                b.store_u8(Self::TAG_ACTOR_RESTORE)?
+                    .store(actor)?
+                    .store_ref(CellRef::resident(state.clone()))?;
+            }
         }
         Ok(())
     }
@@ -868,7 +878,7 @@ impl CellDecode for TxEntry {
             ),
             Self::TAG_FEE => Self::Fee(s.load_u64()?),
             Self::TAG_ACTOR_SAVE => {
-                let actor = ActorID::Hash(<[u8; 32]>::decode(s, r)?);
+                let actor = ActorID::decode(s, r)?;
                 let cell = cells::read_cell(r, &s.load_ref()?)?;
                 Self::ActorSave {
                     actor,
@@ -876,7 +886,7 @@ impl CellDecode for TxEntry {
                 }
             }
             tag @ (Self::TAG_ACTOR_DEPLOY | Self::TAG_SET_CODE) => {
-                let actor = ActorID::Hash(<[u8; 32]>::decode(s, r)?);
+                let actor = ActorID::decode(s, r)?;
                 let cell = cells::read_cell(r, &s.load_ref()?)?;
                 let code = cell.load_graph(r)?;
                 if tag == Self::TAG_ACTOR_DEPLOY {
@@ -890,13 +900,17 @@ impl CellDecode for TxEntry {
                 Self::Send(Message::from_cell(&cell, r)?)
             }
             Self::TAG_STORAGE_PURCHASE => Self::StoragePurchase {
-                actor: ActorID::Hash(<[u8; 32]>::decode(s, r)?),
+                actor: ActorID::decode(s, r)?,
                 bytes: s.load_u64()?,
                 expiry_height: s.load_u64()?,
                 fee_sparks: Scalar::decode(s, r)?,
             },
             Self::TAG_ACTOR_DESTROY => Self::ActorDestroy {
-                actor: ActorID::Hash(<[u8; 32]>::decode(s, r)?),
+                actor: ActorID::decode(s, r)?,
+            },
+            Self::TAG_ACTOR_RESTORE => Self::ActorRestore {
+                actor: ActorID::decode(s, r)?,
+                state: cells::read_cell(r, &s.load_ref()?)?.as_ref().clone(),
             },
             _ => return Err(CellError::InvalidFormat),
         })
@@ -1486,6 +1500,47 @@ mod envelope_tests {
         );
         let malformed = Cell::new(5u64.to_le_bytes().to_vec(), cell.refs().to_vec()).unwrap();
         assert!(TxLog::from_cell(&malformed, &mut ()).is_err());
+    }
+
+    #[test]
+    fn actor_restore_effect_preserves_partial_state_without_reading_descendants() {
+        struct RootOnly(usize);
+        impl CellReader for RootOnly {
+            fn read(
+                &mut self,
+                id: cells::CellID,
+                resident: Option<&Arc<Cell>>,
+            ) -> Result<Arc<Cell>, CellError> {
+                self.0 += 1;
+                resident.cloned().ok_or(CellError::MissingCell(id))
+            }
+        }
+
+        let code = Cell::new(vec![0], vec![]).unwrap();
+        let data = Scalar::ONE.to_cell().unwrap().prune(1).unwrap();
+        let state = Cell::new(vec![], vec![code.into(), data.clone().into()]).unwrap();
+        let actor = ActorID::from([0x42; 32]);
+        let effect = TxEntry::ActorRestore {
+            actor,
+            state: state.clone(),
+        };
+        let cell = effect.to_cell().unwrap();
+        assert_eq!(cell.payload(), [&[15][..], &actor.0[..]].concat());
+        assert_eq!(cell.refs().len(), 1);
+        let mut reader = RootOnly(0);
+        match TxEntry::from_cell(&cell, &mut reader).unwrap() {
+            TxEntry::ActorRestore {
+                actor: decoded,
+                state: root,
+            } => {
+                assert_eq!(decoded, actor);
+                assert_eq!(root.id(), state.id());
+                assert_eq!(root.refs()[1].id(), data.id());
+                assert!(root.refs()[1].as_resident().unwrap().is_pruned());
+            }
+            _ => panic!("wrong effect"),
+        }
+        assert_eq!(reader.0, 1);
     }
 
     #[test]

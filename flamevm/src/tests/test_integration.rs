@@ -183,7 +183,7 @@ fn reentrant_call_runs_and_its_effect_is_observable() {
     // A.recv (method 0) calls A.method1; A never holds its state, so the
     // re-entry is permitted (ADR 0017) and A.method1's "R" log appears.
     let mut reg = MemRegistry::new();
-    let a_id = ActorID::Hash([0xaa; 32]);
+    let a_id = ActorID::from([0xaa; 32]);
     let a_method1 = log_str(b(), "R").to_bytecode();
     let a_recv = call_with_sel(&a_id, 1).drop_().drop_().to_bytecode();
     let a_code = dispatch_code(&[(0, a_recv.clone()), (1, a_method1)]);
@@ -212,7 +212,7 @@ fn setcode_upgrade_changes_dispatched_behavior() {
     let recv_v1 = log_str(b(), "v1").to_bytecode();
     // Method 1: push the native replacement code graph, setcode.
     let upgrade = b().push_cell(c2.clone()).setcode().to_cell().unwrap();
-    let id = ActorID::Hash([0xcc; 32]);
+    let id = ActorID::from([0xcc; 32]);
     let code = dispatch_cells(&[(0, crate::code_cell(&recv_v1).unwrap()), (1, upgrade)]);
     reg.deploy(id.clone(), code, empty_state(), 1_000_000)
         .expect("deploy");
@@ -244,7 +244,7 @@ fn setcode_preserves_native_graphs_through_storage_effect_encoding_and_replay() 
         .setcode()
         .to_cell()
         .unwrap();
-    let id = ActorID::Hash([0xab; 32]);
+    let id = ActorID::from([0xab; 32]);
     let mut registry = MemRegistry::new();
     registry
         .deploy(id.clone(), upgrade.clone(), empty_state(), 1_000_000)
@@ -287,7 +287,7 @@ fn setcode_resident_and_unloaded_graphs_have_equal_gas_and_persistent_availabili
     let replacement = b().push_cell(leaf.clone()).exec().to_cell().unwrap();
     let reference: CellRef = replacement.clone().into();
     let cells = CellIndex::collect(Arc::new(replacement.clone())).unwrap();
-    let id = ActorID::Hash([0xac; 32]);
+    let id = ActorID::from([0xac; 32]);
     let mut spent = Vec::new();
     let mut usage = Vec::new();
     for reference in [reference.clone(), reference.to_unloaded()] {

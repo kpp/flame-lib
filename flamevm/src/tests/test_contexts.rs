@@ -27,8 +27,8 @@ enum Gate {
 }
 
 fn kind(context: Context) -> CallKind {
-    let actor = ActorID::Hash([0x11; 32]);
-    let caller = ActorID::Hash([0x22; 32]);
+    let actor = ActorID::from([0x11; 32]);
+    let caller = ActorID::from([0x22; 32]);
     match context {
         Context::ExternalRoot => CallKind::ExternalRoot,
         Context::InternalRoot => CallKind::InternalRoot {
@@ -60,6 +60,19 @@ fn is_actor(context: Context) -> bool {
     matches!(context, Context::InternalRoot | Context::ActorCall)
 }
 
+fn context_registry() -> MemRegistry {
+    let mut registry = MemRegistry::new();
+    registry
+        .deploy(
+            ActorID::from([0x11; 32]),
+            ScriptBuilder::new().nop().to_bytecode(),
+            empty_state(),
+            1_000_000,
+        )
+        .unwrap();
+    registry
+}
+
 fn step(context: Context, instruction: Instruction) -> Result<bool, VMError> {
     let frame =
         CallFrame::new(vec![instruction], kind(context), 1_000_000).with_anchor(Anchor([0x33; 32]));
@@ -67,7 +80,7 @@ fn step(context: Context, instruction: Instruction) -> Result<bool, VMError> {
     if is_external(context) {
         vm.step_external(&mut make_stub_delegate())
     } else {
-        vm.step_internal_with_registry(&mut MemRegistry::new())
+        vm.step_internal_with_registry(&mut context_registry())
     }
 }
 
@@ -174,7 +187,7 @@ fn raw_scalar_range_checks_in_every_context_and_preserves_type() {
             let result = if is_external(context) {
                 vm.step_external(&mut make_stub_delegate())
             } else {
-                vm.step_internal_with_registry(&mut MemRegistry::new())
+                vm.step_internal_with_registry(&mut context_registry())
             };
             match expected_error {
                 Some(error) => assert_eq!(
@@ -207,7 +220,7 @@ fn range_expression_context_matrix() {
             ));
         } else {
             let error = vm
-                .step_internal_with_registry(&mut MemRegistry::new())
+                .step_internal_with_registry(&mut context_registry())
                 .unwrap_err();
             assert!(matches!(error, VMError::ExternalOnly));
         }
@@ -227,7 +240,7 @@ fn callerid_reports_attribution_without_granting_actor_context() {
         if is_external(context) {
             vm.step_external(&mut make_stub_delegate()).unwrap();
         } else {
-            vm.step_internal_with_registry(&mut MemRegistry::new())
+            vm.step_internal_with_registry(&mut context_registry())
                 .unwrap();
         }
         assert_bytes(vm.current_call.stack.last().unwrap(), &expected);
@@ -241,7 +254,7 @@ fn callerid_reports_attribution_without_granting_actor_context() {
 
 #[test]
 fn nested_contractopen_does_not_transitively_inherit_actor_identity() {
-    let constructor = ActorID::Constructor(vec![1, 2, 3]);
+    let constructor = ActorID::from(crate::code_cell(&[1, 2, 3]).unwrap().id());
     let expected = constructor.to_hash();
     let frame = CallFrame::new(
         Vec::new(),
@@ -316,7 +329,7 @@ fn contractopen_call_rejects_before_consuming_operands() {
     ];
 
     assert!(matches!(
-        vm.step_internal_with_registry(&mut MemRegistry::new()),
+        vm.step_internal_with_registry(&mut context_registry()),
         Err(VMError::OpcodeRequiresActorContext)
     ));
     assert_eq!(vm.current_call.stack.len(), 4);
@@ -325,7 +338,7 @@ fn contractopen_call_rejects_before_consuming_operands() {
 
 #[test]
 fn issuepub_is_available_in_actorcall() {
-    let actor = ActorID::Hash([0x11; 32]);
+    let actor = ActorID::from([0x11; 32]);
     let script = ScriptBuilder::new()
         .push_int(7u64)
         .push_literal(CellValue::from_bytes(b"tag".to_vec()).unwrap())
@@ -335,7 +348,7 @@ fn issuepub_is_available_in_actorcall() {
         ScriptBuilder::parse(&script).unwrap().into_instructions(),
         CallKind::ActorCall {
             actor,
-            caller: ActorID::Hash([0x22; 32]),
+            caller: ActorID::from([0x22; 32]),
         },
         1_000,
     );
@@ -356,7 +369,7 @@ fn send_is_available_everywhere_but_contractopen_never_delegates_its_caller() {
         .push_int(0u64)
         .push_literal(CellValue::from_bytes(vec![0; 32]).unwrap())
         .push_int(0u64)
-        .push_literal(CellValue::from_bytes(vec![0x77; 32]).unwrap())
+        .push_literal(actor_address(&ActorID::from([0x77; 32])))
         .send()
         .to_bytecode();
 
@@ -372,7 +385,7 @@ fn send_is_available_everywhere_but_contractopen_never_delegates_its_caller() {
             if is_external(context) {
                 vm.step_external(&mut make_stub_delegate()).unwrap();
             } else {
-                vm.step_internal_with_registry(&mut MemRegistry::new())
+                vm.step_internal_with_registry(&mut context_registry())
                     .unwrap();
             }
         }

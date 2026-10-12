@@ -6,11 +6,9 @@ use super::test_helpers::*;
 use crate::{empty_state, state_root, ActorID, ActorRegistry, Scalar};
 
 /// Helper: deploys an actor whose `recv` method runs `script`.
-/// Derives the actor's id from the script bytes (treats `script`
-/// as a stand-in for the constructor — real deployments would
-/// hash the actual constructor that produces this state).
+/// Derives the actor's id from the factual constructor CellID.
 fn deploy_recv(reg: &mut MemRegistry, script: Vec<u8>, capacity: u64) -> ActorID {
-    let id = ActorID::Hash(ActorID::Constructor(script.clone()).to_hash());
+    let id = ActorID::from(crate::code_cell(&script).unwrap().id());
     reg.deploy(id.clone(), script, empty_state(), capacity)
         .expect("deploy");
     id
@@ -43,7 +41,7 @@ fn call_script(target: &ActorID, gas: u64) -> Vec<u8> {
     ScriptBuilder::new()
         .push_int(0u64) // k = 0 args
         .push_int(gas) // gas
-        .push_literal(CellValue::from_bytes(target.to_hash().to_vec()).unwrap()) // addr (32-byte)
+        .push_literal(actor_address(&target)) // tagged ActorAddress Cell
         .call()
         .to_bytecode()
 }
@@ -56,7 +54,7 @@ fn call_with_selector(target: &ActorID, sel: u64, gas: u64) -> Vec<u8> {
         .push_int(sel) // selector arg (top)
         .push_int(1u64) // k = 1 arg
         .push_int(gas)
-        .push_literal(CellValue::from_bytes(target.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&target))
         .call()
         .to_bytecode()
 }
@@ -88,6 +86,30 @@ fn assert_same_bearer(actual: &Value, expected: &Value) {
     }
 }
 
+#[test]
+fn call_rejects_bare_actor_ids_and_encoded_transport_envelopes() {
+    let mut registry = MemRegistry::new();
+    let caller = deploy_recv(&mut registry, nop_recv(), 1_000);
+    let envelope = ActorAddress::from(ActorID::from([0x52; 32]))
+        .to_envelope()
+        .unwrap()
+        .encode();
+    for bytes in [vec![0; 32], vec![1; 32], vec![2; 32], envelope] {
+        let mut vm = vm_for_actor(caller, ScriptBuilder::new().call().to_bytecode());
+        vm.current_call.stack = vec![
+            Value::Scalar(Scalar::ZERO),
+            Value::Scalar(Scalar::from(1_000u64)),
+            Value::Cell(CellValue::from_bytes(bytes).unwrap()),
+        ];
+        assert!(matches!(
+            vm.step_internal_with_registry(&mut registry),
+            Err(VMError::Cell(_))
+        ));
+        assert!(vm.call_stack.is_empty());
+        assert!(!registry.actor(&caller).unwrap().is_checked_out());
+    }
+}
+
 fn failed_call_stack(
     child: Vec<u8>,
     arg: Value,
@@ -99,7 +121,7 @@ fn failed_call_stack(
     let caller_script = ScriptBuilder::new()
         .push_int(1u64)
         .push_int(gas)
-        .push_literal(CellValue::from_bytes(callee.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&callee))
         .call()
         .to_bytecode();
     let caller = deploy_recv(&mut reg, caller_script.clone(), 10_000);
@@ -145,7 +167,7 @@ fn failed_internal_decrypt_restores_call_arguments() {
         .push_int(q_blind)
         .push_int(5u64)
         .push_int(100_000u64)
-        .push_literal(CellValue::from_bytes(callee.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&callee))
         .call()
         .to_bytecode();
     let caller = deploy_recv(&mut reg, caller_script.clone(), 10_000);
@@ -194,7 +216,7 @@ fn call_rejects_nested_nonportable_argument() {
         Value::Dict(outer),
         Value::Scalar(Scalar::ONE),
         Value::Scalar(Scalar::from(10_000u64)),
-        witness_cell(CellValue::from_bytes(callee.to_hash().to_vec()).unwrap()),
+        witness_cell(actor_address(&callee)),
     ];
 
     let err = vm.step_internal_with_registry(&mut reg).unwrap_err();
@@ -263,7 +285,7 @@ fn call_to_checked_out_actor_blocked() {
     // `[count=0, success=0]`. The state's absence *is*
     // the lock; `resolve_method` returns `ActorEmpty`.
     let mut reg = MemRegistry::new();
-    let id = ActorID::Hash([0xa1; 32]);
+    let id = ActorID::from([0xa1; 32]);
     reg.deploy(
         id.clone(),
         ScriptBuilder::new().nop().to_bytecode(),
@@ -272,7 +294,7 @@ fn call_to_checked_out_actor_blocked() {
     )
     .expect("deploy");
     // Check the state out, as a live frame mid-update would.
-    reg.actor_mut(&id).expect("present").state = None;
+    drop(reg.load_state(&id).unwrap());
 
     let script = call_script(&id, 10_000);
     let mut vm = vm_for_actor(id.clone(), script);
@@ -293,8 +315,8 @@ fn reentrant_call_succeeds_when_state_not_held() {
     // runs (it logs) because A never checked out its state. Under the
     // old call-stack guard this re-entry was rejected.
     let mut reg = MemRegistry::new();
-    let a_id = ActorID::Hash([0xaa; 32]);
-    let b_id = ActorID::Hash([0xbb; 32]);
+    let a_id = ActorID::from([0xaa; 32]);
+    let b_id = ActorID::from([0xbb; 32]);
 
     // A.method1: emit a Data log entry, then return cleanly.
     let a_method1 = ScriptBuilder::new()
@@ -435,8 +457,8 @@ fn call_refunds_leftover_gas_to_caller() {
 #[test]
 fn reentrant_view_of_mid_update_state_is_blocked() {
     let mut reg = MemRegistry::new();
-    let a_id = ActorID::Hash([0xaa; 32]);
-    let b_id = ActorID::Hash([0xbb; 32]);
+    let a_id = ActorID::from([0xaa; 32]);
+    let b_id = ActorID::from([0xbb; 32]);
 
     // A.method1 (a "view"): load state — never reached, A holds the lock.
     let a_method1 = ScriptBuilder::new().load().save().to_bytecode();
@@ -488,7 +510,7 @@ fn reentrant_view_of_mid_update_state_is_blocked() {
 #[test]
 fn call_depth_is_capped() {
     let mut reg = MemRegistry::new();
-    let id = ActorID::Hash([0xcc; 32]);
+    let id = ActorID::from([0xcc; 32]);
     // recv: call SELF (no state load → re-entry permitted), drop markers.
     let recv = {
         let mut p = ScriptBuilder::parse(&call_script(&id, 900_000)).expect("parse");
@@ -519,7 +541,7 @@ fn call_depth_is_capped() {
 #[test]
 fn setcode_upgrade_end_to_end() {
     let mut reg = MemRegistry::new();
-    let a_id = ActorID::Hash([0x5c; 32]);
+    let a_id = ActorID::from([0x5c; 32]);
 
     // C2: method 0 logs "v2"; padded with nops so its label positions
     // differ from C1's (staleness detector).
@@ -578,7 +600,9 @@ fn setcode_upgrade_end_to_end() {
     driver.push_instr(Instruction::Drop);
     let script = driver.to_bytecode();
 
-    let r_id = ActorID::Hash([0xd1; 32]);
+    let r_id = ActorID::from([0xd1; 32]);
+    reg.deploy(r_id, script.clone(), empty_state(), 1_000_000)
+        .unwrap();
     let mut vm = vm_for_actor(r_id, script);
     while vm.step_internal_with_registry(&mut reg).expect("step ok") {}
 
@@ -690,14 +714,14 @@ fn nested_failures_refund_unused_grants_without_creating_gas() {
 #[test]
 fn call_depth_caps_at_exactly_max() {
     let mut reg = MemRegistry::new();
-    let id = ActorID::Hash([0xce; 32]);
+    let id = ActorID::from([0xce; 32]);
     // recv: args…k=0, gas−200, addr → call; consume its result.
     let recv = ScriptBuilder::new()
         .push_int(0u64) // k = 0 args
         .gas()
         .push_int(-200i64)
         .add() // grant = remaining − 200
-        .push_literal(CellValue::from_bytes(id.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&id))
         .call()
         .drop_()
         .drop_()
@@ -764,7 +788,7 @@ fn f1_failed_subcall_load_does_not_destroy_actor() {
     let a_recv = ScriptBuilder::new()
         .push_int(0u64) // k = 0 args
         .push_int(5_000u64) // gas
-        .push_literal(CellValue::from_bytes(x_id.to_hash().to_vec()).unwrap()) // addr
+        .push_literal(actor_address(&x_id)) // addr
         .call()
         .drop_() // drop status = 0
         .drop_() // drop restored-value count = 0
@@ -837,7 +861,7 @@ fn f1_failed_subcall_save_rolls_back_state_mutation() {
     let a_recv = ScriptBuilder::new()
         .push_int(0u64)
         .push_int(5_000u64)
-        .push_literal(CellValue::from_bytes(x_id.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&x_id))
         .call()
         .drop_()
         .drop_()
@@ -921,7 +945,7 @@ fn f3_save_failure_rolls_back_and_preserves_actor() {
     let a_recv = ScriptBuilder::new()
         .push_int(0u64)
         .push_int(5_000u64)
-        .push_literal(CellValue::from_bytes(x_id.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&x_id))
         .call()
         .drop_()
         .drop_()
@@ -961,7 +985,7 @@ fn save_emits_actorsave_with_full_state() {
     // Recv: `load; save` — round-trip with no state change still
     // emits the ActorSave entry.
     let recv = ScriptBuilder::new().load().save().to_bytecode();
-    let id = ActorID::Hash([0xab; 32]);
+    let id = ActorID::from([0xab; 32]);
     let state = empty_state();
     let expected_root = state_root(&state);
     reg.deploy(id.clone(), recv.clone(), state, 10_000)
@@ -995,11 +1019,11 @@ fn call_to_unknown_actor_rejected_with_marker() {
     // Caller exists; target does not — pre-frame registry lookup
     // fails. The original Token argument must be restored before
     // `count=1, success=0`; no side effects are emitted.
-    let ghost = ActorID::Hash([0xab; 32]);
+    let ghost = ActorID::from([0xab; 32]);
     let a_script = ScriptBuilder::new()
         .push_int(1u64)
         .push_int(10_000u64)
-        .push_literal(CellValue::from_bytes(ghost.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&ghost))
         .call()
         .to_bytecode();
     let a = deploy_recv(&mut reg, a_script.clone(), 10_000);
@@ -1076,14 +1100,14 @@ fn nested_call_failure_restores_one_original_bearer() {
     let b_script = ScriptBuilder::new()
         .push_int(1u64)
         .push_int(5_000u64)
-        .push_literal(CellValue::from_bytes(c.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&c))
         .call()
         .to_bytecode();
     let b = deploy_recv(&mut reg, b_script, 10_000);
     let a_script = ScriptBuilder::new()
         .push_int(1u64)
         .push_int(100_000u64)
-        .push_literal(CellValue::from_bytes(b.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&b))
         .call()
         .to_bytecode();
     let a = deploy_recv(&mut reg, a_script.clone(), 10_000);
@@ -1122,7 +1146,7 @@ fn successful_call_discards_escrow_copy() {
     let caller_script = ScriptBuilder::new()
         .push_int(1u64)
         .push_int(5_000u64)
-        .push_literal(CellValue::from_bytes(callee.to_hash().to_vec()).unwrap())
+        .push_literal(actor_address(&callee))
         .call()
         .to_bytecode();
     let caller = deploy_recv(&mut reg, caller_script.clone(), 10_000);
