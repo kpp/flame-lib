@@ -226,7 +226,7 @@ The note is:
 A note is `89 + N` bytes, and the memo's length is public: `N` is the note's
 length minus 89. The memo MUST be at most 4006 bytes (4095 minus 89). The note
 travels as a single zero-ref VM Cell, bounded by `cells::MAX_CELL_PAYLOAD`
-(4095 bytes). No separate VM String type or Snake continuation is involved.
+(4095 bytes), with no additional length prefix.
 
 ## Building the transaction
 

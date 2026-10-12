@@ -145,7 +145,7 @@ struct CellData {
     commitment: CellCommitment,
 }
 
-// Avoid recursive destruction of long resident snake chains.
+// Avoid recursive destruction of deep resident Cell graphs.
 impl Drop for CellData {
     fn drop(&mut self) {
         let mut pending = std::mem::take(&mut self.refs).into_vec();

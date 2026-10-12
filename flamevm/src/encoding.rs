@@ -10,26 +10,6 @@ use crate::{ClearToken, Commitment, Dict, Point, Scalar, Token, Value};
 /// Bound recursive typed decoding independently of witness availability or gas.
 pub(crate) const MAX_VALUE_DEPTH: usize = 128;
 
-/// Encodes a complete length-prefixed byte string in a dedicated Cell chain.
-pub(crate) fn blob_cell(bytes: &[u8]) -> Result<Cell, CellError> {
-    let mut builder = CellBuilder::new();
-    builder.store_snake(bytes)?;
-    Ok(builder.build())
-}
-
-/// Resolves and exactly reads one dedicated byte-string Cell chain.
-pub(crate) fn read_blob<R: CellReader + ?Sized>(
-    reference: &CellRef,
-    resolver: &mut R,
-    limit: usize,
-) -> Result<Vec<u8>, CellError> {
-    let cell = read_cell(resolver, reference)?;
-    let mut slice = CellSlice::new(&cell);
-    let bytes = slice.load_snake(resolver, limit)?;
-    slice.finish()?;
-    Ok(bytes)
-}
-
 impl CellEncode for Scalar {
     fn encode(&self, builder: &mut CellBuilder) -> Result<(), CellError> {
         builder.store_bytes(self.as_bytes())?;
@@ -391,24 +371,6 @@ mod tests {
                 matches!(Value::from_cell(&wrapped, &mut ()).unwrap(), Value::Cell(reference) if reference.id() == cell.id())
             );
         }
-    }
-
-    #[test]
-    fn arbitrary_blobs_still_use_snake_chains() {
-        let bytes = vec![0xa5; 20_000];
-        let cell = blob_cell(&bytes).unwrap();
-        assert_eq!(cell.payload().len(), MAX_CELL_PAYLOAD);
-        assert_eq!(cell.refs().len(), 1);
-        let mut bag = CellIndex::collect(Arc::new(cell.clone())).unwrap();
-        assert_eq!(
-            read_blob(
-                &CellRef::resident(cell.clone()).to_unloaded(),
-                &mut bag,
-                bytes.len()
-            )
-            .unwrap(),
-            bytes
-        );
     }
 
     #[test]

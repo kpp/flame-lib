@@ -7,8 +7,6 @@ pub mod ctl;
 mod error;
 mod index;
 mod slice;
-#[cfg(test)]
-mod snake;
 mod transport;
 mod trie;
 

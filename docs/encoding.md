@@ -15,7 +15,7 @@ Human-readable formats are specified in [Addresses](address.md).
 | `Cell` | 0..4095 payload bytes, 0..4 refs, or explicit pruning record. |
 | Scalar | Canonical 32-byte LE residue below the Ristretto scalar order. |
 | Point / Predicate | 32-byte CompressedRistretto representation; curve validation at cryptographic use. |
-| Snake blob | U32 LE total byte length; fill remaining payload before continuing through the next ref. |
+| Byte blob | Dedicated zero-ref Cell, 0..4095 raw payload bytes with no length prefix. |
 | Trie | One radix-4 Patricia Cell format; owning schema fixes key width. |
 
 `CellID` is the highest-level factual hash. References commit hash/depth
@@ -23,8 +23,9 @@ summaries; pruning preserves lower commitments but changes the factual ID.
 Transport is a root-last DAG: V128 record count, Cell records and backward
 V128 reference distances. See [Cells](cells.md) for records and proof levels.
 
-Schemas below share preceding declarations. Conditional refs and Snake chains
-use handwritten codecs; CTL does not automatically spill fields into children.
+Schemas below share preceding declarations. Conditional refs use handwritten
+codecs; CTL does not automatically spill fields into children. Applications
+define explicit layouts for larger pure-data transfers.
 
 ## Values and Contracts
 
@@ -194,7 +195,8 @@ enum TxEntry: U8 {
 }
 ```
 
-Data is a Snake blob; ActorSave data is a Value root; ActorRestore state is the
+Data is a raw byte blob in one zero-ref Cell, at most 4095 bytes, without a
+length prefix. ActorSave data is a Value root; ActorRestore state is the
 supplied ActorState proof. External Tx transport carries its root directly.
 Typed CellEnvelope snapshots wrap U8 cap and one proof-root reference.
 
@@ -219,5 +221,7 @@ Witness root is the transaction sequence's factual ID; effects root is the
 execution-record sequence's factual ID. Block transport uses CellEnvelope.
 
 Utreexo proofs keep their existing `merkle / readerwriter` byte encoding,
-wrapped in Snake Cells inside BlockTx. These Cell layouts change consensus
-identities; no legacy decoder or state migration is provided.
+stored as raw payloads in dedicated zero-ref Cells inside BlockTx, with no
+additional length prefix. Each depth-63 proof fits the 4095-byte Cell limit.
+These Cell layouts change consensus identities; no legacy decoder or state
+migration is provided.

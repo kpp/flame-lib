@@ -74,11 +74,12 @@ equal the block's committed contract root.
 Utreexo is not part of the Cell migration. `Forest`, `Proof`, and Merkle `Path`
 retain their existing `readerwriter` encodings and validation, including the
 occupied-level bitmap, ordered roots, proof kind, position, depth, and neighbor
-hashes. The block transport wraps each legacy Proof byte string in a snake Cell;
-it does not add Cell codecs to the Utreexo types or change the forest format.
-Proof strings are bounded to the existing depth-63 representation and decoded
-with exact byte consumption. The Serde forms of `Forest`, `WorkForest`,
-`Catchup`, and `Proof` remain local working-state formats.
+hashes. The block transport stores each legacy Proof byte string as the raw
+payload of a dedicated zero-ref Cell, without another length prefix. It does
+not add Cell codecs to the Utreexo types or change the forest format. Proofs
+are bounded to the existing depth-63 representation, fit the 4095-byte Cell
+limit, and are decoded with exact byte consumption. The Serde forms of
+`Forest`, `WorkForest`, `Catchup`, and `Proof` remain local working-state formats.
 
 Utreexo retains its specialized Merkle hashing and proof-update algorithm, and
 is the remaining consumer of `merkle` / `readerwriter`. Other chain collections
@@ -142,9 +143,9 @@ transport. Their `CellEnvelope` is a normal Cell carrying a level cap and a
 reference to the physical proof root, not a root-ID packet prefix.
 Block Cells refer to the header
 and ordered transaction Trie; each transaction refers to its ExternalTx and
-ordered proof Trie whose leaves contain snake-wrapped legacy Utreexo Proof
-bytes. Scalar fields use little-endian encoding; ordered Trie indices use
-fixed-width big-endian keys.
+ordered proof Trie whose leaves contain raw legacy Utreexo Proof bytes
+in dedicated zero-ref Cells. Scalar fields use little-endian encoding;
+ordered Trie indices use fixed-width big-endian keys.
 
 Each ExternalTx body references its program, whose subcells carry the supplied
 execution witness hierarchy. Body TxID commits the program and canonical pruned

@@ -95,44 +95,6 @@ impl CellBuilder {
         Ok(self)
     }
 
-    /// Stores a byte string with a four-byte little-endian length prefix.
-    ///
-    /// The prefix must fit here. Bytes fill this Cell before spilling into
-    /// dedicated continuation Cells, using the next reference slot. Each
-    /// nonterminal continuation is full and has one ref; the last has none.
-    /// The builder stays on this Cell, so later refs can still be stored here.
-    /// An empty string or exact fit uses no continuation ref.
-    ///
-    /// Fails without mutation if the length exceeds u32, the continuation depth
-    /// exceeds u16, or payload/reference capacity is unavailable. No whole-string
-    /// buffer is used.
-    pub fn store_snake(&mut self, value: &[u8]) -> Result<&mut Self, CellError> {
-        let length = u32::try_from(value.len()).map_err(|_| CellError::PayloadCapacity)?;
-        let available = self
-            .remaining_bytes()
-            .checked_sub(4)
-            .ok_or(CellError::PayloadCapacity)?;
-        let inline = value.len().min(available);
-        if inline < value.len() && self.remaining_refs() == 0 {
-            return Err(CellError::ReferenceCapacity);
-        }
-        check_snake_depth(value.len() - inline)?;
-
-        // Build only the overflow, tail first, directly into its final Cells.
-        let mut next = None;
-        for chunk in value[inline..].chunks(MAX_CELL_PAYLOAD).rev() {
-            next = Some(CellRef::resident(Cell::new(
-                chunk.to_vec(),
-                next.into_iter().collect(),
-            )?));
-        }
-
-        self.payload.extend_from_slice(&length.to_le_bytes());
-        self.payload.extend_from_slice(&value[..inline]);
-        self.refs.extend(next);
-        Ok(self)
-    }
-
     pub fn store_ref(&mut self, value: CellRef) -> Result<&mut Self, CellError> {
         if self.refs.len() == MAX_CELL_REFS {
             return Err(CellError::ReferenceCapacity);
@@ -157,13 +119,6 @@ impl CellBuilder {
     pub fn build(self) -> Cell {
         Cell::new(self.payload, self.refs).expect("CellBuilder enforces Cell limits")
     }
-}
-
-fn check_snake_depth(overflow_bytes: usize) -> Result<(), CellError> {
-    if overflow_bytes.div_ceil(MAX_CELL_PAYLOAD) > usize::from(u16::MAX) {
-        return Err(CellError::DepthOverflow);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -221,17 +176,6 @@ mod tests {
         assert_eq!(builder.used_bytes(), 1);
         assert_eq!(builder.used_refs(), 0);
         assert_eq!(builder.build().payload(), &[7]);
-    }
-
-    #[test]
-    fn snake_depth_limit_is_checked_before_building_a_chain() {
-        let max_overflow = MAX_CELL_PAYLOAD * usize::from(u16::MAX);
-        assert_eq!(check_snake_depth(0), Ok(()));
-        assert_eq!(check_snake_depth(max_overflow), Ok(()));
-        assert_eq!(
-            check_snake_depth(max_overflow + 1),
-            Err(CellError::DepthOverflow)
-        );
     }
 
     #[test]

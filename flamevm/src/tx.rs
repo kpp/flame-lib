@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::{ActorID, ActorRegistry};
 use crate::contract::{Contract, ContractID};
-use crate::encoding::{blob_cell, read_blob};
 use crate::errors::VMError;
 use crate::message::Message;
 use crate::prover::Prover;
@@ -783,8 +782,10 @@ impl CellEncode for TxEntry {
                 b.store_u8(Self::TAG_HEADER)?.store(h)?;
             }
             Self::Data(bytes) => {
+                let mut data = CellBuilder::new();
+                data.store_bytes(bytes)?;
                 b.store_u8(Self::TAG_DATA)?
-                    .store_ref(CellRef::resident(blob_cell(bytes)?))?;
+                    .store_ref(CellRef::resident(data.build()))?;
             }
             Self::Input(id) => {
                 b.store_u8(Self::TAG_INPUT)?.store_bytes(id)?;
@@ -860,7 +861,13 @@ impl CellDecode for TxEntry {
     fn decode<R: CellReader + ?Sized>(s: &mut CellSlice<'_>, r: &mut R) -> Result<Self, CellError> {
         Ok(match s.load_u8()? {
             Self::TAG_HEADER => Self::Header(TxHeader::decode(s, r)?),
-            Self::TAG_DATA => Self::Data(read_blob(&s.load_ref()?, r, u32::MAX as usize)?),
+            Self::TAG_DATA => {
+                let cell = cells::read_cell(r, &s.load_ref()?)?;
+                let mut data = CellSlice::new(&cell);
+                let bytes = data.load_bytes(data.remaining_bytes())?;
+                data.finish()?;
+                Self::Data(bytes.to_vec())
+            }
             Self::TAG_INPUT => Self::Input(<[u8; 32]>::decode(s, r)?),
             Self::TAG_RECEIVE => Self::Receive(<[u8; 32]>::decode(s, r)?),
             Self::TAG_OUTPUT => {
@@ -1486,7 +1493,7 @@ mod envelope_tests {
                 version: 1,
                 locktime: 0,
             }),
-            TxEntry::Data(vec![42; 20_000]),
+            TxEntry::Data(vec![42; cells::MAX_CELL_PAYLOAD]),
             TxEntry::Fee(17),
         ]);
         let cell = log.to_cell().unwrap();
@@ -1496,10 +1503,43 @@ mod envelope_tests {
         let decoded = TxLog::from_cell(&root, &mut envelope).unwrap();
         assert_eq!(decoded.effect_id(), log.effect_id());
         assert!(
-            matches!(&decoded.entries()[1], TxEntry::Data(bytes) if bytes == &vec![42; 20_000])
+            matches!(&decoded.entries()[1], TxEntry::Data(bytes) if bytes == &vec![42; cells::MAX_CELL_PAYLOAD])
         );
         let malformed = Cell::new(5u64.to_le_bytes().to_vec(), cell.refs().to_vec()).unwrap();
         assert!(TxLog::from_cell(&malformed, &mut ()).is_err());
+    }
+
+    #[test]
+    fn data_entries_use_one_raw_payload_cell() {
+        for length in [0, cells::MAX_CELL_PAYLOAD] {
+            let bytes = vec![42; length];
+            let entry = TxEntry::Data(bytes.clone()).to_cell().unwrap();
+            let data = entry.refs()[0].as_resident().unwrap();
+            assert_eq!(data.payload(), bytes);
+            assert!(data.refs().is_empty());
+            assert!(matches!(
+                TxEntry::from_cell(&entry, &mut ()).unwrap(),
+                TxEntry::Data(decoded) if decoded == bytes
+            ));
+        }
+        assert!(matches!(
+            TxEntry::Data(vec![0; cells::MAX_CELL_PAYLOAD + 1]).to_cell(),
+            Err(CellError::PayloadCapacity)
+        ));
+        let empty = Cell::new(vec![], vec![]).unwrap();
+        for (data, error) in [
+            (
+                Cell::new(vec![42], vec![empty.clone().into()]).unwrap(),
+                CellError::TrailingReferences,
+            ),
+            (empty.prune(1).unwrap(), CellError::PrunedCell),
+        ] {
+            let entry = Cell::new(vec![TxEntry::TAG_DATA], vec![data.into()]).unwrap();
+            assert!(matches!(
+                TxEntry::from_cell(&entry, &mut ()),
+                Err(actual) if actual == error
+            ));
+        }
     }
 
     #[test]

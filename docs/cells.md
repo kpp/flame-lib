@@ -46,9 +46,10 @@ coordinated activation, not mixed decoding of the old and new formats.
 The VM has no separate String type. `CellValue` holds a `CellRef` and optional
 `Arc<CellWitness>` directly; typed private annotations are never encoded or
 hashed. Byte-only operands use an ordinary zero-ref Cell with up to 4095 raw
-payload bytes, without another length prefix. Cryptographic proofs and other
-potentially longer protocol byte fields may still use Snake encoding, but
-programs do not. First-class raw Cell handles and all VM byte operations use
+payload bytes, without another length prefix. Protocol blob fields use the
+same bounded raw payload layout. Applications define explicit layouts for
+larger pure-data transfers; programs use `pushcell exec` continuation.
+First-class raw Cell handles and all VM byte operations use
 Builder/Slice, including Point/ref writes and transcripts. The former String
 Value tag 1 is reserved and rejected; Cell remains tag 13, without renumbering.
 Existing state containing the removed tag needs an explicit migration.
@@ -180,7 +181,7 @@ Responsibilities are split as follows:
 
 | Layer | Responsibility |
 | --- | --- |
-| `cells` | Cell construction, canonical records and IDs, bounded reading/writing including snake strings, Cell hierarchy validation, content lookup, and generic fixed-key Trie traversal |
+| `cells` | Cell construction, canonical records and IDs, bounded payload/reference reading and writing, Cell hierarchy validation, content lookup, and generic fixed-key Trie traversal |
 | `flamevm` | Cell encodings for VM values and instructions; Contract, Actor, Predicate, and Dict semantics; portability and linearity checks; execution-time Cell access |
 | `flamechain` | Persistent actor Cell stores, transaction witness hierarchy commitment, per-external execution scheduling, block limits, and state commitments |
 | `merkle` | The specialized Utreexo accumulator only; it is not a dependency of `cells` or `flamevm` |
@@ -507,7 +508,6 @@ impl CellBuilder {
     pub fn store_u32(&mut self, value: u32) -> Result<&mut Self, CellError>;
     pub fn store_u64(&mut self, value: u64) -> Result<&mut Self, CellError>;
     pub fn store_bytes(&mut self, value: &[u8]) -> Result<&mut Self, CellError>;
-    pub fn store_snake(&mut self, value: &[u8]) -> Result<&mut Self, CellError>;
     pub fn store_ref(&mut self, value: CellRef) -> Result<&mut Self, CellError>;
     pub fn store<T: CellEncode + ?Sized>(
         &mut self,
@@ -523,14 +523,13 @@ check capacity before mutation. The generic `store` checkpoints the two vector
 lengths and restores them on error, so a failed compound write is atomic.
 Writing checks payload/reference capacity, requires complete reference
 metadata, and rejects child depths that would overflow in the new parent.
-Snake construction checks its continuation depth before allocation. These are
-structural checks, not portability or business validation. Once all stores
-have succeeded, `build` is infallible.
+These are structural checks, not portability or business validation. Once all
+stores have succeeded, `build` is infallible.
 
 Primitive `CellBuilder` stores never spill automatically into another Cell.
-The containing type explicitly chooses `store_snake` for length-prefixed byte
-strings, a Trie, or another child layout. Only `store_snake` creates continuation
-Cells, under the canonical rules below.
+The containing type explicitly chooses child Cells or a Trie and defines
+each child's layout. Pure byte blobs occupy one zero-ref Cell with at most
+4095 raw payload bytes and no length prefix.
 
 ```rust
 #[derive(Clone)]
@@ -549,11 +548,6 @@ impl CellSlice<'_> {
     pub fn load_u32(&mut self) -> Result<u32, CellError>;
     pub fn load_u64(&mut self) -> Result<u64, CellError>;
     pub fn load_bytes(&mut self, len: usize) -> Result<&[u8], CellError>;
-    pub fn load_snake<R: CellReader + ?Sized>(
-        &mut self,
-        cells: &mut R,
-        limit: usize,
-    ) -> Result<Vec<u8>, CellError>;
     pub fn load_ref(&mut self) -> Result<CellRef, CellError>;
 
     pub fn preload<T>(
@@ -682,8 +676,8 @@ stores leave the Builder unchanged. Failed reads leave both Slice offsets
 unchanged, but work already charged is not refunded. `finish` checks exact
 consumption of both streams; it is distinct from simply dropping a cursor.
 There is no implicit Builder-to-Slice conversion and no automatic spill on
-ordinary stores. Explicit Snake operations remain available for schemas that
-actually require a byte chain.
+ordinary stores. Applications that need larger data define their own
+explicit child layouts.
 
 ### Ownership and portability
 
@@ -936,81 +930,6 @@ debt, besides ordinary instruction/allocation work. Allocated Variables have no
 public Pedersen commitment, so they cannot be Token components in `borrow` or
 `issuepriv`.
 
-## Snake encoding
-
-Snake is a length-prefixed byte-string encoding operated directly by
-`CellBuilder::store_snake` and `CellSlice::load_snake`, not a separate type or
-buffering writer. It uses a linear chain inspired by TON, but requires full
-nonterminal segments and records the total byte length.
-
-The exact layout is:
-
-1. A four-byte little-endian `u32` byte length, wholly within the current
-   Cell's remaining payload. Insufficient prefix space, or a length above
-   `u32::MAX`, returns `PayloadCapacity` without changing the builder.
-2. String bytes occupy the available parent payload after the prefix. If they
-   overflow, the parent payload must be exactly 4095 bytes and its next
-   reference in serialization order points to the continuation. A missing
-   builder reference slot returns `ReferenceCapacity` without mutation.
-3. Continuation Cells belong only to this string. Each nonterminal continuation
-   has exactly 4095 payload bytes and one reference at index zero; the terminal
-   has exactly the remaining bytes and no references.
-4. Stop when the declared length is satisfied. Empty strings and exact fits
-   create/consume no continuation reference and no empty sentinel.
-
-The parent reference is the reader's next unread reference, not necessarily
-reference zero. Descent is local to this operation: the public builder/slice
-stays on the parent, preserving its later references. When a string fits
-inline, later payload fields are also available; after overflow, the parent's
-payload is full, although it may still have reference slots.
-
-Examples starting in an empty builder (`len` is the four-byte prefix):
-
-```text
-0 bytes:       [len=0]
-4091 bytes:    [len=4091 | 4091 bytes]
-4092 bytes:    [len=4092 | 4091 bytes] -> [1 byte]
-8186 bytes:    [len=8186 | 4091 bytes] -> [4095 bytes]
-8187 bytes:    [len=8187 | 4091 bytes] -> [4095 bytes] -> [1 byte]
-```
-
-A parent with other references can encode a 6000-byte string as:
-
-```text
-parent payload: [70 17 00 00 | 4091 string bytes]
-parent refs:    [earlier object, continuation, later object]
-                                     |
-                                     v
-                         [1909 string bytes; no refs]
-```
-
-After loading the earlier reference and the string, the next `load_ref` returns
-the later object. The length prefix has no type tag, version, or terminator.
-
-```rust
-builder.store_snake(bytes)?;
-builder.store_ref(later_object)?;
-
-let bytes = slice.load_snake(cells, max_length)?;
-let later_object = slice.load_ref()?;
-```
-
-Writing copies input directly into the final payloads and constructs only the
-overflow chain, iteratively from tail to head; it never stages a whole-string
-buffer. Reading checks the declared length against the caller's limit before
-allocation or resolution, then grows the result only from validated data.
-It follows continuation refs through `CellReader`, checking each resolved
-body's commitment and exact payload/reference shape. Short nonterminals, extra
-continuation refs, incorrectly sized terminal payloads, explicit pruning
-records, missing bodies, depth overflows, and limit overruns fail. Each
-continuation makes positive progress toward the
-bounded length; no recursive walk or separate snake cycle set is needed.
-
-A failed read leaves the parent cursor unchanged, but resolver charges and
-read-only cache entries do not roll back. The successful result is a `Vec<u8>`.
-Snake is used for proof blobs and other explicitly unbounded byte
-fields, not for bounded zero-ref VM byte operands.
-
 ## Trie
 
 The existing radix-4 Patricia Trie moves into `cells` and uses Cells directly.
@@ -1172,7 +1091,7 @@ For an ordinary record at position `i`, each distance `d` names record
 `i - d`, and must satisfy `1 <= d <= i`. `V128` uses canonical unsigned
 LEB128. A distance is a relative index, not a hash or an instruction to find
 data outside this packet. Relative indexes keep immediate-child references
-at one byte even in a long Snake or large graph.
+at one byte even in a large graph.
 
 The example above has these references:
 
@@ -1243,7 +1162,7 @@ grants execution access to extra uncommitted records.
 `hash_preimage(level)` and hash/depth computation are independent of transport.
 The flat bag codec, independent bag hash, and root-ID packet prefix are
 removed. Transactions carry their execution witness hierarchy by Cell
-reference, rather than embedding serialized bag bytes in a Snake.
+reference.
 
 The in-memory `CellIndex` retains exact lookup scopes; snapshots of its bodies
 are normal Cell hierarchies. Standalone summary records retain their existing
@@ -1385,7 +1304,7 @@ empty lookup provider and still supports resident reads. Metered and recording
 contexts implement CellReader instead, covering every logical access, even
 when no lookup is needed. `read_cell(reader, reference)` checks the returned
 ID and full expected commitment; `resolve_cell(reader, id)` checks the ID.
-Codecs, Trie, Snake, and CellView use this shared read path. Pure lookups do
+Codecs, Trie, and CellView use this shared read path. Pure lookups do
 not determine gas prices or witness-recording policy.
 
 The concrete VM read context may use exactly these sources:
@@ -1456,8 +1375,7 @@ all required checks succeed.
 In particular:
 
 - Contract opening, Predicate selection, Dict access/mutation, and
-  snake reads must not consume a linear argument before a possible
-  Cell failure.
+  byte reads must not consume a linear argument before a possible Cell failure.
 - A failed synchronous call returns exactly the caller's `k` arguments and
   rolls back callee effects.
 - `send` validates portability and captures its payload before emitting the
@@ -1536,7 +1454,7 @@ same underlying Cells:
 | Predicate program branch | Predicate commitment | External transaction witness hierarchy |
 | Dict | Typed Dict wrapper with key width, length, and Trie root | Current resident graph/store, then external transaction witness hierarchy |
 | VM Cell | Its `CellRef` plus optional private `CellWitness` | Current resident graph/store, then external transaction witness hierarchy |
-| Snake-encoded bytes | Typed protocol-proof/blob field, not executable code | Current resident graph/store, then external transaction witness hierarchy |
+| Raw byte blob | Zero-ref Cell, up to 4095 payload bytes without a length prefix | Current resident graph/store, then external transaction witness hierarchy |
 | Utreexo proof data | Existing Utreexo format, unchanged | Explicit legacy proof input; specialized accumulator verification applies; Cell migration deferred |
 
 Raw `slice` opens a Cell's bytes/refs through the current resolver, without
@@ -1614,9 +1532,10 @@ The end state is:
 
 1. Every consensus type has one expected `CellEncode`/`CellDecode` layout.
 2. Every content object's identity is derived from its canonical root Cell.
-3. Unbounded protocol byte fields use length-prefixed Snake encoding; keyed
-   collections use `Trie`. VM byte-only operands use zero-ref Cells;
-   fixed and small fields stay in the parent payload or explicit child Cells.
+3. Byte blobs use zero-ref Cells with at most 4095 raw payload bytes and no
+   length prefix. Keyed collections use `Trie`; fixed and small fields stay
+   in the parent payload or explicit child Cells. Applications define larger
+   pure-data transfer layouts.
 4. A standalone graph is transported from its root Cell. Typed snapshots may
    use `CellEnvelope`; persistent types commit a content root `CellID` and the
    availability snapshot's root `CellID`.
@@ -1630,8 +1549,7 @@ The end state is:
    helpers. It is not a flat Reader/Writer compatibility layer.
 
 The Cell API does not prescribe one generic list encoding. Actual types use
-the smallest of the three existing structures: payload for bounded items,
-snake encoding for bytes, and a fixed-width Trie for unbounded keyed or
+payload for bounded items and a fixed-width Trie for unbounded keyed or
 ordinal collections. Add a generic list wrapper only if several real types
 would otherwise duplicate the same layout.
 
@@ -1687,7 +1605,7 @@ because those sets are now committed by ordinary snapshot Cell roots.
 
 | Area | Implementation |
 | --- | --- |
-| Primitive and streaming API | `cells/src/cell.rs`, `builder.rs`, `slice.rs`, `codec.rs`: ordinary/pruned Cells, level masks and depths, shared read-only CellViews, exact codecs, inline length-prefixed snake operations |
+| Primitive and streaming API | `cells/src/cell.rs`, `builder.rs`, `slice.rs`, `codec.rs`: ordinary/pruned Cells, level masks and depths, shared read-only CellViews, exact codecs and bounded payload/reference operations |
 | Transport | `cells/src/transport.rs`: root-last ordered DAG, deduplication, backward indexes, bounded and metered decoding; `index.rs`: exact availability and typed Cell snapshots |
 | Trie | `cells/src/trie.rs`: one radix-4 Patricia format; resolver-backed get/insert/remove/ordered navigation; raw root wrapping/unwrapping |
 | Dict | `flamevm/src/dict.rs`: one Trie index, typed runtime witness cache, sticky summaries, lazy authenticated reads; no Dict2 |
@@ -1780,7 +1698,6 @@ change VM, proof, actor, and block commitments as one format.
 - [ton-swift Builder API](https://github.com/tonkeeper/ton-swift/blob/aacae64c40f40500a9485b6b2d8d060a4777cf72/Source/TonSwift/Cells/Builder.swift)
 - [ton-swift Slice API](https://github.com/tonkeeper/ton-swift/blob/aacae64c40f40500a9485b6b2d8d060a4777cf72/Source/TonSwift/Cells/Slice.swift)
 - [ton-swift typed Cell serialization](https://github.com/tonkeeper/ton-swift/blob/aacae64c40f40500a9485b6b2d8d060a4777cf72/Source/TonSwift/Cells/Serialization.swift)
-- [ton-swift snake string encoding](https://github.com/tonkeeper/ton-swift/blob/aacae64c40f40500a9485b6b2d8d060a4777cf72/Source/TonSwift/Cells/SnakeEncoding.swift)
 - [TON canonical BoC declarations](https://github.com/ton-blockchain/ton/blob/master/crypto/tl/boc.tlb)
 
 TON's algorithms inform the level/hash rules; Flame's descriptors, byte payloads,

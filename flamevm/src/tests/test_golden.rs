@@ -19,7 +19,7 @@ fn golden_consensus_hashes() {
         ),
         (
             vec![header(), TxEntry::Data(vec![1, 2, 3])],
-            "984221dd9f0f7790f9d930310e082b87169cba1ca9946ce695850925c49b0d98",
+            "b91a77db5912986f514a84597f0fae06a1e9fb7d458ddb2d89b486876fee91fd",
         ),
         (
             vec![header(), TxEntry::Fee(1000)],
@@ -232,7 +232,7 @@ fn golden_txlog_wire_encoding() {
         (
             TxEntry::Data(vec![1, 2, 3]),
             1,
-            crate::encoding::blob_cell(&[1, 2, 3]).unwrap().id(),
+            Cell::new(vec![1, 2, 3], vec![]).unwrap().id(),
         ),
         (
             TxEntry::ActorSave {

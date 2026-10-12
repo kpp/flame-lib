@@ -349,7 +349,7 @@ which root or commitment level is trusted, prove retained pruning claims,
 enforce application invariants, or select VM portability/linearity rules.
 Those remain the consuming protocol's responsibility.
 
-There is no implicit Snake encoding, automatic spilling, or "remaining
-bytes" built-in in this version. Factor larger data into explicit child Cells
-and describe each child's layout; the separate existing Snake APIs remain
-available to handwritten codecs.
+There is no automatic spilling or "remaining bytes" built-in in this
+version. Raw byte blobs occupy one zero-ref Cell with at most 4095 payload
+bytes and no length prefix; handwritten codecs read that payload directly.
+Applications define explicit child layouts for larger pure-data transfers.

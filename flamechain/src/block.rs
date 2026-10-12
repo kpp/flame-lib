@@ -396,23 +396,23 @@ fn sequence_cell_with<T>(
     Ok(builder.build())
 }
 
-/// Utreexo keeps its existing codec. The block's proof Trie transports those
-/// canonical bytes as a snake, without changing Proof, Path, or Forest.
+/// Utreexo keeps its existing codec as a reference-free Cell payload.
 fn proof_cell(proof: &Proof) -> Result<Cell, CellError> {
-    let mut builder = CellBuilder::new();
-    builder.store_snake(&readerwriter::Encodable::encode_to_vec(proof))?;
-    Ok(builder.build())
+    Cell::new(readerwriter::Encodable::encode_to_vec(proof), vec![])
 }
 
 fn decode_proof_cell<R: CellReader + ?Sized>(
     cell: &Cell,
-    cells: &mut R,
+    _cells: &mut R,
 ) -> Result<Proof, CellError> {
     let mut slice = CellSlice::new(cell);
-    let bytes = slice.load_snake(cells, 1 + 8 + 4 + 32 * 63)?;
+    if slice.remaining_bytes() > 1 + 8 + 4 + 32 * 63 {
+        return Err(CellError::LimitExceeded);
+    }
+    let mut bytes = slice.load_bytes(slice.remaining_bytes())?;
     slice.finish()?;
     readerwriter::Reader::read_all(
-        &mut bytes.as_slice(),
+        &mut bytes,
         <Proof as readerwriter::Decodable>::decode,
     )
     .map_err(|error| match error {
@@ -1762,30 +1762,47 @@ mod tests {
                 position: 2,
                 neighbors: vec![Hash([1; 32]), Hash([2; 32])],
             }),
+            Proof::Committed(merkle::Path {
+                position: 0,
+                neighbors: vec![Hash([7; 32]); 63],
+            }),
         ] {
             let bytes = readerwriter::Encodable::encode_to_vec(&proof);
             let cell = proof_cell(&proof).unwrap();
-            assert_eq!(&cell.payload()[..4], &(bytes.len() as u32).to_le_bytes());
-            assert_eq!(&cell.payload()[4..], bytes);
+            assert_eq!(cell.payload(), bytes);
             assert!(cell.refs().is_empty());
             let restored = decode_proof_cell(&cell, &mut ()).unwrap();
             assert_eq!(readerwriter::Encodable::encode_to_vec(&restored), bytes);
         }
         let mut trailing = CellBuilder::new();
-        trailing.store_snake(&[0, 1]).unwrap();
+        trailing.store_bytes(&[0, 1]).unwrap();
         assert!(matches!(
             decode_proof_cell(&trailing.build(), &mut ()),
             Err(CellError::TrailingBytes)
         ));
         let mut extra_ref = CellBuilder::new();
         extra_ref
-            .store_snake(&[0])
+            .store_bytes(&[0])
             .unwrap()
             .store_ref(CellRef::resident(Cell::new(vec![], vec![]).unwrap()))
             .unwrap();
         assert!(matches!(
             decode_proof_cell(&extra_ref.build(), &mut ()),
             Err(CellError::TrailingReferences)
+        ));
+        let oversized = proof_cell(&Proof::Committed(merkle::Path {
+            position: 0,
+            neighbors: vec![Hash([7; 32]); 64],
+        }))
+        .unwrap();
+        assert!(matches!(
+            decode_proof_cell(&oversized, &mut ()),
+            Err(CellError::LimitExceeded)
+        ));
+        let pruned = proof_cell(&Proof::Transient).unwrap().prune(1).unwrap();
+        assert!(matches!(
+            decode_proof_cell(&pruned, &mut ()),
+            Err(CellError::PrunedCell)
         ));
     }
 

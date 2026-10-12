@@ -128,7 +128,7 @@ Calls themselves are intra-transaction control flow, not effects. Anything a cal
 
 Canonical internal log shapes are enforced by the state machine. Success is `Header, Receive, effects...`; `ActorDeploy` and `ActorRestore` appear when address resolution performs them, including synchronous callees. Any `ActorDestroy` entries form a suffix. Failed delivery is exactly `Header, Receive, Output(refund)`. Lease expiry freezes the actor image without emitting retirement/destruction effects. External logs start with `Header` and cannot contain internal-only actor effects.
 
-**TxLog transport.** Effects are **re-derived by re-executing** the bytecode under the proof/signature binding; a supplied log does not authorize effects. External TxBody carries only its canonical 36-byte pruning record. `TxEntry` and `TxLog` implement `CellEncode` and `CellDecode` for archival and light-client transport. The log envelope holds a u64-LE count and a Trie of consecutive u64 big-endian indices, whose leaves reference tagged TxEntry Cells (tags 0–15). Blob fields use snakes; typed fields use their expected Cell layouts. `TxLog::effect_id()` returns its level-zero hash, not the external TxID. See [Data encoding](encoding.md#txlog).
+**TxLog transport.** Effects are **re-derived by re-executing** the bytecode under the proof/signature binding; a supplied log does not authorize effects. External TxBody carries only its canonical 36-byte pruning record. `TxEntry` and `TxLog` implement `CellEncode` and `CellDecode` for archival and light-client transport. The log envelope holds a u64-LE count and a Trie of consecutive u64 big-endian indices, whose leaves reference tagged TxEntry Cells (tags 0–15). Blob fields use dedicated zero-ref Cells with at most 4095 raw payload bytes and no length prefix; typed fields use their expected Cell layouts. `TxLog::effect_id()` returns its level-zero hash, not the external TxID. See [Data encoding](encoding.md#txlog).
 
 Internal transactions do not pay transaction-prioritization fees. Actors may
 nevertheless burn Flame for storage through `addstorage`. Internal transactions
@@ -328,7 +328,8 @@ bytes and literal references independently; `exec` changes the current Cell.
 
 Utreexo is outside this migration: its accumulator, paths, hashing, and legacy
 `merkle`/`readerwriter` codecs remain unchanged. Outer block transport merely
-wraps the existing Utreexo `Proof` bytes in snake Cells.
+stores the existing Utreexo `Proof` bytes as raw payloads in dedicated
+zero-ref Cells, without an additional length prefix.
 
 Canonical `pushint` opcode width boundaries:
 
@@ -389,8 +390,9 @@ without a separate byte-string prefix. Byte-only operations require zero refs;
 they do not flatten graphs. Reads use Slice and writes use Builder.
 
 There is no separate VM String type. Bounded data, signatures and hashes use
-Cell payloads. Schema-defined blob fields may use multi-Cell Snakes; programs
-instead use explicit `pushcell exec` continuation. `CellValue::from_bytes` and
+Cell payloads. Blob fields use one zero-ref Cell, at most 4095 bytes, with
+no length prefix. Applications define layouts for larger pure-data transfers;
+programs use explicit `pushcell exec` continuation. `CellValue::from_bytes` and
 `CellValue::script` are fallible, enforcing the single-payload capacity; fixed
 32-byte Point, Scalar and Contract-ID constructors are bounded by construction.
 
@@ -899,8 +901,8 @@ from the original call. Missing/pruned targets and gas exhaustion use that
 call's ordinary failure rollback and argument recovery; root failures reject
 the transaction. Resident and unloaded targets pay the same read charge.
 
-Thus `pushcell exec` is explicit continuation. No program length prefix, Snake
-decoder, implicit child traversal or new call frame is involved. The builder
+Thus `pushcell exec` is explicit continuation. No program length prefix,
+implicit child traversal or new call frame is involved. The builder
 packs straight-line programs at instruction boundaries and emits this pair.
 It rejects automatic splitting of labeled programs: labels cannot span Cells.
 The transaction commits its original program graph, not the last Cell executed.
