@@ -194,7 +194,7 @@ fn call_rejects_nested_nonportable_argument() {
         Value::Dict(outer),
         Value::Scalar(Scalar::ONE),
         Value::Scalar(Scalar::from(10_000u64)),
-        Value::String(String::from(callee.to_hash().to_vec())),
+        witness_cell(String::from(callee.to_hash().to_vec())),
     ];
 
     let err = vm.step_internal_with_registry(&mut reg).unwrap_err();

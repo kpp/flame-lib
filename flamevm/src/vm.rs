@@ -7,7 +7,7 @@ use cells::{read_cell, CellRef};
 use cells::{
     Cell, CellBuilder, CellDecode, CellEncode, CellError, CellID, CellIndex, CellReader, CellSlice,
 };
-use core::convert::TryFrom;
+use core::convert::{TryFrom, TryInto};
 use core::mem;
 use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::scalar::Scalar as DalekScalar;
@@ -1364,6 +1364,8 @@ impl VM {
                 self.op_write_uint(n)
             }
             I::WriteScalar => self.op_write_uint(32),
+            I::WritePoint => self.op_write_point(),
+            I::WriteRef => self.op_write_ref(),
             I::AppendBytes => self.op_append_bytes(),
             I::AppendRefs => self.op_append_refs(),
             I::WriteZeros => self.op_write_zeros(),
@@ -1712,46 +1714,53 @@ impl VM {
         Ok(())
     }
 
-    /// `transcript` — `label → merlin`. Pops a label string,
-    /// creates a fresh Merlin transcript bound to it.
+    /// Byte labels and data are zero-ref Cell/Slice/Builder payloads.
+    // shortcut: transcript work uses the existing 136-byte hash price; recalibrate with Merlin benchmarks.
     fn op_transcript(&mut self) -> Result<(), VMError> {
-        let label = self.pop_string()?;
-        self.charge_alloc_bytes(label.len())?;
-        self.push_value(Value::Merlin(Merlin::new(&label.to_bytes())));
+        let label = self.pop_byte_source()?;
+        self.current_call
+            .charge_gas(hash_gas(label.byte_payload()?.len(), 136)?)?;
+        self.push_value(Value::Merlin(Merlin::new(label.byte_payload()?)));
         Ok(())
     }
 
-    /// `twrite` — `merlin label str → merlin`. Pops `str` (top),
-    /// `label`, and the merlin; absorbs `(label, str)` into the
-    /// transcript; pushes merlin back.
     fn op_twrite(&mut self) -> Result<(), VMError> {
-        let data = self.pop_string()?;
-        let label = self.pop_string()?;
-        self.charge_alloc_bytes(
-            label
-                .len()
-                .checked_add(data.len())
-                .ok_or(VMError::OutOfGas)?,
-        )?;
-        let mut m = self.pop_value()?.to_merlin()?;
-        m.write_bytes(&label.to_bytes(), &data.to_bytes());
-        self.push_value(Value::Merlin(m));
+        let data = self.pop_byte_source()?;
+        let label = self.pop_byte_source()?;
+        let mut merlin = self.pop_value()?.to_merlin()?;
+        let length = label
+            .byte_payload()?
+            .len()
+            .checked_add(data.byte_payload()?.len())
+            .ok_or(VMError::OutOfGas)?;
+        self.current_call.charge_gas(hash_gas(length, 136)?)?;
+        merlin.write_bytes(label.byte_payload()?, data.byte_payload()?);
+        self.push_value(Value::Merlin(merlin));
         Ok(())
     }
 
-    /// `tread` — `merlin label n → merlin str`. Squeezes `n`
-    /// bytes of challenge from the transcript under `label`; pushes the
-    /// merlin back, then the new String.
     fn op_tread(&mut self) -> Result<(), VMError> {
-        let n = self.pop_byte_count(usize::MAX)?;
-        String::check_length(n)?;
-        self.charge_alloc_bytes(n)?;
-        let label = self.pop_string()?;
-        self.charge_alloc_bytes(label.len())?;
-        let mut m = self.pop_value()?.to_merlin()?;
-        let out = m.read_bytes(&label.to_bytes(), n);
-        self.push_value(Value::Merlin(m));
-        self.push_value(Value::String(String::from(out)));
+        let count = self.pop_byte_count(cells::MAX_CELL_PAYLOAD)?;
+        let mut builder = self.pop_value()?.into_builder()?;
+        let label = self.pop_byte_source()?;
+        let mut merlin = self.pop_value()?.to_merlin()?;
+        if count > builder.remaining_bytes() {
+            return Err(CellError::PayloadCapacity.into());
+        }
+        self.current_call.charge_gas(hash_gas(
+            label
+                .byte_payload()?
+                .len()
+                .checked_add(count)
+                .ok_or(VMError::OutOfGas)?,
+            136,
+        )?)?;
+        self.charge_alloc_bytes(count)?;
+        builder.store_zeros(count)?;
+        let start = builder.used_bytes() - count;
+        merlin.read_into(label.byte_payload()?, &mut builder.payload_mut()[start..]);
+        self.push_value(Value::Merlin(merlin));
+        self.push_value(Value::Builder(builder));
         Ok(())
     }
 
@@ -1772,9 +1781,14 @@ impl VM {
         Ok(())
     }
 
-    /// Resolve plain Cell bytes in the current scope; preserve owned Slice/Builder data.
+    /// Plain bytes never silently flatten a graph or discard its references.
     fn pop_byte_source(&mut self) -> Result<Value, VMError> {
-        let source = match self.pop_value()? {
+        let value = self.pop_value()?;
+        self.byte_source(value)
+    }
+
+    fn byte_source(&mut self, value: Value) -> Result<Value, VMError> {
+        let source = match value {
             Value::Cell(reference) => {
                 let cell = cells::read_cell(&mut self.resolver(), &reference)?;
                 Value::Slice(crate::Slice::new(cell)?)
@@ -1786,6 +1800,42 @@ impl VM {
             return Err(CellError::InvalidFormat.into());
         }
         Ok(source)
+    }
+
+    /// Restore private annotations only after checking the authenticated public bytes.
+    fn pop_annotated_bytes(&mut self) -> Result<(Value, Option<Arc<String>>), VMError> {
+        let value = self.pop_value()?;
+        let witness = match &value {
+            Value::Cell(cell) => cell.witness.clone(),
+            _ => None,
+        };
+        let source = self.byte_source(value)?;
+        // Identical public charge with or without a private annotation.
+        self.charge_alloc_bytes(source.byte_payload()?.len())?;
+        if let Some(witness) = &witness {
+            witness.check_len()?;
+            if witness.len() != source.byte_payload()?.len()
+                || witness.to_bytes_vec() != source.byte_payload()?
+            {
+                return Err(VMError::Cell(CellError::CellCommitmentMismatch(
+                    witness.to_cell()?.id(),
+                )));
+            }
+        }
+        Ok((source, witness))
+    }
+
+    fn pop_commitment(&mut self) -> Result<Commitment, VMError> {
+        let (source, witness) = self.pop_annotated_bytes()?;
+        let bytes = array32(source.byte_payload()?).ok_or(VMError::TypeNotPoint)?;
+        if let Some(witness) = witness {
+            if let String::Witness(value) = witness.as_ref() {
+                if let crate::StringWitness::Point(Point::Commitment(commitment)) = value.as_ref() {
+                    return Ok(commitment.as_ref().clone());
+                }
+            }
+        }
+        Ok(Commitment::Closed(CompressedRistretto(bytes)))
     }
 
     /// Append a cached hash at an explicit level, without loading the Cell body.
@@ -1802,31 +1852,12 @@ impl VM {
         Ok(())
     }
 
-    /// `log` — `str | cell → ø`. A Cell must be a payload-only byte container.
-    /// Emits
-    /// `TxEntry::Data(bytes)` into the txlog. Witness-bearing String
-    /// variants serialize via `to_bytes` so prover and verifier emit
-    /// the same canonical bytes.
+    /// Log raw payload bytes, never a graph or a decoded bearer value.
     fn op_log(&mut self) -> Result<(), VMError> {
-        let bytes = match self.pop_value()? {
-            Value::Cell(reference) => {
-                let cell = cells::read_cell(&mut self.resolver(), &reference)?;
-                if cell.is_pruned() {
-                    return Err(CellError::PrunedCell.into());
-                }
-                if !cell.refs().is_empty() {
-                    return Err(CellError::InvalidFormat.into());
-                }
-                self.charge_alloc_bytes(cell.payload().len())?;
-                cell.payload().to_vec()
-            }
-            value => {
-                let string = value.to_string()?;
-                self.charge_alloc_bytes(string.len())?;
-                string.to_bytes()
-            }
-        };
-        self.txlog.push(TxEntry::Data(bytes));
+        let source = self.pop_byte_source()?;
+        self.charge_alloc_bytes(source.byte_payload()?.len())?;
+        self.txlog
+            .push(TxEntry::Data(source.byte_payload()?.to_vec()));
         Ok(())
     }
 
@@ -2006,14 +2037,6 @@ impl VM {
         Ok(n)
     }
 
-    /// Pushes a failure marker (`Scalar(0)`) — used by `read*` opcodes
-    /// when the source string is too short to satisfy the request. The
-    /// original string is restored under the marker.
-    fn push_read_failure(&mut self, original: String) {
-        self.push_value(Value::String(original));
-        self.push_value(Value::Scalar(Scalar::ZERO));
-    }
-
     fn op_slice(&mut self) -> Result<(), VMError> {
         let reference = self.pop_value()?.into_cell_ref()?;
         let cell = cells::read_cell(&mut self.resolver(), &reference)?;
@@ -2102,23 +2125,43 @@ impl VM {
         Ok(())
     }
 
-    /// `readpoint` — `s → s' point 1 | s 0`. Splits off the first
-    /// 32 bytes of `s` as a `Point` (decompressability not validated
-    /// here; later opcodes that consume the point may reject it).
     fn op_read_point(&mut self) -> Result<(), VMError> {
-        let s = self.pop_string()?;
-        if s.len() < 32 {
-            self.push_read_failure(s);
+        let mut slice = self.pop_value()?.into_slice()?;
+        if slice.remaining_bytes() < 32 {
+            self.push_value(Value::Slice(slice));
+            self.push_value(Value::Scalar(Scalar::ZERO));
             return Ok(());
         }
-        self.charge_alloc_bytes(s.len())?;
-        let bytes = s.to_bytes();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes[..32]);
-        let point = Point::from_bytes(arr);
-        self.push_value(Value::String(String::from(bytes[32..].to_vec())));
+        let point = Point::from_bytes(array32(&slice.bytes()[..32]).unwrap());
+        slice.advance_bytes(32);
+        self.push_value(Value::Slice(slice));
         self.push_value(Value::Point(point));
-        self.push_value(Value::Scalar(Scalar::from(1u64)));
+        self.push_value(Value::Scalar(Scalar::ONE));
+        Ok(())
+    }
+
+    fn op_write_point(&mut self) -> Result<(), VMError> {
+        let point = self.pop_value()?.to_point()?;
+        let mut builder = self.pop_value()?.into_builder()?;
+        if builder.remaining_bytes() < 32 {
+            return Err(CellError::PayloadCapacity.into());
+        }
+        self.charge_alloc_bytes(32)?;
+        builder.store_bytes(&point.to_bytes())?;
+        self.push_value(Value::Builder(builder));
+        Ok(())
+    }
+
+    fn op_write_ref(&mut self) -> Result<(), VMError> {
+        let reference = self.pop_value()?.into_cell_ref()?;
+        let mut builder = self.pop_value()?.into_builder()?;
+        if builder.remaining_refs() == 0 {
+            return Err(CellError::ReferenceCapacity.into());
+        }
+        reference.validate_child()?;
+        self.charge_alloc_items(1)?;
+        builder.store_ref(reference)?;
+        self.push_value(Value::Builder(builder));
         Ok(())
     }
 
@@ -2181,13 +2224,15 @@ impl VM {
         self.current_call.charge_gas(alloc_item_gas(n)?)
     }
 
-    /// `writezeros` — `s n → s'`. Appends `n` zero bytes.
     fn op_write_zeros(&mut self) -> Result<(), VMError> {
-        let n = self.pop_byte_count(usize::MAX)?;
-        let s = self.pop_string()?;
-        self.charge_alloc_bytes(s.appended_len(n)?)?;
-        let appended = s.append_zeros(n)?;
-        self.push_value(Value::String(appended));
+        let count = self.pop_byte_count(cells::MAX_CELL_PAYLOAD)?;
+        let mut builder = self.pop_value()?.into_builder()?;
+        if count > builder.remaining_bytes() {
+            return Err(CellError::PayloadCapacity.into());
+        }
+        self.charge_alloc_bytes(count)?;
+        builder.store_zeros(count)?;
+        self.push_value(Value::Builder(builder));
         Ok(())
     }
 
@@ -2358,17 +2403,15 @@ impl VM {
         Ok(())
     }
 
-    /// `mod252` — pops a `String` of 0..=64 bytes, interprets it
-    /// as a little-endian unsigned integer, reduces it modulo ℓ, and
-    /// pushes the canonical `Scalar` residue.
+    /// Reduce up to 64 little-endian bytes to a Scalar; no implicit graph traversal.
     fn op_mod252(&mut self) -> Result<(), VMError> {
-        let s = self.pop_string()?;
-        let bytes = s.to_bytes();
+        let source = self.pop_byte_source()?;
+        let bytes = source.byte_payload()?;
         if bytes.len() > 64 {
-            return Err(VMError::StringTooLongForModReduction);
+            return Err(VMError::BytesTooLongForModReduction);
         }
         let mut buf = [0u8; 64];
-        buf[..bytes.len()].copy_from_slice(&bytes);
+        buf[..bytes.len()].copy_from_slice(bytes);
         let scalar = DalekScalar::from_bytes_mod_order_wide(&buf);
         self.push_value(Value::Scalar(Scalar::from(scalar)));
         Ok(())
@@ -2577,45 +2620,27 @@ impl VM {
         Ok(())
     }
 
-    /// Transitional adapter for the byte consumers not migrated in this step.
-    fn pop_string(&mut self) -> Result<String, VMError> {
-        match self.pop_value()? {
-            Value::String(string) => {
-                string.check_len()?;
-                Ok(string)
-            }
-            Value::Cell(reference) => {
-                let cell = cells::read_cell(&mut self.resolver(), &reference)?;
-                if cell.is_pruned() {
-                    return Err(CellError::PrunedCell.into());
-                }
-                if !cell.refs().is_empty() {
-                    return Err(CellError::InvalidFormat.into());
-                }
-                self.charge_alloc_bytes(cell.payload().len())?;
-                Ok(reference
-                    .witness
-                    .as_ref()
-                    .map(|value| value.as_ref().clone())
-                    .unwrap_or_else(|| String::from(cell.payload().to_vec())))
-            }
-            _ => Err(VMError::TypeNotString),
-        }
+    fn pop_bytes_32(&mut self) -> Result<[u8; 32], VMError> {
+        let source = self.pop_byte_source()?;
+        array32(source.byte_payload()?).ok_or(VMError::MalformedAddress)
     }
 
-    fn pop_string_32(&mut self) -> Result<[u8; 32], VMError> {
-        let s = self.pop_string()?;
-        array32(&s.to_bytes()).ok_or(VMError::MalformedAddress)
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), VMError> {
+        self.charge_alloc_bytes(bytes.len())?;
+        self.current_call
+            .charge_gas(hash_gas(bytes.len().saturating_add(2), 64)?)?;
+        self.push_value(Value::Cell(Cell::new(bytes.to_vec(), vec![])?.into()));
+        Ok(())
     }
 
-    /// Actor destinations accept a 32-byte hash or a canonical ActorID Cell
-    /// envelope, including constructor code for deploy-on-first-delivery.
+    /// Existing destinations remain a bare hash or a byte-encoded ActorID envelope.
     fn pop_actor_id(&mut self) -> Result<ActorID, VMError> {
-        let bytes = self.pop_string()?.to_bytes_vec();
-        if let Some(hash) = array32(&bytes) {
+        let source = self.pop_byte_source()?;
+        let bytes = source.byte_payload()?;
+        if let Some(hash) = array32(bytes) {
             return Ok(ActorID::Hash(hash));
         }
-        let envelope = cells::CellEnvelope::decode(&bytes, bytes.len(), &mut self.current_call)?;
+        let envelope = cells::CellEnvelope::decode(bytes, bytes.len(), &mut self.current_call)?;
         let root = envelope
             .cells()
             .get(&envelope.root())
@@ -2678,12 +2703,12 @@ impl VM {
     /// `TypeNotScalar`; the confidential path lives in [`op_issuepriv`].
     fn op_issuepub(&mut self) -> Result<(), VMError> {
         let actor = self.require_actor()?.clone();
-        let tag = self.pop_string()?;
+        let tag = self.pop_byte_source()?;
         let qty = match self.pop_value()? {
             Value::Scalar(i) => i,
             _ => return Err(VMError::TypeNotScalar),
         };
-        let flv = flavor_from_actor(&actor, &tag);
+        let flv = flavor_from_actor(&actor, tag.byte_payload()?);
         // Cleartext qty + flv go straight into the txlog as `Scalar`s —
         // no commitment indirection. The `IssuePub` entry is publicly
         // auditable directly on the wire.
@@ -2711,7 +2736,7 @@ impl VM {
         // One committed variable plus a 64-bit range gadget.
         self.current_call.charge_gas(r1cs_gas(65)?)?;
 
-        let tag = self.pop_string()?;
+        let tag = self.pop_byte_source()?;
         let qty_var = self.pop_value()?.to_variable()?;
         // Register the Pedersen commitment with the CS. On the prover
         // the open assignment travels through; on the verifier only
@@ -2732,7 +2757,7 @@ impl VM {
         .map_err(VMError::R1CSError)?;
 
         // Flavor binds to the enclosing predicate + tag.
-        let flv = flavor_from_predicate(&predicate, &tag);
+        let flv = flavor_from_predicate(&predicate, tag.byte_payload()?);
         let flv_commit = Commitment::unblinded(flv);
 
         self.txlog.push(TxEntry::IssuePriv(
@@ -2837,10 +2862,10 @@ impl VM {
     /// recompute and verify a cleartext token's flavor without
     /// running the corresponding `issuepub`.
     fn op_issuepubflv(&mut self) -> Result<(), VMError> {
-        let tag = self.pop_string()?;
-        let cid = self.pop_string()?;
-        let bytes = array32(&cid.to_bytes()).ok_or(VMError::IndexOutOfRange)?;
-        let flv = flavor_from_actor(&ActorID::Hash(bytes), &tag);
+        let tag = self.pop_byte_source()?;
+        let cid = self.pop_byte_source()?;
+        let bytes = array32(cid.byte_payload()?).ok_or(VMError::IndexOutOfRange)?;
+        let flv = flavor_from_actor(&ActorID::Hash(bytes), tag.byte_payload()?);
         self.push_value(Value::Scalar(flv));
         Ok(())
     }
@@ -2855,11 +2880,11 @@ impl VM {
     /// confidential token's flavor (the flv commitment is unblinded,
     /// so its point determines the scalar).
     fn op_issueprivflv(&mut self) -> Result<(), VMError> {
-        let tag = self.pop_string()?;
-        let pred = self.pop_string()?;
-        let bytes = array32(&pred.to_bytes()).ok_or(VMError::IndexOutOfRange)?;
+        let tag = self.pop_byte_source()?;
+        let pred = self.pop_byte_source()?;
+        let bytes = array32(pred.byte_payload()?).ok_or(VMError::IndexOutOfRange)?;
         let predicate = Predicate::opaque(curve25519_dalek::ristretto::CompressedRistretto(bytes));
-        let flv = flavor_from_predicate(&predicate, &tag);
+        let flv = flavor_from_predicate(&predicate, tag.byte_payload()?);
         self.push_value(Value::Scalar(flv));
         Ok(())
     }
@@ -2896,14 +2921,14 @@ impl VM {
         out
     }
 
-    /// _contract-id:string32_ **input** → _contract_
+    /// _contract-id:bytes32_ **input** → _contract_
     ///
     /// The public body must resolve in the frozen transaction Cell hierarchy. Private
     /// witnesses may replace its typed values only after matching this identity.
     fn op_input(&mut self) -> Result<(), VMError> {
         self.require_external()?;
-        let encoded = self.pop_string()?;
-        let id = array32(&encoded.to_bytes()).ok_or(VMError::MalformedContractEncoding)?;
+        let encoded = self.pop_byte_source()?;
+        let id = array32(encoded.byte_payload()?).ok_or(VMError::MalformedContractEncoding)?;
         let cell = cells::resolve_cell(&mut self.resolver(), id)?;
         let public = Contract::from_trusted_cell(&cell, &mut self.resolver())?;
         self.charge_value_encoding(public.payload(), 3)?;
@@ -3037,31 +3062,32 @@ impl VM {
 
     /// _contract script sig gas portable-args… m_ **signcall** → _results… k'_
     ///
-    /// Checks an Explicit signature over `script` immediately in internal
-    /// execution, or defers it for external batch verification, then enters an
-    /// isolated `ContractOpen` frame via [`enter_contract_open_frame`].
+
+    /// The signed statement remains source bytes, not a newly defined program-graph hash.
     fn op_signcall(&mut self) -> Result<(), VMError> {
         let m = self.pop_byte_count(usize::MAX)?;
         let args = self.pop_n_values(m)?;
         Self::require_portable_call_args(&args)?;
         let gas = self.pop_gas_limit()?;
-        let sig_bytes = self.pop_string()?.to_bytes();
-        let prog_str = self.pop_string()?;
+        let signature_bytes = self.pop_byte_source()?;
+        let (program_bytes, witness) = self.pop_annotated_bytes()?;
         let contract = self.pop_value()?.to_contract()?;
-        if sig_bytes.len() != 64 {
-            return Err(VMError::BadSignatureBytes);
-        }
-        // Same price in both contexts: internal execution verifies now;
-        // external execution schedules the same work in the final batch.
+        let sig: [u8; 64] = signature_bytes
+            .byte_payload()?
+            .try_into()
+            .map_err(|_| VMError::BadSignatureBytes)?;
         self.current_call.charge_gas(GAS_SIGNATURE_VERIFY)?;
-        let mut sig = [0u8; 64];
-        sig.copy_from_slice(&sig_bytes);
-        // Canonical bytecode for the signed message; `prog_str` is kept
-        // for `to_instructions()` (witness-preserving) just below.
-        self.charge_alloc_bytes(prog_str.len())?;
-        let msg = Self::signcall_message(&prog_str.to_bytes_vec());
-        let code_bytes = prog_str.len();
-        let code = prog_str.into_script()?;
+        let code_bytes = program_bytes.byte_payload()?.len();
+        let msg = Self::signcall_message(program_bytes.byte_payload()?);
+        self.charge_alloc_bytes(code_bytes)?;
+        let code = match witness.as_deref() {
+            Some(value @ String::Witness(annotation))
+                if matches!(annotation.as_ref(), crate::StringWitness::Script(_)) =>
+            {
+                value.clone().into_script()?
+            }
+            _ => Script::Opaque(program_bytes.byte_payload()?.to_vec()),
+        };
         let verification_key = contract.predicate.verification_key();
         let external = self.is_external();
         if !external {
@@ -3072,8 +3098,6 @@ impl VM {
                 .verify(&mut signcall_verification_transcript(&msg), key)
                 .map_err(|_| VMError::SignatureVerificationFailed)?;
         }
-        // Snapshot cursors before recording an external deferred signature,
-        // so a failed child removes it with the rest of the child effects.
         let child_anchor = self.split_anchor_for_call()?;
         if external {
             self.deferred_sigs.push(DeferredSig::Explicit {
@@ -3164,7 +3188,7 @@ impl VM {
             .to_u64()
             .ok_or(VMError::InvalidBitrange)?;
         let refund_predicate = Predicate::opaque(curve25519_dalek::ristretto::CompressedRistretto(
-            self.pop_string_32()?,
+            self.pop_bytes_32()?,
         ));
         let k = self.pop_byte_count(usize::MAX)?;
         let args = self.pop_n_values(k)?;
@@ -3368,18 +3392,17 @@ impl VM {
 
     /// _code_ **setcode** → ø
     ///
-    /// Replaces the current actor's code blob with the popped String's
-    /// bytes and records `TxEntry::SetCode`. Upgrade *policy* (who may
+    /// Replaces the actor's byte-only code blob from a plain byte source
+    /// and records `TxEntry::SetCode`. Upgrade *policy* (who may
     /// call this) is the author's, gated in the actor's own code via
     /// `callerid` — actors authenticate by identity, not signatures.
     /// See ADR 0018.
     fn op_setcode(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
         let actor = ActorID::Hash(self.require_actor()?.to_hash());
         let registry = registry.ok_or(VMError::RegistryUnavailable)?;
-        let code_string = self.pop_string()?;
-        self.charge_alloc_bytes(code_string.len())?;
-        let code = code_string.to_bytes();
-        self.charge_alloc_bytes(code.len())?;
+        let source = self.pop_byte_source()?;
+        self.charge_alloc_bytes(source.byte_payload()?.len().saturating_mul(2))?;
+        let code = source.byte_payload()?.to_vec();
         registry.set_code(&actor, code.clone())?;
         registry.validate_actor_storage(&actor, self.block_height)?;
         self.txlog.push(TxEntry::SetCode { actor, code });
@@ -3460,14 +3483,13 @@ impl VM {
         Ok(())
     }
 
-    /// **selfid** → _string_
+    /// **selfid** → _cell_
     fn op_selfid(&mut self) -> Result<(), VMError> {
         let actor = self.require_actor()?.clone();
-        self.push_value(Value::String(String::from(actor.to_hash().to_vec())));
-        Ok(())
+        self.push_bytes(&actor.to_hash())
     }
 
-    /// **anchor** → _string_
+    /// **anchor** → _cell_
     ///
     /// Pushes the tx's *current* anchor (the value the next consume
     /// site would split). Hard-fails `AnchorMissing` if no anchor
@@ -3475,13 +3497,12 @@ impl VM {
     /// `send`. Available in either context.
     fn op_anchor(&mut self) -> Result<(), VMError> {
         let a = self.last_anchor.ok_or(VMError::AnchorMissing)?;
-        self.push_value(Value::String(String::from(a.0.to_vec())));
-        Ok(())
+        self.push_bytes(&a.0)
     }
 
-    /// **callerid** → _string_
+    /// **callerid** → _cell_
     ///
-    /// Pushes the direct caller actor id, or all-zero String when no
+    /// Pushes the direct caller actor id in a zero-ref Cell, or zero bytes when no
     /// authenticated actor directly invoked this frame. Available in actor
     /// and ContractOpen frames, but not ExternalRoot.
     fn op_callerid(&mut self) -> Result<(), VMError> {
@@ -3489,8 +3510,7 @@ impl VM {
             return Err(VMError::OpcodeRequiresActorContext);
         }
         let bytes = self.current_call.kind.caller_id().unwrap_or([0u8; 32]);
-        self.push_value(Value::String(String::from(bytes.to_vec())));
-        Ok(())
+        self.push_bytes(&bytes)
     }
 
     /// **timelock** → _n {0|1}_
@@ -3650,26 +3670,20 @@ impl VM {
         }
     }
 
-    /// `scalar` — `string → expr`. Pops a String, downcasts to
-    /// `Scalar` via `String::to_scalar`, pushes `Expression::Constant`.
-    /// For `String::Opaque(bytes)`, the bytes are parsed as a
-    /// canonical scalar. For `StringWitness::Scalar(i)`, the
-    /// witness is extracted directly.
+    /// Parse public canonical scalar bytes, then lift to a constant Expression.
     fn op_scalar(&mut self) -> Result<(), VMError> {
         self.require_external()?;
-        let s = self.pop_string()?;
-        let int = s.to_scalar()?;
-        self.push_value(Value::Expression(Expression::constant(int)));
+        let source = self.pop_byte_source()?;
+        let bytes = array32(source.byte_payload()?).ok_or(VMError::InvalidScalarEncoding)?;
+        let scalar = Scalar::from_bytes(bytes).ok_or(VMError::InvalidScalarEncoding)?;
+        self.push_value(Value::Expression(Expression::constant(scalar)));
         Ok(())
     }
 
-    /// _s_ **commit** → _var_
     fn op_commit(&mut self) -> Result<(), VMError> {
         self.require_external()?;
-        let s = self.pop_string()?;
-        let commitment = s.to_commitment()?;
-        let var = Variable { commitment };
-        self.push_value(Value::Variable(var));
+        let commitment = self.pop_commitment()?;
+        self.push_value(Value::Variable(Variable { commitment }));
         Ok(())
     }
 
@@ -3825,22 +3839,17 @@ impl VM {
         let quadratic_work = mix_items.checked_mul(mix_items).ok_or(VMError::OutOfGas)?;
         self.charge_alloc_items(quadratic_work)?;
         self.current_call.charge_gas(r1cs_gas(quadratic_work)?)?;
-        // Stack depth check: we'll pop 2n commitment Strings + m token values.
+        // Stack depth check: 2n commitment byte sources plus m bearer values.
         let needed = m.saturating_add(n.saturating_mul(2));
         if needed > self.current_call.stack.len() {
             return Err(VMError::StackUnderflow);
         }
-        // Build outputs (closest to top): each output pops (flv, qty)
-        // Strings → builds Token (with Closed commitments since the
-        // String→Commitment downcast retains witness only for
-        // String::Commitment variants).
+        // Output commitments retain private annotations only after public-byte validation.
         let mut output_tokens: Vec<Token> = Vec::with_capacity(n);
         let mut cloak_outs: Vec<spacesuit::AllocatedValue> = Vec::with_capacity(n);
         for _ in 0..n {
-            let flv_str = self.pop_string()?;
-            let qty_str = self.pop_string()?;
-            let flv_commit = flv_str.to_commitment()?;
-            let qty_commit = qty_str.to_commitment()?;
+            let flv_commit = self.pop_commitment()?;
+            let qty_commit = self.pop_commitment()?;
             let token = Token::new(qty_commit, flv_commit);
             // Build the AllocatedValue against the CS.
             let allocated = Self::value_to_allocated(Value::Token(token.clone()), delegate)?;
@@ -4076,7 +4085,7 @@ mod cell_execution_tests {
             if private_overlay {
                 vm.contract_witnesses.insert(id, contract.clone());
             }
-            vm.push_value(Value::String(String::from(id.to_vec())));
+            vm.push_value(Value::Cell(Cell::new(id.to_vec(), vec![]).unwrap().into()));
             vm.op_input()
                 .expect("input does not eagerly hydrate hidden branches");
             vm.op_signtx().unwrap();

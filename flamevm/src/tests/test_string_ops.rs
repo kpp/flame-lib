@@ -27,6 +27,7 @@ fn read_point_success() {
     let mut vm = vm_with_script(
         ScriptBuilder::new()
             .push_str(s(&bytes))
+            .slice()
             .read_point()
             .to_bytecode(),
     );
@@ -44,6 +45,7 @@ fn read_point_too_short() {
     let mut vm = vm_with_script(
         ScriptBuilder::new()
             .push_str(s(&[0; 31]))
+            .slice()
             .read_point()
             .to_bytecode(),
     );
@@ -54,8 +56,7 @@ fn read_point_too_short() {
 #[test]
 fn write_zeros_appends_n_zero_bytes() {
     let mut vm = vm_with_script(
-        ScriptBuilder::new()
-            .push_str(s(&[0xaa]))
+        builder_bytes(&[0xaa])
             .push_int(3u64)
             .write_zeros()
             .to_bytecode(),

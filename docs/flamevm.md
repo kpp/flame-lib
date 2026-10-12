@@ -382,19 +382,19 @@ bytecode must be regenerated or explicitly migrated before using this format.
 
 Binary byte-aligned strings of 0..4095 bytes (`String::MAX_LEN`).
 
-The runtime String type and its opcodes remain temporarily alongside Cell
-handles. Literal loading and selected byte/ref reads and writes now use Cells, Slices and
-Builders. Replacing its other operations is deferred.
+The String Value and host-side witness carrier remain temporarily for stored
+format compatibility. VM byte operations now use Cells, Slices and Builders;
+they neither accept nor produce String Values.
 Its canonical encoding is one payload-only
 Cell: raw bytes, no length prefix, no references, no snake continuation. Strings
 can hold bounded data, short programs, signatures, and hashes. Schema-defined
 blob fields may use multi-Cell Snakes independently of this runtime limit;
-programs instead use explicit `pushcell exec` continuation. Other types can be parsed from strings.
+programs instead use explicit `pushcell exec` continuation.
 
-New byte/ref reads use Slice and writes use Builder; String remains only for
-unmigrated operations and host-side witness compatibility.
+Byte/ref reads use Slice and writes use Builder. Host `push_str` compiles a
+literal Cell; the VM sees a Cell handle, not a String Value.
 
-Literal parsing and VM growth reject results over the limit with
+Host literal parsing and stored-value encoding reject results over the limit with
 `StringTooLong` before allocating them. Witness-bearing Strings obey the same
 limit on their public bytes, before witness serialization.
 
@@ -405,7 +405,13 @@ limit on their public bytes, before witness serialization.
 - `StringWitness::Script(instructions)` — bounded compatibility source programs used before `signcall`; predicate-branch overlays are supplied separately.
 - `StringWitness::Contract(c)` — used before `input`, carrying open commitments on Token payloads.
 
-The verifier sees `String::Opaque(bytes)`. Atomic point/scalar downcasts preserve the same public bytes. A Contract witness emits only its 32-byte ContractID; ScriptBuilder collects its public Cell bodies and keeps private openings separately. `input` must resolve the authenticated public path before restoring private atomic witnesses. Predicate programs likewise use authenticated Cell paths; a private script overlay may only replace matching public bytecode.
+The verifier sees the literal's public Cell bytes, without annotations. A
+Contract witness emits its 32-byte ContractID; ScriptBuilder collects its public
+bodies and keeps private openings separately. `input` resolves the authenticated
+public path before restoring private atomic witnesses. Commitment/script
+consumers validate per-value annotations against public bytes; unrelated hints
+do not change parsing semantics. Predicate overlays likewise require matching
+public code. String equality/storage compatibility remains until its removal.
 
 **`pushpoint` also carries witnesses.** Because the `pushpoint` instruction's in-memory operand is a `Point` (not a raw `[u8; 32]`), the prover can attach a `Point::Commitment` / `Point::Predicate` witness to a literal point pushed via `pushpoint` — not only via `pushstr` + `String::point`. The wire encoding stays the canonical 32 bytes regardless.
 
@@ -658,15 +664,15 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | 1f | [roll](#roll) | | x\_k … x\_0 k → x\_{k-1} … x\_0 x\_k | Move the value at depth `k` to the top (`k` popped as scalar). |
 | 2k | [dup:k](#dupk) | | x\_k … x\_0 → x\_k … x\_0 x\_k | One-byte `dup` with `k` ∈ 0..=15 baked into the opcode. |
 | 3k | [roll:k](#rollk) | | x\_k … x\_0 → x\_{k-1} … x\_0 x\_k | One-byte `roll` with `k` ∈ 0..=15 baked into the opcode. |
-|    |  **String**  | | | |
+|    |  **Cell bytes**  | | | |
 | 40 | [readuint](#readuint) | | s n → s' x 1 \| s 0 | Read 0..32 bytes from a Slice as a canonical LE Scalar. |
 | 41 | [readscalar](#readscalar) | | s → s' x 1 \| s 0 | Read a full canonical 32-byte LE Scalar from a Slice. |
 | 42 | [readbytes](#readbytes) | | s b n → s' b' 1 \| s b 0 | Copy N Slice bytes into a Builder; overflow hard-fails. |
-| 43 | [readpoint](#readpoint) | | s → s' p 1 \| s 0 | Pull a 32-byte Ristretto point off the head of a string. |
+| 43 | [readpoint](#readpoint) | | s → s' p 1 \| s 0 | Read 32 opaque Point bytes from a Slice; preserve refs. |
 | 44 | [writeuint](#writeuint) | | b x n → b' | Write the low 0..32 bytes of a Scalar into a Builder. |
 | 45 | [writescalar](#writescalar) | | b x → b' | Write the full canonical 32-byte LE Scalar into a Builder. |
 | 46 | [appendbytes](#appendbytes) | | s b → s' b' | Append all unread bytes; preserve unread refs. |
-| 47 | [writezeros](#writezeros) | | s n → s' | Append `n` zero-bytes to a string. |
+| 47 | [writezeros](#writezeros) | | b n → b' | Append `n` zero bytes to a Builder; preserve refs. |
 | 48 | [bitnot](#bitnot) | | b → b' | Invert Builder payload bytes in place; preserve refs. |
 | 49 | [bitor](#bitor) | | b s → b' | OR Builder bytes with Cell/Slice payload bytes of equal length. |
 | 4a | [bitand](#bitand) | | b s → b' | AND Builder bytes with Cell/Slice payload bytes of equal length. |
@@ -682,14 +688,14 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | 53 | [add](#add) | | x y → z | Add scalars (or Expressions); Point/MSM operands lift to MSM. |
 | 54 | [mul](#mul) | | x y → z | Multiply scalars (or CS gate); Scalar·Point or Scalar·MSM lift to MSM. |
 | 55 | [divmod](#divmod) | | x z → d r | Centered integer division toward zero — push quotient and remainder. |
-| 56 | [mod252](#mod252) | | s → scalar | Reduce a ≤64-byte LE string modulo ℓ. |
+| 56 | [mod252](#mod252) | | bytes → scalar | Reduce a ≤64-byte zero-ref payload modulo ℓ. |
 | 57 | [not](#not) | | x → y | Logical NOT for scalars; structural negation for Constraints. |
 | 58 | [and](#and) | | a b → c | Logical AND for scalars; lifts to Constraint conjunction in CS. |
 | 59 | [or](#or) | | a b → c | Logical OR for scalars; lifts to Constraint disjunction in CS. |
 | 5a | [size](#size) | | x → x n | Cell payload bytes, Slice unread bytes, Builder used bytes, or Dict entries. |
 |    | **Constraints**  | | | |
-| 60 | [scalar](#scalar) | ext. | s → expr | Lift a 32-byte scalar string to a constant Expression. |
-| 61 | [commit](#commit) | ext. | s → var | Wrap a 32-byte Pedersen-commitment point as a CS Variable. |
+| 60 | [scalar](#scalar) | ext. | bytes → expr | Parse a canonical 32-byte scalar payload and lift to a constant Expression. |
+| 61 | [commit](#commit) | ext. | bytes → var | Parse a 32-byte commitment payload as a CS Variable; retain authenticated prover annotations. |
 | 62 | [alloc](#alloc) | ext. | ø → expr | Allocate a fresh R1CS variable and push it as a one-term Expression. |
 | 63 | [expr](#expr) | ext. | var → expr | Bind a Variable into the CS and push it as a one-term Expression. |
 | 64 | [range](#range) | | x n → x | Check a Scalar in either context; range-prove an Expression externally. `n` ∈ 1..=64. |
@@ -705,13 +711,13 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | 78 | [next](#first--last--next) | | dict k → dict {k' 1 \| 0} | Push the smallest key strictly greater than `k`. |
 |    | **Cryptography**  | | | |
 | 80 | [transcript](#transcript) | | label → merlin | Open a new Merlin transcript seeded with `label`. |
-| 81 | [twrite](#twrite) | | m label s → m | Append a labeled byte string to a transcript. |
-| 82 | [tread](#tread) | | m label n → m s | Challenge `n` bytes from a transcript under `label`. |
+| 81 | [twrite](#twrite) | | m label bytes → m | Absorb zero-ref byte payloads into a transcript. |
+| 82 | [tread](#tread) | | m label b n → m b' | Append `n` challenge bytes directly into the Builder. |
 | 83 | [sha256](#sha256) | | s b → b' | Append a 32-byte SHA-256 payload digest into the provided Builder. |
 | 84 | [sha512](#sha512) | | s b → b' | Append a 64-byte SHA-512 payload digest into the provided Builder. |
 | 85 | [sha3](#sha3) | | s b → b' | Append a 32-byte SHA3-256 payload digest into the provided Builder. |
 | 86 | [keccak256](#keccak256) | | s b → b' | Append a 32-byte Keccak-256 payload digest into the provided Builder. |
-| 87 | [log](#log) | | s / cell → ø | Emit a String or payload-only Cell as a transaction-log data entry. |
+| 87 | [log](#log) | | bytes → ø | Emit a zero-ref Cell/Slice/Builder payload as a transaction-log data entry. |
 | 88 | [cellhash](#cellhash) | | c level b → b' | Append the cached Cell hash at an explicit level; no body read. |
 |    | **Tokens** | | | |
 | 90 | [amount](#amount) | | t → t qty flv | Peek the quantity and flavor of a token without consuming it. |
@@ -740,6 +746,8 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | aa | [loadref](#loadref) | | s index → s' c | Remove any indexed remaining reference; do not load the child body. |
 | ab | [cellinfo](#cellinfo) | | c → c bytes refs depth level pruned | Inspect the Cell's own factual record; preserve the handle. |
 | ac | [runslice](#runslice) | | ø → s | Copy the current program's unread byte/ref cursors after this instruction. |
+| ad | [writeref](#writeref) | | b c → b' | Append one Cell reference without loading its body. |
+| ae | [writepoint](#writepoint) | | b p → b' | Append a Point's 32 public compressed bytes. |
 |    | **Contracts & predicates** | | | |
 | c0 | [input](#input) | ext. | id → contract | Resolve a Utreexo-validated ContractID through the execution witness hierarchy. |
 | c1 | [contract](#contract) | | payload pred → contract | Lock one portable Value under the predicate. |
@@ -756,9 +764,9 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | d5 | [addstorage](#addstorage) | actor | q → {debt 1 \| 0} | Buy `q` bytes for one storage year and return a negative Flame token. |
 | d6 | [quotestorage](#quotestorage) | actor | q → {fee 1 \| 0} | Quote the positive integral storage fee in sparks without reserving bytes. |
 |    | **Frame introspection** | | | |
-| e0 | [selfid](#selfid) | actor | ø → s | Push the current actor's id (32-byte string). |
-| e1 | [anchor](#anchor) | | ø → s | Push the current frame's anchor (32-byte string). |
-| e2 | [callerid](#callerid) | caller | ø → s | Push the direct caller actor's id, or zero when none. |
+| e0 | [selfid](#selfid) | actor | ø → c | Push the current actor's id in a 32-byte zero-ref Cell. |
+| e1 | [anchor](#anchor) | | ø → c | Push the current frame's anchor in a 32-byte zero-ref Cell. |
+| e2 | [callerid](#callerid) | caller | ø → c | Push the direct caller actor's id in a Cell, or zero bytes when none. |
 | e4 | [gas](#gas) | | ø → n | Push remaining gas budget for the current call. |
 | e5 | [gaslimit](#gaslimit) | | ø → n | Push the call's total gas budget cap. |
 | e6 | [usage](#usage) | actor | ø → n | Push the actor's currently occupied storage bytes. |
@@ -799,7 +807,7 @@ Canonical failure-shape vectors (stack order is bottom-to-top):
 | `readuint`: `Slice(aa), 2` | `Slice(aa), 0` | count |
 | `readscalar`: `Slice(aa×31)` | `Slice(aa×31), 0` | nothing else |
 | `readbytes`: `Slice(01), Builder(), 5` | `Slice(01), Builder(), 0` | count |
-| `readpoint`: `String(00×31)` | `String(00×31), 0` | nothing else |
+| `readpoint`: `Slice(00×31)` | `Slice(00×31), 0` | neither cursor advances |
 | `replace`: `{ }, 5, 7` (no prior value) | `{5: 7}, 0` | key and new value enter the Dict |
 | `getopt`: `{ }, 5` | `{ }, 0` | key |
 | `getdup`: `{ }, 5` | `{ }, 0` | key |
@@ -1070,10 +1078,15 @@ Appends all remaining Slice references, exhausts its reference cursor, and
 preserves its byte cursor. Child bodies are not resolved. Check the complete
 reference capacity and every child's depth metadata before mutation.
 
-### Remaining byte/String instructions
+### Byte consumers and temporary host compatibility
 
-Their migration is undecided. They accept ordinary zero-ref Cells through a
-metered byte adapter as well as temporary String Values, and may return Strings.
+VM byte consumers accept zero-ref Cells, Slices with no remaining refs, or
+Builders with no refs. They consume the supplied container and use only its
+payload bytes: there is no implicit traversal, flattening or pruning hydration.
+Cell bodies are resolved through the metered context; existing Slices/Builders
+are read directly. Pruned Cells and remaining references hard-fail. Temporary
+String Values are not accepted by these operations; the type is retained only
+for stored-value and host/witness compatibility, pending its separate removal.
 The host `push_str` helper now compiles a child Cell and `pushcell`; 0x19 is only
 a compatibility source marker for byte-only host APIs, never a native opcode.
 Private witnesses remain outside public Cell bytes. Load loop/branch constants
@@ -1084,12 +1097,34 @@ once and duplicate them: program reference cursors do not rewind on jumps.
 _s_ → _s' p 1_ | _s 0_
 
 Reads 32 bytes as a [Point](#point). Soft-fail on insufficient bytes.
+The operand must be a Slice. Advance only its byte cursor, leaving refs intact;
+short input changes neither cursor. Copies share the Cell allocation and no
+suffix buffer is allocated. Point decompression remains a later consumer's job.
+
+### writepoint
+
+_b p_ → _b'_
+
+Append the Point's 32-byte public compressed representation. Preserve Builder
+refs and payload prefix. Capacity and gas are checked before writing. Private
+commitment/predicate annotations are not serialized or attached to the Builder.
+
+### writeref
+
+_b c_ → _b'_
+
+Append the Cell reference as a child of the Builder, preserving payload bytes.
+This enables dynamically constructed Cell DAGs. The operand must be a Cell,
+not a Contract or other typed Value. Unloaded and pruned references are allowed;
+their bodies are not read. Check reference capacity and child depth metadata,
+then charge one reference item before writing. Finalization hashes the graph.
 
 ### writezeros
 
-_s n_ → _s'_
+_b n_ → _b'_
 
-Appends `n` zero-bytes.
+Append `0..=4095` zero bytes directly into the Builder, preserving its refs.
+Capacity and gas are checked before mutation; no temporary zero buffer is used.
 
 ### bitnot
 
@@ -1181,7 +1216,9 @@ division gadget is allocated. Available in external and internal contexts.
 
 _s_ → _scalar_
 
-Reads up to 64 bytes of `s` as a little-endian unsigned integer, reduces modulo ℓ, and pushes the canonical `Scalar` residue. Hard-fails `StringTooLongForModReduction` when `s.len() > 64`.
+Consumes a zero-ref Cell/Slice/Builder payload of up to 64 bytes as a
+little-endian unsigned integer, reduces modulo ℓ, and pushes a canonical Scalar.
+Longer payloads fail `BytesTooLongForModReduction`.
 
 ### not
 
@@ -1224,13 +1261,20 @@ the rollback model described above.
 
 _s_ → _expr_
 
-Pops a 32-byte String, downcasts to `Scalar` via `String::to_scalar`, pushes `Expression::Constant(scalar)`. Witness-bearing `StringWitness::Scalar(i)` extracts the witness directly; `String::Opaque(bytes)` parses a canonical little-endian residue strictly less than ℓ.
+Consumes exactly 32 zero-ref bytes from a Cell/Slice/Builder, parses a canonical
+little-endian residue strictly less than ℓ, and pushes `Expression::Constant`.
+Private annotations cannot override the public scalar bytes.
 
 ### commit
 
 _s_ → _var_
 
-Pops a 32-byte String, downcasts to a [Commitment](#types), wraps in `Variable { commitment }`. Verifier: `String::Opaque(point bytes)` → `Commitment::Closed(point)`. Prover: `StringWitness::Point(Point::Commitment(Open(witness)))` preserves the witness. Downstream [`expr`](#expr) binds the variable into the CS.
+Consumes exactly 32 zero-ref bytes from a Cell/Slice/Builder and wraps the
+commitment point in a Variable. On a Cell, a prover's per-value Point annotation
+may preserve an open commitment only after its encoding matches the resolved
+public payload. A Slice/Builder has no annotation and yields a closed commitment.
+The same boundary applies to `mix` output commitments. `expr` binds the Variable
+into the constraint system. Neither operation decodes bearer Tokens from bytes.
 
 ### alloc
 
@@ -1321,6 +1365,8 @@ _label_ → _merlin_
 Creates a fresh [Merlin transcript](#types) seeded with `label`. The transcript
 is never copyable but is droppable; `twrite` / `tread` consume and return it
 while building custom ZKP statements.
+Labels and absorbed data are zero-ref Cell/Slice/Builder payloads. Slices use
+only unread bytes. Containers are consumed; no temporary String is created.
 
 ### twrite
 
@@ -1330,9 +1376,13 @@ Appends `(label, s)` to the transcript and returns the same transcript on top.
 
 ### tread
 
-_merlin label n_ → _merlin s_
+_merlin label b n_ → _merlin b'_
 
-Challenges `n` bytes under `label`; pushes the result as a String.
+Append `0..=4095` challenge bytes under `label` directly into the provided
+Builder, preserving its prefix and refs, and return the advanced transcript.
+Capacity, count and gas checks precede transcript mutation. Challenge extraction
+uses no intermediate buffer. Zero-length extraction follows Merlin's ordinary
+challenge semantics; it still advances the transcript.
 
 ### sha256 / sha512 / sha3 / keccak256
 
@@ -1368,11 +1418,11 @@ compare those Builders with `eq`; `eq` itself never chooses a lower level.
 
 _s_ → ø
 
-Pops a String or a payload-only, non-pruned Cell and emits `TxEntry::Data(bytes)`
+Consumes a zero-ref Cell/Slice/Builder payload and emits `TxEntry::Data(bytes)`
 into the txlog. It is visible to the outer verifier and does not occupy
-persistent storage. Witness-bearing Strings serialize via `to_bytes`; Cells
-resolve through the metered read context before their payload is copied.
-Refs are not silently ignored: a Cell containing refs fails `InvalidFormat`.
+persistent storage. Cells resolve through the metered read context before their
+payload is copied; Slices and Builders are read directly. Remaining references
+are not silently ignored and fail `InvalidFormat`.
 This permits `pushcell log` to publish all 4095 payload bytes without putting a
 large String operand into the instruction stream.
 
@@ -1390,7 +1440,7 @@ Peeks the top token-shaped value and pushes `(qty, flv)` above it. `ClearToken`:
 
 _qty tag_ → _T_
 
-Pops `tag` (String) and `qty` (`Variable` — a Pedersen commitment lifted via [`commit`](#commit)). Allocates a 64-bit range proof on `qty`. Builds `Token(qty_commitment, unblinded(flavor))` where `flavor = flavor_from_predicate(current_predicate, tag)`. Emits `TxEntry::IssuePriv(qty_commitment_point, unblinded_flv_point)` — the confidential-issuance txlog effect. Pushes the `Token`.
+Pops `tag` (zero-ref byte source) and `qty` (`Variable` — a Pedersen commitment lifted via [`commit`](#commit)). Allocates a 64-bit range proof on `qty`. Builds `Token(qty_commitment, unblinded(flavor))` where `flavor = flavor_from_predicate(current_predicate, tag)`. Emits `TxEntry::IssuePriv(qty_commitment_point, unblinded_flv_point)` — the confidential-issuance txlog effect. Pushes the `Token`.
 
 The current_predicate is the predicate stored on the enclosing `CallKind::ContractOpen` frame — created by [`open`](#open) or [`signcall`](#signcall) against an empty contract whose predicate is the desired issuer. Hard-fails `OpcodeRequiresPredicateContext` from `ExternalRoot` (no enclosing predicate) and from any `ActorCall` frame (issuance binds to a predicate, not an actor; the two issuance domains are kept disjoint by construction). Hard-fails `ExternalOnly` in internal context (the CS lane is required for the range proof and the qty commitment).
 
@@ -1402,7 +1452,7 @@ The current_predicate is the predicate stored on the enclosing `CallKind::Contra
 
 _pred tag_ → _scalar_
 
-Pops `tag` (String) and `pred` (String, exactly 32 bytes — a compressed Ristretto predicate point). Pushes `flavor_from_predicate(pred, tag)` as `Scalar`. Pure helper: no CS, no txlog entry, no predicate-context requirement. Domain separator is `flamevm.issuepriv.flavor` (consensus-fixed). Hard-fails `IndexOutOfRange` if `pred` is not exactly 32 bytes.
+Pops `tag` (zero-ref byte source) and `pred` (zero-ref byte source, exactly 32 bytes — a compressed Ristretto predicate point). Pushes `flavor_from_predicate(pred, tag)` as `Scalar`. Pure helper: no CS, no txlog entry, no predicate-context requirement. Domain separator is `flamevm.issuepriv.flavor` (consensus-fixed). Hard-fails `IndexOutOfRange` if `pred` is not exactly 32 bytes.
 
 The confidential token's flv commitment is unblinded, so its point uniquely determines this scalar — meaning a consumer who knows the issuing predicate's point and the tag can recompute the flavor and check that an incoming Token belongs to the expected issuance domain.
 
@@ -1410,7 +1460,7 @@ The confidential token's flv commitment is unblinded, so its point uniquely dete
 
 _qty tag_ → _CT_
 
-Pops `tag` (String) and `qty` (`Scalar` — cleartext). Builds `ClearToken(qty, flavor_from_actor(current_actor, tag))` and emits `TxEntry::IssuePub(qty, flv)` carrying the cleartext `(qty, flv)` pair directly as `Scalar`s — publicly auditable on the wire without commitment indirection. Pushes the `ClearToken`.
+Pops `tag` (zero-ref byte source) and `qty` (`Scalar` — cleartext). Builds `ClearToken(qty, flavor_from_actor(current_actor, tag))` and emits `TxEntry::IssuePub(qty, flv)` carrying the cleartext `(qty, flv)` pair directly as `Scalar`s — publicly auditable on the wire without commitment indirection. Pushes the `ClearToken`.
 
 The current actor is stored on either `CallKind::InternalRoot` or
 `CallKind::ActorCall`. Both may issue. The opcode hard-fails
@@ -1425,7 +1475,7 @@ to an actor, not a predicate). It runs without CS in internal execution.
 
 _cid tag_ → _scalar_
 
-Pops `tag` (String) and `cid` (String, exactly 32 bytes — an actor id). Pushes `flavor_from_actor(cid, tag)` as `Scalar`. Pure helper: no CS, no txlog entry, no actor-context requirement. Domain separator is `flamevm.issuepub.flavor` (consensus-fixed). Hard-fails `IndexOutOfRange` if `cid` is not exactly 32 bytes.
+Pops `tag` (zero-ref byte source) and `cid` (zero-ref byte source, exactly 32 bytes — an actor id). Pushes `flavor_from_actor(cid, tag)` as `Scalar`. Pure helper: no CS, no txlog entry, no actor-context requirement. Domain separator is `flamevm.issuepub.flavor` (consensus-fixed). Hard-fails `IndexOutOfRange` if `cid` is not exactly 32 bytes.
 
 ### retire
 
@@ -1468,7 +1518,7 @@ _a q_ → _a' b_
 
 _tokens… commitments… m n_ → _tokens_
 
-Pops `n` (output count) and `m` (input count) as `Scalar`; then `n` output Pedersen commitment pairs (qty/flv Strings); then `m` input token-shaped values (any of `Token`, `WideToken`, `ClearToken`). Invokes the [spacesuit cloak gadget](../spacesuit/spec.md) to constrain that inputs balance outputs per flavor and to 64-bit range-prove each output. Pushes `n` output `Token`s.
+Pops `n` (output count) and `m` (input count) as `Scalar`; then `n` output Pedersen commitment pairs (qty/flv zero-ref byte sources); then `m` input token-shaped values (any of `Token`, `WideToken`, `ClearToken`). Invokes the [spacesuit cloak gadget](../spacesuit/spec.md) to constrain that inputs balance outputs per flavor and to 64-bit range-prove each output. Pushes `n` output `Token`s.
 
 Hard-fails `MixDegenerate` if `m == 0` or `n == 0`.
 
@@ -1590,15 +1640,15 @@ Pushes the type code of the top value as `Scalar`, leaving the value on the stac
 
 ### input
 
-_contract_id:string32_ → _contract_
+_contract_id:bytes32_ → _contract_
 
 Resolves the 32-byte ContractID from the initiating execution witness hierarchy and decodes
 the authenticated Contract: predicate, anchor, and one payload Value. Dict
 branches can remain pruned. Sets `last_anchor = Anchor(contract_id)` and
 emits `TxEntry::Input(contract_id)`.
 
-A prover may push `String::contract(c)`; the emitted bytecode still contains
-only the ID. Public Cell bodies are collected before proving. Private atomic
+A prover may use host `push_str(String::contract(c))`; this emits `pushcell`
+with a child containing the 32-byte ID. Public bodies are collected before proving. Private atomic
 openings are restored only after the same public path/value has resolved.
 A private witness cannot supply a publicly missing branch. Generic untrusted
 Contract imports remain fully validated; the VM input path relies on the
@@ -1675,10 +1725,10 @@ _args… k refund gas addr_ → ø
 
 Asynchronous message-send. Pops operands top-first:
 
-1. `addr` (String) — a bare 32-byte hash or a CellEnvelope for ActorID.
+1. `addr` (zero-ref byte source) — a bare 32-byte hash or byte-encoded CellEnvelope for ActorID.
    The constructor variant has a reference to its native executable code.
 2. `gas` (`Scalar`) — gas allotment.
-3. `refund` (32-byte String) — bounce predicate point.
+3. `refund` (32-byte zero-ref payload) — bounce predicate point.
 4. `k` (`Scalar`) — args count.
 5. `args…` — k portable values, delivery payload. A caller may include Flame
    here for the destination actor to spend with `addstorage`.
@@ -1801,7 +1851,7 @@ state encoding performs no portability validation.
 
 _code_ → ø
 
-Pops a String, measures prospective usage, and replaces the current actor's
+Consumes a zero-ref Cell/Slice/Builder payload, measures prospective usage, and replaces the current actor's
 **code blob** with its bytes. It hard-fails `StorageCapacityExceeded` if the new
 code would exceed current capacity. On success it records
 `TxEntry::SetCode { actor, code }`, symmetric with [`save`](#save)). It is
@@ -1810,7 +1860,7 @@ context.
 
 **Upgrade is author policy over a VM mechanism.** The VM provides `setcode`; *who* may call it is gated in the actor's own code. Actors normally authenticate by **caller identity** — `require(callerid() == GOV)` — and may use `signcall` when immediate signature authorization is required. Internal execution has no deferred signature batch: `signcall` verifies synchronously before entering its child. A naked `setcode` with no caller gate is an unconditionally-upgradeable (i.e. rug-able) actor — deliberately the author's call. See the design.
 
-Hard-fails: `OpcodeRequiresActorContext`, `RegistryUnavailable`, `TypeNotString`, `ActorNotFound`, `StorageCapacityExceeded`.
+Hard-fails: `OpcodeRequiresActorContext`, `RegistryUnavailable`, `TypeNotByteSource`, `ActorNotFound`, `StorageCapacityExceeded`.
 
 **Atomicity.** A `save` failure (`SaveWithoutLoad`, `NonPortableInState`,
 `StorageCapacityExceeded`, `ActorNotFound`) propagates as a frame failure. The
@@ -1885,8 +1935,8 @@ Same call-frame mechanics as [`open`](#open) — taproot reveal is replaced by s
 
 1. Pops `m` (Scalar), `args` (m portable values), and `gas`. A non-portable
    argument hard-fails `NonPortableInCall` before child entry.
-2. Pops `sig` (String, exactly 64 bytes — Schnorr signature).
-3. Pops `script` (String) and `contract`.
+2. Pops `sig` (zero-ref byte source, exactly 64 bytes — Schnorr signature).
+3. Pops `script` (zero-ref byte source) and `contract`.
 4. Builds `signcall_message(script_bytes)` via a Merlin transcript labelled
    `flamevm.signcall`. Scripts bind themselves to further context (anchor,
    actor identity, tx data) through explicit checks inside the signed program.
@@ -1904,6 +1954,12 @@ and returns the original Contract plus explicit arguments using the same failure
 shape as `open`; the count is `m`, excluding the contextual Contract. Internal
 signature failure occurs before child entry and hard-fails the current frame.
 
+This migration does not change the signed statement: `signcall` still signs
+source bytes and accepts the existing byte-only script form, not arbitrary
+native program graphs with literal refs. Host `push_script` annotations remain
+validated against the public source bytes. A graph-aware signature statement
+would require a separate deliberate format decision.
+
 ### timelock
 
 ø → _n {0|1}_
@@ -1920,13 +1976,13 @@ Pushes `TxHeader::version` as a `Scalar`. Available in either context.
 
 ø → _s_
 
-Pushes the current frame's actor id as a 32-byte String. Hard-fails `OpcodeRequiresActorContext` from `ExternalRoot` or `ContractOpen` (no actor identity).
+Pushes the current frame's actor id in a 32-byte zero-ref Cell. Hard-fails `OpcodeRequiresActorContext` from `ExternalRoot` or `ContractOpen` (no actor identity).
 
 ### anchor
 
 ø → _s_
 
-Pushes the frame's *current* `last_anchor` as a 32-byte String — the value the next consume site would split. Hard-fails `AnchorMissing` if no anchor has been claimed yet (same rule as `contract` / `output` / `send` / `call`). Available in either context.
+Pushes the frame's *current* `last_anchor` in a 32-byte zero-ref Cell — the value the next consume site would split. Hard-fails `AnchorMissing` if no anchor has been claimed yet (same rule as `contract` / `output` / `send` / `call`). Available in either context.
 
 ### gas
 
@@ -1942,7 +1998,7 @@ walk the same sequence. Label tables are collected afresh per frame, so gas is
 a pure function of code and inputs rather than cache history.
 
 Variable-size allocation work is additional gas: canonical code and decoded
-payload activation, String byte growth, Dict/collection growth, rollback
+payload activation, Builder byte/ref growth, Dict/collection growth, rollback
 escrows, actor-state activation and cloning, constraint terms, range-proof
 terms, MSM/batch vectors, and `mix`'s quadratic work are charged before the
 corresponding allocation. Fixed-size stack pushes are bounded by the base
@@ -2008,7 +2064,7 @@ checked-out committed state until `save` supplies a replacement. Hard-fails
 
 Pushes the directly invoking actor's canonical 32-byte id. `InternalRoot` and
 `ActorCall` use their recorded caller; `ContractOpen` uses its compact read-only
-`caller_id`. It pushes the all-zero String when that caller is absent and
+`caller_id`. It pushes a zero-ref Cell containing 32 zero bytes when that caller is absent and
 hard-fails only from `ExternalRoot`, which has no caller frame. A `ContractOpen`
 opened by another `ContractOpen` sees zero: actor attribution is not propagated
 through predicate frames.

@@ -202,7 +202,7 @@ fn mod252_64_bytes_reduces() {
 #[test]
 fn mod252_too_long_errors() {
     let s = b().push_str(String::from(vec![0u8; 65])).mod252();
-    assert!(matches!(run_err(s), VMError::StringTooLongForModReduction));
+    assert!(matches!(run_err(s), VMError::BytesTooLongForModReduction));
 }
 
 #[test]

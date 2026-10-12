@@ -51,8 +51,8 @@ fn selfid_in_internal_root_pushes_hash_string() {
     );
     vm.step_internal().expect("step ok");
     match vm.current_call.stack.last().expect("stack non-empty") {
-        Value::String(s) => assert_eq!(s.as_opaque().unwrap(), &[0xab; 32]),
-        _ => panic!("expected String"),
+        value @ Value::Cell(_) => assert_str(value, &[0xab; 32]),
+        _ => panic!("expected Cell"),
     }
 }
 
@@ -78,8 +78,8 @@ fn selfid_in_constructor_form_uses_canonical_hash_seed() {
     );
     vm.step_internal().expect("step ok");
     match vm.current_call.stack.last().expect("stack non-empty") {
-        Value::String(s) => assert_eq!(s.as_opaque().unwrap(), &expected[..]),
-        _ => panic!("expected String"),
+        value @ Value::Cell(_) => assert_str(value, &expected[..]),
+        _ => panic!("expected Cell"),
     }
 }
 
@@ -90,8 +90,8 @@ fn anchor_in_internal_root_pushes_frame_anchor() {
     let mut vm = vm_internal_with(id, None, anc, ScriptBuilder::new().anchor().to_bytecode());
     vm.step_internal().expect("step ok");
     match vm.current_call.stack.last().expect("stack non-empty") {
-        Value::String(s) => assert_eq!(s.as_opaque().unwrap(), &[0xff; 32]),
-        _ => panic!("expected String"),
+        value @ Value::Cell(_) => assert_str(value, &[0xff; 32]),
+        _ => panic!("expected Cell"),
     }
 }
 
@@ -117,8 +117,8 @@ fn callerid_with_some_caller_pushes_hash_string() {
     );
     vm.step_internal().expect("step ok");
     match vm.current_call.stack.last().expect("stack non-empty") {
-        Value::String(s) => assert_eq!(s.as_opaque().unwrap(), &[0x33; 32]),
-        _ => panic!("expected String"),
+        value @ Value::Cell(_) => assert_str(value, &[0x33; 32]),
+        _ => panic!("expected Cell"),
     }
 }
 
@@ -133,8 +133,8 @@ fn callerid_with_none_caller_pushes_zero_string() {
     );
     vm.step_internal().expect("step ok");
     match vm.current_call.stack.last().expect("stack non-empty") {
-        Value::String(s) => assert_eq!(s.as_opaque().unwrap(), &[0u8; 32]),
-        _ => panic!("expected String"),
+        value @ Value::Cell(_) => assert_str(value, &[0u8; 32]),
+        _ => panic!("expected Cell"),
     }
 }
 

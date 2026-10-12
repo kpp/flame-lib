@@ -118,9 +118,9 @@ fn send_rejects_nested_nonportable_payload() {
     vm.current_call.stack = vec![
         Value::Dict(outer),
         Value::Scalar(Scalar::ONE),
-        Value::String(String::from(vec![0u8; 32])),
+        witness_cell(String::from(vec![0u8; 32])),
         Value::Scalar(Scalar::ONE),
-        Value::String(String::from(vec![0u8; 32])),
+        witness_cell(String::from(vec![0u8; 32])),
     ];
     assert!(matches!(
         vm.step_internal(),

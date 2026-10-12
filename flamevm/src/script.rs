@@ -364,6 +364,14 @@ impl ScriptBuilder {
         self.instructions.push(Instruction::WriteScalar);
         self
     }
+    pub fn write_point(mut self) -> Self {
+        self.instructions.push(Instruction::WritePoint);
+        self
+    }
+    pub fn write_ref(mut self) -> Self {
+        self.instructions.push(Instruction::WriteRef);
+        self
+    }
     pub fn append_bytes(mut self) -> Self {
         self.instructions.push(Instruction::AppendBytes);
         self
@@ -539,7 +547,7 @@ impl ScriptBuilder {
         self.instructions.push(Instruction::TWrite);
         self
     }
-    /// `tread` (0x82) — squeeze `n` challenge bytes under `label`.
+    /// `m label b n tread → m b'`: append `n` challenge bytes to a Builder.
     pub fn tread(mut self) -> Self {
         self.instructions.push(Instruction::TRead);
         self

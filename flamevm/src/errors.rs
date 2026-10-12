@@ -100,9 +100,9 @@ pub enum VMError {
     #[error("Division by zero")]
     DivByZero,
 
-    /// This error occurs when `mod252` sees a String longer than 64 bytes.
-    #[error("String too long for mod252 (max 64 bytes)")]
-    StringTooLongForModReduction,
+    /// `mod252` accepts at most 64 raw bytes.
+    #[error("Byte payload too long for mod252 (max 64 bytes)")]
+    BytesTooLongForModReduction,
 
     /// This error occurs when `size` is applied to a type that has no length.
     #[error("Type has no length")]

@@ -77,6 +77,13 @@ pub(crate) fn test_payload(values: Vec<Value>) -> Value {
     }
 }
 
+pub(crate) fn witness_cell(literal: String) -> Value {
+    Value::Cell(crate::CellValue {
+        reference: literal.to_cell().unwrap().into(),
+        witness: Some(Arc::new(literal)),
+    })
+}
+
 pub(crate) fn open_with_test_inner(inner: ScriptBuilder, recover: bool) -> ScriptBuilder {
     let mut branch = ScriptBuilder::new()
         .drop_()

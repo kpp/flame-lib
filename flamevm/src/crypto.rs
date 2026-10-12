@@ -129,7 +129,11 @@ impl Merlin {
     /// `label`. Used by the `merlinread` opcode.
     pub fn read_bytes(&mut self, label: &[u8], n: usize) -> Vec<u8> {
         let mut out = vec![0u8; n];
-        self.transcript.challenge_bytes(label, &mut out);
+        self.read_into(label, &mut out);
         out
+    }
+
+    pub fn read_into(&mut self, label: &[u8], out: &mut [u8]) {
+        self.transcript.challenge_bytes(label, out);
     }
 }

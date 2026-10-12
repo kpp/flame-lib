@@ -27,6 +27,336 @@ fn slice_value(cell: Cell) -> Value {
 }
 
 #[test]
+fn writers_build_dynamic_cell_graphs_and_roundtrip_public_point_bytes() {
+    let point = [0x55; 32]; // Opaque Point bytes remain lazily validated, as before.
+    let program = ScriptBuilder::new()
+        .builder()
+        .builder()
+        .push_int(42u64)
+        .write_scalar()
+        .endcell()
+        .write_ref()
+        .push_point(point)
+        .write_point()
+        .endcell()
+        .slice()
+        .read_point()
+        .verify()
+        .push_point(point)
+        .eq()
+        .verify()
+        .drop_()
+        .drop_()
+        .push_int(0u64)
+        .load_ref()
+        .slice()
+        .read_scalar()
+        .verify()
+        .push_int(42u64)
+        .eq()
+        .verify()
+        .drop_()
+        .drop_()
+        .drop_()
+        .drop_();
+    let pc = PedersenGens::default();
+    let result = Prover::prove(&pc, program, dummy_header(), 1_000_000).unwrap();
+    let verified = Verifier::verify_cell_with_cells(
+        &pc,
+        result.program.clone(),
+        result.proof.as_ref().unwrap(),
+        dummy_header(),
+        1_000_000,
+        None,
+        &result.cells,
+    )
+    .unwrap();
+    assert_eq!(
+        (result.txid, result.gas_used),
+        (verified.txid, verified.gas_used)
+    );
+    for (instruction, byte) in [
+        (Instruction::WriteRef, 0xad),
+        (Instruction::WritePoint, 0xae),
+    ] {
+        assert_eq!(instruction.encode_to_vec(), vec![byte]);
+        assert_eq!(
+            Instruction::parse(&mut &[byte][..])
+                .unwrap()
+                .encode_to_vec(),
+            vec![byte]
+        );
+    }
+}
+
+#[test]
+fn writeref_accepts_unloaded_and_pruned_refs_without_reading_and_enforces_limits() {
+    let child = bytes(&[9]);
+    let refs = [
+        CellRef::from(child.clone()).to_unloaded(),
+        child.prune(1).unwrap().into(),
+    ];
+    for reference in refs {
+        let mut vm = operation(
+            Instruction::WriteRef,
+            vec![
+                builder_value(&[7], &[]),
+                Value::Cell(reference.clone().into()),
+            ],
+        );
+        run_to_end(&mut vm).unwrap();
+        let Value::Builder(builder) = &vm.current_call.stack[0] else {
+            panic!()
+        };
+        assert_eq!(builder.payload(), &[7]);
+        assert_eq!(builder.refs()[0].id(), reference.id());
+        assert_eq!(vm.current_call.gas_used, 2);
+    }
+    let four = vec![CellRef::from(child.clone()); 4];
+    assert!(matches!(
+        run_to_end(&mut operation(
+            Instruction::WriteRef,
+            vec![builder_value(&[], &four), Value::Cell(child.clone().into())]
+        )),
+        Err(VMError::Cell(CellError::ReferenceCapacity))
+    ));
+    let depth = cells::CellCommitment::new(0, vec![[9; 32]], vec![u16::MAX]).unwrap();
+    assert!(matches!(
+        run_to_end(&mut operation(
+            Instruction::WriteRef,
+            vec![
+                builder_value(&[], &[]),
+                Value::Cell(CellRef::Unloaded(Arc::new(depth)).into())
+            ]
+        )),
+        Err(VMError::Cell(CellError::DepthOverflow))
+    ));
+    for bad in [
+        Value::Scalar(Scalar::ONE),
+        Value::ClearToken(ClearToken::new(Scalar::ONE, FLAME_FLAVOR)),
+    ] {
+        assert!(matches!(
+            run_to_end(&mut operation(
+                Instruction::WriteRef,
+                vec![builder_value(&[], &[]), bad]
+            )),
+            Err(VMError::TypeNotCell)
+        ));
+    }
+    let mut vm = operation(
+        Instruction::WriteRef,
+        vec![builder_value(&[], &[]), Value::Cell(child.into())],
+    );
+    vm.current_call.gas_limit = 1;
+    assert!(matches!(run_to_end(&mut vm), Err(VMError::OutOfGas)));
+}
+
+#[test]
+fn point_reads_advance_only_bytes_and_writes_preserve_refs_and_check_capacity() {
+    let reference: CellRef = bytes(&[9]).into();
+    for count in [0, 31, 32, 33] {
+        let cell = Cell::new(vec![0x55; count], vec![reference.clone()]).unwrap();
+        let mut vm = operation(Instruction::ReadPoint, vec![slice_value(cell)]);
+        run_to_end(&mut vm).unwrap();
+        let Value::Slice(slice) = &vm.current_call.stack[0] else {
+            panic!()
+        };
+        let success = count >= 32;
+        assert_eq!(
+            slice.remaining_bytes(),
+            count - if success { 32 } else { 0 }
+        );
+        assert_eq!(slice.remaining_refs(), 1);
+        assert_int(
+            vm.current_call.stack.last().unwrap(),
+            Scalar::from(success as u64),
+        );
+        assert_eq!(vm.current_call.gas_used, 1);
+    }
+    let mut vm = operation(
+        Instruction::WritePoint,
+        vec![
+            builder_value(&[9], &[reference]),
+            Value::Point(Point::from_bytes([0x55; 32])),
+        ],
+    );
+    run_to_end(&mut vm).unwrap();
+    let Value::Builder(builder) = &vm.current_call.stack[0] else {
+        panic!()
+    };
+    assert_eq!(builder.used_refs(), 1);
+    assert_eq!(builder.payload(), &[vec![9], vec![0x55; 32]].concat());
+    assert_eq!(vm.current_call.gas_used, 33);
+    let full = vec![0; cells::MAX_CELL_PAYLOAD - 31];
+    assert!(matches!(
+        run_to_end(&mut operation(
+            Instruction::WritePoint,
+            vec![
+                builder_value(&full, &[]),
+                Value::Point(Point::from_bytes([0; 32]))
+            ]
+        )),
+        Err(VMError::Cell(CellError::PayloadCapacity))
+    ));
+    assert!(matches!(
+        run_to_end(&mut operation(
+            Instruction::ReadPoint,
+            vec![Value::Cell(bytes(&[0; 32]).into())]
+        )),
+        Err(VMError::TypeNotSlice)
+    ));
+}
+
+#[test]
+fn transcripts_accept_byte_containers_and_append_challenges_without_losing_refs() {
+    let reference: CellRef = bytes(&[9]).into();
+    for count in [0, 32, cells::MAX_CELL_PAYLOAD - 1] {
+        let mut expected = Merlin::new(b"protocol");
+        expected.write_bytes(b"data", b"message");
+        let challenge = expected.read_bytes(b"challenge", count);
+        let mut vm = vm_with_script(ScriptBuilder::new().transcript().twrite().tread());
+        vm.current_call.stack = vec![Value::Cell(bytes(b"protocol").into())];
+        vm.step_internal().unwrap();
+        vm.current_call.stack.push(slice_value(bytes(b"data")));
+        vm.current_call.stack.push(builder_value(b"message", &[]));
+        vm.step_internal().unwrap();
+        vm.current_call.stack.push(builder_value(b"challenge", &[]));
+        vm.current_call
+            .stack
+            .push(builder_value(&[7], &[reference.clone()]));
+        vm.current_call
+            .stack
+            .push(Value::Scalar(Scalar::from(count as u64)));
+        vm.step_internal().unwrap();
+        let Value::Builder(builder) = vm.current_call.stack.pop().unwrap() else {
+            panic!()
+        };
+        assert_eq!(&builder.payload()[1..], challenge);
+        assert_eq!(builder.payload()[0], 7);
+        assert_eq!(builder.refs()[0].id(), reference.id());
+        let Value::Merlin(mut actual) = vm.current_call.stack.pop().unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            actual.read_bytes(b"next", 32),
+            expected.read_bytes(b"next", 32)
+        );
+    }
+    let label = builder_value(b"challenge", &[]);
+    assert!(matches!(
+        run_to_end(&mut operation(
+            Instruction::TRead,
+            vec![
+                Value::Merlin(Merlin::new(b"protocol")),
+                label,
+                builder_value(&vec![0; cells::MAX_CELL_PAYLOAD], &[]),
+                Value::Scalar(Scalar::ONE)
+            ]
+        )),
+        Err(VMError::Cell(CellError::PayloadCapacity))
+    ));
+    let mut vm = operation(
+        Instruction::TRead,
+        vec![
+            Value::Merlin(Merlin::new(b"protocol")),
+            builder_value(b"challenge", &[]),
+            builder_value(&[], &[]),
+            Value::Scalar(Scalar::from(32u64)),
+        ],
+    );
+    vm.current_call.gas_limit = 32;
+    assert!(matches!(run_to_end(&mut vm), Err(VMError::OutOfGas)));
+}
+
+#[test]
+fn remaining_plain_byte_consumers_reject_graphs_and_legacy_string_values() {
+    let graph = Cell::new(vec![0; 32], vec![bytes(&[9]).into()]).unwrap();
+    for instruction in [
+        Instruction::Transcript,
+        Instruction::Mod252,
+        Instruction::Log,
+    ] {
+        for source in [
+            Value::Cell(graph.clone().into()),
+            slice_value(graph.clone()),
+            builder_value(graph.payload(), graph.refs()),
+        ] {
+            assert!(matches!(
+                run_to_end(&mut operation(instruction.clone(), vec![source])),
+                Err(VMError::Cell(CellError::InvalidFormat))
+            ));
+        }
+        assert!(matches!(
+            run_to_end(&mut operation(
+                instruction,
+                vec![Value::String(String::from(vec![]))]
+            )),
+            Err(VMError::TypeNotByteSource)
+        ));
+    }
+    let mut vm = operation(
+        Instruction::WriteZeros,
+        vec![
+            builder_value(&vec![9; cells::MAX_CELL_PAYLOAD - 1], &[]),
+            Value::Scalar(Scalar::ONE),
+        ],
+    );
+    run_to_end(&mut vm).unwrap();
+    let Value::Builder(builder) = &vm.current_call.stack[0] else {
+        panic!()
+    };
+    assert_eq!(builder.payload().last(), Some(&0));
+    assert!(matches!(
+        run_to_end(&mut operation(
+            Instruction::WriteZeros,
+            vec![
+                builder_value(&vec![0; cells::MAX_CELL_PAYLOAD], &[]),
+                Value::Scalar(Scalar::ONE)
+            ]
+        )),
+        Err(VMError::Cell(CellError::PayloadCapacity))
+    ));
+}
+
+#[test]
+fn forged_private_commitment_annotations_cannot_replace_public_bytes() {
+    let literal = String::commitment(Commitment::unblinded(Scalar::from(7u64)));
+    let forged = crate::CellValue {
+        reference: bytes(&[9; 32]).into(),
+        witness: Some(Arc::new(literal)),
+    };
+    let mut vm = vm_external_with_script(ScriptBuilder::new().commit());
+    vm.current_call.stack = vec![Value::Cell(forged)];
+    assert!(matches!(
+        vm.step_external(&mut StubDelegate::new()),
+        Err(VMError::Cell(CellError::CellCommitmentMismatch(_)))
+    ));
+}
+
+#[test]
+fn unrelated_annotations_do_not_change_public_commitment_parsing_or_gas() {
+    let mut results = Vec::new();
+    for literal in [
+        String::scalar(Scalar::ZERO),
+        String::point(Point::from_bytes([0; 32])),
+        String::predicate(Predicate::opaque(CompressedRistretto([0; 32]))),
+    ] {
+        let tx = ScriptBuilder::new()
+            .push_str(literal)
+            .commit()
+            .drop_()
+            .build_tx(dummy_header(), crate::Limits { gas: 1_000_000 })
+            .unwrap();
+        results.push((tx.txid(), tx.metrics()));
+        tx.without_signature()
+            .unwrap()
+            .verify(crate::Limits { gas: 1_000_000 })
+            .unwrap();
+    }
+    assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
 fn runslice_snapshots_after_instruction_with_independent_byte_and_ref_cursors() {
     let children = [bytes(&[1]), bytes(&[2]), bytes(&[3])];
     let program = ScriptBuilder::new()

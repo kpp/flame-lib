@@ -47,8 +47,10 @@ Runtime `String` currently contains at most 4095 bytes. Its expected encoding
 is one Cell with those raw bytes and no references or length prefix; the Cell
 descriptor already supplies the length. Cryptographic proofs and other
 potentially longer protocol byte fields may still use Snake encoding, but
-programs do not. A first-class raw Cell handle is implemented; replacing
-remaining String operations with Builder/Slice is still a proposal below.
+programs do not. First-class raw Cell handles and all VM byte operations are
+implemented with Builder/Slice, including Point/ref writes
+and transcripts. Removing the temporary String Value and host witness carrier
+is a separate stored-format migration.
 Utreexo forest, proof, and path
 serialization also remains unchanged for now.
 
@@ -696,8 +698,8 @@ moving downward or cross an asynchronous send boundary.
 ### Agreed initial instruction replacements
 
 The following instructions are implemented for the String-to-Cell migration.
-The remaining String-oriented instructions are still under review. `pushcell`
-already exists and replaces `pushstr`: literal bytes belong in a program's
+The byte-operation migration is implemented, including the former String
+consumers. `pushcell` replaces `pushstr`: literal bytes belong in a program's
 child Cell, not in an inline string operand.
 
 `s` denotes a Slice, `b` a Builder, `x` a Scalar, and `n` a byte count.
@@ -729,6 +731,24 @@ are not accepted by `cellinfo`, and the original Cell handle is preserved.
 | Byte concatenation (`append`) | `appendbytes` | `s b -> s' b'` | Copy all remaining payload bytes into the Builder; exhaust the byte cursor but preserve the reference cursor. |
 | No previous equivalent | `appendrefs` | `s b -> s' b'` | Append all remaining reference handles to the Builder; exhaust the reference cursor but preserve the byte cursor. Do not resolve child bodies. |
 | No previous equivalent | `loadref` | `s index -> s' c` | Remove one zero-based remaining reference and push its Cell handle; later refs shift down and bytes stay unchanged. |
+| String `readpoint` | `readpoint` | `s -> s' p 1` or `s 0` | Read 32 public compressed Point bytes; advance only bytes, preserve refs, do not allocate a suffix. |
+| No previous equivalent | `writepoint` (0xae) | `b p -> b'` | Append the Point's 32 public bytes; preserve refs, never serialize private annotations. |
+| No previous equivalent | `writeref` (0xad) | `b c -> b'` | Append one Cell handle without reading its body; check ref capacity and depth first. |
+| String `writezeros` | `writezeros` | `b n -> b'` | Append zero bytes directly, bounded by the Builder's remaining capacity. |
+| String transcript input | `transcript`, `twrite` | `label -> m`; `m label data -> m` | Consume zero-ref Cell/Slice/Builder payloads, with no String adapter. |
+| String challenge output | `tread` | `m label b n -> m b'` | Append challenge bytes directly into an explicit Builder; preserve its prefix and refs. |
+
+`mod252`, `scalar`, `commit`, `mix` output commitments, `log`, flavor tags,
+IDs, signatures and byte-only code adapters consume zero-ref Cell/Slice/Builder
+payloads. They reject remaining refs instead of silently discarding a graph.
+`selfid`, `callerid`, and `anchor` now produce 32-byte zero-ref Cells.
+Typed private commitment/script annotations remain host-side and are restored
+only after matching authenticated public bytes. No byte consumer decodes bearer
+Tokens into transferable ownership.
+
+`input` retains a 32-byte ContractID selector, and actor destination/code and
+`signcall` signature-message formats are unchanged. Those protocol-format
+decisions are separate from removing String from the VM byte paths.
 
 `loadref` has no success flag: invalid or absent indexes hard-fail with
 `IndexOutOfRange`. It does not load the child body, so unloaded and explicitly
@@ -819,10 +839,9 @@ must not change consensus gas or which bodies are visible.
 
 ### Minimal migration sequence
 
-1. Complete the separate-type interface around the agreed instruction
-   replacements above. Review the proposed stack transitions and failure
-   results, then decide the remaining String-oriented operations before
-   assigning opcode numbers. Keep String unchanged meanwhile.
+1. Separate-type byte interface implemented, including Point/ref writers,
+   Slice reads and Builder transcript outputs. Retain String only for temporary
+   stored-value and host/witness compatibility; VM byte operations reject it.
 2. Replace the plain byte-string VM variant with immutable Cell/reference.
    Preserve the existing zero-ref raw-byte encoding as that subset. Decide
    deliberately whether its existing Value discriminant can be reused in the
@@ -1624,9 +1643,9 @@ stored in script Cells, not routed through a generic serialization facade.
   transaction/block proof consumers. The crate's `CellView` is not an implicit
   replacement for physical typed decoding or the current signed execution index.
 - Database adapters and archival retrieval outside consensus execution.
-- The remaining String/crypto/typed-conversion migration above, beyond the
-  implemented Builder/Slice subset. Runtime String currently has a bounded zero-ref
-  Cell encoding; no standalone Snake or buffering SnakeWriter is introduced.
+- Removal of the temporary String Value and host/witness carrier after its
+  separate stored-format decision. Byte operations are already Cell/Slice/Builder
+  based; no standalone Snake or buffering SnakeWriter is introduced.
 - Utreexo forest, proof, and path encoding. Keep its current serialization
   until that separate migration is requested.
 - A more compact frozen-actor registry layout. The current implementation

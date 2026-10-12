@@ -23,9 +23,8 @@ fn log_opcode_emits_txentry_data() {
 }
 
 #[test]
-fn log_opcode_requires_string() {
-    // push:5, log — top is Scalar not String.
+fn log_opcode_requires_byte_source() {
     let mut vm = vm_with_script(ScriptBuilder::new().push_int(5u64).log().to_bytecode());
     let err = run_to_end(&mut vm).unwrap_err();
-    assert!(matches!(err, VMError::TypeNotString));
+    assert!(matches!(err, VMError::TypeNotByteSource));
 }

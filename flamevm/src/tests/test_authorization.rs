@@ -21,6 +21,39 @@ fn signcall_signature(program: &[u8], secret: u64) -> (CompressedRistretto, [u8;
     (verification_key, signature.to_bytes())
 }
 
+#[test]
+fn signcall_ignores_unrelated_annotations_on_authenticated_source_bytes() {
+    let mut source = ScriptBuilder::new()
+        .drop_()
+        .push_int(0u64)
+        .return_()
+        .to_bytecode();
+    source.resize(32, 0x1d);
+    let (key, signature) = signcall_signature(&source, 44);
+    let contract = Contract::new(
+        Predicate::opaque(key),
+        Anchor([44; 32]),
+        Value::Scalar(Scalar::ONE),
+    )
+    .unwrap();
+    let point = Point::from_bytes(source.try_into().unwrap());
+    let tx = ScriptBuilder::new()
+        .push_str(String::contract(contract))
+        .input()
+        .push_str(String::point(point))
+        .push_str(signature.to_vec())
+        .push_int(10_000u64)
+        .push_int(0u64)
+        .signcall()
+        .verify()
+        .drop_()
+        .build_tx(dummy_header(), Limits { gas: 1_000_000 })
+        .unwrap()
+        .without_signature()
+        .unwrap();
+    tx.verify(Limits { gas: 1_000_000 }).unwrap();
+}
+
 fn internal_signcall_code(
     verification_key: CompressedRistretto,
     program: Vec<u8>,
@@ -165,8 +198,8 @@ fn failed_signcall_restores_contract_and_argument_and_signature_checkpoint() {
     vm.last_anchor = Some(Anchor([0x42; 32]));
     vm.current_call.stack = vec![
         Value::Contract(Box::new(contract)),
-        Value::String(String::from(program)),
-        Value::String(String::from(signature.to_vec())),
+        witness_cell(String::from(program)),
+        witness_cell(String::from(signature.to_vec())),
         Value::Scalar(Scalar::from(10_000u64)),
         Value::Token(token.clone()),
         Value::Scalar(Scalar::ONE),

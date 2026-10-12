@@ -46,7 +46,7 @@ const OP_DUPK_MAX: u8 = 0x2f;
 const OP_ROLLK_BASE: u8 = 0x30;
 const OP_ROLLK_MAX: u8 = 0x3f;
 
-// 0x4X — Cell bytes/refs and remaining String operations
+// 0x4X — Cell bytes/refs
 const OP_READUINT: u8 = 0x40;
 const OP_READSCALAR: u8 = 0x41;
 const OP_READBYTES: u8 = 0x42;
@@ -61,6 +61,8 @@ const OP_ENDCELL: u8 = 0xa9;
 const OP_LOADREF: u8 = 0xaa;
 const OP_CELLINFO: u8 = 0xab;
 const OP_RUNSLICE: u8 = 0xac;
+const OP_WRITEREF: u8 = 0xad;
+const OP_WRITEPOINT: u8 = 0xae;
 const OP_WRITEZEROS: u8 = 0x47;
 const OP_BITNOT: u8 = 0x48;
 const OP_BITOR: u8 = 0x49;
@@ -196,6 +198,8 @@ pub enum Instruction {
     ReadPoint,        // s readpoint → s' p 1 | s 0
     WriteUint,        // b x n writeuint → b'
     WriteScalar,      // b x writescalar → b'
+    WritePoint,       // b p writepoint → b'
+    WriteRef,         // b c writeref → b'
     AppendBytes,      // s b appendbytes → s' b'
     AppendRefs,       // s b appendrefs → s' b'
     Builder,          // ø builder → b
@@ -204,7 +208,7 @@ pub enum Instruction {
     LoadRef,          // s index loadref → s' c
     CellInfo,         // c cellinfo → c bytes refs depth level pruned
     RunSlice,         // ø runslice → slice (unread current program bytes/refs)
-    WriteZeros,       // s n writezeros → s'
+    WriteZeros,       // b n writezeros → b'
     BitNot,           // b bitnot → b'
     BitOr,            // b s bitor → b'
     BitAnd,           // b s bitand → b'
@@ -218,7 +222,7 @@ pub enum Instruction {
     Add,              // x y add → z
     Mul,              // x y mul → z
     DivMod,           // x z divmod → d r
-    Mod252,           // s mod252 → int
+    Mod252,           // bytes mod252 → int
     Not,              // x not → y
     And,              // a b and → c
     Or,               // a b or → c
@@ -239,7 +243,7 @@ pub enum Instruction {
     Next,             // dict k next → dict {k' 1 | 0}
     Transcript,       // label transcript → merlin (opens a Merlin transcript)
     TWrite,           // m label s twrite → m
-    TRead,            // m label n tread → m s
+    TRead,            // m label b n tread → m b'
     Sha256,           // s b sha256 → b'
     Sha512,           // s b sha512 → b'
     Sha3,             // s b sha3 → b'
@@ -323,6 +327,8 @@ impl Instruction {
             Instruction::ReadPoint => op(w, OP_READPOINT),
             Instruction::WriteUint => op(w, OP_WRITEUINT),
             Instruction::WriteScalar => op(w, OP_WRITESCALAR),
+            Instruction::WritePoint => op(w, OP_WRITEPOINT),
+            Instruction::WriteRef => op(w, OP_WRITEREF),
             Instruction::AppendBytes => op(w, OP_APPENDBYTES),
             Instruction::AppendRefs => op(w, OP_APPENDREFS),
             Instruction::Builder => op(w, OP_BUILDER),
@@ -526,6 +532,8 @@ impl Instruction {
             OP_READPOINT => Ok(Instruction::ReadPoint),
             OP_WRITEUINT => Ok(Instruction::WriteUint),
             OP_WRITESCALAR => Ok(Instruction::WriteScalar),
+            OP_WRITEPOINT => Ok(Instruction::WritePoint),
+            OP_WRITEREF => Ok(Instruction::WriteRef),
             OP_APPENDBYTES => Ok(Instruction::AppendBytes),
             OP_APPENDREFS => Ok(Instruction::AppendRefs),
             OP_BUILDER => Ok(Instruction::Builder),

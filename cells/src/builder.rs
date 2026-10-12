@@ -86,6 +86,15 @@ impl CellBuilder {
         Ok(self)
     }
 
+    /// Appends zero bytes without an intermediate buffer; capacity failures are atomic.
+    pub fn store_zeros(&mut self, count: usize) -> Result<&mut Self, CellError> {
+        if count > self.remaining_bytes() {
+            return Err(CellError::PayloadCapacity);
+        }
+        self.payload.resize(self.payload.len() + count, 0);
+        Ok(self)
+    }
+
     /// Stores a byte string with a four-byte little-endian length prefix.
     ///
     /// The prefix must fit here. Bytes fill this Cell before spilling into
@@ -162,6 +171,22 @@ mod tests {
     use super::*;
     use crate::CellCommitment;
     use std::sync::Arc;
+
+    #[test]
+    fn zero_filling_checks_capacity_before_mutating() {
+        let mut builder = CellBuilder::new();
+        builder.store_bytes(&[7]).unwrap();
+        builder.store_zeros(MAX_CELL_PAYLOAD - 1).unwrap();
+        assert_eq!(builder.payload()[0], 7);
+        assert!(builder.payload()[1..].iter().all(|byte| *byte == 0));
+        let before = builder.payload().to_vec();
+        assert_eq!(
+            builder.store_zeros(1).unwrap_err(),
+            CellError::PayloadCapacity
+        );
+        assert_eq!(builder.payload(), before);
+        builder.store_zeros(0).unwrap();
+    }
 
     #[test]
     fn borrowed_commitments_match_finalization_after_in_place_payload_edits() {

@@ -896,19 +896,19 @@ fn input_pushes_contract_seeds_anchor_and_emits_txlog() {
 }
 
 #[test]
-fn input_requires_string_on_top() {
+fn input_requires_byte_source_on_top() {
     // Non-String top → TypeNotString. (Use an Scalar.)
     let mut vm = vm_external_with_script(Vec::new());
     vm.push_value(Value::Scalar(Scalar::from(7u64)));
     let err = vm.op_input().unwrap_err();
-    assert!(matches!(err, VMError::TypeNotString));
+    assert!(matches!(err, VMError::TypeNotByteSource));
 }
 
 #[test]
 fn input_rejects_malformed_bytes() {
     // Random non-canonical bytes on the stack.
     let mut vm = vm_external_with_script(Vec::new());
-    vm.push_value(Value::String(String::from(vec![0xffu8; 8])));
+    vm.push_value(witness_cell(String::from(vec![0xffu8; 8])));
     let err = vm.op_input().unwrap_err();
     assert!(matches!(err, VMError::MalformedContractEncoding));
 }
@@ -918,7 +918,7 @@ fn input_rejects_trailing_bytes_after_contract_id() {
     let mut bytes = fixture_contract().id().to_vec();
     bytes.push(0);
     let mut vm = vm_external_with_script(Vec::new());
-    vm.push_value(Value::String(String::from(bytes)));
+    vm.push_value(witness_cell(String::from(bytes)));
     assert!(matches!(
         vm.op_input(),
         Err(VMError::MalformedContractEncoding)
@@ -934,7 +934,7 @@ fn input_in_internal_context_errors_external_only() {
     // Even with a well-formed string on the stack, internal context
     // rejects the opcode before any decoding happens.
     let contract_bytes = fixture_contract().id().to_vec();
-    vm.push_value(Value::String(String::from(contract_bytes)));
+    vm.push_value(witness_cell(String::from(contract_bytes)));
     let err = vm.step_internal().unwrap_err();
     assert!(matches!(err, VMError::ExternalOnly));
 }
@@ -970,7 +970,7 @@ fn input_via_step_external_dispatch() {
             .with_cells(CellIndex::collect(Arc::new(contract.to_cell().unwrap())).unwrap())
             .input(),
     );
-    vm.push_value(Value::String(String::from(expected.to_vec())));
+    vm.push_value(witness_cell(String::from(expected.to_vec())));
     assert!(vm.step_external(&mut StubDelegate::new()).unwrap());
     assert!(matches!(&vm.current_call.stack[0], Value::Contract(c) if c.id() == expected));
     assert_eq!(vm.txlog.len(), 2);

@@ -289,9 +289,9 @@ fn gas_counter_overflow_is_out_of_gas() {
 /// `writezeros` growth spends gas cumulatively; freeing the previous buffer
 /// does not refund it.
 #[test]
-fn gas_bounds_cumulative_string_growth() {
+fn gas_bounds_cumulative_builder_growth() {
     let script = ScriptBuilder::new()
-        .push_str(String::from(Vec::new()))
+        .builder()
         .push_int(60u64)
         .write_zeros()
         .push_int(60u64)
@@ -371,6 +371,7 @@ fn allocation_gas_trips_on_pushstr_append_and_tread() {
             .push_str(String::from(b"L".to_vec()))
             .transcript()
             .push_str(String::from(b"x".to_vec()))
+            .builder()
             .push_int(200u64)
             .tread()
             .to_bytecode(),

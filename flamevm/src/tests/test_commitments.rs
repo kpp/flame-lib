@@ -10,7 +10,7 @@ fn op_scalar_pushes_constant_expression() {
     // confirm the result is Expression::Constant.
     let mut vm = vm_external_with_script(ScriptBuilder::new().scalar().to_bytecode());
     let s = String::scalar(Scalar::from(99u64));
-    vm.push_value(Value::String(s));
+    vm.push_value(witness_cell(s));
     let mut delegate = StubDelegate::new();
     vm.step_external(&mut delegate).expect("scalar ok");
     assert_eq!(vm.current_call.stack.len(), 1);
@@ -29,7 +29,7 @@ fn op_commit_pushes_variable() {
     // commitment preserved.
     let mut vm = vm_external_with_script(ScriptBuilder::new().commit().to_bytecode());
     let c = Commitment::unblinded(Scalar::from(42u64));
-    vm.push_value(Value::String(String::commitment(c.clone())));
+    vm.push_value(witness_cell(String::commitment(c.clone())));
     let mut delegate = StubDelegate::new();
     vm.step_external(&mut delegate).expect("commit ok");
     assert_eq!(vm.current_call.stack.len(), 1);

@@ -229,7 +229,7 @@ fn issuepub_clear_path_emits_txlog_and_returns_cleartoken() {
 
     // Stack: [ClearToken(7, flavor)].
     assert_eq!(vm.current_call.stack.len(), 1);
-    let expected_flv = test_flavor_from_actor(&actor, &String::from(b"gold".to_vec()));
+    let expected_flv = test_flavor_from_actor(&actor, b"gold");
     match &vm.current_call.stack[0] {
         Value::ClearToken(t) => {
             assert_eq!(t.qty(), Scalar::from(7u64));
@@ -341,7 +341,7 @@ fn issuepriv_emits_token_with_predicate_bound_flavor() {
 
     // After `return k=1`: parent stack = [Token, k=1, success=1].
     let predicate = Predicate::opaque(curve25519_dalek::ristretto::CompressedRistretto([0u8; 32]));
-    let expected_flv = flavor_from_predicate(&predicate, &tag_str);
+    let expected_flv = flavor_from_predicate(&predicate, &tag_str.to_bytes_vec());
     assert_eq!(vm.current_call.stack.len(), 3);
     match &vm.current_call.stack[0] {
         Value::Token(t) => {
@@ -537,7 +537,7 @@ fn issuepriv_prove_then_verify_end_to_end() {
     // result.txid as ground truth — the verifier reconstructs the
     // identical txlog by replaying the bytecode.
     let predicate = Predicate::opaque(pred_point);
-    let expected_flv = flavor_from_predicate(&predicate, &tag_str);
+    let expected_flv = flavor_from_predicate(&predicate, &tag_str.to_bytes_vec());
     let expected_flv_pt = Commitment::unblinded(expected_flv).to_point();
     let expected_qty_pt = qty_commit.to_point();
     let has_issue = verified.txlog.iter().any(|e| {
@@ -804,8 +804,7 @@ fn issuepubflv_pushes_correct_flavor() {
         .to_bytecode();
     let mut vm = vm_with_script(script);
     run_to_end(&mut vm).expect("issuepubflv ok");
-    let expected =
-        test_flavor_from_actor(&ActorID::Hash(actor_bytes), &String::from(b"gold".to_vec()));
+    let expected = test_flavor_from_actor(&ActorID::Hash(actor_bytes), b"gold");
     assert_eq!(vm.current_call.stack.len(), 1);
     assert_int(&vm.current_call.stack[0], expected);
 }
@@ -834,7 +833,7 @@ fn issueprivflv_pushes_correct_flavor() {
     let mut vm = vm_with_script(script);
     run_to_end(&mut vm).expect("issueprivflv ok");
     let predicate = Predicate::opaque(curve25519_dalek::ristretto::CompressedRistretto(pred_bytes));
-    let expected = flavor_from_predicate(&predicate, &String::from(b"gold".to_vec()));
+    let expected = flavor_from_predicate(&predicate, b"gold");
     assert_eq!(vm.current_call.stack.len(), 1);
     assert_int(&vm.current_call.stack[0], expected);
 }
