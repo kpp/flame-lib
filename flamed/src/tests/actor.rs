@@ -42,8 +42,18 @@ async fn actor_tracks_updates_expiry_and_replay() {
     assert!(deployed.storage_used > 0);
     assert!(deployed.storage_used <= deployed.storage_capacity);
     let code = &deployed.code.as_ref().unwrap().0;
-    assert_eq!(flamevm::code_root(code), deployed.code_hash);
-    assert_eq!(code.len() as u64, deployed.code_size);
+    let mut code_gas = u64::MAX;
+    let code_envelope = CellEnvelope::decode(code, code.len(), &mut code_gas).unwrap();
+    assert_eq!(code_envelope.root(), deployed.code_hash);
+    assert_eq!(
+        code_envelope
+            .cells()
+            .get(&deployed.code_hash)
+            .unwrap()
+            .payload()
+            .len() as u64,
+        deployed.code_size
+    );
     let state = &deployed.state.as_ref().unwrap().0;
     let mut gas = state.len() as u64 * 1024;
     let envelope = CellEnvelope::decode(state, state.len(), &mut gas).unwrap();
@@ -140,31 +150,31 @@ async fn actor_tracks_updates_expiry_and_replay() {
 fn actor_keeps_full_data_and_reports_unavailable_or_malformed_bodies() {
     let literal = CellValue::from_bytes(vec![0xab; 257]).unwrap();
     let state = Value::Dict(Dict::from_values(vec![Value::Cell(literal.clone()); 2_001]));
-    let nop = ScriptBuilder::new().nop().to_bytecode();
-    let mut code = nop.repeat(10_001);
-    code.extend(
-        ScriptBuilder::new()
-            .push_literal(CellValue::from_bytes(vec![0xcd; 257]).unwrap())
-            .to_bytecode(),
-    );
-    let error_offset = code.len();
-    let mut incomplete = ScriptBuilder::new()
-        .push_literal(CellValue::from_bytes(vec![0xef]).unwrap())
-        .to_bytecode();
-    incomplete.pop();
-    code.extend(incomplete);
+    let literal_code = flamevm::Cell::new(vec![0xcd; 257], vec![]).unwrap();
+    let mut program = ScriptBuilder::new();
+    for _ in 0..1_001 {
+        program = program.nop();
+    }
+    let complete = program.push_cell(literal_code.clone()).to_cell().unwrap();
+    let error_offset = complete.payload().len();
+    let mut payload = complete.payload().to_vec();
+    payload.push(0x18); // Truncated full-width scalar literal.
+    let code = flamevm::Cell::new(payload, complete.refs().to_vec()).unwrap();
+    let code_bytes = CellEnvelope::new(code.id(), CellIndex::collect(code.clone().into()).unwrap())
+        .unwrap()
+        .encode();
     let state_cell = state.to_cell().unwrap();
     let mut snapshot = ActorResult {
         id: ActorId([1; 32]),
         height: 1,
         block: BlockId([2; 32]),
-        code_hash: flamevm::code_root(&code),
+        code_hash: code.id(),
         state_hash: state_cell.id(),
-        code_size: code.len() as u64,
+        code_size: code.payload().len() as u64,
         state_size: 0,
         storage_used: 0,
         storage_capacity: 0,
-        code: Some(ActorCode(code)),
+        code: Some(ActorCode(code_bytes)),
         state: Some(ActorStateEnvelope(state.to_envelope().unwrap().encode())),
         decoded_state: None,
         state_error: None,
@@ -188,10 +198,10 @@ fn actor_keeps_full_data_and_reports_unavailable_or_malformed_bodies() {
             }]
         }));
     assert!(detail.state_error.is_none());
-    assert_eq!(detail.instructions.len(), 10_002);
+    assert_eq!(detail.instructions.len(), 1_002);
     assert_eq!(
-        detail.instructions[10_001].text,
-        format!("pushcell bytes 0x{}", "cd".repeat(257))
+        detail.instructions[1_001].text,
+        format!("pushcell 0x{}", hex::encode(literal_code.id()))
     );
     assert!(detail
         .code_error
@@ -218,7 +228,7 @@ fn actor_keeps_full_data_and_reports_unavailable_or_malformed_bodies() {
     snapshot.code = Some(ActorCode(vec![]));
     let malformed = crate::inspect::actor(snapshot.clone());
     assert!(malformed.decoded_state.is_none() && malformed.state_error.is_some());
-    assert!(malformed.instructions.is_empty() && malformed.code_error.is_none());
+    assert!(malformed.instructions.is_empty() && malformed.code_error.is_some());
     snapshot.state = None;
     snapshot.code = None;
     let missing = crate::inspect::actor(snapshot);

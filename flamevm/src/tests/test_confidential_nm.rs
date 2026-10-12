@@ -487,7 +487,7 @@ fn confidential_1_to_1_with_fee() {
     let mut program = ScriptBuilder::new();
     // Consume the input contract — push the witness-bearing CellWitness::Contract
     // so the Token's open commitments survive into the CS.
-    program = program.push_literal(CellValue::contract(contract));
+    program = program.push_cell(CellValue::contract(contract).unwrap());
     program = program.input();
     program = push_taproot_proof_to_program(program, &cp);
     program = program
@@ -697,7 +697,7 @@ fn confidential_with_fee_undersupply_rejected() {
     // the unbalanced output qty.
     let out_pred = output_predicate_point(out.predicate_tag);
     let mut program = ScriptBuilder::new();
-    program = program.push_literal(CellValue::contract(contract));
+    program = program.push_cell(CellValue::contract(contract).unwrap());
     program = program.input();
     program = push_taproot_proof_to_program(program, &cp);
     program = program

@@ -1,5 +1,6 @@
 //! Small in-memory [`ActorRegistry`] used by FlameVM unit tests.
 
+use cells::Cell;
 use std::collections::BTreeMap;
 
 use crate::actor::{code_state_bytes, ActorID, ActorRegistry, StoragePurchase};
@@ -8,10 +9,27 @@ use crate::value::Value;
 
 #[derive(Clone)]
 pub struct TestActor {
-    pub code: Vec<u8>,
+    pub code: Cell,
     pub state: Option<Value>,
     pub capacity: u64,
     committed_usage: u64,
+}
+
+/// Legacy bytecode fixtures are compiled once; native graph fixtures stay intact.
+pub trait TestCode {
+    fn into_code(self) -> Result<Cell, VMError>;
+}
+
+impl TestCode for Vec<u8> {
+    fn into_code(self) -> Result<Cell, VMError> {
+        Ok(crate::code_cell(&self)?)
+    }
+}
+
+impl TestCode for Cell {
+    fn into_code(self) -> Result<Cell, VMError> {
+        Ok(self)
+    }
 }
 
 impl TestActor {
@@ -66,7 +84,7 @@ impl MemRegistry {
     pub fn deploy(
         &mut self,
         id: ActorID,
-        code: Vec<u8>,
+        code: impl TestCode,
         state: Value,
         capacity: u64,
     ) -> Result<(), VMError> {
@@ -76,10 +94,11 @@ impl MemRegistry {
     pub fn deploy_with_capacity(
         &mut self,
         id: ActorID,
-        code: Vec<u8>,
+        code: impl TestCode,
         state: Value,
         capacity: u64,
     ) -> Result<(), VMError> {
+        let code = code.into_code()?;
         let key = id.to_hash();
         if self.actors.contains_key(&key) {
             return Err(VMError::ActorAlreadyExists);
@@ -124,7 +143,7 @@ impl MemRegistry {
         Ok(())
     }
 
-    pub fn load_code(&self, id: &ActorID) -> Result<Vec<u8>, VMError> {
+    pub fn load_code(&self, id: &ActorID) -> Result<Cell, VMError> {
         let actor = self
             .actors
             .get(&id.to_hash())
@@ -135,7 +154,8 @@ impl MemRegistry {
         Ok(actor.code.clone())
     }
 
-    pub fn set_code(&mut self, id: &ActorID, code: Vec<u8>) -> Result<(), VMError> {
+    pub fn set_code(&mut self, id: &ActorID, code: impl TestCode) -> Result<(), VMError> {
+        let code = code.into_code()?;
         let key = id.to_hash();
         let actor = self.actors.get(&key).ok_or(VMError::ActorNotFound)?;
         let state = actor.state.as_ref().ok_or(VMError::ActorEmpty)?;
@@ -194,7 +214,7 @@ impl ActorRegistry for MemRegistry {
         MemRegistry::save_state(self, id, state)
     }
 
-    fn load_code(&self, id: &ActorID) -> Result<Vec<u8>, VMError> {
+    fn load_code(&self, id: &ActorID) -> Result<Cell, VMError> {
         MemRegistry::load_code(self, id)
     }
 
@@ -203,7 +223,7 @@ impl ActorRegistry for MemRegistry {
         if actor.is_checked_out() {
             return Err(VMError::ActorEmpty);
         }
-        Ok(actor.code.len() as u64)
+        Ok(actor.code.payload().len() as u64)
     }
 
     fn actor_state_bytes(&self, id: &ActorID) -> Result<u64, VMError> {
@@ -211,13 +231,19 @@ impl ActorRegistry for MemRegistry {
         if actor.is_checked_out() {
             return Err(VMError::ActorEmpty);
         }
+        let code_bytes = cells::CellIndex::collect(std::sync::Arc::new(actor.code.clone()))?
+            .iter()
+            .try_fold(0u64, |size, (_, cell)| {
+                size.checked_add(cell.record_size() as u64)
+                    .ok_or(VMError::StorageArithmeticOverflow)
+            })?;
         actor
             .committed_usage
-            .checked_sub(actor.code.len() as u64)
+            .checked_sub(code_bytes)
             .ok_or(VMError::StorageArithmeticOverflow)
     }
 
-    fn set_code(&mut self, id: &ActorID, code: Vec<u8>) -> Result<(), VMError> {
+    fn set_code(&mut self, id: &ActorID, code: Cell) -> Result<(), VMError> {
         MemRegistry::set_code(self, id, code)
     }
 
@@ -301,7 +327,7 @@ impl ActorRegistry for MemRegistry {
         destroyed
     }
 
-    fn deploy(&mut self, id: ActorID, code: Vec<u8>, state: Value) -> Result<(), VMError> {
+    fn deploy(&mut self, id: ActorID, code: Cell, state: Value) -> Result<(), VMError> {
         MemRegistry::deploy_with_capacity(self, id, code, state, 0)
     }
 }

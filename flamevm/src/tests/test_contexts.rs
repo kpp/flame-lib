@@ -119,7 +119,6 @@ fn assert_gate(name: &str, instruction: Instruction, gate: Gate) {
 #[test]
 fn restricted_opcode_context_matrix() {
     for (name, instruction) in [
-        ("scalar", Instruction::Scalar),
         ("commit", Instruction::Commit),
         ("alloc", Instruction::Alloc(None)),
         ("expr", Instruction::Expr),

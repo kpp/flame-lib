@@ -202,6 +202,7 @@ fn compiler_continuations_preserve_private_assignments_and_transaction_identity(
     }
     script = script
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .push_int(7u64)
         .eq()
         .verify();
@@ -251,7 +252,7 @@ fn taproot_exec_failure_returns_the_contract_and_cell_argument() {
     .unwrap();
     let arg = Cell::new(vec![9], vec![]).unwrap();
     let source = ScriptBuilder::new()
-        .push_literal(CellValue::contract(contract))
+        .push_cell(CellValue::contract(contract).unwrap())
         .input()
         .push_taproot_proof(&tree, 0)
         .unwrap()
@@ -439,7 +440,7 @@ fn exec_cannot_create_gas_or_execute_other_value_types() {
 }
 
 #[test]
-fn script_cell_codec_preserves_refs_and_source_execution_rejects_hidden_refs() {
+fn script_cell_codec_and_witness_preserve_native_references() {
     let cell = Cell::new(vec![9], vec![]).unwrap();
     let graph = Cell::new(vec![8], vec![cell.clone().into()]).unwrap();
     for instruction in [
@@ -451,15 +452,12 @@ fn script_cell_codec_preserves_refs_and_source_execution_rejects_hidden_refs() {
         let encoded = script.to_cell().unwrap();
         let decoded = Script::from_cell(&encoded, &mut ()).unwrap();
         assert_eq!(decoded.to_cell().unwrap().id(), encoded.id());
-        assert!(matches!(
-            CellValue::script(instructions)
-                .unwrap()
-                .witness()
-                .unwrap()
-                .clone()
-                .into_script(),
-            Err(VMError::Cell(CellError::InvalidFormat))
-        ));
+        let annotated = CellValue::script(instructions).unwrap();
+        assert_eq!(annotated.id(), encoded.id());
+        assert_eq!(
+            annotated.witness().unwrap().to_cell().unwrap().id(),
+            encoded.id()
+        );
     }
 }
 

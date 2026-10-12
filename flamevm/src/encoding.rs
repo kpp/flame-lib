@@ -363,15 +363,21 @@ mod tests {
     }
 
     #[test]
-    fn cell_values_reject_oversized_payloads_but_allow_graphs() {
+    fn cell_values_bound_raw_payloads_but_allow_program_graphs() {
         assert!(matches!(
             crate::CellValue::from_bytes(vec![0; MAX_CELL_PAYLOAD + 1]),
             Err(CellError::PayloadTooLarge { .. })
         ));
-        assert!(matches!(
-            crate::CellValue::script(vec![crate::ops::Instruction::Nop; MAX_CELL_PAYLOAD + 1]),
-            Err(CellError::PayloadTooLarge { .. })
-        ));
+        let program =
+            crate::CellValue::script(vec![crate::ops::Instruction::Nop; MAX_CELL_PAYLOAD + 1])
+                .unwrap();
+        let root = program.to_cell().unwrap();
+        assert!(root.payload().len() <= MAX_CELL_PAYLOAD);
+        assert_eq!(
+            root.refs().len(),
+            1,
+            "native programs have explicit continuations"
+        );
 
         for reference in [
             CellRef::resident(Cell::new(vec![1], vec![]).unwrap()).to_unloaded(),

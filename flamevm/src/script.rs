@@ -108,20 +108,45 @@ impl ScriptBuilder {
     }
 
     fn witnesses(&self) -> Vec<&CellWitness> {
-        let mut pending = vec![self.instructions.as_slice()];
-        pending.extend(self.scripts.values().map(Vec::as_slice));
+        enum Pending<'a> {
+            Instructions(&'a [Instruction]),
+            Value(&'a crate::Value),
+            Witness(&'a CellWitness),
+        }
+        let mut pending = vec![Pending::Instructions(self.instructions.as_slice())];
+        pending.extend(
+            self.scripts
+                .values()
+                .map(|script| Pending::Instructions(script.as_slice())),
+        );
         let mut witnesses = Vec::new();
-        while let Some(instructions) = pending.pop() {
-            for instruction in instructions {
-                let literal = match instruction {
-                    Instruction::CellLiteral(literal) => Some(literal.as_ref()),
-                    Instruction::PushCell(Some(literal)) => Some(literal),
-                    _ => None,
-                };
-                if let Some(witness) = literal.and_then(CellValue::witness) {
+        while let Some(item) = pending.pop() {
+            match item {
+                Pending::Instructions(instructions) => {
+                    pending.extend(instructions.iter().filter_map(|instruction| {
+                        let literal = match instruction {
+                            Instruction::CellLiteral(literal) => Some(literal.as_ref()),
+                            Instruction::PushCell(Some(literal)) => Some(literal),
+                            _ => None,
+                        };
+                        literal.and_then(CellValue::witness).map(Pending::Witness)
+                    }));
+                }
+                Pending::Value(crate::Value::Dict(dict)) => {
+                    pending.extend(dict.cached_values().map(Pending::Value));
+                }
+                Pending::Value(crate::Value::Cell(value)) => {
+                    pending.extend(value.witness().map(Pending::Witness));
+                }
+                Pending::Value(_) => {}
+                Pending::Witness(witness) => {
                     witnesses.push(witness);
-                    if let CellWitness::Script(nested) = witness {
-                        pending.push(nested);
+                    match witness {
+                        CellWitness::Script(nested) => pending.push(Pending::Instructions(nested)),
+                        CellWitness::Contract(contract) => {
+                            pending.push(Pending::Value(contract.payload()))
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -237,12 +262,12 @@ impl ScriptBuilder {
         self
     }
 
-    /// Cell literal carrying a private source-byte script annotation for `signcall`.
+    /// Native program Cell carrying its private instruction annotations.
     pub fn push_script(mut self, inner: ScriptBuilder) -> Result<Self, CellError> {
         self.cells.extend(inner.cells);
         self.scripts.extend(inner.scripts);
         self.instructions
-            .push(Instruction::CellLiteral(Arc::new(CellValue::script(
+            .push(Instruction::PushCell(Some(CellValue::script(
                 inner.instructions,
             )?)));
         Ok(self)
@@ -326,7 +351,7 @@ impl ScriptBuilder {
         self.instructions.push(Instruction::LoadRef);
         self
     }
-    /// `c cellinfo → c bytes refs depth level pruned`, using factual metadata.
+    /// Peek Cell/Slice/Builder bytes, refs, factual depth, level and pruning flag.
     pub fn cell_info(mut self) -> Self {
         self.instructions.push(Instruction::CellInfo);
         self
@@ -456,7 +481,7 @@ impl ScriptBuilder {
 
     // ── CS opcodes ─────────────────────────────────────
 
-    /// `alloc` (0x5c) — allocates a low-level R1CS variable. `witness`
+    /// Allocate a copyable Variable handle. `witness`
     /// = `Some(int)` on the prover side (fills the cleartext value
     /// the constraint system uses), `None` on the verifier side.
     pub fn alloc(mut self, witness: Option<Scalar>) -> Self {
@@ -464,7 +489,7 @@ impl ScriptBuilder {
         self
     }
 
-    /// `expr` (0x5d).
+    /// Consume a Scalar or Variable handle into a non-copyable Expression.
     pub fn expr(mut self) -> Self {
         self.instructions.push(Instruction::Expr);
         self
@@ -478,15 +503,7 @@ impl ScriptBuilder {
         self
     }
 
-    /// `scalar` (0x5a) — `cell/slice/builder → expr`. Lifts 32 payload bytes
-    /// (parsed as `Scalar`) into a constant Expression.
-    pub fn scalar(mut self) -> Self {
-        self.instructions.push(Instruction::Scalar);
-        self
-    }
-
-    /// `commit` (0x5b) — `cell/slice/builder → var`. Promotes 32 payload bytes
-    /// (parsed as a Pedersen commitment) into a Variable.
+    /// `point commit → var`: retain the Point's commitment witness when present.
     pub fn commit(mut self) -> Self {
         self.instructions.push(Instruction::Commit);
         self
@@ -826,9 +843,9 @@ impl ScriptBuilder {
 
     /// `input`. Witness data (open commitments on Token
     /// payloads) rides on the pushed CellValue — call
-    /// `push_literal(CellValue::contract(c))` before this on the prover side;
-    /// verifiers push `CellValue::from_bytes(contract.id().to_vec())?` and resolve
-    /// the body from the transaction's public witness Cell hierarchy.
+    /// `push_cell(CellValue::contract(c)?)` before this on the prover side;
+    /// verifiers push the public Contract root reference and resolve its body
+    /// from the transaction's committed program/witness Cell graph.
     pub fn input(mut self) -> Self {
         self.instructions.push(Instruction::Input);
         self
@@ -1230,7 +1247,7 @@ mod witness_tests {
     use crate::{vm::Anchor, Predicate, Value};
 
     #[test]
-    fn nested_witnesses_are_collected_separately_from_bytecode() {
+    fn native_contract_and_program_roots_keep_private_witnesses_separate() {
         let contract = Contract::new(
             Predicate::opaque(Predicate::unspendable_key()),
             Anchor([5; 32]),
@@ -1238,8 +1255,8 @@ mod witness_tests {
         )
         .unwrap();
         let id = contract.id();
-        let reference = CellValue::contract(contract);
-        assert_eq!(reference.payload().unwrap(), id);
+        let reference = CellValue::contract(contract).unwrap();
+        assert_eq!(reference.id(), id);
         assert!(matches!(
             reference.witness(),
             Some(CellWitness::Contract(_))
@@ -1253,7 +1270,7 @@ mod witness_tests {
             .push_literal(reference)
             .input()
             .alloc(Some(Scalar::from(9u64)));
-        let branch_id = script_cell(&branch.to_bytecode()).unwrap().id();
+        let branch_id = branch.to_cell().unwrap().id();
         let program = ScriptBuilder::new()
             .push_script(branch.clone())
             .unwrap()
@@ -1263,16 +1280,23 @@ mod witness_tests {
         assert!(bag.contains(&id));
         assert!(
             !bag.contains(&branch_id),
-            "inline bytecode needs no duplicate code Cell"
+            "inline program refs need no duplicate lookup body"
         );
         assert_eq!(program.contract_witnesses()[&id].id(), id);
         let scripts = program.script_witnesses().unwrap();
         assert!(
             matches!(scripts[&branch_id].last(), Some(Instruction::Alloc(Some(value))) if *value == Scalar::from(9u64))
         );
-        let bytecode = program.to_bytecode();
-        let public = ScriptBuilder::parse(&bytecode).unwrap();
-        assert_eq!(public.to_bytecode(), bytecode);
+        let root = program.to_cell().unwrap();
+        let instructions = Script::from_cell(&root, &mut ())
+            .unwrap()
+            .into_instructions()
+            .unwrap();
+        let mut public = ScriptBuilder::new();
+        for instruction in instructions {
+            public.push_instr(instruction);
+        }
+        assert_eq!(public.to_cell().unwrap().id(), root.id());
         assert!(public.contract_witnesses().is_empty());
         assert!(public.script_witnesses().unwrap().is_empty());
     }

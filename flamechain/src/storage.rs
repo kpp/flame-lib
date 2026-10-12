@@ -8,10 +8,7 @@ use cells::{
     CellReader, CellRef, CellSlice, Trie, read_cell,
 };
 
-use flamevm::{
-    ActorID, ActorRegistry, Scalar, StoragePurchase, VMError, Value, code_cell, code_from_cell,
-    empty_state,
-};
+use flamevm::{ActorID, ActorRegistry, Scalar, StoragePurchase, VMError, Value, empty_state};
 #[cfg(test)]
 use flamevm::{code_root, state_root};
 
@@ -101,7 +98,7 @@ pub struct ActorInfo {
     pub code_root: CellID,
     /// Root cell hash of the current state, even when its bytes are unavailable.
     pub state_root: CellID,
-    /// Logical bytecode length, excluding cell framing.
+    /// Root program payload length; descendants are loaded and metered on demand.
     pub code_size: u64,
     /// Logical state size in encoded cell bytes.
     pub state_size: u64,
@@ -109,8 +106,8 @@ pub struct ActorInfo {
     pub storage_used: u64,
     /// Capacity of leases valid at the snapshot height, in bytes.
     pub storage_capacity: u64,
-    /// Bytecode, if all its cells are resident.
-    pub code: Option<Vec<u8>>,
+    /// Root and reachable resident code cells. Descendants may be unavailable.
+    pub code: Option<CellEnvelope>,
     /// State root and reachable resident cells. Descendants may still be unloaded.
     /// Absent if even the state root body is unavailable.
     pub state: Option<CellEnvelope>,
@@ -118,7 +115,7 @@ pub struct ActorInfo {
 
 #[derive(Clone)]
 struct LiveActor {
-    code: Option<Vec<u8>>,
+    code: Option<Cell>,
     code_bytes: u64,
     state: Option<Value>,
     state_bytes: u64,
@@ -213,7 +210,7 @@ fn collect_owned(
 impl LiveActor {
     fn retain_changes(&mut self) -> Result<(), CellError> {
         let code = match &self.code {
-            Some(code) => CellRef::resident(code_cell(code)?),
+            Some(code) => CellRef::resident(code.clone()),
             None => self.code_root.clone(),
         };
         let state = match &self.state {
@@ -580,7 +577,10 @@ impl ActorStore {
         // In particular, load_state would check out the actor for execution.
         let mut cells = live.cells.as_ref().clone();
         let code = match self.load_code_with_cells(actor, &mut cells) {
-            Ok(code) => Some(code),
+            Ok(code) => Some(CellEnvelope::new(
+                code.id(),
+                collect_owned([Arc::new(code)], &live.cells)?,
+            )?),
             Err(VMError::Cell(CellError::MissingCell(_))) => None,
             Err(error) => return Err(error),
         };
@@ -643,7 +643,7 @@ impl ActorStore {
         Ok(root.build().id())
     }
 
-    pub(crate) fn replay_deploy(&mut self, actor: ActorID, code: Vec<u8>) -> Result<(), VMError> {
+    pub(crate) fn replay_deploy(&mut self, actor: ActorID, code: Cell) -> Result<(), VMError> {
         self.deploy(actor, code, empty_state())
     }
 
@@ -672,7 +672,7 @@ impl ActorStore {
     pub(crate) fn replay_set_code(
         &mut self,
         actor: &ActorID,
-        code: Vec<u8>,
+        code: Cell,
         height: u64,
     ) -> Result<(), VMError> {
         self.set_code(actor, code)?;
@@ -751,33 +751,12 @@ impl ActorRegistry for ActorStore {
         Ok(())
     }
 
-    fn load_code(&self, actor: &ActorID) -> Result<Vec<u8>, VMError> {
+    fn load_code(&self, actor: &ActorID) -> Result<Cell, VMError> {
         let mut cells = self.actor_cells(actor)?.as_ref().clone();
         self.load_code_with_cells(actor, &mut cells)
     }
 
     fn load_code_with_cells(
-        &self,
-        actor: &ActorID,
-        cells: &mut dyn CellReader,
-    ) -> Result<Vec<u8>, VMError> {
-        let live = self.require_live(actor.to_hash())?.live.as_ref().unwrap();
-        if self.checked_out.contains(&actor.to_hash()) {
-            return Err(VMError::ActorEmpty);
-        }
-        let cell = read_cell(cells, &live.code_root)?;
-        let code = code_from_cell(
-            &cell,
-            cells,
-            usize::try_from(live.code_bytes).map_err(|_| VMError::StorageArithmeticOverflow)?,
-        )?;
-        if code.len() as u64 != live.code_bytes {
-            return Err(CellError::InvalidFormat.into());
-        }
-        Ok(code)
-    }
-
-    fn load_program_with_cells(
         &self,
         actor: &ActorID,
         cells: &mut dyn CellReader,
@@ -790,7 +769,18 @@ impl ActorRegistry for ActorStore {
         if cell.is_pruned() {
             return Err(CellError::PrunedCell.into());
         }
+        if cell.payload().len() as u64 != live.code_bytes {
+            return Err(CellError::InvalidFormat.into());
+        }
         Ok(cell.as_ref().clone())
+    }
+
+    fn load_program_with_cells(
+        &self,
+        actor: &ActorID,
+        cells: &mut dyn CellReader,
+    ) -> Result<Cell, VMError> {
+        self.load_code_with_cells(actor, cells)
     }
 
     fn actor_cells(&self, actor: &ActorID) -> Result<Arc<CellIndex>, VMError> {
@@ -817,13 +807,16 @@ impl ActorRegistry for ActorStore {
         Ok(live.state_bytes)
     }
 
-    fn set_code(&mut self, actor: &ActorID, code: Vec<u8>) -> Result<(), VMError> {
+    fn set_code(&mut self, actor: &ActorID, code: Cell) -> Result<(), VMError> {
+        if code.is_pruned() {
+            return Err(CellError::PrunedCell.into());
+        }
         let key = actor.to_hash();
         self.require_live(key)?;
         self.record_actor(key);
         let live = self.actors.get_mut(&key).unwrap().live.as_mut().unwrap();
-        live.code_root = CellRef::resident(code_cell(&code)?).to_unloaded();
-        live.code_bytes = code.len() as u64;
+        live.code_root = CellRef::resident(code.clone()).to_unloaded();
+        live.code_bytes = code.payload().len() as u64;
         live.code = Some(code);
         live.retain_changes()?;
         Ok(())
@@ -946,7 +939,10 @@ impl ActorRegistry for ActorStore {
         ids.into_iter().map(ActorID::Hash).collect()
     }
 
-    fn deploy(&mut self, id: ActorID, code: Vec<u8>, state: Value) -> Result<(), VMError> {
+    fn deploy(&mut self, id: ActorID, code: Cell, state: Value) -> Result<(), VMError> {
+        if code.is_pruned() {
+            return Err(CellError::PrunedCell.into());
+        }
         if !state.is_portable() {
             return Err(VMError::NonPortableInState);
         }
@@ -956,9 +952,9 @@ impl ActorRegistry for ActorStore {
         }
         let state_bytes = Self::state_bytes(&state)?;
         let mut live = LiveActor {
-            code_root: CellRef::resident(code_cell(&code)?).to_unloaded(),
+            code_root: CellRef::resident(code.clone()).to_unloaded(),
             state_root: CellRef::resident(state.to_cell()?).to_unloaded(),
-            code_bytes: code.len() as u64,
+            code_bytes: code.payload().len() as u64,
             code: Some(code),
             state: Some(state),
             state_bytes,
@@ -988,10 +984,52 @@ mod tests {
     }
 
     #[test]
+    fn native_code_graph_survives_snapshots_and_upgrade_rollback() {
+        let child = Cell::new(vec![0x1d], vec![]).unwrap();
+        let pruned = Cell::new(vec![7; 80], vec![]).unwrap().prune(1).unwrap();
+        let code = Cell::new(
+            vec![0xa6, 0xa7],
+            vec![child.clone().into(), pruned.clone().into()],
+        )
+        .unwrap();
+        let mut store = ActorStore::new(StorageParams::default()).unwrap();
+        store.deploy(actor(), code.clone(), empty_state()).unwrap();
+        store.purchase_storage(&actor(), 1_024, 0).unwrap().unwrap();
+        let before = store.actor_root().unwrap();
+        let info = store.actor_info(&actor(), 0).unwrap();
+        assert_eq!(info.code_size, code.payload().len() as u64);
+        let bytes = info.code.unwrap().encode();
+        let mut gas = u64::MAX;
+        let mut envelope = CellEnvelope::decode(&bytes, bytes.len(), &mut gas).unwrap();
+        assert_eq!(envelope.root(), code.id());
+        assert!(envelope.cells().contains(&child.id()));
+        assert!(envelope.cells().contains(&pruned.id()));
+        let recovered = envelope
+            .cells()
+            .get(&code.id())
+            .unwrap()
+            .load_graph(&mut envelope)
+            .unwrap();
+        let recovered_pruned = recovered.refs()[1].as_resident().unwrap();
+        assert!(recovered_pruned.is_pruned());
+        assert_eq!(recovered_pruned.commitment(), pruned.commitment());
+        store.push_checkpoint();
+        store.set_code(&actor(), child).unwrap();
+        assert_ne!(store.actor_root().unwrap(), before);
+        store.pop_checkpoint_rollback();
+        assert_eq!(store.actor_root().unwrap(), before);
+        assert_eq!(store.load_code(&actor()).unwrap().id(), recovered.id());
+    }
+
+    #[test]
     fn canonical_actor_root_vector() {
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
         store
-            .deploy(actor(), vec![0x1d], Value::Scalar(Scalar::from(42u64)))
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0x1d]).unwrap(),
+                Value::Scalar(Scalar::from(42u64)),
+            )
             .unwrap();
         store.purchase_storage(&actor(), 1_024, 0).unwrap().unwrap();
         let graph = store.stored_actor(&actor()).unwrap();
@@ -1021,7 +1059,9 @@ mod tests {
         .unwrap();
         let state = Value::Dict(Dict::from_trusted_cell(&root, &mut ()).unwrap());
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
-        store.deploy(actor(), vec![0], state).unwrap();
+        store
+            .deploy(actor(), flamevm::code_cell(&vec![0]).unwrap(), state)
+            .unwrap();
         assert!(store.actor_root().is_ok());
 
         let live = store
@@ -1041,7 +1081,11 @@ mod tests {
     fn execution_body_scope_is_shared_and_rollback_restores_it() {
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
         store
-            .deploy(actor(), vec![0], Value::Scalar(Scalar::from(42u64)))
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                Value::Scalar(Scalar::from(42u64)),
+            )
             .unwrap();
         let before = store.actor_cells(&actor()).unwrap();
         assert!(Arc::ptr_eq(&before, &store.actor_cells(&actor()).unwrap()));
@@ -1072,7 +1116,12 @@ mod tests {
         let token = flamevm::Token::cleartext(Scalar::from(7u64), FLAME_FLAVOR).unwrap();
         assert!(token.qty().assignment().is_some());
         let mut warm = ActorStore::new(StorageParams::default()).unwrap();
-        warm.deploy(actor(), vec![0], Value::Token(token)).unwrap();
+        warm.deploy(
+            actor(),
+            flamevm::code_cell(&vec![0]).unwrap(),
+            Value::Token(token),
+        )
+        .unwrap();
         let mut cold = warm.clone();
         let live = cold
             .actors
@@ -1108,11 +1157,20 @@ mod tests {
     fn actor_info_reads_public_cells_without_checkout_or_cached_witnesses() {
         let token = flamevm::Token::cleartext(Scalar::from(7u64), FLAME_FLAVOR).unwrap();
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
-        store.deploy(actor(), vec![0], Value::Token(token)).unwrap();
+        store
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                Value::Token(token),
+            )
+            .unwrap();
         let root_before = store.actor_root().unwrap();
         for _ in 0..2 {
             let info = store.actor_info(&actor(), 0).unwrap();
-            assert_eq!(info.code, Some(vec![0]));
+            assert_eq!(
+                info.code.as_ref().map(CellEnvelope::root),
+                Some(code_root(&[0]))
+            );
             let mut envelope = info.state.unwrap();
             let root = envelope.cells().get(&envelope.root()).unwrap();
             let Value::Token(token) = Value::from_cell(&root, &mut envelope).unwrap() else {
@@ -1143,7 +1201,13 @@ mod tests {
         let mut state = Dict::new();
         state.insert(Scalar::ZERO, Value::Scalar(Scalar::ONE));
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
-        store.deploy(actor(), vec![0], Value::Dict(state)).unwrap();
+        store
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                Value::Dict(state),
+            )
+            .unwrap();
         let live = store
             .actors
             .get_mut(&actor().to_hash())
@@ -1160,7 +1224,10 @@ mod tests {
             .unwrap();
         live.cells = Arc::new(resident);
         let info = store.actor_info(&actor(), 0).unwrap();
-        assert_eq!(info.code, Some(vec![0]));
+        assert_eq!(
+            info.code.as_ref().map(CellEnvelope::root),
+            Some(code_root(&[0]))
+        );
         let mut envelope = info.state.unwrap();
         assert_eq!(envelope.root(), info.state_root);
         assert_eq!(envelope.cells().len(), 1);
@@ -1199,11 +1266,21 @@ mod tests {
     fn actor_state_boundaries_reject_nested_nonportable_dicts() {
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
         assert!(matches!(
-            store.deploy(actor(), vec![0], nested_nonportable_state()),
+            store.deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                nested_nonportable_state()
+            ),
             Err(VMError::NonPortableInState)
         ));
 
-        store.deploy(actor(), vec![0], empty_state()).unwrap();
+        store
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                empty_state(),
+            )
+            .unwrap();
         store.load_state(&actor()).unwrap();
         assert!(matches!(
             store.save_state(&actor(), nested_nonportable_state()),
@@ -1218,7 +1295,13 @@ mod tests {
     #[test]
     fn quote_rounding_and_pool_boundaries_are_exact() {
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
-        store.deploy(actor(), vec![0], empty_state()).unwrap();
+        store
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                empty_state(),
+            )
+            .unwrap();
         let quote = store.quote_storage(&actor(), 1_024, 10).unwrap().unwrap();
         assert_eq!(quote.fee_sparks, Scalar::from(1_000_007_630u64));
         assert_eq!(quote.expiry_height, 52_510);
@@ -1243,7 +1326,13 @@ mod tests {
 
         let params = small_params();
         let mut store = ActorStore::new(params).unwrap();
-        store.deploy(actor(), vec![0], empty_state()).unwrap();
+        store
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                empty_state(),
+            )
+            .unwrap();
         assert_eq!(store.quote_storage(&actor(), 0, 0).unwrap(), None);
         assert_eq!(store.quote_storage(&actor(), 63, 0).unwrap(), None);
         assert_eq!(
@@ -1278,7 +1367,9 @@ mod tests {
         let state = Value::Scalar(Scalar::from(7u64));
         let state_hash = state_root(&state);
         let mut store = ActorStore::new(params).unwrap();
-        store.deploy(actor(), vec![0], state).unwrap();
+        store
+            .deploy(actor(), flamevm::code_cell(&vec![0]).unwrap(), state)
+            .unwrap();
         let base_usage = store.actor_usage(&actor()).unwrap();
 
         let first = store
@@ -1356,8 +1447,20 @@ mod tests {
     fn nested_purchase_commit_is_undone_by_outer_rollback() {
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
         let other = ActorID::Hash([8; 32]);
-        store.deploy(actor(), vec![0], empty_state()).unwrap();
-        store.deploy(other.clone(), vec![0], empty_state()).unwrap();
+        store
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                empty_state(),
+            )
+            .unwrap();
+        store
+            .deploy(
+                other.clone(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                empty_state(),
+            )
+            .unwrap();
         let before_pool = store.available_units();
         let before_root = store.actor_root().unwrap();
 
@@ -1380,7 +1483,13 @@ mod tests {
     fn nested_expiry_and_freezing_commit_is_undone_by_outer_rollback() {
         let params = small_params();
         let mut store = ActorStore::new(params).unwrap();
-        store.deploy(actor(), vec![0], empty_state()).unwrap();
+        store
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                empty_state(),
+            )
+            .unwrap();
         store
             .purchase_storage(&actor(), params.unit_bytes, 0)
             .unwrap()
@@ -1413,24 +1522,46 @@ mod tests {
     #[test]
     fn expiry_recycles_without_redeploying_tombstone() {
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
-        store.deploy(actor(), vec![0], empty_state()).unwrap();
+        store
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                empty_state(),
+            )
+            .unwrap();
         store.purchase_storage(&actor(), 1_024, 0).unwrap().unwrap();
         store.load_state(&actor()).unwrap();
         assert_eq!(store.commit_tx_destructions(), vec![actor()]);
         assert!(matches!(
-            store.deploy(actor(), vec![0], empty_state()),
+            store.deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                empty_state()
+            ),
             Err(VMError::ActorAlreadyExists)
         ));
         store
             .begin_block(StorageParams::default().lease_duration_blocks)
             .unwrap();
-        store.deploy(actor(), vec![0], empty_state()).unwrap();
+        store
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                empty_state(),
+            )
+            .unwrap();
     }
 
     #[test]
     fn expiry_index_is_checked_against_committed_leases() {
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
-        store.deploy(actor(), vec![0], empty_state()).unwrap();
+        store
+            .deploy(
+                actor(),
+                flamevm::code_cell(&vec![0]).unwrap(),
+                empty_state(),
+            )
+            .unwrap();
         store.purchase_storage(&actor(), 1_024, 0).unwrap().unwrap();
         store.expiries.clear();
         assert_eq!(

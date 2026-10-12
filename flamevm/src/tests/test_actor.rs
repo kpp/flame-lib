@@ -86,16 +86,22 @@ fn registry_code_roundtrip_and_reentry_lock() {
     let id = fixture_id(0x2a);
     reg.deploy(id.clone(), vec![0xde, 0xad], empty_state(), 100)
         .unwrap();
-    assert_eq!(reg.load_code(&id).unwrap(), vec![0xde, 0xad]);
+    assert_eq!(
+        reg.load_code(&id).unwrap().id(),
+        crate::code_cell(&[0xde, 0xad]).unwrap().id()
+    );
     reg.set_code(&id, vec![0x02, 0x03]).unwrap();
-    assert_eq!(reg.load_code(&id).unwrap(), vec![0x02, 0x03]);
+    assert_eq!(
+        reg.load_code(&id).unwrap().id(),
+        crate::code_cell(&[0x02, 0x03]).unwrap().id()
+    );
     drop(reg.load_state(&id).unwrap());
     assert!(matches!(reg.load_code(&id), Err(VMError::ActorEmpty)));
 }
 
 #[test]
 fn charged_usage_counts_state_and_code() {
-    let code = fixture_code();
+    let code = crate::code_cell(&fixture_code()).unwrap();
     let small = empty_state();
     let mut large = Dict::new();
     large.insert(
@@ -106,7 +112,10 @@ fn charged_usage_counts_state_and_code() {
     let small_usage = code_state_bytes(&code, &small).unwrap();
     let large_usage = code_state_bytes(&code, &large).unwrap();
     assert!(large_usage - small_usage >= 100);
-    assert!(code_state_bytes(&[0x1d; 100], &small).unwrap() - small_usage >= 99);
+    assert!(
+        code_state_bytes(&crate::code_cell(&[0x1d; 100]).unwrap(), &small).unwrap() - small_usage
+            >= 99
+    );
 }
 
 #[test]

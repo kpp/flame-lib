@@ -38,19 +38,19 @@ pub enum Value {
 impl Value {
     /// Returns a fresh copy of this value if its type is **copyable** per
     /// spec.md §Stack discipline (plain-data types). Linear types
-    /// (tokens, contracts, variables, expressions, constraints, transcripts)
+    /// (tokens, contracts, expressions, constraints, transcripts)
     /// are never copyable and produce [`VMError::TypeNotCopyable`].
     pub fn try_clone(&self) -> Result<Value, VMError> {
         match self {
             Value::Scalar(i) => Ok(Value::Scalar(*i)),
             Value::Point(p) => Ok(Value::Point(p.clone())),
+            Value::Variable(variable) => Ok(Value::Variable(variable.clone())),
             Value::Dict(d) => Ok(Value::Dict(d.try_clone()?)),
             Value::Token(_)
             | Value::ClearToken(_)
             | Value::WideToken(_)
             | Value::Contract(_)
             | Value::Merlin(_)
-            | Value::Variable(_)
             | Value::Expression(_)
             | Value::Constraint(_)
             | Value::MultiscalarMul(_) => Err(VMError::TypeNotCopyable),
@@ -64,7 +64,7 @@ impl Value {
     /// Plain-data and copyable containers; never linear types.
     pub fn is_copyable(&self) -> bool {
         match self {
-            Value::Scalar(_) | Value::Point(_) | Value::Cell(_) | Value::Slice(_) => true,
+            Value::Scalar(_) | Value::Point(_) | Value::Variable(_) | Value::Cell(_) | Value::Slice(_) => true,
             Value::Dict(d) => d.is_copyable(),
             _ => false,
         }
@@ -237,7 +237,9 @@ impl Value {
         }
 
         match self {
-            Value::Scalar(_) | Value::ClearToken(_) | Value::Variable(_) => 0,
+            // Public price, independent of private opening presence.
+            Value::Variable(Variable::Committed(_)) => 1,
+            Value::Variable(_) | Value::Scalar(_) | Value::ClearToken(_) => 0,
             Value::Dict(d) => d.clone_gas(),
             Value::Point(_) | Value::Token(_) | Value::Merlin(_) => 1,
             Value::Cell(_) | Value::Slice(_) => 1,
@@ -426,9 +428,6 @@ mod capability_tests {
     fn droppability_matrix_matches_asset_ownership() {
         for value in [
             Value::Merlin(Merlin::new(b"drop-test")),
-            Value::Variable(Variable {
-                commitment: Commitment::unblinded(Scalar::ONE),
-            }),
             Value::Expression(Expression::Constant(Scalar::ONE)),
             Value::Constraint(Constraint::Cleartext(true)),
             Value::MultiscalarMul(MultiscalarMul::term(
@@ -440,6 +439,10 @@ mod capability_tests {
             assert!(value.is_droppable());
             assert!(!value.is_copyable());
         }
+        let variable = Value::Variable(Variable::Committed(Commitment::unblinded(Scalar::ONE)));
+        assert!(variable.is_copyable());
+        assert!(variable.is_droppable());
+        assert!(!variable.is_portable());
 
         let mut dict = Dict::new();
         dict.insert(Scalar::ZERO, Value::Scalar(Scalar::ONE));

@@ -47,7 +47,7 @@ fn open_executes_direct_policy_cell_with_semantic_authentication_and_bytecode_di
     )
     .unwrap();
     let program = ScriptBuilder::new()
-        .push_literal(CellValue::contract(contract))
+        .push_cell(CellValue::contract(contract).unwrap())
         .input()
         .push_point(*key.as_bytes())
         .push_cell(partial)
@@ -439,7 +439,7 @@ fn taproot_program_larger_than_one_cell_opens_through_continuations() {
     )
     .unwrap();
     let outer = ScriptBuilder::new()
-        .push_literal(CellValue::contract(contract))
+        .push_cell(CellValue::contract(contract).unwrap())
         .input();
     let outer = push_taproot_proof_to_program(outer, &proof)
         .push_int(100_000u64)
@@ -501,9 +501,12 @@ fn open_preserves_alloc_witnesses_from_predicate_builder() {
     let inner = ScriptBuilder::new()
         .drop_()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(10u64)))
+        .expr()
         .eq()
         .verify()
         .push_int(0u64)
@@ -516,7 +519,7 @@ fn open_preserves_alloc_witnesses_from_predicate_builder() {
     )
     .unwrap();
     let outer = ScriptBuilder::new()
-        .push_literal(CellValue::contract(contract))
+        .push_cell(CellValue::contract(contract).unwrap())
         .input()
         .push_taproot_proof(&tree, 0)
         .unwrap()
@@ -883,7 +886,7 @@ fn input_pushes_contract_seeds_anchor_and_emits_txlog() {
     let expected_id = contract.id();
     let mut vm = vm_external_with_script(
         ScriptBuilder::new()
-            .push_literal(CellValue::contract(contract))
+            .push_cell(CellValue::contract(contract).unwrap())
             .input(),
     );
     run_to_end(&mut vm).unwrap();
@@ -896,12 +899,93 @@ fn input_pushes_contract_seeds_anchor_and_emits_txlog() {
 }
 
 #[test]
-fn input_requires_byte_source_on_top() {
-    // A Scalar is not a byte source.
+fn input_requires_cell_on_top() {
+    // A Scalar is not a Contract root Cell.
     let mut vm = vm_external_with_script(Vec::new());
     vm.push_value(Value::Scalar(Scalar::from(7u64)));
     let err = vm.op_input().unwrap_err();
-    assert!(matches!(err, VMError::TypeNotByteSource));
+    assert!(matches!(err, VMError::TypeNotCell));
+}
+
+#[test]
+fn input_resolves_the_contract_root_reference_and_rejects_pruned_or_missing_bodies() {
+    let root = fixture_contract().to_cell().unwrap();
+    let reference: CellRef = root.clone().into();
+    let program = |reference: CellRef| ScriptBuilder::new().push_cell(reference).input();
+    let mut resident = vm_external_with_script(program(reference.clone()));
+    run_to_end(&mut resident).unwrap();
+    let cells = CellIndex::collect(Arc::new(root.clone())).unwrap();
+    let mut unloaded = vm_external_with_script(program(reference.to_unloaded()).with_cells(cells));
+    run_to_end(&mut unloaded).unwrap();
+    assert_eq!(
+        resident.current_call.gas_used,
+        unloaded.current_call.gas_used
+    );
+    assert!(matches!(&unloaded.current_call.stack[0], Value::Contract(c) if c.id() == root.id()));
+
+    let mut missing = vm_external_with_script(program(reference.to_unloaded()));
+    assert!(
+        matches!(run_to_end(&mut missing), Err(VMError::Cell(CellError::MissingCell(id))) if id == root.id())
+    );
+    assert_eq!(missing.txlog.len(), 1);
+    assert!(missing.last_anchor.is_none());
+
+    let mut pruned = vm_external_with_script(program(root.prune(1).unwrap().into()));
+    assert!(matches!(
+        run_to_end(&mut pruned),
+        Err(VMError::Cell(CellError::PrunedCell))
+    ));
+    assert_eq!(pruned.txlog.len(), 1);
+    assert!(pruned.last_anchor.is_none());
+}
+
+#[test]
+fn input_rejects_a_private_contract_witness_for_another_public_root() {
+    let contract = fixture_contract();
+    let mut other = contract.clone();
+    other.anchor = Anchor([0x99; 32]);
+    let root = contract.to_cell().unwrap();
+    let mut vm = vm_external_with_script(ScriptBuilder::new().push_cell(root.clone()).input());
+    vm.contract_witnesses.insert(root.id(), other);
+    assert!(matches!(
+        run_to_end(&mut vm),
+        Err(VMError::MalformedContractEncoding)
+    ));
+    assert_eq!(vm.txlog.len(), 1);
+    assert!(vm.last_anchor.is_none());
+}
+
+#[test]
+fn input_does_not_treat_contract_id_bytes_as_a_contract_body() {
+    let contract = fixture_contract();
+    let mut vm = vm_external_with_script(
+        ScriptBuilder::new()
+            .with_cells(contract.to_envelope().unwrap().cells().clone())
+            .push_cell(Cell::new(contract.id().to_vec(), vec![]).unwrap())
+            .input(),
+    );
+    assert!(matches!(run_to_end(&mut vm), Err(VMError::Cell(_))));
+    assert_eq!(vm.txlog.len(), 1);
+}
+
+#[test]
+fn input_rejects_nonportable_bearers_in_a_fabricated_contract_cell() {
+    let mut builder = CellBuilder::new();
+    Predicate::opaque(Predicate::unspendable_key())
+        .encode(&mut builder)
+        .unwrap();
+    builder.store_bytes(&[0x55; 32]).unwrap();
+    // Encoders permit diagnostic data; input admission must still reject a debt.
+    Value::ClearToken(ClearToken::new(Scalar::from(-1i64), FLAME_FLAVOR))
+        .encode(&mut builder)
+        .unwrap();
+    let mut vm = vm_external_with_script(ScriptBuilder::new().push_cell(builder.build()).input());
+    assert!(matches!(
+        run_to_end(&mut vm),
+        Err(VMError::Cell(CellError::InvalidFormat))
+    ));
+    assert_eq!(vm.txlog.len(), 1);
+    assert!(vm.last_anchor.is_none());
 }
 
 #[test]
@@ -912,18 +996,21 @@ fn input_rejects_malformed_bytes() {
         CellValue::from_bytes(vec![0xffu8; 8]).unwrap(),
     ));
     let err = vm.op_input().unwrap_err();
-    assert!(matches!(err, VMError::MalformedContractEncoding));
+    assert!(matches!(err, VMError::Cell(_)));
 }
 
 #[test]
-fn input_rejects_trailing_bytes_after_contract_id() {
-    let mut bytes = fixture_contract().id().to_vec();
+fn input_rejects_trailing_bytes_after_contract_encoding() {
+    let root = fixture_contract().to_cell().unwrap();
+    let mut bytes = root.payload().to_vec();
     bytes.push(0);
     let mut vm = vm_external_with_script(Vec::new());
-    vm.push_value(witness_cell(CellValue::from_bytes(bytes).unwrap()));
+    vm.push_value(Value::Cell(
+        Cell::new(bytes, root.refs().to_vec()).unwrap().into(),
+    ));
     assert!(matches!(
         vm.op_input(),
-        Err(VMError::MalformedContractEncoding)
+        Err(VMError::Cell(CellError::TrailingBytes))
     ));
 }
 
@@ -933,10 +1020,9 @@ fn input_in_internal_context_errors_external_only() {
     // `ExternalOnly` because internal transactions cannot consume
     // Utreexo entries.
     let mut vm = vm_with_script(ScriptBuilder::new().input().to_bytecode());
-    // Even with a well-formed string on the stack, internal context
+    // Even with a well-formed Contract Cell on the stack, internal context
     // rejects the opcode before any decoding happens.
-    let contract_bytes = fixture_contract().id().to_vec();
-    vm.push_value(witness_cell(CellValue::from_bytes(contract_bytes).unwrap()));
+    vm.push_value(Value::Cell(fixture_contract().to_cell().unwrap().into()));
     let err = vm.step_internal().unwrap_err();
     assert!(matches!(err, VMError::ExternalOnly));
 }
@@ -947,7 +1033,7 @@ fn input_then_output_anchor_chain() {
     let expected = Anchor(contract.id());
     let mut vm = vm_external_with_script(
         ScriptBuilder::new()
-            .push_literal(CellValue::contract(contract))
+            .push_cell(CellValue::contract(contract).unwrap())
             .input(),
     );
     run_to_end(&mut vm).unwrap();
@@ -972,9 +1058,7 @@ fn input_via_step_external_dispatch() {
             .with_cells(CellIndex::collect(Arc::new(contract.to_cell().unwrap())).unwrap())
             .input(),
     );
-    vm.push_value(witness_cell(
-        CellValue::from_bytes(expected.to_vec()).unwrap(),
-    ));
+    vm.push_value(Value::Cell(contract.to_cell().unwrap().into()));
     assert!(vm.step_external(&mut StubDelegate::new()).unwrap());
     assert!(matches!(&vm.current_call.stack[0], Value::Contract(c) if c.id() == expected));
     assert_eq!(vm.txlog.len(), 2);
@@ -988,7 +1072,7 @@ fn external_tx_one_input_one_output_via_signtx() {
     let predicate = input.predicate.to_point();
     let (left, right) = Anchor(input_id).split();
     let program = ScriptBuilder::new()
-        .push_literal(CellValue::contract(input))
+        .push_cell(CellValue::contract(input).unwrap())
         .input()
         .signtx()
         .drop_()
@@ -1037,7 +1121,7 @@ fn external_tx_two_inputs_two_outputs_via_open() {
     let id1 = contract1.id();
     let id2 = contract2.id();
     let p = ScriptBuilder::new()
-        .push_literal(CellValue::contract(contract1))
+        .push_cell(CellValue::contract(contract1).unwrap())
         .input();
     let p = push_taproot_proof_to_program(p, &proof1)
         .push_int(10_000u64)
@@ -1045,7 +1129,7 @@ fn external_tx_two_inputs_two_outputs_via_open() {
         .open()
         .verify()
         .drop_()
-        .push_literal(CellValue::contract(contract2))
+        .push_cell(CellValue::contract(contract2).unwrap())
         .input();
     let p = push_taproot_proof_to_program(p, &proof2)
         .push_int(10_000u64)

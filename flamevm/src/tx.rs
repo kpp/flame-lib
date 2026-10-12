@@ -647,7 +647,7 @@ pub enum TxEntry {
     /// canonical actor id and full constructor code so state-machine replay
     /// does not need the original Message. The initial state is the canonical
     /// empty state.
-    ActorDeploy { actor: ActorID, code: Vec<u8> },
+    ActorDeploy { actor: ActorID, code: Cell },
 
     /// Output: a newly sealed contract, emitted by the `output` opcode.
     Output(Contract),
@@ -693,10 +693,10 @@ pub enum TxEntry {
     ActorSave { actor: ActorID, state: Value },
 
     /// Actor-code replacement recorded by `setcode`. Carries the full
-    /// new code blob for state-machine replay; the entry Cell contains the
+    /// new program graph for state-machine replay; the entry Cell contains the
     /// actor hash and a reference to native executable code. Symmetric with
     /// `ActorSave`. See ADR 0018.
-    SetCode { actor: ActorID, code: Vec<u8> },
+    SetCode { actor: ActorID, code: Cell },
 
     /// Outbound asynchronous message scheduled by `op_send`. Carries
     /// the full [`Message`](Message) — its `anchor` is
@@ -819,7 +819,7 @@ impl CellEncode for TxEntry {
                     Self::TAG_SET_CODE
                 })?
                 .store_bytes(&actor.to_hash())?
-                .store_ref(CellRef::resident(crate::code_cell(code)?))?;
+                .store_ref(CellRef::resident(code.clone()))?;
             }
             Self::Send(message) => {
                 b.store_u8(Self::TAG_SEND)?
@@ -878,7 +878,7 @@ impl CellDecode for TxEntry {
             tag @ (Self::TAG_ACTOR_DEPLOY | Self::TAG_SET_CODE) => {
                 let actor = ActorID::Hash(<[u8; 32]>::decode(s, r)?);
                 let cell = cells::read_cell(r, &s.load_ref()?)?;
-                let code = crate::code_from_cell(&cell, r, u32::MAX as usize)?;
+                let code = cell.load_graph(r)?;
                 if tag == Self::TAG_ACTOR_DEPLOY {
                     Self::ActorDeploy { actor, code }
                 } else {
@@ -1091,7 +1091,7 @@ mod envelope_tests {
         .unwrap();
         let tx = build(
             ScriptBuilder::new()
-                .push_literal(CellValue::contract(contract))
+                .push_literal(CellValue::contract(contract).unwrap())
                 .input()
                 .push_taproot_proof(&tree, 0)
                 .unwrap()
@@ -1195,9 +1195,12 @@ mod envelope_tests {
         let leaf = ScriptBuilder::new()
             .drop_()
             .alloc(Some(Scalar::from(7u64)))
+            .expr()
             .alloc(Some(Scalar::from(3u64)))
+            .expr()
             .add()
             .alloc(Some(Scalar::from(10u64)))
+            .expr()
             .eq()
             .verify();
         let inner = PredicateTree::from_scripts(None, vec![leaf], [1; 32]).unwrap();
@@ -1210,7 +1213,7 @@ mod envelope_tests {
         let inner_contract_id = inner_contract.id();
         let branch = ScriptBuilder::new()
             .drop_()
-            .push_literal(CellValue::contract(inner_contract))
+            .push_literal(CellValue::contract(inner_contract).unwrap())
             .input()
             .push_taproot_proof(&inner, 0)
             .unwrap()
@@ -1228,7 +1231,7 @@ mod envelope_tests {
         let hidden_id = hidden_contract.id();
         let unused = ScriptBuilder::new()
             .drop_()
-            .push_literal(CellValue::contract(hidden_contract))
+            .push_literal(CellValue::contract(hidden_contract).unwrap())
             .drop_();
         let outer = PredicateTree::from_scripts(None, vec![branch, unused], [4; 32]).unwrap();
         let contract = Contract::new(
@@ -1240,7 +1243,7 @@ mod envelope_tests {
         let contract_id = contract.id();
         let limits = Limits { gas: 1_000_000 };
         let program = ScriptBuilder::new()
-            .push_literal(CellValue::contract(contract))
+            .push_literal(CellValue::contract(contract).unwrap())
             .input()
             .push_taproot_proof(&outer, 0)
             .unwrap()
@@ -1510,7 +1513,9 @@ mod envelope_tests {
         let limits = Limits { gas: 100_000 };
         let unsigned = ScriptBuilder::new()
             .alloc(Some(Scalar::ONE))
+            .expr()
             .alloc(Some(Scalar::from(2u64)))
+            .expr()
             .eq()
             .not()
             .verify()

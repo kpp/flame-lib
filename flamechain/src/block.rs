@@ -1015,7 +1015,7 @@ impl Blockchain {
                     TxEntry::Send(message) => new_sends.push(message),
                     TxEntry::ActorDeploy { actor, code } => {
                         let actor = Self::canonical_effect_actor(&actor)?;
-                        if ActorID::Constructor(code.clone()).to_hash() != actor.to_hash() {
+                        if code.id() != actor.to_hash() {
                             return Err(ChainError::InvalidEffectLog);
                         }
                         self.actors.replay_deploy(actor.clone(), code)?;
@@ -1876,7 +1876,7 @@ mod tests {
 
         let send = |input: &Contract| {
             ScriptBuilder::new()
-                .push_literal(flamevm::CellValue::contract(input.clone()))
+                .push_literal(flamevm::CellValue::contract(input.clone()).unwrap())
                 .input()
                 .push_point(*opening.internal_key.as_bytes())
                 .push_cell(opening.root.clone())
@@ -1977,7 +1977,11 @@ mod tests {
     fn deploy_actor(store: &mut ActorStore, id: u8, code: Vec<u8>) -> ActorID {
         let actor = ActorID::Hash([id; 32]);
         store
-            .deploy(actor.clone(), code, empty_state())
+            .deploy(
+                actor.clone(),
+                flamevm::code_cell(&code).unwrap(),
+                empty_state(),
+            )
             .expect("deploy test actor");
         store
             .purchase_storage(&actor, 1_024, 0)
@@ -2075,7 +2079,11 @@ mod tests {
         let mut store = ActorStore::new(StorageParams::default()).unwrap();
         let mut quote_store = store.clone();
         quote_store
-            .deploy(target.clone(), code.clone(), empty_state())
+            .deploy(
+                target.clone(),
+                flamevm::code_cell(&code).unwrap(),
+                empty_state(),
+            )
             .unwrap();
         let fee = quote_store
             .quote_storage(&target, 1_024, 0)
@@ -2137,7 +2145,11 @@ mod tests {
         let baseline = ActorStore::new(StorageParams::default()).unwrap();
         let mut quote_store = baseline.clone();
         quote_store
-            .deploy(target.clone(), constructor_code, empty_state())
+            .deploy(
+                target.clone(),
+                flamevm::code_cell(&constructor_code).unwrap(),
+                empty_state(),
+            )
             .unwrap();
         let fee = quote_store
             .quote_storage(&target, 1_024, 0)
@@ -2162,7 +2174,7 @@ mod tests {
         assert!(matches!(
             log.entries().get(2),
             Some(TxEntry::ActorDeploy { actor: deployed, code })
-                if deployed == &actor && !code.is_empty()
+                if deployed == &actor && !code.payload().is_empty()
         ));
         assert!(
             log.iter()
@@ -2207,7 +2219,10 @@ mod tests {
         assert!(sends.is_empty());
         assert_eq!(work.normalize(&hasher).0.count(), 0);
         chain.actors.assert_supply(0).unwrap();
-        assert_eq!(chain.actors.load_code(&actor).unwrap(), replacement_code);
+        assert_eq!(
+            chain.actors.load_code(&actor).unwrap().id(),
+            flamevm::code_cell(&replacement_code).unwrap().id()
+        );
         let replayed_state = chain.actors.load_state(&actor).unwrap();
         assert_eq!(state_root(&replayed_state), state_root(&expected_state));
     }
@@ -2230,7 +2245,10 @@ mod tests {
             }),
             TxEntry::Receive([1; 32]),
             TxEntry::Data(vec![0]),
-            TxEntry::ActorDeploy { actor, code },
+            TxEntry::ActorDeploy {
+                actor,
+                code: flamevm::code_cell(&code).unwrap(),
+            },
         ]);
 
         assert!(matches!(
@@ -2260,7 +2278,10 @@ mod tests {
                 locktime: 0,
             }),
             TxEntry::Receive([2; 32]),
-            TxEntry::ActorDeploy { actor, code },
+            TxEntry::ActorDeploy {
+                actor,
+                code: flamevm::code_cell(&code).unwrap(),
+            },
         ]);
         let mut work = chain.contracts.work_forest();
         assert!(matches!(
@@ -2557,7 +2578,7 @@ mod tests {
             .actors
             .deploy(
                 actor.clone(),
-                ScriptBuilder::new().nop().to_bytecode(),
+                ScriptBuilder::new().nop().to_cell().unwrap(),
                 state.clone(),
             )
             .unwrap();

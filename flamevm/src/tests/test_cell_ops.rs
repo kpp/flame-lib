@@ -319,7 +319,7 @@ fn remaining_plain_byte_consumers_reject_graphs_and_non_byte_values() {
 }
 
 #[test]
-fn forged_private_commitment_annotations_cannot_replace_public_bytes() {
+fn commit_rejects_cells_including_private_commitment_annotations() {
     let literal = CellValue::commitment(Commitment::unblinded(Scalar::from(7u64)));
     let forged = crate::CellValue {
         reference: bytes(&[9; 32]).into(),
@@ -329,12 +329,12 @@ fn forged_private_commitment_annotations_cannot_replace_public_bytes() {
     vm.current_call.stack = vec![Value::Cell(forged)];
     assert!(matches!(
         vm.step_external(&mut StubDelegate::new()),
-        Err(VMError::Cell(CellError::CellCommitmentMismatch(_)))
+        Err(VMError::TypeNotPoint)
     ));
 }
 
 #[test]
-fn unrelated_annotations_do_not_change_public_commitment_parsing_or_gas() {
+fn raw_point_reading_ignores_unrelated_annotations_and_has_identical_gas() {
     let mut results = Vec::new();
     for literal in [
         CellValue::scalar(Scalar::ZERO),
@@ -343,6 +343,11 @@ fn unrelated_annotations_do_not_change_public_commitment_parsing_or_gas() {
     ] {
         let tx = ScriptBuilder::new()
             .push_literal(literal)
+            .slice()
+            .read_point()
+            .verify()
+            .roll_k(1)
+            .drop_()
             .commit()
             .drop_()
             .build_tx(dummy_header(), crate::Limits { gas: 1_000_000 })
@@ -552,13 +557,12 @@ fn cellinfo_rejects_other_types_and_matches_public_verifier_stats_and_gas() {
         run_to_end(&mut operation(Instruction::CellInfo, vec![])),
         Err(VMError::StackUnderflow)
     ));
-    for value in [
-        Value::Scalar(Scalar::ZERO),
-        slice_value(bytes(&[])),
-        builder_value(&[], &[]),
-    ] {
+    for value in [Value::Scalar(Scalar::ZERO), Value::Dict(Dict::new())] {
         let mut vm = operation(Instruction::CellInfo, vec![value]);
-        assert!(matches!(run_to_end(&mut vm), Err(VMError::TypeNotCell)));
+        assert!(matches!(
+            run_to_end(&mut vm),
+            Err(VMError::TypeNotByteSource)
+        ));
         assert_eq!(vm.current_call.stack.len(), 1);
     }
     let mut program = ScriptBuilder::new();
@@ -567,6 +571,50 @@ fn cellinfo_rejects_other_types_and_matches_public_verifier_stats_and_gas() {
         (bytes(&[9]).prune(4).unwrap(), [34, 0, 0, 4, 1]),
     ] {
         program = program.push_cell(cell).cell_info();
+        for value in expected.iter().rev() {
+            program = program
+                .push_int(*value as u64)
+                .eq()
+                .verify()
+                .drop_()
+                .drop_();
+        }
+        program = program.drop_();
+    }
+    let leaf = bytes(&[9]);
+    let branch = Cell::new(vec![], vec![leaf.into()]).unwrap();
+    let pruned = branch.prune(4).unwrap();
+    let root = Cell::new(vec![1, 2, 3], vec![branch.into(), pruned.clone().into()]).unwrap();
+    let tails = [
+        (
+            ScriptBuilder::new()
+                .push_cell(root)
+                .slice()
+                .push_int(1u64)
+                .read_uint()
+                .verify()
+                .drop_()
+                .push_int(1u64)
+                .load_ref()
+                .drop_(),
+            [2, 1, 2, 0, 0],
+        ),
+        (
+            ScriptBuilder::new()
+                .builder()
+                .push_int(0x0201u64)
+                .push_int(2u64)
+                .write_uint()
+                .push_cell(pruned)
+                .write_ref(),
+            [2, 1, 1, 4, 0],
+        ),
+    ];
+    for (tail, expected) in tails {
+        for instruction in tail.into_instructions() {
+            program.push_instr(instruction);
+        }
+        program = program.cell_info();
         for value in expected.iter().rev() {
             program = program
                 .push_int(*value as u64)
@@ -588,6 +636,103 @@ fn cellinfo_rejects_other_types_and_matches_public_verifier_stats_and_gas() {
         .verify_with_metrics(crate::Limits { gas: 1_000_000 })
         .unwrap();
     assert_eq!(metrics.gas_used, gas);
+}
+
+#[test]
+fn cellinfo_describes_slice_tail_and_builder_without_hashing_or_loading_children() {
+    let leaf = bytes(&[9]);
+    let branch = Cell::new(vec![], vec![leaf.clone().into()]).unwrap();
+    let pruned: CellRef = branch.prune(7).unwrap().into();
+    let detached = CellRef::from(branch).to_unloaded();
+    let refs = vec![detached, pruned, leaf.into()];
+    let root = Arc::new(Cell::new(vec![1, 2, 3], refs.clone()).unwrap());
+    let mut slice = crate::Slice::new(root).unwrap();
+    slice.advance_bytes(1);
+    let pointer = slice.bytes().as_ptr();
+    for step in 0..=refs.len() {
+        let expected = Cell::new(slice.bytes().to_vec(), slice.refs().cloned().collect()).unwrap();
+        let mut builder = CellBuilder::new();
+        builder.store_bytes(slice.bytes()).unwrap();
+        for reference in slice.refs() {
+            builder.store_ref(reference.clone()).unwrap();
+        }
+        for value in [Value::Slice(slice.clone()), Value::Builder(builder)] {
+            let mut vm = operation(Instruction::CellInfo, vec![value]);
+            run_to_end(&mut vm).unwrap();
+            assert_eq!(vm.current_call.gas_used, 1 + slice.remaining_refs() as u64);
+            let stats = [
+                slice.remaining_bytes() as u64,
+                slice.remaining_refs() as u64,
+                expected.depth(expected.level()).unwrap() as u64,
+                expected.level() as u64,
+                0,
+            ];
+            for (actual, expected) in vm.current_call.stack[1..].iter().zip(stats) {
+                assert_int(actual, Scalar::from(expected));
+            }
+            match &vm.current_call.stack[0] {
+                Value::Slice(original) => {
+                    assert_eq!(original.bytes().as_ptr(), pointer);
+                    assert_eq!(original.bytes(), slice.bytes());
+                    assert_eq!(
+                        original.refs().map(CellRef::id).collect::<Vec<_>>(),
+                        slice.refs().map(CellRef::id).collect::<Vec<_>>()
+                    );
+                }
+                Value::Builder(original) => {
+                    assert_eq!(original.payload(), slice.bytes());
+                    assert_eq!(
+                        original.commitment().unwrap(),
+                        expected.commitment().clone()
+                    );
+                }
+                _ => panic!("operand type changed"),
+            }
+        }
+        if step < refs.len() {
+            slice.load_ref(if step == 0 { 1 } else { 0 }).unwrap();
+        }
+    }
+
+    for length in [0, cells::MAX_CELL_PAYLOAD] {
+        for value in [
+            slice_value(bytes(&vec![0; length])),
+            builder_value(&vec![0; length], &[]),
+        ] {
+            let mut vm = operation(Instruction::CellInfo, vec![value]);
+            run_to_end(&mut vm).unwrap();
+            assert_eq!(vm.current_call.gas_used, 1);
+            assert_int(&vm.current_call.stack[1], Scalar::from(length as u64));
+            for stat in &vm.current_call.stack[2..] {
+                assert_int(stat, Scalar::ZERO);
+            }
+        }
+    }
+}
+
+#[test]
+fn cellinfo_precharges_transient_reference_work_without_mutating_operand() {
+    let child: CellRef = bytes(&[9]).into();
+    for value in [
+        slice_value(Cell::new(vec![1], vec![child.clone(); 4]).unwrap()),
+        builder_value(&[1], &vec![child; 4]),
+    ] {
+        let mut vm = operation(Instruction::CellInfo, vec![value]);
+        vm.current_call.gas_limit = 4;
+        assert!(matches!(run_to_end(&mut vm), Err(VMError::OutOfGas)));
+        assert_eq!(vm.current_call.stack.len(), 1);
+        match &vm.current_call.stack[0] {
+            Value::Slice(slice) => {
+                assert_eq!(slice.remaining_refs(), 4);
+                assert_eq!(slice.bytes(), &[1]);
+            }
+            Value::Builder(builder) => {
+                assert_eq!(builder.used_refs(), 4);
+                assert_eq!(builder.payload(), &[1]);
+            }
+            _ => panic!("operand type changed"),
+        }
+    }
 }
 
 #[test]
@@ -1072,7 +1217,12 @@ fn equal_cell_bytes_do_not_overwrite_per_value_private_annotations() {
         .push_literal(CellValue::scalar(Scalar::ZERO))
         .push_literal(CellValue::point(Point::from_bytes([0; 32])))
         .drop_()
-        .scalar()
+        .slice()
+        .read_scalar()
+        .verify()
+        .roll_k(1)
+        .drop_()
+        .expr()
         .push_int(0u64)
         .eq()
         .verify();

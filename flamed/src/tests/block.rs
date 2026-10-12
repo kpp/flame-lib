@@ -139,7 +139,7 @@ pub(super) fn deploy(node: &mut Node, genesis: &GenesisFile) -> (ActorId, Contra
         .to_bytecode();
     let actor = ActorID::Constructor(constructor);
     let unsigned = ScriptBuilder::new()
-        .push_literal(CellValue::contract(input.clone()))
+        .push_literal(CellValue::contract(input.clone()).unwrap())
         .input()
         .signtx()
         .push_int(20 * FLAME)
@@ -172,7 +172,7 @@ pub(super) fn send_messages(
 ) -> ContractID {
     let input = contract_of(node, &input_id);
     let mut script = ScriptBuilder::new()
-        .push_literal(CellValue::contract(input.clone()))
+        .push_literal(CellValue::contract(input.clone()).unwrap())
         .input()
         .signtx();
     for gas in gas_limits {
@@ -312,7 +312,7 @@ fn failed_delivery_summary_matches_its_archived_refund() {
     let predicate = input.predicate.to_point().to_bytes();
     let missing = ActorId([0x77; 32]);
     let unsigned = ScriptBuilder::new()
-        .push_literal(CellValue::contract(input.clone()))
+        .push_literal(CellValue::contract(input.clone()).unwrap())
         .input()
         .signtx()
         .push_int(20 * FLAME)

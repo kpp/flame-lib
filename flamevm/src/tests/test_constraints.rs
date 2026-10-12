@@ -4,6 +4,106 @@
 
 use super::test_helpers::*;
 
+#[test]
+fn allocated_variable_can_be_duplicated_into_two_expressions_for_squaring() {
+    let limits = crate::Limits { gas: 1_000_000 };
+    let unsigned = ScriptBuilder::new()
+        .alloc(Some(Scalar::from(7u64)))
+        .dup_k(0)
+        .expr()
+        .roll_k(1)
+        .expr()
+        .mul()
+        .push_int(49u64)
+        .expr()
+        .eq()
+        .verify()
+        .build_tx(dummy_header(), limits)
+        .unwrap();
+    let gas = unsigned.metrics().gas_used;
+    let (_, metrics) = unsigned
+        .without_signature()
+        .unwrap()
+        .verify_with_metrics(limits)
+        .unwrap();
+    assert_eq!(metrics.gas_used, gas);
+}
+
+#[test]
+fn allocated_variable_can_bind_one_expression_and_be_reused_in_another() {
+    let limits = crate::Limits { gas: 1_000_000 };
+    let unsigned = ScriptBuilder::new()
+        .alloc(Some(Scalar::from(7u64)))
+        .dup_k(0)
+        .expr()
+        .push_int(3u64)
+        .expr()
+        .push_int(4u64)
+        .expr()
+        .add()
+        .eq()
+        .verify()
+        .dup_k(0)
+        .expr()
+        .roll_k(1)
+        .expr()
+        .mul()
+        .push_int(49u64)
+        .expr()
+        .eq()
+        .verify()
+        .build_tx(dummy_header(), limits)
+        .unwrap();
+    unsigned
+        .without_signature()
+        .unwrap()
+        .verify(limits)
+        .unwrap();
+}
+
+#[test]
+fn expressions_remain_noncopyable_even_when_constant() {
+    let mut vm = vm_external_with_script(ScriptBuilder::new().push_int(7u64).expr().dup_k(0));
+    assert!(matches!(run_to_end(&mut vm), Err(VMError::TypeNotCopyable)));
+}
+
+#[test]
+fn getdup_copies_variable_without_copying_its_dictionary() {
+    let program = ScriptBuilder::new()
+        .alloc(Some(Scalar::from(7u64)))
+        .push_int(3u64)
+        .push_int(1u64)
+        .dict()
+        .push_int(3u64)
+        .get_dup();
+    let count = program.instructions().len();
+    let generators = PedersenGens::default();
+    let mut prover = Prover::new(&generators);
+    let mut vm = vm_external_with_script(program);
+    for _ in 0..count {
+        vm.step_external(&mut prover).unwrap();
+    }
+    let [Value::Dict(dict), Value::Variable(Variable::Allocated {
+        variable,
+        assignment,
+    }), Value::Scalar(status)] = vm.current_call.stack.as_slice()
+    else {
+        panic!("expected original Dict, copied Variable, success")
+    };
+    assert_eq!(*status, Scalar::ONE);
+    let Value::Variable(Variable::Allocated {
+        variable: original,
+        assignment: original_assignment,
+    }) = dict.get(&Scalar::from(3u64)).unwrap()
+    else {
+        panic!("expected original Variable in Dict")
+    };
+    assert_eq!(variable, original);
+    assert_eq!(assignment, original_assignment);
+    assert_eq!(*assignment, Some(Scalar::from(7u64)));
+    assert!(!Value::Dict(dict.clone()).is_copyable());
+}
+
 /// Regression: in external context, `eq` of two Cells (or Points) must
 /// cleartext peek-compare, not route into the CS branch and hard-fail
 /// `to_expression()`. Guards the spec's `anchor … eq verify` binding idiom.
@@ -34,12 +134,14 @@ fn range_proof_accepts_in_range_value() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(42u64)))
+        .expr()
         .push_int(64u64)
         .range()
         // Constrain that the same alloc equals 42 to close the proof
         // with a non-trivial constraint (so verification has
         // something to check beyond the range gadget).
         .alloc(Some(Scalar::from(42u64)))
+        .expr()
         .eq()
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove succeeds");
@@ -71,9 +173,11 @@ fn range_proof_rejects_out_of_range_value() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(512u64)))
+        .expr()
         .push_int(8u64)
         .range()
         .alloc(Some(Scalar::from(512u64)))
+        .expr()
         .eq()
         .verify();
     let result = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000);
@@ -116,9 +220,11 @@ fn range_bit_count_zero_rejected() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(0u64)))
+        .expr()
         .push_int(0u64)
         .range()
         .alloc(Some(Scalar::from(0u64)))
+        .expr()
         .eq()
         .verify();
     let err = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).unwrap_err();
@@ -131,9 +237,11 @@ fn range_bit_count_above_64_rejected() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(1u64)))
+        .expr()
         .push_int(65u64)
         .range()
         .alloc(Some(Scalar::from(1u64)))
+        .expr()
         .eq()
         .verify();
     let err = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).unwrap_err();
@@ -148,11 +256,15 @@ fn constraint_and_overload_combines_two_constraints() {
     let program = ScriptBuilder::new()
         // Constraint 1: alloc(7) == alloc(7) — pushes Constraint
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .eq()
         // Constraint 2: alloc(3) == alloc(3) — pushes Constraint
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .eq()
         // AND the two Constraints
         .and()
@@ -185,10 +297,14 @@ fn constraint_or_overload_combines_two_constraints() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(8u64)))
+        .expr()
         .eq()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .eq()
         .or()
         .verify();
@@ -219,7 +335,9 @@ fn constraint_not_overload_negates_constraint() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(8u64)))
+        .expr()
         .eq()
         .not()
         .verify();
@@ -251,10 +369,14 @@ fn constraint_and_with_false_branch_rejected() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .eq()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .alloc(Some(Scalar::from(99u64)))
+        .expr()
         .eq()
         .and()
         .verify();
@@ -318,9 +440,12 @@ fn failed_call_unsat_cs_does_not_pollute_parent_proof() {
     // is rolled back into a `0` marker on the parent.
     let inner = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(99u64)))
+        .expr()
         .eq()
         .verify() // unsat constraint into CS
         .push_int(0u64)
@@ -330,9 +455,12 @@ fn failed_call_unsat_cs_does_not_pollute_parent_proof() {
     let outer = open_with_inner(inner, true)
         // Parent's own constraint: 7 + 3 == 10 — satisfiable.
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(10u64)))
+        .expr()
         .eq()
         .verify();
     let result = Prover::prove(&pc_gens, outer, dummy_header(), 1_000_000).expect("prove ok");
@@ -370,9 +498,12 @@ fn clean_call_cs_alloc_propagates_to_parent_proof() {
     // Child: adds an UNSATISFIABLE constraint and returns cleanly.
     let inner = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(99u64)))
+        .expr()
         .eq()
         .verify()
         .push_int(0u64)
@@ -457,9 +588,12 @@ fn failed_call_rolls_back_every_state_lane() {
         .verify() // appends 1·G to batch
         // ── lane 5: R1CS (unsatisfiable 7+3==99) ────────────────
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(99u64)))
+        .expr()
         .eq()
         .verify()
         // ── deliberately fail ───────────────────────────────────
@@ -471,9 +605,12 @@ fn failed_call_rolls_back_every_state_lane() {
     let outer = open_with_inner(inner, true)
         // Parent's own satisfiable constraint: 7 + 3 == 10.
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(10u64)))
+        .expr()
         .eq()
         .verify();
 

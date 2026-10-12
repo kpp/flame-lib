@@ -63,12 +63,12 @@ impl Point {
     }
 
     /// Downcasts to `Commitment`. `Opaque` → `Commitment::Closed`;
-    /// `Commitment` returns its witness directly; `Predicate` errors.
+    /// `Commitment` returns its witness directly; other annotations are ignored.
     pub fn to_commitment(self) -> Result<Commitment, VMError> {
         match self {
             Point::Commitment(c) => Ok(*c),
             Point::Opaque(c) => Ok(Commitment::Closed(c)),
-            Point::Predicate(_) => Err(VMError::TypeNotPoint),
+            Point::Predicate(predicate) => Ok(Commitment::Closed(predicate.to_point())),
         }
     }
 

@@ -84,7 +84,6 @@ const OP_OR: u8 = 0x59;
 const OP_SIZE: u8 = 0x5a;
 
 // 0x6X — Constraints
-const OP_SCALAR: u8 = 0x60;
 const OP_COMMIT: u8 = 0x61;
 const OP_ALLOC: u8 = 0x62;
 const OP_EXPR: u8 = 0x63;
@@ -206,7 +205,7 @@ pub enum Instruction {
     Slice,            // c slice → s
     EndCell,          // b endcell → c
     LoadRef,          // s index loadref → s' c
-    CellInfo,         // c cellinfo → c bytes refs depth level pruned
+    CellInfo,         // c/s/b cellinfo → c/s/b bytes refs depth level pruned
     RunSlice,         // ø runslice → slice (unread current program bytes/refs)
     WriteZeros,       // b n writezeros → b'
     BitNot,           // b bitnot → b'
@@ -227,9 +226,8 @@ pub enum Instruction {
     And,              // a b and → c
     Or,               // a b or → c
     Size,             // x size → x n
-    Scalar,           // s scalar → expr
     Commit,           // s commit → var
-    Alloc(Option<Scalar>), // ø alloc → expr
+    Alloc(Option<Scalar>), // ø alloc → var
     Expr,             // var expr → expr
     Range,            // x n range → x (scalar anywhere; expression external-only)
     Dict,             // val key … val key n dict → dict
@@ -357,7 +355,6 @@ impl Instruction {
             Instruction::And => op(w, OP_AND),
             Instruction::Or => op(w, OP_OR),
             Instruction::Size => op(w, OP_SIZE),
-            Instruction::Scalar => op(w, OP_SCALAR),
             Instruction::Commit => op(w, OP_COMMIT),
             Instruction::Alloc(_) => op(w, OP_ALLOC),
             Instruction::Expr => op(w, OP_EXPR),
@@ -452,15 +449,6 @@ impl Instruction {
             Self::PushPoint(_) => 33,
             Self::Label(n) | Self::Jump(n) | Self::JumpIf(n) => 1 + subvarint_size(u64::from(*n)),
             _ => 1,
-        }
-    }
-
-    pub(crate) fn source_size(&self) -> usize {
-        match self {
-            Self::CellLiteral(value) => value.payload().map_or(1, |payload| {
-                1 + subvarint_size(payload.len() as u64) + payload.len()
-            }),
-            _ => self.encoded_size(),
         }
     }
 
@@ -573,7 +561,6 @@ impl Instruction {
             OP_AND => Ok(Instruction::And),
             OP_OR => Ok(Instruction::Or),
             OP_SIZE => Ok(Instruction::Size),
-            OP_SCALAR => Ok(Instruction::Scalar),
             OP_COMMIT => Ok(Instruction::Commit),
             OP_ALLOC => Ok(Instruction::Alloc(None)),
             OP_EXPR => Ok(Instruction::Expr),

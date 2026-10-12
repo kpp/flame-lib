@@ -96,6 +96,22 @@ executable root and availability snapshot. The snapshot is not consumable via
 the program cursor, leaving all four code refs available to literal operands.
 TxID retains the original graph commitment after any number of `exec` transfers.
 Actor code roots and selected Taproot programs are native executable Cells too.
+`signcall` accepts a native Cell and signs its factual highest-level CellID,
+including supplied/pruned branches. Its existing transcript domain and labels
+are retained; source-byte signatures are not interchangeable with graph-ID
+signatures. `CellWitness::Script` retains matching private instruction overlays
+for the native graph, not a flattened source-byte representation.
+`setcode` accepts a Cell, rejects a pruned root, and resolves the whole supplied
+ordinary DAG through the scoped, metered reader before persistence. Explicit
+pruned children remain terminals; missing ordinary children hard-fail.
+The VM uses `Cell::load_graph_scoped`, which meters reads before expanding
+descendants and prepays copying and hash work independently of cache reuse.
+Transport normalization keeps `load_graph`'s resident-frontier union; that
+unmetered transport prepass is not used inside VM execution.
+Actor registry APIs, storage effects and RPC code transport preserve this graph.
+Root code-byte limits still count only root payload bytes; rent counts unique
+retained Cell records throughout the code/state graph. Actor addressing remains
+on its existing byte-oriented interface pending a separate redesign.
 At a complete transaction transport boundary, `Cell::load_graph(reader)` restores
 resident refs from the supplied body table, preserving every hash/depth and
 explicit prune. It shares already resident nodes and does not materialize actors
@@ -710,15 +726,19 @@ short input or a noncanonical scalar). `builder` (0x4f) creates an empty Builder
 `loadref` (0xaa) removes any indexed remaining reference from a Slice. The renamed
 operations retain 0x40/41/42/44/45/46, and `appendrefs` uses 0x4e.
 
-`cellinfo` (0xab) peeks a Cell: `c -> c bytes refs depth level pruned`.
+`cellinfo` (0xab) peeks a Cell, Slice or Builder: `x -> x bytes refs depth level pruned`.
 It reads the Cell's own record through the metered resolver, without loading
 descendants; an unavailable unloaded record hard-fails. The results are its own
 payload bytes, immediate refs, highest-level factual depth, highest significant
 level, and explicit-pruning flag (`0`/`1`). A pruned record reports
 `34 * popcount(mask)` bytes, zero refs and factual depth zero; its retained
 semantic depths are not returned. An ordinary Cell with pruned descendants has
-flag zero even when its level is nonzero. `size` is unchanged. Slices/Builders
-are not accepted by `cellinfo`, and the original Cell handle is preserved.
+flag zero even when its level is nonzero. A Slice reports its unread bytes and
+remaining refs; a Builder reports its used bytes and stored refs. Their depth
+and level describe the ordinary Cell formed by those contents, derived only
+from cached child masks/depths, without hashing payloads or loading child bodies.
+Both report pruned flag zero and cost the instruction plus one gas per ref.
+The original operand, cursor state and ref order are preserved. `size` is unchanged.
 
 | Previous instruction | Replacement | Stack effect | Behavior |
 | --- | --- | --- | --- |
@@ -738,8 +758,8 @@ are not accepted by `cellinfo`, and the original Cell handle is preserved.
 | Byte-string transcript input | `transcript`, `twrite` | `label -> m`; `m label data -> m` | Consume zero-ref Cell/Slice/Builder payloads, without an intermediate container. |
 | Byte-string challenge output | `tread` | `m label b n -> m b'` | Append challenge bytes directly into an explicit Builder; preserve its prefix and refs. |
 
-`mod252`, `scalar`, `commit`, `mix` output commitments, `log`, flavor tags,
-IDs, signatures and byte-only code adapters consume zero-ref Cell/Slice/Builder
+`mod252`, `mix` output commitments, `log`, flavor tags,
+IDs and signatures consume zero-ref Cell/Slice/Builder
 payloads. They reject remaining refs instead of silently discarding a graph.
 `selfid`, `callerid`, and `anchor` now produce 32-byte zero-ref Cells.
 `evalpoint` (0x89) materializes public lazy MSM arithmetic as an ordinary Point;
@@ -747,12 +767,22 @@ payloads. They reject remaining refs instead of silently discarding a graph.
 Evaluation adds no assertion to the batch and costs 4× the full MSM verification
 price. It never evaluates secret R1CS Expressions.
 Typed private commitment/script annotations remain host-side and are restored
-only after matching authenticated public bytes. No byte consumer decodes bearer
+only after matching authenticated public encodings. No byte consumer decodes bearer
 Tokens into transferable ownership.
 
-`input` retains a 32-byte ContractID selector, and actor destination/code and
-`signcall` signature-message formats are unchanged. Those protocol-format
-decisions are separate from removing String from the VM byte paths.
+`commit` consumes a Point and preserves its commitment opening; public bytes
+must first be read through `slice readpoint`. `amount` preserves the quantity
+and flavor commitment annotations when returning Points. `readpoint` and
+`writepoint` remain public-byte operations and do not restore private openings.
+The old `scalar` opcode 0x60 is reserved and fails as an unknown opcode;
+external-only `expr` accepts a Scalar directly as a constant Expression.
+
+`input` consumes the actual Contract root Cell supplied by `pushcell`, not a
+32-byte ID payload. Its factual CellID is the ContractID. This typed ownership
+boundary authenticates and decodes the public body before restoring matching
+private openings. The chain still enforces membership and spend-once rules.
+Other program-executing operands also use native Cells; only actor addressing
+retains its byte-oriented interface.
 
 `loadref` has no success flag: invalid or absent indexes hard-fail with
 `IndexOutOfRange`. It does not load the child body, so unloaded and explicitly
@@ -788,8 +818,12 @@ directly, per handle, shared by `dup`, not in a global hash-keyed table.
 Identical bytes can have distinct private Scalar/Point/Script witnesses.
 Byte-only host APIs still use a source-only 0x19 literal marker; this is never a
 native VM instruction. All byte consumers use Cell/Slice/Builder and preserve
-the zero-ref restriction. Point, Scalar and Contract-ID witness constructors
-produce 32-byte cells; `from_bytes` and `script` return errors on capacity overflow.
+the zero-ref restriction. Point and Scalar witness constructors produce
+32-byte payload Cells. Fallible `CellValue::contract(contract)` constructs the
+canonical Contract root, including its payload refs; `CellValue::script` builds
+the native instruction-aligned graph with explicit continuations. Use
+`push_cell(CellValue::contract(contract)?)` or `push_script(program)?`, not a
+byte-source round trip, to preserve those graphs and private witnesses.
 Programs must preload/duplicate constants used in loops or skipped branches;
 `pushcell`'s reference cursor is neither rewound nor advanced by a skip scan.
 
@@ -856,8 +890,8 @@ must not change consensus gas or which bodies are visible.
    reserve and reject former String tag 1 rather than silently reinterpreting it.
    No schema version is added and private metadata stays outside Cell identity.
 3. Add transient Builder and owned Slice Values with the existing
-   byte/ref operations, explicit finalize/open, independent cursors, and exact
-   finish. Do not add editing, seeking, graph flattening, automatic spilling,
+   byte/ref operations, explicit finalize/open and independent cursors.
+   Do not add editing, seeking, graph flattening, automatic spilling,
    or generic typed-value decoding in this first step.
 4. Migrate byte-oriented opcodes to explicit zero-ref checks; migrate program,
    predicate, Contract-input, and actor readers through their expected typed
@@ -868,9 +902,38 @@ must not change consensus gas or which bodies are visible.
    to manufacture or duplicate linear values through raw bytes. The obsolete
    String API is removed and the VM specification describes CellValue directly.
 
-This migration does not change the current Cell record, Cell hierarchy, Trie, actor
-availability commitments, or Utreexo encoding. It changes the VM-facing data
-and execution interface; those changes require their own reviewed activation.
+This migration does not change the Cell record, Trie or availability-snapshot
+formats, or Utreexo encoding. It changes VM operands, executable graph handling,
+actor code effects and signed program commitments; resulting consensus identity
+changes require coordinated activation, not automatic legacy interpretation.
+
+### Constraint witnesses and registers
+
+Variables are copyable, nonportable handles; Expressions are noncopyable
+materialized linear combinations. Both remain external-execution-only
+constraint-system values, not persisted data or token ownership.
+
+| Instruction | Operand/result | Witness behavior |
+| --- | --- | --- |
+| `commit` | Point → committed Variable | Preserve a Pedersen opening when present; otherwise retain the closed public point. |
+| `alloc` | → allocated Variable | Allocate one R1CS register, with a private assignment on the prover. |
+| `expr` | Scalar/Variable → Expression | Scalar becomes a constant; committed Variable registers its point; allocated Variable reuses its register. |
+| `amount` | Token → Token, qty Point, flavor Point | Preserve both original commitment openings; public encoding is unchanged. |
+| `borrow` | Scalar/committed Variable components → debt and credit | Quantity and flavor independently select public or secret representation. |
+
+To reuse a computation, allocate a Variable, constrain one Expression of that
+register to the desired expression, then duplicate the Variable and explicitly
+build further Expressions. Each materialization is gas-priced; no instruction
+duplicates an Expression tree or Dict.
+
+Two Scalar `borrow` components keep the clear-token pair. Otherwise execution
+must be external: public components are bound in the CS and become unblinded
+Token commitments, while committed components keep their openings. Public
+quantity must fit `u64`; public flavor may be any Scalar. A public quantity
+costs three R1CS items; a secret quantity costs 67 for binding, range proof and
+debt, besides ordinary instruction/allocation work. Allocated Variables have no
+public Pedersen commitment, so they cannot be Token components in `borrow` or
+`issuepriv`.
 
 ## Snake encoding
 
@@ -1469,7 +1532,7 @@ same underlying Cells:
 
 | Use | Root held by | Body source when accessed |
 | --- | --- | --- |
-| Contract | `ContractID` / UTXO input | External transaction witness hierarchy |
+| Contract | Native Contract root Cell supplied to `input`; its CellID is the ContractID | Inline program graph / external transaction witness hierarchy |
 | Actor code and state | Actor registry record | Actor's stored Cell hierarchy, then external transaction witness hierarchy for pruned bodies |
 | Predicate program branch | Predicate commitment | External transaction witness hierarchy |
 | Dict | Typed Dict wrapper with key width, length, and Trie root | Current resident graph/store, then external transaction witness hierarchy |

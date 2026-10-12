@@ -541,13 +541,18 @@ fn setcode_upgrade_end_to_end() {
         .push_int(0u64)
         .return_()
         .to_bytecode();
+    let c2 = crate::code_cell(&c2).unwrap();
     let upgrade_handler = ScriptBuilder::new()
-        .push_literal(CellValue::from_bytes(c2.clone()).unwrap())
+        .push_cell(c2.clone())
         .setcode()
         .push_int(0u64)
         .return_()
-        .to_bytecode();
-    let c1 = dispatch_code(&[(0, v1_handler), (1, upgrade_handler)]);
+        .to_cell()
+        .unwrap();
+    let c1 = dispatch_cells(&[
+        (0, crate::code_cell(&v1_handler).unwrap()),
+        (1, upgrade_handler),
+    ]);
     reg.deploy(a_id.clone(), c1, empty_state(), 1_000_000)
         .expect("deploy A");
 
@@ -598,8 +603,8 @@ fn setcode_upgrade_end_to_end() {
         "SetCode effect recorded"
     );
     assert_eq!(
-        reg.actor(&a_id).unwrap().code,
-        c2,
+        reg.actor(&a_id).unwrap().code.id(),
+        c2.id(),
         "registry holds the new code"
     );
 }

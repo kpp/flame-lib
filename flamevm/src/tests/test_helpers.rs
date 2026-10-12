@@ -13,7 +13,7 @@
 // "defined multiple times".
 pub use super::super::*;
 
-pub(crate) use super::mem_registry::MemRegistry;
+pub(crate) use super::mem_registry::{MemRegistry, TestCode};
 
 pub use crate::{
     CellValue, CellWitness, CheckedFee, CommitmentWitness, Constraint, Expression, Instruction,
@@ -100,7 +100,7 @@ pub(crate) fn open_with_test_inner(inner: ScriptBuilder, recover: bool) -> Scrip
     )
     .unwrap();
     let program = ScriptBuilder::new()
-        .push_literal(CellValue::contract(contract))
+        .push_cell(CellValue::contract(contract).unwrap())
         .input()
         .with_script_witness(branch)
         .unwrap();
@@ -125,19 +125,19 @@ pub(crate) struct StubRegistry {
 }
 
 impl ActorRegistry for StubRegistry {
-    fn load_code(&self, _actor: &ActorID) -> Result<Vec<u8>, VMError> {
-        Ok(self.script.clone())
+    fn load_code(&self, _actor: &ActorID) -> Result<Cell, VMError> {
+        Ok(crate::code_cell(&self.script)?)
     }
 
     fn actor_code_bytes(&self, _actor: &ActorID) -> Result<u64, VMError> {
-        Ok(self.script.len() as u64)
+        Ok(crate::code_cell(&self.script)?.payload().len() as u64)
     }
 
     fn actor_state_bytes(&self, _actor: &ActorID) -> Result<u64, VMError> {
         Ok(0)
     }
 
-    fn set_code(&mut self, _actor: &ActorID, _code: Vec<u8>) -> Result<(), VMError> {
+    fn set_code(&mut self, _actor: &ActorID, _code: Cell) -> Result<(), VMError> {
         unimplemented!("StubRegistry::set_code — use MemRegistry")
     }
 
@@ -194,7 +194,7 @@ impl ActorRegistry for StubRegistry {
     fn commit_tx_destructions(&mut self) -> Vec<ActorID> {
         Vec::new()
     }
-    fn deploy(&mut self, _id: ActorID, _code: Vec<u8>, _state: Value) -> Result<(), VMError> {
+    fn deploy(&mut self, _id: ActorID, _code: Cell, _state: Value) -> Result<(), VMError> {
         unimplemented!("StubRegistry::deploy — use MemRegistry")
     }
 }
@@ -372,8 +372,9 @@ pub(crate) fn msg_with_sel(actor: ActorID, sel: u64) -> Message {
 /// Deploys an actor whose code is `recv` (id derived from the code, a
 /// stand-in for the real constructor) and returns its id. The common
 /// Bucket-C fixture: deploy, then `deliver` and read the effect log.
-pub(crate) fn deploy_actor(reg: &mut MemRegistry, recv: Vec<u8>) -> ActorID {
-    let id = ActorID::Hash(ActorID::Constructor(recv.clone()).to_hash());
+pub(crate) fn deploy_actor(reg: &mut MemRegistry, recv: impl TestCode) -> ActorID {
+    let recv = recv.into_code().expect("actor code compiles");
+    let id = ActorID::Hash(recv.id());
     reg.deploy(id.clone(), recv, empty_state(), 1_000_000)
         .expect("deploy");
     id
@@ -453,6 +454,37 @@ pub(crate) fn dispatch_code(arms: &[(u64, Vec<u8>)]) -> Vec<u8> {
         p = p.jump(n);
     }
     p.label(n).to_bytecode()
+}
+
+/// Native dispatch keeps handler graphs as refs and chooses them without consuming
+/// refs belonging to a skipped branch.
+pub(crate) fn dispatch_cells(arms: &[(u64, Cell)]) -> Cell {
+    let mut program = ScriptBuilder::new();
+    for (index, (selector, _)) in arms.iter().enumerate() {
+        program = program
+            .push_int(*selector)
+            .eq()
+            .jumpif(index as u32)
+            .drop_();
+    }
+    program = program.drop_().push_int(0u64).verify();
+    for (index, _) in arms.iter().enumerate() {
+        program = program
+            .label(index as u32)
+            .drop_()
+            .drop_()
+            .run_slice()
+            .push_int(index as u64)
+            .load_ref()
+            .roll_k(1)
+            .drop_()
+            .exec();
+    }
+    Cell::new(
+        program.to_bytecode(),
+        arms.iter().map(|(_, cell)| cell.clone().into()).collect(),
+    )
+    .unwrap()
 }
 
 /// Helper: builds a VM with a child ContractOpen frame as `current_call`
@@ -613,8 +645,7 @@ pub(crate) fn vm_external_with_script(script: impl TestProgram) -> VM {
     fixture_vm(script, CallKind::ExternalRoot)
 }
 
-/// Builds a wire-encoded contract as a `Vec<u8>` so tests can feed it
-/// to the `input` opcode (which pops a `CellValue` and decodes it).
+/// Transport bytes for codec tests; `input` itself takes the Contract root Cell.
 pub(crate) fn encode_contract_to_bytes(contract: &Contract) -> Vec<u8> {
     contract.to_envelope().unwrap().encode()
 }
@@ -751,7 +782,7 @@ pub(crate) fn make_signtx_script_with_contract(
     .expect("payload is portable");
     let contract_id = contract.id();
     let script = ScriptBuilder::new()
-        .push_literal(CellValue::contract(contract))
+        .push_cell(CellValue::contract(contract).unwrap())
         .input()
         .signtx()
         .drop_(); // drop the single payload
@@ -783,11 +814,10 @@ pub(crate) fn make_open_token(
 // The script shape:
 //
 //   ┌── per input contract i ───────────────────────────────────┐
-//   │  pushstr <contract_id_i>                               │
-//   │  input  (Contract body from the transaction Cell index)       │
+//   │  pushcell <contract_root_i>                           │
+//   │  input  (instantiate the supplied Contract root)      │
 //   │  pushpoint <internal_key_i>                            │
-//   │  pushstr <program_trie_root_i>                         │
-//   │  push:<program_index_i>                                │
+//   │  pushcell <selected_policy_tree_i>                    │
 //   │  push:<gas>                                           │
 //   │  push:0  (k = 0 args)                                  │
 //   │  open   (branch loaded from Cell index returns the Token)     │
@@ -878,7 +908,7 @@ pub(crate) fn output_predicate_point(tag: u8) -> CompressedRistretto {
 /// separately by the negative tests).
 ///
 /// Returns the prover ScriptBuilder (witnesses inline) — the canonical
-/// bytecode is recovered via `program.to_bytecode()` on the
+/// native program is recovered via `program.to_cell()` on the
 /// verifier side.
 pub(crate) fn build_confidential_nm_program(
     inputs: &[NMInputSpec],
@@ -889,10 +919,10 @@ pub(crate) fn build_confidential_nm_program(
     //                    taproot_proof pieces + push:0 + open. ──
     for inp in inputs {
         let (contract, cp) = build_input_contract(inp);
-        // pushstr CellValue::contract(c) — prover-side witness carrier
+        // The Contract root carries prover-side private openings.
         // (Token's open commitments ride along into op_input).
-        // The verifier-side equivalent is `CellValue::from_bytes(contract.to_bytes()).unwrap()`.
-        program = program.push_literal(CellValue::contract(contract));
+        // The verifier-side equivalent is its unannotated public root Cell.
+        program = program.push_cell(CellValue::contract(contract).unwrap());
         program = program.input();
         // taproot_proof pieces.
         program = push_taproot_proof_to_program(program, &cp);

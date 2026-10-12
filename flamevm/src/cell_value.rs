@@ -1,8 +1,8 @@
 use std::{convert::TryInto, ops::Deref, sync::Arc};
 
-use cells::{Cell, CellError, CellRef, MAX_CELL_PAYLOAD};
+use cells::{Cell, CellEncode, CellError, CellRef};
 
-use crate::{Commitment, Contract, Instruction, Point, Predicate, Scalar, Script, VMError};
+use crate::{Commitment, Contract, Instruction, Point, Predicate, Scalar};
 
 /// A VM Cell handle with optional private, per-value prover annotations.
 /// Identity and serialization depend only on `reference`, never the annotation.
@@ -17,48 +17,20 @@ pub struct CellValue {
 pub enum CellWitness {
     Point(Point),
     Scalar(Scalar),
-    /// Source-byte script with private instruction witnesses, used by `signcall`.
+    /// Native program graph with private instruction witnesses.
     Script(Vec<Instruction>),
-    /// Contract ID bytes; the public body is supplied in the transaction graph.
+    /// Public Contract root with private openings of its payload values.
     Contract(Contract),
 }
 
 impl CellWitness {
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) fn to_cell(&self) -> Result<Cell, CellError> {
         match self {
-            Self::Script(instructions) => instructions.iter().map(Instruction::source_size).sum(),
-            _ => 32,
+            Self::Point(point) => Cell::new(point.to_bytes().to_vec(), vec![]),
+            Self::Scalar(scalar) => Cell::new(scalar.to_bytes().to_vec(), vec![]),
+            Self::Contract(contract) => contract.to_cell(),
+            Self::Script(instructions) => crate::script::instruction_cell(instructions),
         }
-    }
-
-    pub(crate) fn to_bytes_vec(&self) -> Vec<u8> {
-        match self {
-            Self::Point(point) => point.to_bytes().to_vec(),
-            Self::Scalar(scalar) => scalar.to_bytes().to_vec(),
-            Self::Contract(contract) => contract.id().to_vec(),
-            Self::Script(instructions) => {
-                let mut bytes = Vec::new();
-                for instruction in instructions {
-                    instruction.encode_source(&mut bytes);
-                }
-                bytes
-            }
-        }
-    }
-
-    pub(crate) fn into_script(self) -> Result<Script, VMError> {
-        let Self::Script(instructions) = self else {
-            return Err(VMError::TypeNotCell);
-        };
-        // signcall signs source bytes; native refs omitted by that format cannot be hidden.
-        if instructions.iter().any(|instruction| match instruction {
-            Instruction::PushCell(Some(_)) => true,
-            Instruction::CellLiteral(value) => value.payload().is_err(),
-            _ => false,
-        }) {
-            return Err(CellError::InvalidFormat.into());
-        }
-        Ok(Script::Transparent(instructions))
     }
 }
 
@@ -68,16 +40,9 @@ impl CellValue {
         Ok(Cell::new(bytes, vec![])?.into())
     }
 
-    /// Constructs public bytes and attaches their matching private annotation.
+    /// Constructs the public Cell graph and attaches its matching private annotation.
     pub fn from_witness(witness: CellWitness) -> Result<Self, CellError> {
-        let length = witness.len();
-        if length > MAX_CELL_PAYLOAD {
-            return Err(CellError::PayloadTooLarge {
-                actual: length,
-                max: MAX_CELL_PAYLOAD,
-            });
-        }
-        let mut value = Self::from_bytes(witness.to_bytes_vec())?;
+        let mut value = Self::from(witness.to_cell()?);
         value.witness = Some(Arc::new(witness));
         Ok(value)
     }
@@ -95,9 +60,8 @@ impl CellValue {
         Self::from_witness(CellWitness::Scalar(scalar.into()))
             .expect("32-byte Scalar fits in a Cell")
     }
-    pub fn contract(contract: Contract) -> Self {
+    pub fn contract(contract: Contract) -> Result<Self, CellError> {
         Self::from_witness(CellWitness::Contract(contract))
-            .expect("32-byte Contract ID fits in a Cell")
     }
     pub fn script(instructions: Vec<Instruction>) -> Result<Self, CellError> {
         Self::from_witness(CellWitness::Script(instructions))

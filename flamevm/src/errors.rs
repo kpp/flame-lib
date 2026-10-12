@@ -7,6 +7,8 @@ use thiserror::Error;
 pub enum VMError {
     #[error("Item is not a MultiscalarMul")]
     TypeNotMultiscalarMul,
+    #[error("Item is not a committed Variable")]
+    TypeNotCommittedVariable,
     #[error("Item is not a Cell")]
     TypeNotCell,
     #[error("Item is not a Slice")]

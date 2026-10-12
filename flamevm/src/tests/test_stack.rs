@@ -144,6 +144,29 @@ fn dup_immediate_zero_copies_top() {
 }
 
 #[test]
+fn dup_committed_variable_preserves_witness_with_identical_public_gas() {
+    let open = Commitment::blinded_with_factor(Scalar::from(7u64), DalekScalar::from(3u64));
+    let closed = Commitment::Closed(open.to_point());
+    let mut gas = Vec::new();
+    for commitment in [open.clone(), closed] {
+        let mut vm = vm_external_with_script(ScriptBuilder::new().dup_k(0));
+        vm.push_value(Value::Variable(Variable::Committed(commitment.clone())));
+        vm.step_external(&mut StubDelegate::new()).unwrap();
+        assert_eq!(vm.current_call.stack.len(), 2);
+        for value in &vm.current_call.stack {
+            let Value::Variable(Variable::Committed(copy)) = value else {
+                panic!("expected copied Variable")
+            };
+            assert_eq!(copy, &commitment);
+        }
+        gas.push(vm.current_call.gas_used);
+    }
+    assert_eq!(gas[0], gas[1]);
+    assert_eq!(gas[0], GAS_PER_INSTRUCTION + GAS_PER_ALLOC_BYTE);
+    assert!(Value::Variable(Variable::Committed(open)).is_copyable());
+}
+
+#[test]
 fn dup_immediate_k_picks_kth_from_top() {
     // push:1, push:2, push:3, dup:2 → 1 2 3 1
     let mut vm = vm_with_script(

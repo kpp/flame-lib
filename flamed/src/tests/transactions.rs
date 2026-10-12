@@ -304,7 +304,7 @@ async fn transaction_rpc_checks_parameters_and_only_returns_confirmed_executions
         .collect();
     let input = contract_of(&node, &change);
     let unsigned = ScriptBuilder::new()
-        .push_literal(CellValue::contract(input.clone()))
+        .push_literal(CellValue::contract(input.clone()).unwrap())
         .input()
         .signtx()
         .push_point(input.predicate.to_point().to_bytes())

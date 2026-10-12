@@ -184,9 +184,11 @@ fn amount_on_cleartoken_pushes_qty_and_flv() {
 }
 
 #[test]
-fn amount_on_token_pushes_points() {
+fn amount_on_token_preserves_both_commitment_witnesses() {
     let mut vm = vm_with_script(ScriptBuilder::new().amount().to_bytecode());
-    vm.push_value(Value::Token(make_cleartext_token(33, 44)));
+    let qty = Commitment::blinded_with_factor(Scalar::from(33u64), DalekScalar::from(7u64));
+    let flv = Commitment::blinded_with_factor(Scalar::from(44u64), DalekScalar::from(9u64));
+    vm.push_value(Value::Token(Token::new(qty.clone(), flv.clone())));
     vm.step_internal().expect("step ok");
     assert_eq!(vm.current_call.stack.len(), 3);
     match &vm.current_call.stack[0] {
@@ -194,13 +196,62 @@ fn amount_on_token_pushes_points() {
         _ => panic!("bottom must be original Token"),
     }
     match &vm.current_call.stack[1] {
-        Value::Point(_) => {}
+        Value::Point(Point::Commitment(commitment)) => {
+            assert_eq!(commitment.as_ref(), &qty);
+        }
         _ => panic!("middle must be Point (qty commitment)"),
     }
     match &vm.current_call.stack[2] {
-        Value::Point(_) => {}
+        Value::Point(Point::Commitment(commitment)) => {
+            assert_eq!(commitment.as_ref(), &flv);
+        }
         _ => panic!("top must be Point (flv commitment)"),
     }
+}
+
+#[test]
+fn amount_on_closed_token_preserves_closed_commitments() {
+    let qty = Commitment::Closed(Commitment::unblinded(Scalar::from(3u64)).to_point());
+    let flv = Commitment::Closed(Commitment::unblinded(Scalar::from(4u64)).to_point());
+    let mut vm = vm_with_script(ScriptBuilder::new().amount());
+    vm.push_value(Value::Token(Token::new(qty.clone(), flv.clone())));
+    vm.step_internal().unwrap();
+    for (value, expected) in vm.current_call.stack[1..].iter().zip([qty, flv]) {
+        let Value::Point(Point::Commitment(commitment)) = value else {
+            panic!("expected commitment Point")
+        };
+        assert_eq!(commitment.as_ref(), &expected);
+        assert!(commitment.witness().is_none());
+    }
+}
+
+#[test]
+fn amount_has_identical_public_gas_with_and_without_private_openings() {
+    let qty = Commitment::blinded_with_factor(Scalar::from(3u64), DalekScalar::from(7u64));
+    let flv = Commitment::blinded_with_factor(Scalar::from(4u64), DalekScalar::from(9u64));
+    let mut results = Vec::new();
+    for token in [
+        Token::new(qty.clone(), flv.clone()),
+        Token::new(
+            Commitment::Closed(qty.to_point()),
+            Commitment::Closed(flv.to_point()),
+        ),
+    ] {
+        let mut vm = vm_with_script(ScriptBuilder::new().amount());
+        vm.push_value(Value::Token(token));
+        vm.step_internal().unwrap();
+        let points: Vec<_> = vm.current_call.stack[1..]
+            .iter()
+            .map(|value| {
+                let Value::Point(point) = value else {
+                    panic!("expected Point")
+                };
+                point.to_bytes()
+            })
+            .collect();
+        results.push((vm.current_call.gas_used, points));
+    }
+    assert_eq!(results[0], results[1]);
 }
 
 #[test]
@@ -294,7 +345,7 @@ fn issuepub_at_external_root_errors_actor_context() {
 #[test]
 fn issuepriv_emits_token_with_predicate_bound_flavor() {
     // Inside a ContractOpen frame in external context: push a blinded
-    // commitment as a witness-bearing CellValue, lift it to a Variable
+    // commitment as a witness-bearing Point, lift it to a Variable
     // via `commit`, push a tag, run `issuepriv`. Then `push:1 return`
     // so the Token returns to the parent frame cleanly. The opcode
     // does:
@@ -312,12 +363,12 @@ fn issuepriv_emits_token_with_predicate_bound_flavor() {
 
     // Build the VM by hand instead of going through bytecode — the
     // bytecode roundtrip would strip the prover-side commitment
-    // witness from `CellValue::commitment(...)`, leaving a `Closed`
+    // witness from `Point::commitment(...)`, leaving a `Closed`
     // commitment that `Prover::commit_variable` rejects with
     // `WitnessMissing`. Same pattern as the encrypted-borrow test.
     use curve25519_dalek::ristretto::CompressedRistretto;
     let program = ScriptBuilder::new()
-        .push_literal(CellValue::commitment(qty_commit.clone()))
+        .push_point_typed(Point::commitment(qty_commit.clone()))
         .commit()
         .push_literal(tag_str.clone())
         .issuepriv()
@@ -453,8 +504,8 @@ fn issuepriv_prove_then_verify_end_to_end() {
     let tag_str = CellValue::from_bytes(b"gold".to_vec()).unwrap();
 
     // Leaf script — runs inside the isolated ContractOpen frame on open:
-    //   stack at entry: [qty_witness_string]  (k=1 arg from `open`)
-    //   commit:    pop CellValue → Variable
+    //   stack at entry: [qty_witness_point]  (k=1 arg from `open`)
+    //   commit:    pop Point → Variable
     //   pushstr:   tag
     //   issuepriv: Variable + tag → Token  (TxEntry::IssuePriv)
     //   retire:    Token → ø                 (TxEntry::Retire)
@@ -493,13 +544,13 @@ fn issuepriv_prove_then_verify_end_to_end() {
     //   pushstr(qty_witness); k=1; open;
     //   verify; drop  (consume the success + count markers)
     let outer = ScriptBuilder::new()
-        .push_literal(CellValue::contract(contract))
+        .push_cell(CellValue::contract(contract).unwrap())
         .input()
         .with_script_witness(inner)
         .unwrap();
     let outer = push_taproot_proof_to_program(outer, &cp)
         .push_int(20_000u64) // gas
-        .push_literal(CellValue::commitment(qty_commit.clone())) // qty witness arg
+        .push_point_typed(Point::commitment(qty_commit.clone())) // qty witness arg
         .push_int(1u64) // k = 1 arg
         .open()
         .verify() // pops success marker (1)

@@ -702,7 +702,9 @@ fn failed_call_msm_does_not_pollute_parent_batch() {
     let outer = open_with_inner(inner, true)
         // Trivially-true constraint to give the proof something to check.
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .eq()
         .verify();
     let result = Prover::prove(&pc_gens, outer, dummy_header(), 1_000_000).expect("prove ok");

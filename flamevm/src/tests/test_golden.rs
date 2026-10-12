@@ -40,7 +40,7 @@ fn golden_consensus_hashes() {
                 header(),
                 TxEntry::SetCode {
                     actor: actor.clone(),
-                    code: vec![0x1d],
+                    code: crate::code_cell(&[0x1d]).unwrap(),
                 },
             ],
             "411a403392920265ced1a4b4ece87e380286d4a4ac6e63e7b13e53b739e070e0",
@@ -50,7 +50,7 @@ fn golden_consensus_hashes() {
                 header(),
                 TxEntry::ActorDeploy {
                     actor,
-                    code: vec![0x1d],
+                    code: crate::code_cell(&[0x1d]).unwrap(),
                 },
             ],
             "bc7376d7341da1dc9ea6bad893b54e2372d5f7f7e38ac726707256670c416dbc",
@@ -245,7 +245,7 @@ fn golden_txlog_wire_encoding() {
         (
             TxEntry::SetCode {
                 actor: actor.clone(),
-                code: vec![0x1d],
+                code: crate::code_cell(&[0x1d]).unwrap(),
             },
             10,
             code_root(&[0x1d]),
@@ -253,7 +253,7 @@ fn golden_txlog_wire_encoding() {
         (
             TxEntry::ActorDeploy {
                 actor: actor.clone(),
-                code: vec![0x1d],
+                code: crate::code_cell(&[0x1d]).unwrap(),
             },
             14,
             code_root(&[0x1d]),

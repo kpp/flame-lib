@@ -105,7 +105,7 @@ fn constructor_buys_storage_and_is_reused() {
     let first = VM::execute_internal(dummy_header(), mk(), &mut reg, &block).unwrap();
     let second = VM::execute_internal(dummy_header(), mk(), &mut reg, &block).unwrap();
     let a = reg.actor(&canonical).expect("deployed once");
-    assert_eq!(a.code, code);
+    assert_eq!(a.code.id(), crate::code_cell(&code).unwrap().id());
     assert_eq!(a.capacity, 2_048);
     for result in [first, second] {
         assert!(result.txlog.iter().any(

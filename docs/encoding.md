@@ -84,6 +84,10 @@ instructions do not belong in the public transport or witness snapshot.
 Keep witnesses in `ScriptBuilder` until `build_tx`; raw `to_bytecode()` is not
 a standalone transaction. `PredicateTree::from_scripts` retains typed branch
 programs, including their allocation assignments and nested witnesses.
+Low-level `Prover::prove` returns the native `TxResult::program` Cell; pair it
+with `Verifier::verify_cell_with_cells` and the public execution index. The
+legacy bytecode verification entry points cannot reconstruct a native graph
+from its root payload alone.
 `push_taproot_proof(&tree, logical_index)` emits the inner Point and partial
 policy Cell, and attaches that program's private overlay and nested lookup
 witnesses. Unselected programs' witnesses are not collected. Inline policy code
@@ -93,7 +97,7 @@ For a Contract protected by `tree`, the public workflow is:
 
 ```rust
 let unsigned = ScriptBuilder::new()
-    .push_literal(CellValue::contract(contract))
+    .push_cell(CellValue::contract(contract)?)
     .input()
     .push_taproot_proof(&tree, 0)?
     .push_int(child_gas)
@@ -183,12 +187,38 @@ have no Value encoding.
 `CellRef` and optional `Arc<CellWitness>` directly. Private Point, Scalar,
 Script and Contract annotations are not encoded or included in Cell hashes.
 Consumers validate applicable annotations against the authenticated public
-bytes before using them. A Contract annotation's public payload remains its
-32-byte ContractID; its public body is collected separately into execution
-witnesses. A Script annotation retains the existing byte-only `signcall`
-source format, not a graph-aware signature-message redesign.
+bytes before using them. A Contract annotation's public Cell is its
+canonical Contract root, including its typed payload references; its CellID is
+the ContractID. A Script annotation compiles to the native executable Cell
+graph, retaining private instruction assignments separately from that graph.
+Neither annotation is an ID-only or source-byte wrapper.
 
-Byte operations accept only zero-ref Cell/Slice/Builder payloads. Literal
+`commit` accepts a Point, not a byte container. It creates a committed Variable,
+preserving an applicable private commitment opening. Raw public bytes must first
+pass through `slice readpoint`; that produces a closed, public Point, not an
+opening. `amount` preserves both Token commitment annotations in its projected
+quantity and flavor Points. Serialization with `writepoint` still emits public
+bytes only.
+
+`alloc` produces a copyable, nonportable Variable holding an R1CS register and
+optional assignment; `commit` produces a Variable holding a public Pedersen
+commitment and optional opening. External-only `expr` consumes either kind of
+Variable or a Scalar to form an Expression. Expressions and Dicts remain
+noncopyable: duplicate a Variable, then materialize each Expression explicitly.
+The former `scalar` opcode 0x60 is reserved and fails as an unknown opcode.
+
+`borrow` accepts public Scalars or committed Variables independently for quantity
+and flavor. Two Scalars retain the clear-token pair; any committed component
+uses the external-only WideToken/Token path. On that path a public quantity must fit `u64`;
+public flavor remains an unrestricted Scalar. Public components are bound into
+the constraint system and use unblinded Token commitments. A public quantity
+costs three R1CS items; a secret quantity costs 67, including its range proof,
+in addition to ordinary instruction/allocation charges. Allocated Variables have
+no public commitment and cannot serve as `borrow` or `issuepriv` components.
+
+Raw payload consumers (hashes, transcripts, tags and signatures) require zero
+remaining source refs; Slice reads and Builder writes preserve their independent
+reference streams. Literal
 construction and Builder growth enforce the ordinary 4095-byte capacity.
 Native byte literals use `pushcell` and a child Cell; no inline string opcode
 remains. Host `push_literal(CellValue)` retains the byte-only source literal
@@ -244,11 +274,32 @@ A Contract contains **one Value**, not an implicit list of stack arguments.
 Use a Dict to hold several values. `contract` and `output` take
 `payload predicate`; `signtx` returns that one payload, without an arity.
 
-`input` consumes a 32-byte ContractID, resolves its body from the initiating
-execution index, and creates the linear Contract handle. The chain verifies
-the spend-once Utreexo proof separately. ScriptBuilder can accept a private
-Contract witness, emit its short ID in bytecode, and collect public Cell bodies
-without revealing private token openings.
+`input` consumes a Cell handle pointing to the canonical Contract root, resolves
+that root through the scoped execution context, and creates the linear Contract
+handle. Its factual CellID is the claimed ContractID. It does not interpret a
+32-byte payload as a lookup selector and does not accept a Slice or Builder.
+The chain verifies the spend-once Utreexo proof separately. The fallible
+`CellValue::contract(contract)` constructor supplies the actual public root and
+its private payload openings; `pushcell` carries that root in the program graph.
+Private witnesses cannot replace missing authenticated public paths.
+
+## Executable Cell operands
+
+`open`, `signcall`, `exec`, and `setcode` consume Cell handles and execute or
+persist the native graph without flattening it into source bytes. `open` binds
+the semantic hash(0) through Taproot; `signcall` binds the factual highest-level
+CellID, including literal references and explicit pruned branches. Its existing
+`flamevm.signcall` transcript domain, `program` label, and `msg` challenge remain;
+the `program` message is now the CellID rather than source bytes. Internal
+signatures are checked immediately; external signatures may be batched.
+Private script overlays must compile to that same public graph.
+
+`setcode` rejects a pruned root and resolves the entire supplied ordinary DAG
+through the current actor store and initiating transaction's execution context.
+Each access is metered. Explicit pruned children remain pruned terminals;
+missing ordinary bodies hard-fail. The registry and `SetCode` effect retain the
+same complete supplied view, including references. Loading code for execution
+may remain lazy, but persistence must not depend on an incidental RAM cache.
 
 ## Predicate branches
 
@@ -330,6 +381,13 @@ bytes plus the existing per-lease charge; registry metadata is not charged
 again. Frozen actors retain metadata, code/state IDs, lengths, and leases,
 but discard code/state bodies. They are not literally represented by only
 32 bytes. No tokens are retired by freezing.
+
+Code byte length is the executable root payload length, not the total graph
+size. Actor entry and code-byte admission checks retain this meaning; storage
+usage counts all unique retained code/state Cell records. Actor registry APIs
+and effects carry code as a Cell, while RPC code fields use CellEnvelope graph
+transport. The VM's actor destination/address byte interface is unchanged and
+will be redesigned separately from these native executable operands.
 
 Resolution uses attached resident Cells, then the **current actor's** retained
 code/state bodies from `ActorRegistry::actor_cells`, then the initiating

@@ -105,7 +105,7 @@ pub enum DeferredSig {
     },
 }
 
-/// Consensus transcript for a `signcall` signature after the program bytes
+/// Consensus transcript for a `signcall` signature after the factual program Cell ID
 /// have been reduced to `message`. Shared by immediate internal verification
 /// and deferred external batch verification.
 pub(crate) fn signcall_verification_transcript(message: &[u8]) -> Transcript {
@@ -242,6 +242,34 @@ fn cell_hash_gas(bytes: usize, refs: usize) -> Result<u64, VMError> {
     hash_gas(bytes + 4 + 34 * refs, 64)?
         .checked_add(15 * hash_gas(36 + 34 * refs, 64)?)
         .ok_or(VMError::OutOfGas)
+}
+
+fn cell_view_info<'a>(
+    bytes: usize,
+    refs: impl ExactSizeIterator<Item = &'a cells::CellRef> + Clone,
+) -> Result<[u64; 5], CellError> {
+    let count = refs.len();
+    let mask = refs
+        .clone()
+        .fold(0u16, |mask, reference| mask | reference.commitment().mask());
+    let level = (u16::BITS - mask.leading_zeros()) as u8;
+    let mut depth = 0;
+    for reference in refs {
+        depth = depth.max(
+            reference
+                .commitment()
+                .depth(level)?
+                .checked_add(1)
+                .ok_or(CellError::DepthOverflow)?,
+        );
+    }
+    Ok([
+        bytes as u64,
+        count as u64,
+        u64::from(depth),
+        u64::from(level),
+        0,
+    ])
 }
 
 fn factual_hash_gas(value: &Value) -> Result<u64, VMError> {
@@ -543,8 +571,7 @@ impl CallFrame {
         Self::from_code(Script::Transparent(instructions), kind, gas_limit)
     }
 
-    /// Compatibility source-bytecode entry. Production transaction and actor
-    /// entry points use `from_cell`; bounded byte-source/signcall code also adapts here.
+    /// Compatibility source-bytecode entry. Production execution operands use Cells.
     pub(crate) fn from_bytecode(bytecode: Vec<u8>, kind: CallKind, gas_limit: u64) -> Self {
         Self::from_code(Script::Opaque(bytecode), kind, gas_limit)
     }
@@ -750,6 +777,23 @@ impl CellReader for ExecutionCells<'_> {
     }
 }
 
+fn code_materialization_gas(cell: &Cell) -> u64 {
+    // Charge copies and hashes at every level even when existing bodies can be reused.
+    (cell.record_size() as u64)
+        .saturating_mul(2 * GAS_PER_ALLOC_BYTE)
+        .saturating_mul(u64::from(cell.level_mask().count_ones()) + 1)
+}
+
+struct CodeCells<'a>(ExecutionCells<'a>);
+
+impl CellReader for CodeCells<'_> {
+    fn read(&mut self, id: CellID, resident: Option<&Arc<Cell>>) -> Result<Arc<Cell>, CellError> {
+        let cell = self.0.read(id, resident)?;
+        self.0.charge(code_materialization_gas(&cell))?;
+        Ok(cell)
+    }
+}
+
 impl VM {
     fn resolver(&mut self) -> ExecutionCells<'_> {
         ExecutionCells {
@@ -917,13 +961,19 @@ impl VM {
         let mut deployed_code = None;
         if !registry.exists(&message.target) {
             if let ActorID::Constructor(bytes) = &message.target {
-                if let Err(e) =
-                    registry.deploy(message.target.clone(), bytes.clone(), empty_state())
+                let code = match crate::code_cell(bytes) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        registry.pop_checkpoint_rollback();
+                        return Err(error.into());
+                    }
+                };
+                if let Err(e) = registry.deploy(message.target.clone(), code.clone(), empty_state())
                 {
                     registry.pop_checkpoint_rollback();
                     return Err(e);
                 }
-                deployed_code = Some(bytes.clone());
+                deployed_code = Some(code);
             }
         }
         let code_bytes = match registry.actor_code_bytes(&message.target) {
@@ -1443,7 +1493,6 @@ impl VM {
             I::Alloc(w) => self.op_alloc(w, delegate),
             I::Expr => self.op_expr(delegate),
             I::Range => self.op_range(delegate),
-            I::Scalar => self.op_scalar(),
             I::Commit => self.op_commit(),
             I::Decrypt => self.op_decrypt(delegate),
             I::Mix => self.op_mix(delegate),
@@ -1706,10 +1755,11 @@ impl VM {
             return Err(VMError::IndexOutOfRange);
         }
         let idx = len - 1 - k;
-        let bytes = match &self.current_call.stack[idx] {
-            _ => 0,
-        };
-        self.charge_alloc_bytes(bytes)?;
+        if !self.current_call.stack[idx].is_copyable() {
+            return Err(VMError::TypeNotCopyable);
+        }
+        self.current_call
+            .charge_gas(self.current_call.stack[idx].clone_gas())?;
         let copy = self.current_call.stack[idx].try_clone()?;
         self.push_value(copy);
         Ok(())
@@ -1834,18 +1884,13 @@ impl VM {
         // Identical public charge with or without a private annotation.
         self.charge_alloc_bytes(source.byte_payload()?.len())?;
         if let Some(witness) = &witness {
-            if witness.len() > cells::MAX_CELL_PAYLOAD {
-                return Err(CellError::PayloadTooLarge {
-                    actual: witness.len(),
-                    max: cells::MAX_CELL_PAYLOAD,
-                }
-                .into());
-            }
-            if witness.len() != source.byte_payload()?.len()
-                || witness.to_bytes_vec() != source.byte_payload()?
+            let expected = witness.to_cell()?;
+            if expected.is_pruned()
+                || !expected.refs().is_empty()
+                || expected.payload() != source.byte_payload()?
             {
                 return Err(VMError::Cell(CellError::CellCommitmentMismatch(
-                    Cell::new(witness.to_bytes_vec(), vec![])?.id(),
+                    expected.id(),
                 )));
             }
         }
@@ -1995,10 +2040,10 @@ impl VM {
         let mut dict = self.pop_value()?.to_dict()?;
         let copied = match dict.get_resolved(&k, &mut self.resolver())? {
             Some(v) => {
-                let bytes = match v {
-                    _ => 0,
-                };
-                self.charge_alloc_bytes(bytes)?;
+                if !v.is_copyable() {
+                    return Err(VMError::TypeNotCopyable);
+                }
+                self.current_call.charge_gas(v.clone_gas())?;
                 Some(self.restore_private_value(v.try_clone()?)?)
             }
             None => None,
@@ -2086,20 +2131,32 @@ impl VM {
     }
 
     fn op_cell_info(&mut self) -> Result<(), VMError> {
-        let reference = match self.current_call.stack.last() {
-            Some(Value::Cell(cell)) => cell.reference.clone(),
-            Some(_) => return Err(VMError::TypeNotCell),
+        let refs = match self.current_call.stack.last() {
+            Some(Value::Cell(_)) => 0,
+            Some(Value::Slice(slice)) => slice.remaining_refs(),
+            Some(Value::Builder(builder)) => builder.used_refs(),
+            Some(_) => return Err(VMError::TypeNotByteSource),
             None => return Err(VMError::StackUnderflow),
         };
-        let cell = cells::read_cell(&mut self.resolver(), &reference)?;
-        let level = cell.level();
-        for value in [
-            cell.payload().len() as u64,
-            cell.refs().len() as u64,
-            u64::from(cell.depth(level)?),
-            u64::from(level),
-            u64::from(cell.is_pruned()),
-        ] {
+        self.current_call.charge_gas(refs as u64)?;
+        let stats = match self.current_call.stack.last().unwrap() {
+            Value::Cell(cell) => {
+                let reference = cell.reference.clone();
+                let cell = cells::read_cell(&mut self.resolver(), &reference)?;
+                let level = cell.level();
+                [
+                    cell.payload().len() as u64,
+                    cell.refs().len() as u64,
+                    u64::from(cell.depth(level)?),
+                    u64::from(level),
+                    u64::from(cell.is_pruned()),
+                ]
+            }
+            Value::Slice(slice) => cell_view_info(slice.remaining_bytes(), slice.refs())?,
+            Value::Builder(builder) => cell_view_info(builder.used_bytes(), builder.refs().iter())?,
+            _ => unreachable!(),
+        };
+        for value in stats {
             self.push_value(Value::Scalar(Scalar::from(value)));
         }
         Ok(())
@@ -2717,8 +2774,9 @@ impl VM {
                 Ok(())
             }
             Value::Token(t) => {
-                let qty_pt = Point::from_compressed(t.qty.to_point());
-                let flv_pt = Point::from_compressed(t.flv.to_point());
+                self.charge_alloc_items(2)?;
+                let qty_pt = Point::commitment(t.qty.clone());
+                let flv_pt = Point::commitment(t.flv.clone());
                 self.push_value(Value::Token(t));
                 self.push_value(Value::Point(qty_pt));
                 self.push_value(Value::Point(flv_pt));
@@ -2774,14 +2832,14 @@ impl VM {
         self.current_call.charge_gas(r1cs_gas(65)?)?;
 
         let tag = self.pop_byte_source()?;
-        let qty_var = self.pop_value()?.to_variable()?;
+        let qty_commitment = self.pop_value()?.to_variable()?.into_commitment()?;
         // Register the Pedersen commitment with the CS. On the prover
         // the open assignment travels through; on the verifier only
         // the closed point. Same r1cs::Variable on both sides.
-        let (_qty_point, qty_r1cs) = delegate.commit_variable(&qty_var.commitment)?;
+        let (_qty_point, qty_r1cs) = delegate.commit_variable(&qty_commitment)?;
         // 64-bit range proof on the qty commitment — `borrow`/`mix`
         // already enforce this for confidential token paths.
-        let qty_assignment = match qty_var.commitment.assignment() {
+        let qty_assignment = match qty_commitment.assignment() {
             Some(i) => Some(scalar_to_signed_integer(i)?),
             None => None,
         };
@@ -2798,10 +2856,10 @@ impl VM {
         let flv_commit = Commitment::unblinded(flv);
 
         self.txlog.push(TxEntry::IssuePriv(
-            qty_var.commitment.to_point(),
+            qty_commitment.to_point(),
             flv_commit.to_point(),
         ));
-        self.push_value(Value::Token(Token::new(qty_var.commitment, flv_commit)));
+        self.push_value(Value::Token(Token::new(qty_commitment, flv_commit)));
         Ok(())
     }
 
@@ -2836,8 +2894,7 @@ impl VM {
 
     /// _qty flv_ **borrow** → _widetoken token_
     ///
-    /// Cleartext branch for `Scalar` operands; encrypted (`Variable`)
-    /// branch for CS-bound operands.
+    /// Quantity and flavor independently accept Scalar or committed Variable.
     fn op_borrow<D: Delegate>(&mut self, delegate: &mut D) -> Result<(), VMError> {
         let flv_val = self.pop_value()?;
         let qty_v = self.pop_value()?;
@@ -2849,7 +2906,10 @@ impl VM {
                 self.push_value(Value::ClearToken(pos));
                 Ok(())
             }
-            (Value::Variable(qty), Value::Variable(flv)) => {
+            (
+                qty @ (Value::Scalar(_) | Value::Variable(_)),
+                flv @ (Value::Scalar(_) | Value::Variable(_)),
+            ) => {
                 self.require_external()?;
                 self.op_borrow_encrypted_inner(qty, flv, delegate)
             }
@@ -2948,25 +3008,25 @@ impl VM {
     }
 
     /// Merlin message for `signcall`: binds the signature to the
-    /// program bytes only. Programs add further context (anchor,
+    /// factual program Cell graph. Programs add further context (anchor,
     /// actor identity) via explicit checks inside their script.
-    fn signcall_message(program: &[u8]) -> Vec<u8> {
+    fn signcall_message(program: &Cell) -> Vec<u8> {
         let mut t = Transcript::new(b"flamevm.signcall");
-        t.append_message(b"program", program);
+        t.append_message(b"program", &program.id());
         let mut out = vec![0u8; 32];
         t.challenge_bytes(b"msg", &mut out);
         out
     }
 
-    /// _contract-id:bytes32_ **input** → _contract_
+    /// _contract-cell_ **input** → _contract_
     ///
     /// The public body must resolve in the frozen transaction Cell hierarchy. Private
     /// witnesses may replace its typed values only after matching this identity.
     fn op_input(&mut self) -> Result<(), VMError> {
         self.require_external()?;
-        let encoded = self.pop_byte_source()?;
-        let id = array32(encoded.byte_payload()?).ok_or(VMError::MalformedContractEncoding)?;
-        let cell = cells::resolve_cell(&mut self.resolver(), id)?;
+        let reference = self.pop_value()?.into_cell_ref()?;
+        let id = reference.id();
+        let cell = cells::read_cell(&mut self.resolver(), &reference)?;
         let public = Contract::from_trusted_cell(&cell, &mut self.resolver())?;
         self.charge_value_encoding(public.payload(), 3)?;
         if public.id() != id {
@@ -3100,27 +3160,44 @@ impl VM {
     /// _contract script sig gas portable-args… m_ **signcall** → _results… k'_
     ///
 
-    /// The signed statement remains source bytes, not a newly defined program-graph hash.
+    /// The signature commits to the factual Cell graph, including supplied/pruned branches.
     fn op_signcall(&mut self) -> Result<(), VMError> {
         let m = self.pop_byte_count(usize::MAX)?;
         let args = self.pop_n_values(m)?;
         Self::require_portable_call_args(&args)?;
         let gas = self.pop_gas_limit()?;
         let signature_bytes = self.pop_byte_source()?;
-        let (program_bytes, witness) = self.pop_annotated_bytes()?;
+        let program_value = match self.pop_value()? {
+            Value::Cell(cell) => cell,
+            _ => return Err(VMError::TypeNotCell),
+        };
+        let root = cells::read_cell(&mut self.resolver(), &program_value)?;
         let contract = self.pop_value()?.to_contract()?;
         let sig: [u8; 64] = signature_bytes
             .byte_payload()?
             .try_into()
             .map_err(|_| VMError::BadSignatureBytes)?;
         self.current_call.charge_gas(GAS_SIGNATURE_VERIFY)?;
-        let code_bytes = program_bytes.byte_payload()?.len();
-        let msg = Self::signcall_message(program_bytes.byte_payload()?);
-        self.charge_alloc_bytes(code_bytes)?;
-        let code = match witness.as_deref() {
-            Some(value @ crate::CellWitness::Script(_)) => value.clone().into_script()?,
-            _ => Script::Opaque(program_bytes.byte_payload()?.to_vec()),
-        };
+        let program = Program::new(root.clone())?;
+        let code_bytes = program.len;
+        let msg = Self::signcall_message(&root);
+        let mut private_scripts = BTreeMap::new();
+        if let Some(crate::CellWitness::Script(instructions)) = program_value.witness() {
+            let (witness_root, overlays) = crate::script::compile_program(instructions)?;
+            if witness_root.id() != root.id() {
+                return Err(VMError::TaprootProofMismatch);
+            }
+            private_scripts = overlays;
+        }
+        let instructions = private_scripts
+            .get(&root.id())
+            .or_else(|| self.script_witnesses.get(&root.id()))
+            .cloned();
+        if let Some(instructions) = &instructions {
+            if crate::script::instruction_cell(instructions)?.id() != root.id() {
+                return Err(VMError::TaprootProofMismatch);
+            }
+        }
         let verification_key = contract.predicate.verification_key();
         let external = self.is_external();
         if !external {
@@ -3139,7 +3216,19 @@ impl VM {
                 signature: sig,
             });
         }
-        self.enter_contract_open_frame(contract, code, code_bytes, gas, args, child_anchor)?;
+        self.enter_contract_open_frame(
+            contract,
+            Script::Cell(root.as_ref().clone()),
+            code_bytes,
+            gas,
+            args,
+            child_anchor,
+        )?;
+        self.current_call.code = None;
+        self.current_call.entry_program = Some(root.as_ref().clone());
+        self.current_call.program = Some(program);
+        self.current_call.instructions = instructions;
+        self.current_call.private_scripts = private_scripts;
         Ok(())
     }
 
@@ -3425,7 +3514,7 @@ impl VM {
 
     /// _code_ **setcode** → ø
     ///
-    /// Replaces the actor's byte-only code blob from a plain byte source
+    /// Replaces the actor's native program Cell graph
     /// and records `TxEntry::SetCode`. Upgrade *policy* (who may
     /// call this) is the author's, gated in the actor's own code via
     /// `callerid` — actors authenticate by identity, not signatures.
@@ -3433,9 +3522,15 @@ impl VM {
     fn op_setcode(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
         let actor = ActorID::Hash(self.require_actor()?.to_hash());
         let registry = registry.ok_or(VMError::RegistryUnavailable)?;
-        let source = self.pop_byte_source()?;
-        self.charge_alloc_bytes(source.byte_payload()?.len().saturating_mul(2))?;
-        let code = source.byte_payload()?.to_vec();
+        let reference = self.pop_value()?.into_cell_ref()?;
+        let code = cells::read_cell(&mut self.resolver(), &reference)?;
+        if code.is_pruned() {
+            return Err(CellError::PrunedCell.into());
+        }
+        self.current_call
+            .charge_gas(code_materialization_gas(&code))?;
+        // Persistence needs the same supplied graph regardless of cache residency.
+        let code = code.load_graph_scoped(&mut CodeCells(self.resolver()))?;
         registry.set_code(&actor, code.clone())?;
         registry.validate_actor_storage(&actor, self.block_height)?;
         self.txlog.push(TxEntry::SetCode { actor, code });
@@ -3600,7 +3695,7 @@ impl VM {
         Ok(())
     }
 
-    /// **alloc** → _expr_
+    /// **alloc** → _var_: allocate once; `expr` consumes copies of its handle.
     ///
     /// Allocates a low-level R1CS variable. Witness `Some(i)` on the
     /// prover; `None` on the verifier.
@@ -3618,25 +3713,38 @@ impl VM {
             .cs()
             .allocate(witness_scalar)
             .map_err(VMError::R1CSError)?;
-        let expr = Expression::LinearCombination(
-            vec![(r1cs_var, curve25519_dalek::scalar::Scalar::ONE)],
-            witness,
-        );
-        self.push_value(Value::Expression(expr));
+        self.push_value(Value::Variable(Variable::Allocated {
+            variable: r1cs_var,
+            assignment: witness,
+        }));
         Ok(())
     }
 
-    /// `expr` — `var → expr`. Pops a `Variable`, calls
-    /// `delegate.commit_variable` to allocate a CS-side variable for
-    /// the commitment, pushes a one-term Expression.
+    /// Consume a Scalar or Variable to produce a constant or one-term Expression.
     fn op_expr<D: Delegate>(&mut self, delegate: &mut D) -> Result<(), VMError> {
         self.require_external()?;
-        self.charge_alloc_items(1)?;
-        self.current_call.charge_gas(r1cs_gas(1)?)?;
         use curve25519_dalek::scalar::Scalar as DalekScalar;
-        let var = self.pop_value()?.to_variable()?;
-        let (_point, r1cs_var) = delegate.commit_variable(&var.commitment)?;
-        let witness = var.commitment.assignment();
+        let (r1cs_var, witness) = match self.pop_value()? {
+            Value::Scalar(scalar) => {
+                self.push_value(Value::Expression(Expression::constant(scalar)));
+                return Ok(());
+            }
+            Value::Variable(variable) => {
+                self.charge_alloc_items(1)?;
+                match variable {
+                    Variable::Committed(commitment) => {
+                        self.current_call.charge_gas(r1cs_gas(1)?)?;
+                        let (_, variable) = delegate.commit_variable(&commitment)?;
+                        (variable, commitment.assignment())
+                    }
+                    Variable::Allocated {
+                        variable,
+                        assignment,
+                    } => (variable, assignment),
+                }
+            }
+            _ => return Err(VMError::TypeNotVariable),
+        };
         let expr = Expression::LinearCombination(vec![(r1cs_var, DalekScalar::ONE)], witness);
         self.push_value(Value::Expression(expr));
         Ok(())
@@ -3703,58 +3811,73 @@ impl VM {
         }
     }
 
-    /// Parse public canonical scalar bytes, then lift to a constant Expression.
-    fn op_scalar(&mut self) -> Result<(), VMError> {
-        self.require_external()?;
-        let source = self.pop_byte_source()?;
-        let bytes = array32(source.byte_payload()?).ok_or(VMError::InvalidScalarEncoding)?;
-        let scalar = Scalar::from_bytes(bytes).ok_or(VMError::InvalidScalarEncoding)?;
-        self.push_value(Value::Expression(Expression::constant(scalar)));
-        Ok(())
-    }
-
     fn op_commit(&mut self) -> Result<(), VMError> {
         self.require_external()?;
-        let commitment = self.pop_commitment()?;
-        self.push_value(Value::Variable(Variable { commitment }));
+        let commitment = self.pop_value()?.to_point()?.to_commitment()?;
+        self.push_value(Value::Variable(Variable::Committed(commitment)));
         Ok(())
     }
 
-    /// Encrypted branch of `borrow`. The caller has already
-    /// popped `(qty, flv)` and verified both are `Variable`; this
-    /// just runs the CS plumbing — range-proof + additive-inverse
-    /// allocation — and pushes the `WideToken` / `Token` pair.
+    /// Bind public or committed components, range-prove quantity, and create debt.
     fn op_borrow_encrypted_inner<D: Delegate>(
         &mut self,
-        qty: Variable,
-        flv: Variable,
+        qty: Value,
+        flv: Value,
         delegate: &mut D,
     ) -> Result<(), VMError> {
         use bulletproofs::r1cs::ConstraintSystem;
         use spacesuit::BitRange;
-        // Two committed variables, a 64-bit range gadget, and the allocated
-        // additive inverse.
-        self.current_call.charge_gas(r1cs_gas(67)?)?;
+        // Public quantities are checked directly; only secret quantities need a range gadget.
+        let public_quantity = matches!(&qty, Value::Scalar(_));
+        self.current_call
+            .charge_gas(r1cs_gas(if public_quantity { 3 } else { 67 })?)?;
         // Commit both to the CS. Prover uses the open witness; verifier
         // sees only the closed point. Either way, the returned r1cs vars
         // are bound to the same commitment point on both sides.
-        let (_flv_point, flv_var) = delegate.commit_variable(&flv.commitment)?;
-        let (_qty_point, qty_var) = delegate.commit_variable(&qty.commitment)?;
+        let bind = |value: Value,
+                    delegate: &mut D|
+         -> Result<(Commitment, bulletproofs::r1cs::Variable), VMError> {
+            match value {
+                Value::Variable(variable) => {
+                    let commitment = variable.into_commitment()?;
+                    let (_, variable) = delegate.commit_variable(&commitment)?;
+                    Ok((commitment, variable))
+                }
+                Value::Scalar(scalar) => {
+                    let variable = delegate
+                        .cs()
+                        .allocate(Some(scalar.to_dalek()))
+                        .map_err(VMError::R1CSError)?;
+                    delegate.cs().constrain(variable - scalar.to_dalek());
+                    Ok((Commitment::unblinded(scalar), variable))
+                }
+                _ => Err(VMError::TypeNotScalar),
+            }
+        };
+        if let Value::Scalar(scalar) = &qty {
+            if scalar.to_u64().is_none() {
+                return Err(VMError::InvalidBitrange);
+            }
+        }
+        let (flv_commitment, flv_var) = bind(flv, delegate)?;
+        let (qty_commitment, qty_var) = bind(qty, delegate)?;
         // Witness assignments (prover only). Negative qty is a
         // protocol error here — borrow's +T is range-proven non-negative.
-        let qty_assignment = match qty.commitment.assignment() {
+        let qty_assignment = match qty_commitment.assignment() {
             Some(i) => Some(scalar_to_signed_integer(i)?),
             None => None,
         };
-        let flv_assignment = flv.commitment.assignment().map(|i| i.to_dalek());
+        let flv_assignment = flv_commitment.assignment().map(|i| i.to_dalek());
         // 64-bit range proof on the positive qty.
-        spacesuit::range_proof(
-            delegate.cs(),
-            qty_var.into(),
-            qty_assignment,
-            BitRange::max(),
-        )
-        .map_err(VMError::R1CSError)?;
+        if !public_quantity {
+            spacesuit::range_proof(
+                delegate.cs(),
+                qty_var.into(),
+                qty_assignment,
+                BitRange::max(),
+            )
+            .map_err(VMError::R1CSError)?;
+        }
         // Allocate -qty in the CS, witness = -qty_assignment.
         let neg_qty_assignment = qty_assignment.map(|q| -q);
         let neg_qty_var = delegate
@@ -3774,7 +3897,7 @@ impl VM {
                 _ => None,
             },
         });
-        let token = Token::new(qty.commitment, flv.commitment);
+        let token = Token::new(qty_commitment, flv_commitment);
         self.push_value(Value::WideToken(wide));
         self.push_value(Value::Token(token));
         Ok(())
@@ -4145,7 +4268,9 @@ mod cell_execution_tests {
             if private_overlay {
                 vm.contract_witnesses.insert(id, contract.clone());
             }
-            vm.push_value(Value::Cell(Cell::new(id.to_vec(), vec![]).unwrap().into()));
+            vm.push_value(Value::Cell(
+                CellRef::resident(root.clone()).to_unloaded().into(),
+            ));
             vm.op_input()
                 .expect("input does not eagerly hydrate hidden branches");
             vm.op_signtx().unwrap();
@@ -4191,7 +4316,7 @@ mod cell_execution_tests {
         let program = ScriptBuilder::new()
             .with_script_witness(branch)
             .unwrap()
-            .push_literal(crate::CellValue::contract(contract))
+            .push_literal(crate::CellValue::contract(contract).unwrap())
             .input()
             .push_point(*proof.internal_key.as_bytes())
             .push_cell(proof.root)

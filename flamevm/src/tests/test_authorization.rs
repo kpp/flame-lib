@@ -14,6 +14,10 @@ fn run_external_to_end(vm: &mut VM) -> Result<(), VMError> {
 }
 
 fn signcall_signature(program: &[u8], secret: u64) -> (CompressedRistretto, [u8; 64]) {
+    signcall_cell_signature(&crate::code_cell(program).unwrap(), secret)
+}
+
+fn signcall_cell_signature(program: &Cell, secret: u64) -> (CompressedRistretto, [u8; 64]) {
     let (verification_key, signing_key) = signing_keypair(secret);
     let message = VM::signcall_message(program);
     let signature =
@@ -22,7 +26,169 @@ fn signcall_signature(program: &[u8], secret: u64) -> (CompressedRistretto, [u8;
 }
 
 #[test]
-fn signcall_ignores_unrelated_annotations_on_authenticated_source_bytes() {
+fn signcall_executes_native_program_graph_and_preserves_private_assignments() {
+    let continuation = ScriptBuilder::new()
+        .drop_()
+        .alloc(Some(Scalar::from(7u64)))
+        .expr()
+        .push_int(7u64)
+        .expr()
+        .eq()
+        .verify()
+        .push_int(0u64)
+        .return_();
+    let program = ScriptBuilder::new()
+        .push_script(continuation)
+        .unwrap()
+        .exec();
+    let root = program.to_cell().unwrap();
+    assert_eq!(root.refs().len(), 1);
+    let (key, signature) = signcall_cell_signature(&root, 44);
+    let contract = Contract::new(
+        Predicate::opaque(key),
+        Anchor([44; 32]),
+        Value::Scalar(Scalar::ONE),
+    )
+    .unwrap();
+    let limits = Limits { gas: 1_000_000 };
+    let tx = ScriptBuilder::new()
+        .push_cell(CellValue::contract(contract).unwrap())
+        .input()
+        .push_script(program)
+        .unwrap()
+        .push_literal(CellValue::from_bytes(signature.to_vec()).unwrap())
+        .push_int(100_000u64)
+        .push_int(0u64)
+        .signcall()
+        .verify()
+        .drop_()
+        .build_tx(dummy_header(), limits)
+        .unwrap()
+        .without_signature()
+        .unwrap();
+    let decoded = crate::ExternalTx::from_bytes_bounded(
+        &tx.to_bytes().unwrap(),
+        1,
+        tx.script.len(),
+        tx.proof_bytes().len(),
+    )
+    .unwrap();
+    decoded.verify(limits).unwrap();
+}
+
+#[test]
+fn signcall_signature_binds_factual_pruning_not_just_semantic_hash() {
+    let data = Cell::new(vec![9], vec![]).unwrap();
+    let code = ScriptBuilder::new()
+        .drop_()
+        .push_cell(data.clone())
+        .drop_()
+        .push_int(0u64)
+        .return_()
+        .to_cell()
+        .unwrap();
+    let pruned = Cell::new(code.payload().to_vec(), vec![data.prune(1).unwrap().into()]).unwrap();
+    assert_eq!(code.hash(0).unwrap(), pruned.hash(0).unwrap());
+    assert_ne!(code.id(), pruned.id());
+    let (key, signature) = signcall_cell_signature(&code, 44);
+    let make = |program| {
+        let contract = Contract::new(
+            Predicate::opaque(key),
+            Anchor([44; 32]),
+            Value::Scalar(Scalar::ONE),
+        )
+        .unwrap();
+        ScriptBuilder::new()
+            .push_cell(CellValue::contract(contract).unwrap())
+            .input()
+            .push_cell(program)
+            .push_literal(CellValue::from_bytes(signature.to_vec()).unwrap())
+            .push_int(10_000u64)
+            .push_int(0u64)
+            .signcall()
+            .verify()
+            .drop_()
+    };
+    let limits = Limits { gas: 1_000_000 };
+    make(code)
+        .build_tx(dummy_header(), limits)
+        .unwrap()
+        .without_signature()
+        .unwrap()
+        .verify(limits)
+        .unwrap();
+    let tx = make(pruned)
+        .build_tx(dummy_header(), limits)
+        .unwrap()
+        .without_signature()
+        .unwrap();
+    assert!(matches!(
+        tx.verify(limits),
+        Err(VMError::BatchSignatureVerificationFailed)
+    ));
+}
+
+#[test]
+fn signcall_refunds_unused_gas_and_recovers_arguments_even_after_exhaustion() {
+    for (program, succeeds, exhausts) in [
+        (
+            ScriptBuilder::new()
+                .roll_k(1)
+                .drop_()
+                .push_int(1u64)
+                .return_(),
+            true,
+            false,
+        ),
+        (ScriptBuilder::new().push_int(0u64).verify(), false, false),
+        (ScriptBuilder::new().label(0).jump(0), false, true),
+    ] {
+        let root = program.to_cell().unwrap();
+        let (key, signature) = signcall_cell_signature(&root, 44);
+        let contract = Contract::new(
+            Predicate::opaque(key),
+            Anchor([44; 32]),
+            Value::Scalar(Scalar::ONE),
+        )
+        .unwrap();
+        let token = Token::cleartext(Scalar::from(5u64), FLAME_FLAVOR).unwrap();
+        let mut spent = Vec::new();
+        for grant in [1_000u64, 2_000] {
+            let mut vm = vm_external_with_script(ScriptBuilder::new().signcall());
+            vm.last_anchor = Some(Anchor([44; 32]));
+            vm.current_call.stack = vec![
+                Value::Contract(Box::new(contract.clone())),
+                Value::Cell(root.clone().into()),
+                witness_cell(CellValue::from_bytes(signature.to_vec()).unwrap()),
+                Value::Scalar(Scalar::from(grant)),
+                Value::Token(token.clone()),
+                Value::Scalar(Scalar::ONE),
+            ];
+            run_external_to_end(&mut vm).unwrap();
+            let stack = &vm.current_call.stack;
+            assert_int(&stack[stack.len() - 1], Scalar::from(succeeds as u64));
+            assert_int(&stack[stack.len() - 2], Scalar::ONE);
+            assert!(
+                matches!(&stack[stack.len() - 3], Value::Token(restored) if restored.qty() == token.qty() && restored.flv() == token.flv())
+            );
+            if !succeeds {
+                assert!(
+                    matches!(&stack[0], Value::Contract(restored) if restored.id() == contract.id())
+                );
+                assert!(vm.deferred_sigs.is_empty());
+            }
+            spent.push(vm.current_call.gas_used);
+        }
+        if exhausts {
+            assert_eq!(spent[1] - spent[0], 1_000);
+        } else {
+            assert_eq!(spent[0], spent[1]);
+        }
+    }
+}
+
+#[test]
+fn signcall_ignores_unrelated_annotations_on_authenticated_program_cell() {
     let mut source = ScriptBuilder::new()
         .drop_()
         .push_int(0u64)
@@ -38,7 +204,7 @@ fn signcall_ignores_unrelated_annotations_on_authenticated_source_bytes() {
     .unwrap();
     let point = Point::from_bytes(source.try_into().unwrap());
     let tx = ScriptBuilder::new()
-        .push_literal(CellValue::contract(contract))
+        .push_cell(CellValue::contract(contract).unwrap())
         .input()
         .push_literal(CellValue::point(point))
         .push_literal(CellValue::from_bytes(signature.to_vec()).unwrap())
@@ -58,20 +224,21 @@ fn internal_signcall_code(
     verification_key: CompressedRistretto,
     program: Vec<u8>,
     signature: [u8; 64],
-) -> Vec<u8> {
+) -> Cell {
     ScriptBuilder::new()
         .push_int(0u64)
         .dict()
         .push_point(*verification_key.as_bytes())
         .contract()
-        .push_literal(CellValue::from_bytes(program).unwrap())
+        .push_cell(crate::code_cell(&program).unwrap())
         .push_literal(CellValue::from_bytes(signature.to_vec()).unwrap())
         .push_int(10_000u64)
         .push_int(0u64)
         .signcall()
         .drop_()
         .drop_()
-        .to_bytecode()
+        .to_cell()
+        .unwrap()
 }
 
 #[test]
@@ -152,12 +319,11 @@ fn signcall_records_explicit_sig_and_runs_program() {
         .push_int(5u64) // payload [5]
         .push_point([0xaa; 32])
         .contract()
-        .push_literal(CellValue::from_bytes(prog).unwrap()) // inner script
+        .push_cell(crate::code_cell(&prog).unwrap()) // inner program graph
         .push_literal(CellValue::from_bytes(sig_bytes.to_vec()).unwrap()) // 64-byte sig
         .push_int(1024u64) // gas
         .push_int(0u64) // m = 0 args
-        .signcall()
-        .to_bytecode();
+        .signcall();
     let mut vm = vm_external_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
     run_external_to_end(&mut vm).unwrap();
@@ -198,7 +364,7 @@ fn failed_signcall_restores_contract_and_argument_and_signature_checkpoint() {
     vm.last_anchor = Some(Anchor([0x42; 32]));
     vm.current_call.stack = vec![
         Value::Contract(Box::new(contract)),
-        witness_cell(CellValue::from_bytes(program).unwrap()),
+        Value::Cell(crate::code_cell(&program).unwrap().into()),
         witness_cell(CellValue::from_bytes(signature.to_vec()).unwrap()),
         Value::Scalar(Scalar::from(10_000u64)),
         Value::Token(token.clone()),
@@ -241,12 +407,11 @@ fn signcall_message_binds_only_to_program_not_to_contract() {
             .push_int(5u64)
             .push_point([predicate_byte; 32])
             .contract()
-            .push_literal(CellValue::from_bytes(prog).unwrap())
+            .push_cell(crate::code_cell(&prog).unwrap())
             .push_literal(CellValue::from_bytes(sig.to_vec()).unwrap())
             .push_int(1024u64)
             .push_int(0u64)
-            .signcall()
-            .to_bytecode();
+            .signcall();
         let mut vm = vm_external_with_script(script);
         vm.last_anchor = Some(Anchor([0x42; 32]));
         run_external_to_end(&mut vm).unwrap();
@@ -276,12 +441,11 @@ fn signcall_rejects_wrong_signature_length() {
         .push_int(5u64)
         .push_point([0xaa; 32])
         .contract()
-        .push_literal(CellValue::from_bytes(prog).unwrap())
+        .push_cell(crate::code_cell(&prog).unwrap())
         .push_literal(CellValue::from_bytes(vec![0u8; 63]).unwrap()) // bad: 63-byte sig
         .push_int(1024u64)
         .push_int(0u64)
-        .signcall()
-        .to_bytecode();
+        .signcall();
     let mut vm = vm_external_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
     assert!(matches!(
@@ -396,7 +560,7 @@ fn signcall_explicit_sig_batch_verifies_correctly() {
     // `signcall_message(program)` helper does.
     let inner_prog = vec![0x1c]; // drop
     let mut prog_t = merlin::Transcript::new(b"flamevm.signcall");
-    prog_t.append_message(b"program", &inner_prog);
+    prog_t.append_message(b"program", &crate::code_cell(&inner_prog).unwrap().id());
     let mut msg_bytes = vec![0u8; 32];
     prog_t.challenge_bytes(b"msg", &mut msg_bytes);
     // Sign over a transcript with that message appended (matches
@@ -423,7 +587,7 @@ fn signcall_tampered_sig_batch_rejects() {
     let vk_point = (RISTRETTO_BASEPOINT_TABLE * &sk).compress();
     let inner_prog = vec![0x1c];
     let mut prog_t = merlin::Transcript::new(b"flamevm.signcall");
-    prog_t.append_message(b"program", &inner_prog);
+    prog_t.append_message(b"program", &crate::code_cell(&inner_prog).unwrap().id());
     let mut msg_bytes = vec![0u8; 32];
     prog_t.challenge_bytes(b"msg", &mut msg_bytes);
     let mut sign_t = merlin::Transcript::new(b"flamevm.signcall");
@@ -476,7 +640,7 @@ fn phase20_single_txbound_verifies_with_multisig() {
         _ => panic!("expected TxBound"),
     }
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -489,9 +653,9 @@ fn phase20_single_txbound_verifies_with_multisig() {
     let sig = musig::Signature::sign_multi(vec![sk], items, &mut t).expect("sign_multi");
     // Verifier accepts.
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -581,11 +745,11 @@ fn phase20_two_txbound_verifies_with_multisig() {
     // Script: input contract1, signtx (drop payload), input contract2,
     // signtx (drop payload).
     let program = ScriptBuilder::new()
-        .push_literal(CellValue::contract(contract1))
+        .push_cell(CellValue::contract(contract1).unwrap())
         .input()
         .signtx()
         .drop_()
-        .push_literal(CellValue::contract(contract2))
+        .push_cell(CellValue::contract(contract2).unwrap())
         .input()
         .signtx()
         .drop_();
@@ -594,7 +758,7 @@ fn phase20_two_txbound_verifies_with_multisig() {
     assert_eq!(prover_result.deferred_sigs.len(), 2);
     let txid = prover_result.txid;
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -612,9 +776,9 @@ fn phase20_two_txbound_verifies_with_multisig() {
     let sig = musig::Signature::sign_multi(vec![sk1, sk2], items, &mut t).expect("sign_multi");
 
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -634,16 +798,16 @@ fn phase20_missing_signature_when_txbound_present() {
     let program = script;
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove ok");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = _pp;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    let err = Verifier::verify_with_cells(
+    let err = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -664,14 +828,17 @@ fn phase20_spurious_signature_when_no_txbound() {
     // — no input, no signtx, no TxBound deferred sigs.
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(10u64)))
+        .expr()
         .eq()
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove ok");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -685,9 +852,9 @@ fn phase20_spurious_signature_when_no_txbound() {
         s: DalekScalar::from(0u64),
     };
     let pc_gens_v = PedersenGens::default();
-    let err = Verifier::verify_with_cells(
+    let err = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -715,7 +882,7 @@ fn phase20_tampered_signature_rejected() {
         Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove ok");
     let txid = prover_result.txid;
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -726,9 +893,9 @@ fn phase20_tampered_signature_rejected() {
     t.append_message(b"txid", &txid.0);
     let sig = musig::Signature::sign_multi(vec![sk_wrong], items, &mut t).expect("sign_multi");
     let pc_gens_v = PedersenGens::default();
-    let err = Verifier::verify_with_cells(
+    let err = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -748,23 +915,26 @@ fn phase20_no_txbound_no_signature_roundtrip() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(10u64)))
+        .expr()
         .eq()
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove ok");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = _pp;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    Verifier::verify_with_cells(
+    Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -791,7 +961,7 @@ fn phase20_signature_over_wrong_txid_rejected() {
     let prover_result =
         Prover::prove(&pc_gens, program, header_prove, 1_000_000).expect("prove ok");
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -804,9 +974,9 @@ fn phase20_signature_over_wrong_txid_rejected() {
     t.append_message(b"txid", &wrong_txid);
     let sig = musig::Signature::sign_multi(vec![sk], items, &mut t).expect("sign_multi");
     let pc_gens_v = PedersenGens::default();
-    let err = Verifier::verify_with_cells(
+    let err = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         header_prove,
         1_000_000,
@@ -829,12 +999,11 @@ fn signcall_selfid_errors_no_actor_context() {
         .push_int(5u64)
         .push_point([0xaa; 32])
         .contract()
-        .push_literal(CellValue::from_bytes(prog).unwrap())
+        .push_cell(crate::code_cell(&prog).unwrap())
         .push_literal(CellValue::from_bytes(sig_bytes.to_vec()).unwrap())
         .push_int(1024u64)
         .push_int(0u64)
-        .signcall()
-        .to_bytecode();
+        .signcall();
     let mut vm = vm_external_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
     run_external_to_end(&mut vm).unwrap();

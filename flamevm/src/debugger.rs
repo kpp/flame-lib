@@ -466,6 +466,7 @@ mod tests {
     fn tracing_preserves_normal_execution_gas_and_transaction_identity() {
         let program = ScriptBuilder::new()
             .alloc(Some(Scalar::from(7u64)))
+            .expr()
             .push_int(7u64)
             .eq()
             .verify();

@@ -115,7 +115,7 @@ pub struct ActorResult {
     /// State root cell hash, retained even if the body is unavailable.
     #[serde(with = "crate::codec::hex32")]
     pub state_hash: [u8; 32],
-    /// Logical bytecode length, excluding cell framing.
+    /// Root program payload length; descendants are read on demand.
     pub code_size: u64,
     /// Logical state size in encoded cell bytes.
     pub state_size: u64,
@@ -123,7 +123,7 @@ pub struct ActorResult {
     pub storage_used: u64,
     /// Capacity of leases valid at this height, in bytes.
     pub storage_capacity: u64,
-    /// Bytecode as base64. Null if any code cell is unavailable.
+    /// Native code Cell envelope as base64. Null if the root is unavailable.
     pub code: Option<ActorCode>,
     /// State envelope as base64. Null if the root body is unavailable.
     /// Descendant cells can still be missing.
@@ -290,7 +290,7 @@ pub enum TxEntry {
     ActorDeploy {
         /// Actor identifier.
         actor: ActorId,
-        /// Complete constructor code, encoded as base64.
+        /// Constructor code Cell envelope, encoded as base64.
         #[serde(with = "crate::codec::base64")]
         code: Vec<u8>,
         /// Code root hash.
@@ -311,7 +311,7 @@ pub enum TxEntry {
     SetCode {
         /// Actor identifier.
         actor: ActorId,
-        /// Complete new code, encoded as base64.
+        /// New code Cell envelope, encoded as base64.
         #[serde(with = "crate::codec::base64")]
         code: Vec<u8>,
         /// Code root hash.

@@ -230,7 +230,7 @@ pub fn build_transfer<R: RngCore + CryptoRng>(
     let mut program = ScriptBuilder::new();
     for input in inputs {
         program = program
-            .push_literal(CellValue::contract(input.contract.clone()))
+            .push_cell(CellValue::contract(input.contract.clone()).map_err(VMError::from)?)
             .input()
             .signtx();
     }

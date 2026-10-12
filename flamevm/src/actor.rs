@@ -107,7 +107,7 @@ impl CellDecode for ActorID {
 
 // ── Actor state + code helpers ───────────────────────────────────
 //
-// An actor is `(code, state)`: a single bytecode blob (set by `setcode`,
+// An actor is `(code, state)`: an executable Cell graph (set by `setcode`,
 // dispatched on the `method` opcode) plus an opaque state `Value` the
 // author structures however they like. `op_load` / `op_save` move the
 // state; `state_root` / `code_root` are the canonical commitments for
@@ -196,7 +196,7 @@ pub fn code_from_cell<R: CellReader + ?Sized>(
     Ok(bytes)
 }
 
-/// Canonical program Cell ID of an actor's code, referenced by `TxEntry::SetCode`.
+/// Legacy source-byte constructor address; native program identities use `Cell::id`.
 pub fn code_root(code: &[u8]) -> [u8; 32] {
     code_cell(code)
         .expect("actor code is representable as native program Cells")
@@ -212,8 +212,8 @@ pub fn code_root(code: &[u8]) -> [u8; 32] {
 /// encodability ≠ portability — op_save's `is_portable` check is the
 /// authoritative storage gate; this reports the rare case of a portable
 /// value that lacks an encoder.
-pub fn code_state_bytes(code: &[u8], state: &Value) -> Result<u64, VMError> {
-    let mut graph = CellIndex::collect(Arc::new(code_cell(code)?))?;
+pub fn code_state_bytes(code: &Cell, state: &Value) -> Result<u64, VMError> {
+    let mut graph = CellIndex::collect(Arc::new(code.clone()))?;
     graph.extend(&CellIndex::collect(Arc::new(state.to_cell()?))?)?;
     let size = graph.iter().try_fold(0u64, |size, (_, cell)| {
         size.checked_add(cell.record_size() as u64)
@@ -239,14 +239,13 @@ pub struct StoragePurchase {
 /// transaction.
 ///
 pub trait ActorRegistry {
-    /// Native execution entry. Hosts with committed program Cells should return
-    /// their root directly; the default adapts legacy bytecode-only registries.
+    /// Native execution entry; references remain part of the executable graph.
     fn load_program_with_cells(
         &self,
         id: &ActorID,
         cells: &mut dyn CellReader,
     ) -> Result<Cell, VMError> {
-        Ok(code_cell(&self.load_code_with_cells(id, cells)?)?)
+        self.load_code_with_cells(id, cells)
     }
     /// Bodies committed as resident for this actor, never a node-global cache.
     fn actor_cells(&self, _id: &ActorID) -> Result<Arc<CellIndex>, VMError> {
@@ -259,7 +258,7 @@ pub trait ActorRegistry {
         &self,
         id: &ActorID,
         _cells: &mut dyn CellReader,
-    ) -> Result<Vec<u8>, VMError> {
+    ) -> Result<Cell, VMError> {
         self.load_code(id)
     }
 
@@ -286,10 +285,10 @@ pub trait ActorRegistry {
     /// ensures `state` is portable (op_save checks first).
     fn save_state(&mut self, id: &ActorID, state: Value) -> Result<(), VMError>;
 
-    /// Returns the actor's code blob, method-agnostic — the code itself
+    /// Returns the actor's native program Cell, method-agnostic — the code itself
     /// dispatches on the `method` opcode. Errors `ActorNotFound` or
     /// `ActorEmpty` (checked out → re-entrancy block).
-    fn load_code(&self, actor: &ActorID) -> Result<Vec<u8>, VMError>;
+    fn load_code(&self, actor: &ActorID) -> Result<Cell, VMError>;
 
     /// Code bytes that [`Self::load_code`] would activate. Used to debit gas
     /// before the host clones or decodes the code.
@@ -299,8 +298,8 @@ pub trait ActorRegistry {
     /// debit gas before checkout or deserialization.
     fn actor_state_bytes(&self, actor: &ActorID) -> Result<u64, VMError>;
 
-    /// Replaces the actor's code blob (`setcode`). Errors `ActorNotFound`.
-    fn set_code(&mut self, actor: &ActorID, code: Vec<u8>) -> Result<(), VMError>;
+    /// Replaces the actor's program graph (`setcode`). Errors `ActorNotFound`.
+    fn set_code(&mut self, actor: &ActorID, code: Cell) -> Result<(), VMError>;
 
     /// Charged bytes currently occupied by code, committed state, and lease
     /// records. While state is checked out this remains the committed usage.
@@ -374,5 +373,5 @@ pub trait ActorRegistry {
     /// Installs a provisional actor with no lease. Its constructor may buy
     /// storage; the containing transaction commits only after
     /// [`Self::validate_actor_storage`] succeeds.
-    fn deploy(&mut self, id: ActorID, code: Vec<u8>, state: Value) -> Result<(), VMError>;
+    fn deploy(&mut self, id: ActorID, code: Cell, state: Value) -> Result<(), VMError>;
 }

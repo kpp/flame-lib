@@ -229,7 +229,8 @@ droppable, but non-copyable pure-computation values may be droppable too.
 | Token | no | no | yes |
 | ClearToken | no | quantity is zero | centered quantity is non-negative |
 | WideToken, Contract | no | no | no |
-| Merlin, Variable, Expression, Constraint, MultiscalarMul | no | yes | no |
+| Variable | yes | yes | no |
+| Merlin, Expression, Constraint, MultiscalarMul | no | yes | no |
 
 Droppability tracks asset ownership, not whether a value is mutable or useful.
 Dropping a transcript, expression, constraint, variable, or unscheduled MSM
@@ -283,7 +284,7 @@ Stack-only types (non-portable and without an implemented `Value` encoding):
 | Contract | Linear contract handle. `Contract` has its own top-level encoding, but `Value::Contract` has no generic value tag. |
 | WideToken | Possibly-negative encrypted token tied to the current constraint system. |
 | Merlin | Mutable transcript state tied to the current execution. |
-| Variable | Secret value in the constraint system, tied to a Pedersen commitment. |
+| Variable | Copyable handle to a Pedersen commitment or an allocated R1CS variable; not portable. |
 | Expression | Linear combination of variables. |
 | Constraint | Logical combination of boolean conditions. |
 | MultiscalarMul | Lazy `sum(s_i · P_i)` accumulator; consumed by `verify` which appends it to the same batch as Schnorr/Musig sigs (assertion: `sum == identity`). |
@@ -398,18 +399,21 @@ instead use explicit `pushcell exec` continuation. `CellValue::from_bytes` and
 wrapper. The optional annotation preserves typed private data through copies
 and value transfers; it is never encoded and never affects Cell identity:
 
-- `CellWitness::Point(Point)` — point-shaped witness; the inner [`Point`](#point) is `Opaque`, `Commitment(Open(value, blinding))` (used before `commit`, `scalar`, `expr`), or `Predicate(p)` (used before `signtx`, `signcall`, `contract`, `output`).
-- `CellWitness::Scalar(scalar)` — used before `scalar`.
-- `CellWitness::Script(instructions)` — bounded compatibility source programs used before `signcall`; predicate-branch overlays are supplied separately.
+- `CellWitness::Point(Point)` — point-shaped private annotation for byte-oriented commitment consumers such as `mix`; it is not recovered from serialized bytes by `readpoint`. Point-only `commit` uses typed Points directly, or the witness-preserving Points returned by `amount`.
+- `CellWitness::Scalar(scalar)` — canonical scalar payload; parse with `readscalar` before `expr`.
+- `CellWitness::Script(instructions)` — native executable program graph, retaining private instruction assignments for `signcall` or matching execution overlays.
 - `CellWitness::Contract(c)` — used before `input`, carrying open commitments on Token payloads.
 
 The verifier sees the literal's public Cell bytes, without annotations. A
-Contract witness emits its 32-byte ContractID; ScriptBuilder collects its public
-bodies and keeps private openings separately. `input` resolves the authenticated
+Contract witness emits its actual Contract root and public descendants, while
+keeping private openings separately. `input` resolves the authenticated
 public path before restoring private atomic witnesses. Commitment/script
 consumers validate per-value annotations against public bytes; unrelated hints
 do not change parsing semantics. Predicate overlays likewise require matching
 public code. Ordinary Cell equality uses factual identity and ignores annotations.
+Host witness collection includes program Cells in Contract payloads and cached
+nested Dict values, so `exec`/`open` can retain their private assignments. These
+overlays never supply an absent public body or hydrate an omitted Dict branch.
 
 **`pushpoint` also carries witnesses.** Because the `pushpoint` instruction's in-memory operand is a `Point` (not a raw `[u8; 32]`), the prover can attach a `Point::Commitment` / `Point::Predicate` witness to a literal point pushed via `pushpoint` — not only via a literal `CellValue::point`. The wire encoding stays the canonical 32 bytes regardless.
 
@@ -522,7 +526,7 @@ point as `Commitment::Closed`.
 
 An actor is **`(code, state)`**:
 
-- **code** — a single bytecode blob, set at deploy and replaced by [`setcode`](#setcode). Dispatch is selector-agnostic: the registry returns the blob (`load_code`); by convention the blob dispatches on its **top-of-stack argument**. The VM imposes **no method layout** and reserves nothing.
+- **code** — a native executable Cell graph, set at deploy and replaced by [`setcode`](#setcode). Dispatch is selector-agnostic: the registry returns its root (`load_code`); by convention code dispatches on its **top-of-stack argument**. The VM imposes **no method layout** and reserves nothing. Root payload bytes are accounted on frame entry; nested bodies are independently metered when read. Persistent storage accounts for the retained graph.
 
 - **state** — **any portable `Value`** (Scalar, Cell, Point, Token, Dict, …), with no mandated shape and no methods-in-state. [`load`](#load) checks it out, [`save`](#save) moves it back; the author structures it however they like.
 
@@ -698,10 +702,10 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | 59 | [or](#or) | | a b → c | Logical OR for scalars; lifts to Constraint disjunction in CS. |
 | 5a | [size](#size) | | x → x n | Cell payload bytes, Slice unread bytes, Builder used bytes, or Dict entries. |
 |    | **Constraints**  | | | |
-| 60 | [scalar](#scalar) | ext. | bytes → expr | Parse a canonical 32-byte scalar payload and lift to a constant Expression. |
-| 61 | [commit](#commit) | ext. | bytes → var | Parse a 32-byte commitment payload as a CS Variable; retain authenticated prover annotations. |
-| 62 | [alloc](#alloc) | ext. | ø → expr | Allocate a fresh R1CS variable and push it as a one-term Expression. |
-| 63 | [expr](#expr) | ext. | var → expr | Bind a Variable into the CS and push it as a one-term Expression. |
+| 60 | reserved | | | Former `scalar` opcode; rejected during execution. Use `readscalar`, then `expr`. |
+| 61 | [commit](#commit) | ext. | point → var | Wrap a commitment Point, retaining its private opening when present. |
+| 62 | [alloc](#alloc) | ext. | ø → var | Allocate a fresh, duplicable R1CS variable handle. |
+| 63 | [expr](#expr) | ext. | scalar/var → expr | Create a constant or consume a variable handle into a one-term Expression. |
 | 64 | [range](#range) | | x n → x | Check a Scalar in either context; range-prove an Expression externally. `n` ∈ 1..=64. |
 |    | **Dict**  | | | |
 | 70 | [dict](#dict) | | …kv… n → dict | Build a Dict from `n` `(value, key)` pairs already on the stack. |
@@ -749,12 +753,12 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | a8 | [slice](#slice) | | c → s | Resolve an ordinary Cell and create an owned Slice. |
 | a9 | [endcell](#endcell) | | b → c | Finalize a Builder, computing its Cell hashes. |
 | aa | [loadref](#loadref) | | s index → s' c | Remove any indexed remaining reference; do not load the child body. |
-| ab | [cellinfo](#cellinfo) | | c → c bytes refs depth level pruned | Inspect the Cell's own factual record; preserve the handle. |
+| ab | [cellinfo](#cellinfo) | | x → x bytes refs depth level pruned | Inspect a Cell, Slice tail or Builder; preserve the operand. |
 | ac | [runslice](#runslice) | | ø → s | Copy the current program's unread byte/ref cursors after this instruction. |
 | ad | [writeref](#writeref) | | b c → b' | Append one Cell reference without loading its body. |
 | ae | [writepoint](#writepoint) | | b p → b' | Append a Point's 32 public compressed bytes. |
 |    | **Contracts & predicates** | | | |
-| c0 | [input](#input) | ext. | id → contract | Resolve a Utreexo-validated ContractID through the execution witness hierarchy. |
+| c0 | [input](#input) | ext. | cell → contract | Decode an admitted Contract root through the execution witness hierarchy; its CellID is the input ID. |
 | c1 | [contract](#contract) | | payload pred → contract | Lock one portable Value under the predicate. |
 | c2 | [output](#output) | | payload pred → ø | Like `contract`, but emits an Output. |
 | c3 | [open](#open) | | contract ik program gas args… k → {results… k' 1 \| contract args… k 0} | Authenticate the program Cell's hash(0) and run an isolated frame. |
@@ -765,7 +769,7 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | d1 | [call](#call) | actor | args… k gas addr → {results… k' 1 \| args… k 0} | Synchronously call an actor. |
 | d2 | [load](#load) | actor | ø → value | Check out the actor's state (any portable Value; moves it out, locks re-entry). |
 | d3 | [save](#save) | actor | value → ø | Move the state value back in (requires checkout; unlocks). |
-| d4 | [setcode](#setcode) | actor | code → ø | Replace the actor's code blob (author-gated upgrade). |
+| d4 | [setcode](#setcode) | actor | cell → ø | Replace the actor's native code graph (author-gated upgrade). |
 | d5 | [addstorage](#addstorage) | actor | q → {debt 1 \| 0} | Buy `q` bytes for one storage year and return a negative Flame token. |
 | d6 | [quotestorage](#quotestorage) | actor | q → {fee 1 \| 0} | Quote the positive integral storage fee in sparks without reserving bytes. |
 |    | **Frame introspection** | | | |
@@ -989,22 +993,29 @@ Finalization precharges a conservative bound for all sixteen possible hashes.
 
 ### cellinfo
 
-_c_ → _c bytes refs depth level pruned_
+_x_ → _x bytes refs depth level pruned_
 
-Peeks a **Cell** and pushes five Scalars in this order (`pruned` is on top):
+Peeks a **Cell, Slice or Builder** and pushes five Scalars in this order (`pruned` is on top):
 
 | Result | Meaning |
 | --- | --- |
-| `bytes` | This record's own payload length, not descendant payloads. |
-| `refs` | This record's immediate reference count. |
-| `depth` | Cached depth at the highest significant level: the factual depth. |
+| `bytes` | Cell payload length, Slice unread bytes, or Builder used bytes; excludes descendants. |
+| `refs` | Cell immediate refs, Slice remaining refs, or Builder stored refs. |
+| `depth` | Factual depth at the highest significant level of these contents. |
 | `level` | Highest significant hash level, not the number of set mask bits. |
-| `pruned` | `1` for an explicit pruned record, otherwise `0`. |
+| `pruned` | `1` for an explicit pruned Cell; `0` for ordinary Cells, Slices and Builders. |
 
 Resolves the Cell's own record through the metered resolver, equally priced for
 resident and unloaded handles. Child bodies are not loaded. The original handle
-and its private annotations stay unchanged. Missing records, invalid commitments,
-wrong types (`TypeNotCell`), and exhausted gas hard-fail before any stats are
+and its private annotations stay unchanged. Slices use only their unread byte/ref
+streams, not the original backing Cell's metadata; Builders use their current
+contents. Their level is the highest set bit's level in the union of remaining
+child masks (zero for an empty mask), and depth is one
+plus the maximum child depth at that level (zero when there are no refs).
+Neither hashes payloads nor loads children; charge one gas per immediate ref,
+in addition to the instruction cost. Byte/ref cursors, ref order and Builder
+buffers are unchanged. Missing records, invalid commitments,
+wrong types (`TypeNotByteSource`), and exhausted gas hard-fail before any stats are
 pushed. There is no success flag and no change to `size`.
 
 Pruned records can be inspected even though `slice` cannot parse them. They
@@ -1261,36 +1272,42 @@ the failure boundary. On clean return the snapshot is dropped and
 the child's CS contributions remain in the final proof. See
 the rollback model described above.
 
-### scalar
-
-_s_ → _expr_
-
-Consumes exactly 32 zero-ref bytes from a Cell/Slice/Builder, parses a canonical
-little-endian residue strictly less than ℓ, and pushes `Expression::Constant`.
-Private annotations cannot override the public scalar bytes.
-
 ### commit
 
-_s_ → _var_
+_point_ → _var_
 
-Consumes exactly 32 zero-ref bytes from a Cell/Slice/Builder and wraps the
-commitment point in a Variable. On a Cell, a prover's per-value Point annotation
-may preserve an open commitment only after its encoding matches the resolved
-public payload. A Slice/Builder has no annotation and yields a closed commitment.
-The same boundary applies to `mix` output commitments. `expr` binds the Variable
-into the constraint system. Neither operation decodes bearer Tokens from bytes.
+Consumes a Point and wraps its commitment as a `Variable::Committed`.
+`Point::Commitment` retains its opening; ordinary Points and unrelated predicate
+annotations yield a closed commitment. For raw bytes use `slice readpoint`
+and handle its success flag first. Serialization does not carry private openings:
+provers use typed Points or witness-preserving `amount` outputs.
+`expr` registers the commitment in the constraint system. Byte-oriented `mix`
+output commitments retain their separate authenticated Cell-annotation interface.
 
 ### alloc
 
-ø → _expr_
+ø → _var_
 
-Allocates a low-level R1CS variable. The prover-side `Instruction::Alloc(Some(scalar))` carries the cleartext witness; the verifier sees `Alloc(None)` and the variable is left unassigned, constrained later by `eq`/`verify`. Pushes a one-term `Expression::LinearCombination([(var, 1)], witness?)`.
+Allocates a low-level R1CS variable once. The prover's `Alloc(Some(scalar))`
+retains its assignment; the verifier sees `Alloc(None)`. The result is a
+copyable, droppable, non-portable `Variable::Allocated` handle. Each `expr`
+consumes one handle into a non-copyable Expression referring to that same
+allocation. Thus `alloc dup:0 expr roll:1 expr mul` squares one allocated
+value without copying an expression tree. To reuse a larger computation,
+allocate a variable, constrain one expression of it equal to that computation,
+and consume further handle copies in other expressions. Dicts and Expressions
+remain non-copyable. An allocated handle has no public commitment and is not
+a substitute for a committed Variable in `borrow` or `issuepriv`.
 
 ### expr
 
-_var_ → _expr_
+_scalar/var_ → _expr_
 
-Pops a `Variable`, commits it via the delegate's `commit_variable`, pushes a one-term Expression bound to the resulting R1CS variable.
+Consumes a Scalar into `Expression::Constant`, without allocating CS variables.
+A committed Variable registers its Point with `commit_variable`; an allocated
+Variable reuses its existing R1CS handle. Both produce a one-term Expression.
+External-only, including the constant case. The redundant `scalar` opcode is
+removed: canonical byte parsing is `readscalar`, followed by `expr`.
 
 ### range
 
@@ -1462,7 +1479,7 @@ See [Token / ClearToken / WideToken](#tokens) for type semantics.
 
 _t_ → _t qty flv_
 
-Peeks the top token-shaped value and pushes `(qty, flv)` above it. `ClearToken`: both as `Scalar` (cleartext). `Token`: both as `Point` (the compressed commitment points; works without a live CS). `WideToken`: hard-fails `TypeNotToken` — its quantity isn't yet range-proven.
+Peeks the top token-shaped value and pushes `(qty, flv)` above it. `ClearToken`: both as Scalar. `Token`: both as `Point::Commitment`, preserving the original open or closed commitments and private assignments; works without a live CS. The token itself is retained. `WideToken` hard-fails `TypeNotToken` — its quantity isn't yet range-proven. Logical copying costs are independent of private opening presence.
 
 ### issuepriv
 
@@ -1521,7 +1538,23 @@ _qty flv_ → _−T +T_
 
 Cleartext branch (both `Scalar`): pushes `(ClearToken(-qty, flv), ClearToken(qty, flv))`. The negative half is non-portable until balanced.
 
-Encrypted branch (both `Variable`, external context): commits both to the CS, range-proves the positive `qty` 64-bit, allocates `-qty`, constrains the sum to zero, pushes `(WideToken(-qty, flv), Token(qty, flv))`.
+Quantity and flavor independently accept Scalar or committed Variable. Any
+Variable makes the operation external-only and yields `(WideToken, Token)`:
+
+| Quantity | Flavor | Binding and checks |
+| --- | --- | --- |
+| Scalar | Scalar | ClearToken pair; no CS. |
+| Scalar | committed Variable | Check public qty is a non-negative u64; bind it as a constant; register flavor. |
+| committed Variable | Scalar | Range-prove qty to 64 bits; bind public flavor as a full-field constant. |
+| committed Variable | committed Variable | Register both; range-prove qty to 64 bits. |
+
+Public components use unblinded commitments. Every confidential branch binds
+the debt quantity to the negative of the positive quantity, with identical
+flavor. Quantity assignment/range failures never produce portable positive
+tokens. The public-quantity branch charges three R1CS units; secret-quantity
+branches charge 67, including the 64-bit range gadget. Gas is independent of
+private assignments. Allocated Variables without a public commitment fail
+`TypeNotCommittedVariable`.
 
 Raw `Point` operand hard-fails `TokenRequiresCS` — lift to `Variable` via [`commit`](#commit) first.
 
@@ -1686,15 +1719,16 @@ Pushes the type code of the top value as `Scalar`, leaving the value on the stac
 
 ### input
 
-_contract_id:bytes32_ → _contract_
+_contract_cell_ → _contract_
 
-Resolves the 32-byte ContractID from the initiating execution witness hierarchy and decodes
-the authenticated Contract: predicate, anchor, and one payload Value. Dict
+Resolves the supplied Cell reference through the execution context and decodes
+the authenticated Contract root: predicate, anchor, and one payload Value. Its
+factual CellID is the ContractID. Dict
 branches can remain pruned. Sets `last_anchor = Anchor(contract_id)` and
 emits `TxEntry::Input(contract_id)`.
 
-A prover may use host `push_literal(CellValue::contract(c))`; this emits `pushcell`
-with a child containing the 32-byte ID. Public bodies are collected before proving. Private atomic
+A prover uses `push_cell(CellValue::contract(c)?)`; this emits `pushcell`
+with the actual Contract root and its supplied descendants. Private atomic
 openings are restored only after the same public path/value has resolved.
 A private witness cannot supply a publicly missing branch. Generic untrusted
 Contract imports remain fully validated; the VM input path relies on the
@@ -1702,7 +1736,9 @@ already-admitted UTXO identity.
 
 The VM does not verify accumulator membership: the chain must check the
 spend-once Utreexo proof and reject duplicate inputs. Missing/malformed witness
-bodies or a non-32-byte ID hard-fail. `input` is external-only.
+bodies, pruned roots, arbitrary malformed Cells, and old ID-only payloads hard-fail.
+Copyable raw Cells do not create bearer ownership without chain admission.
+`input` is external-only.
 
 ### contract
 
@@ -1897,8 +1933,12 @@ state encoding performs no portability validation.
 
 _code_ → ø
 
-Consumes a zero-ref Cell/Slice/Builder payload, measures prospective usage, and replaces the current actor's
-**code blob** with its bytes. It hard-fails `StorageCapacityExceeded` if the new
+Consumes a Cell reference, resolves its root, and replaces the current actor's
+native **code graph**. All unpruned descendants must be available through the
+scoped resolver and are materialized with gas charges before persistence;
+explicit pruned terminal records stay pruned. Missing unpruned bodies fail,
+rather than making persistent availability depend on prover/verifier cache
+residency. A pruned root is not executable. It hard-fails `StorageCapacityExceeded` if the new
 code would exceed current capacity. On success it records
 `TxEntry::SetCode { actor, code }`, symmetric with [`save`](#save)). It is
 method-agnostic and independent of the state checkout lock. Requires actor
@@ -1906,7 +1946,7 @@ context.
 
 **Upgrade is author policy over a VM mechanism.** The VM provides `setcode`; *who* may call it is gated in the actor's own code. Actors normally authenticate by **caller identity** — `require(callerid() == GOV)` — and may use `signcall` when immediate signature authorization is required. Internal execution has no deferred signature batch: `signcall` verifies synchronously before entering its child. A naked `setcode` with no caller gate is an unconditionally-upgradeable (i.e. rug-able) actor — deliberately the author's call. See the design.
 
-Hard-fails: `OpcodeRequiresActorContext`, `RegistryUnavailable`, `TypeNotByteSource`, `ActorNotFound`, `StorageCapacityExceeded`.
+Hard-fails: `OpcodeRequiresActorContext`, `RegistryUnavailable`, `TypeNotCell`, `ActorNotFound`, Cell resolution/pruning errors, `StorageCapacityExceeded`.
 
 **Atomicity.** A `save` failure (`SaveWithoutLoad`, `NonPortableInState`,
 `StorageCapacityExceeded`, `ActorNotFound`) propagates as a frame failure. The
@@ -1982,9 +2022,10 @@ Same call-frame mechanics as [`open`](#open) — taproot reveal is replaced by s
 1. Pops `m` (Scalar), `args` (m portable values), and `gas`. A non-portable
    argument hard-fails `NonPortableInCall` before child entry.
 2. Pops `sig` (zero-ref byte source, exactly 64 bytes — Schnorr signature).
-3. Pops `script` (zero-ref byte source) and `contract`.
-4. Builds `signcall_message(script_bytes)` via a Merlin transcript labelled
-   `flamevm.signcall`. Scripts bind themselves to further context (anchor,
+3. Pops `script` (Cell reference), resolves its executable root, and pops `contract`.
+4. Builds `signcall_message(script.id())` via a Merlin transcript labelled
+   `flamevm.signcall`, committing to the factual highest-level hash of the
+   supplied graph, including references and explicit pruning. Scripts bind themselves to further context (anchor,
    actor identity, tx data) through explicit checks inside the signed program.
 5. In external execution, records `DeferredSig::Explicit` for final batch
    verification. In internal execution, parses and verifies the signature
@@ -2000,11 +2041,12 @@ and returns the original Contract plus explicit arguments using the same failure
 shape as `open`; the count is `m`, excluding the contextual Contract. Internal
 signature failure occurs before child entry and hard-fails the current frame.
 
-This migration does not change the signed statement: `signcall` still signs
-source bytes and accepts the existing byte-only script form, not arbitrary
-native program graphs with literal refs. Host `push_script` annotations remain
-validated against the public source bytes. A graph-aware signature statement
-would require a separate deliberate format decision.
+This changes the signed statement from source bytes to the factual program
+CellID; old source-byte signatures are not accepted. `CellWitness::Script` and
+host `push_script` retain private native instruction overlays only after their
+compiled graph matches that ID. Continuations and child programs execute via
+the ordinary Cell frame machinery; private overlays do not supply missing
+public bodies. Actor addressing is unchanged and will be designed separately.
 
 ### timelock
 

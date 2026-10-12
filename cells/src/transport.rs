@@ -124,11 +124,24 @@ impl Cell {
     }
 
     /// Restores resident refs for a complete supplied graph. Explicit pruning
-    /// records remain cuts; missing ordinary bodies are errors. For transport
-    /// boundaries, not implicit traversal during VM execution.
+    /// records remain cuts; missing ordinary bodies are errors. Like transport
+    /// encoding, this unions resident frontiers before resolving missing bodies.
     pub fn load_graph<R: CellReader + ?Sized>(&self, reader: &mut R) -> Result<Self, CellError> {
+        self.resident_graph(self.resolved_graph(reader)?)
+    }
+
+    /// Materializes a graph in an already indexed lookup scope, without scanning
+    /// resident frontiers before reads. The reader owns lookup and metering.
+    pub fn load_graph_scoped<R: CellReader + ?Sized>(
+        &self,
+        reader: &mut R,
+    ) -> Result<Self, CellError> {
+        self.resident_graph(ordered(Arc::new(self.clone()), reader)?)
+    }
+
+    fn resident_graph(&self, records: Vec<Arc<Cell>>) -> Result<Self, CellError> {
         let mut resident = BTreeMap::<_, Arc<Cell>>::new();
-        for cell in self.resolved_graph(reader)? {
+        for cell in records {
             let ready = cell.refs().iter().all(|reference| {
                 reference
                     .as_resident_arc()
@@ -382,6 +395,43 @@ mod tests {
         let restored = proof.load_graph(&mut ()).unwrap();
         assert!(restored.refs()[0].as_resident().unwrap().is_pruned());
         assert_eq!(restored.id(), proof.id());
+    }
+
+    #[test]
+    fn load_graph_stops_before_scanning_a_resident_frontier_when_metering_fails() {
+        let watched = Arc::new(leaf(9));
+        let mut root = Cell::new(vec![1], vec![watched.clone().into()]).unwrap();
+        for _ in 0..1_000 {
+            root = Cell::new(vec![1], vec![root.into()]).unwrap();
+        }
+        struct Exhausted<'a> {
+            watched: &'a Arc<Cell>,
+            baseline: usize,
+            reads: usize,
+        }
+        impl CellReader for Exhausted<'_> {
+            fn read(
+                &mut self,
+                _: crate::CellID,
+                _: Option<&Arc<Cell>>,
+            ) -> Result<Arc<Cell>, CellError> {
+                self.reads += 1;
+                // A frontier-union prepass would retain this distant body before this read.
+                assert_eq!(Arc::strong_count(self.watched), self.baseline);
+                Err(CellError::ResourceExhausted)
+            }
+        }
+        let mut reader = Exhausted {
+            baseline: Arc::strong_count(&watched),
+            watched: &watched,
+            reads: 0,
+        };
+        assert!(matches!(
+            root.load_graph_scoped(&mut reader),
+            Err(CellError::ResourceExhausted)
+        ));
+        assert_eq!(reader.reads, 1);
+        assert_eq!(Arc::strong_count(&watched), reader.baseline);
     }
 
     #[test]

@@ -26,15 +26,18 @@ fn program_builder_emits_expected_bytecode() {
     // alloc(7) alloc(3) add alloc(10) eq verify
     let p = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(10u64)))
+        .expr()
         .eq()
         .verify();
     assert_eq!(
         p.to_bytecode(),
-        // alloc(0x62) alloc(0x62) add(0x53) alloc(0x62) eq(0x51) verify(0xa0)
-        vec![0x62, 0x62, 0x53, 0x62, 0x51, 0xa0]
+        // alloc(0x62), expr(0x63), add(0x53), eq(0x51), verify(0xa0)
+        vec![0x62, 0x63, 0x62, 0x63, 0x53, 0x62, 0x63, 0x51, 0xa0]
     );
     let wits: Vec<_> = p.to_witnesses().into();
     assert_eq!(wits.len(), 3);
@@ -95,9 +98,12 @@ fn prove_then_verify_alloc_arithmetic_equality() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(10u64)))
+        .expr()
         .eq()
         .verify();
 
@@ -129,9 +135,12 @@ fn prove_succeeds_but_verify_fails_on_tampered_proof() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(10u64)))
+        .expr()
         .eq()
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove succeeds");
@@ -172,9 +181,12 @@ fn prove_fails_for_unsatisfiable_equality() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(99u64)))
+        .expr()
         .eq()
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000)
@@ -202,9 +214,9 @@ fn prove_fails_for_unsatisfiable_equality() {
 }
 
 #[test]
-fn alloc_pushes_expression_with_witness() {
+fn alloc_pushes_copyable_variable_with_witness() {
     // Build a single-alloc program and stop after the alloc to
-    // inspect the produced Expression.
+    // inspect the produced Variable.
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new().alloc(Some(Scalar::from(42u64)));
     let mut prover = Prover::new(&pc_gens);
@@ -221,11 +233,11 @@ fn alloc_pushes_expression_with_witness() {
 
     assert_eq!(vm.current_call.stack.len(), 1);
     match &vm.current_call.stack[0] {
-        Value::Expression(Expression::LinearCombination(terms, witness)) => {
-            assert_eq!(terms.len(), 1);
-            assert_eq!(*witness, Some(Scalar::from(42u64)));
+        Value::Variable(Variable::Allocated { assignment, .. }) => {
+            assert_eq!(*assignment, Some(Scalar::from(42u64)));
+            assert!(vm.current_call.stack[0].is_copyable());
         }
-        _ => panic!("expected Expression with witness"),
+        _ => panic!("expected Variable with witness"),
     }
 }
 
@@ -235,9 +247,12 @@ fn prove_then_verify_alloc_multiplication() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(4u64)))
+        .expr()
         .alloc(Some(Scalar::from(5u64)))
+        .expr()
         .mul()
         .alloc(Some(Scalar::from(20u64)))
+        .expr()
         .eq()
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove succeeds");
@@ -268,8 +283,10 @@ fn prove_then_verify_alloc_with_negation() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(5u64)))
+        .expr()
         .neg()
         .alloc(Some(Scalar::from(-5i64)))
+        .expr()
         .eq()
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove succeeds");
@@ -308,7 +325,9 @@ fn alloc_without_witness_works_in_verifier_path() {
     let pc_gens = PedersenGens::default();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(0u64)))
+        .expr()
         .alloc(Some(Scalar::from(0u64)))
+        .expr()
         .eq()
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove succeeds");
@@ -342,12 +361,16 @@ fn shared_bp_gens_is_singleton() {
     let pc_gens = PedersenGens::default();
     let program1 = ScriptBuilder::new()
         .alloc(Some(Scalar::from(1u64)))
+        .expr()
         .alloc(Some(Scalar::from(1u64)))
+        .expr()
         .eq()
         .verify();
     let program2 = ScriptBuilder::new()
         .alloc(Some(Scalar::from(2u64)))
+        .expr()
         .alloc(Some(Scalar::from(2u64)))
+        .expr()
         .eq()
         .verify();
     Prover::prove(&pc_gens, program1, dummy_header(), 1_000_000)
@@ -366,9 +389,12 @@ fn phase18_txid_deterministic_for_equal_inputs() {
     let mk_program = || {
         ScriptBuilder::new()
             .alloc(Some(Scalar::from(7u64)))
+            .expr()
             .alloc(Some(Scalar::from(3u64)))
+            .expr()
             .add()
             .alloc(Some(Scalar::from(10u64)))
+            .expr()
             .eq()
             .verify()
     };
@@ -392,9 +418,12 @@ fn phase18_txid_changes_when_header_changes() {
     let mk_program = || {
         ScriptBuilder::new()
             .alloc(Some(Scalar::from(7u64)))
+            .expr()
             .alloc(Some(Scalar::from(3u64)))
+            .expr()
             .add()
             .alloc(Some(Scalar::from(10u64)))
+            .expr()
             .eq()
             .verify()
     };
@@ -434,9 +463,12 @@ fn phase18_prove_verify_roundtrip_binds_txid() {
     let header = dummy_header();
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(10u64)))
+        .expr()
         .eq()
         .verify();
     let prover_result = Prover::prove(&pc_gens, program, header, 1_000_000).expect("prove ok");
@@ -476,9 +508,12 @@ fn phase18_verifier_rejects_proof_under_different_header() {
     };
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(7u64)))
+        .expr()
         .alloc(Some(Scalar::from(3u64)))
+        .expr()
         .add()
         .alloc(Some(Scalar::from(10u64)))
+        .expr()
         .eq()
         .verify();
     let _pp = Prover::prove(&pc_gens, program, prove_header, 1_000_000).expect("prove ok");
@@ -516,7 +551,9 @@ fn phase21_txresult_populated_for_trivial_program() {
     };
     let program = ScriptBuilder::new()
         .alloc(Some(Scalar::from(5u64)))
+        .expr()
         .alloc(Some(Scalar::from(5u64)))
+        .expr()
         .eq()
         .verify();
     let prover_result = Prover::prove(&pc_gens, program, header, 1_000_000).expect("prove ok");
@@ -536,16 +573,16 @@ fn phase21_txresult_populated_for_trivial_program() {
     // Verifier side: same TxID and txlog; proof is None (consumed).
     let prover_txid = prover_result.txid;
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = prover_result;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    let verifier_result = Verifier::verify_with_cells(
+    let verifier_result = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode.clone(),
+        program.clone(),
         &proof,
         header,
         1_000_000,
@@ -555,7 +592,7 @@ fn phase21_txresult_populated_for_trivial_program() {
     .expect("verify ok");
     // Cross-verify all the fields agree.
     assert_eq!(verifier_result.txid, prover_txid);
-    assert_eq!(verifier_result.bytecode, bytecode);
+    assert_eq!(verifier_result.program.id(), program.id());
     // Verifier-side proof slot is None — it was consumed inside
     // `cs.verify` and never re-attached.
     assert!(verifier_result.proof.is_none());
@@ -635,7 +672,7 @@ fn phase21_deferred_sigs_in_txresult() {
     assert_eq!(prover_result.deferred_sigs.len(), 1);
     let prover_txid = prover_result.txid;
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
@@ -651,9 +688,9 @@ fn phase21_deferred_sigs_in_txresult() {
     )
     .expect("sign_multi");
     let pc_gens_v = PedersenGens::default();
-    let verifier_result = Verifier::verify_with_cells(
+    let verifier_result = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,

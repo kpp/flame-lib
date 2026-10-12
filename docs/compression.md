@@ -8,7 +8,7 @@ describe implemented behavior.
 The concrete implementation is now specified in [cells.md](cells.md) and
 [encoding.md](encoding.md). Those documents supersede the provisional
 Tree/Link, request-manifest, and ContractRef API sketches below. The code uses
-Cell Tries, a whole execution witness hierarchy committed through TxID, ID-only Contract
+Cell Tries, a whole execution witness hierarchy committed through TxID, native Cell Contract
 inputs, lazy authenticated Dict paths, and actor freezing. Taproot roots now
 contain executable policy code: `open` authenticates hash(0), while bytecode
 uses `runslice` / `loadref` / `exec` for optional branch dispatch. The historical
@@ -24,10 +24,10 @@ ordinary byte-compression codec and does not, by itself, guarantee that the
 witness data remains available.
 
 The immediate scope is actor state, portable storage-bound Dict branches, and
-whole-Contract preimages. A common ordered Merkle tree may cover Taproot program
-trees and Utreexo items.
-Merkleizing the Contract payload itself is a possible later format migration, not
-part of the first Contract design. Sharing a primitive does not require every use
+whole-Contract preimages. Cells already cover Contract payload references and
+lazy Dict paths. The generic ordered-tree and versioned-envelope proposals below
+are historical alternatives, not additional migrations to implement. Utreexo
+retains its specialized forest for now. Sharing a primitive does not require every use
 to share the same update or ownership policy.
 
 ## Core insights
@@ -46,9 +46,9 @@ to share the same update or ownership policy.
   is still active, reducing resident storage without freezing all of its state.
 - Opening a Contract and restoring a frozen actor are instances of the same basic
   operation: resolve a short authenticated reference using witness data.
-- A later versioned Contract/Value format may contain a Dict with witnessed
-  branches. Restoring the Contract then need not eagerly restore every branch of
-  every nested Dict.
+- The implemented Contract/Value format can contain a Dict with witnessed
+  branches. Restoring the Contract need not eagerly restore every branch of
+  every nested Dict; no extra schema version is required.
 - Witness data may be supplied explicitly as program data, implicitly through
   the transaction execution context, or through both interfaces.
 - These cases may use one content-addressed witness transport and one set of
@@ -187,7 +187,7 @@ Dict may cache only opened entries, so the Tree and envelope are authoritative
 and cache absence is never key absence. Flat
 serialization alone checks whether the keys are exactly `0..len-1`: if so it
 omits the keys and writes list form; otherwise it writes every key. Decoding
-either form recreates the same explicit keyed entries. The current flat codec
+either form recreates the same explicit keyed entries. The earlier flat codec
 rebuilds capability flags from the present entries, losing sticky history, and
 has no Tree-availability representation. A compressed-state envelope is a
 separate format. This matches the current `BTreeMap`-backed Dict behavior.
@@ -222,12 +222,11 @@ working metadata, not a generic Tree availability flag. Proof positions describe
 paths in the current forest state and may change when normalization relocates
 survivors.
 
-Contract IDs and actor state roots currently commit flat `Value` encodings; Dict has
-no independent Tree root. Taproot and Utreexo already use the same ordered
-binary shape. Initially they should reuse only the request/transport and proof
-conventions; replacing `Forest`/`WorkForest` or Taproot's current proof structs
-with `Link`/`Node` is worthwhile only if it makes their code smaller. Adopting
-`wrapped_tree` or new metadata is a versioned consensus migration.
+This original proposal assumed flat Contract/actor Value encodings without an
+independent Dict tree. That assumption is superseded: Dict has a Cell Trie root,
+and Taproot opens executable Cell graphs. Utreexo alone retains its specialized
+forest. The `Link`/`Node` and request-keyed transport adapters here are historical
+alternatives, not wrappers to add to the implemented Cell format.
 
 ### Proofs and limitations
 
@@ -271,7 +270,7 @@ adjacency/boundary proof produces normal not-found behavior.
 Linearity is enforced by the containing type. Witness bytes alone are not
 authority to commit a stack `Value`; hydration runs only through a domain gate.
 Actor state requires an exclusive checkout, and a Dict requires its uniquely
-owned wrapper. A ContractID string is intentionally copyable, so speculative VM
+owned wrapper. A Contract root Cell handle is intentionally copyable, so speculative VM
 execution may resolve it more than once; the transaction becomes valid only if
 the Utreexo batch accepts exactly one consumption of that ContractID. Duplicate
 input claims reject the candidate and all speculative effects. Hydration fills
@@ -373,15 +372,15 @@ hydration only fills local bodies. Explicit pruning/restoration changes the
 authenticated availability root and the derived inline-byte charge, but never
 the content root or droppability history.
 
-Authenticating these fields is a new compressed-state rule. The current flat
-Dict encoding omits sticky history and cannot by itself round-trip this
-envelope.
+The earlier flat Dict encoding could not round-trip this proposed envelope.
+The implemented Cell-based Dict already authenticates its sticky capability
+flags; the fields above describe a superseded envelope design.
 
 Every parent commitment containing a stored Dict commits this full envelope,
 not only the Dict content root. Otherwise a witness could substitute
 availability or droppability metadata without changing a containing Contract or
-actor state. This requires a versioned `Value::Dict` encoding before lazy Dicts
-can cross a persistent Contract or actor-state boundary.
+actor state. In the implemented format, Cell references and committed Dict flags
+provide this binding without adding a per-type schema version.
 
 A keyed lookup asks the current execution's witness context for a membership
 or adjacency proof under `(tree commitment, key)`. A valid absence proof
@@ -413,10 +412,10 @@ machinery:
 | Witness result | Exact Contract body; predicate opening separately | Actor code and selected state branches |
 | Consumption | Contract is opened or spent | Actor remains and receives a new state root |
 
-Both can use content-addressed witness blobs and authenticated paths. The first
-Contract design restores its exact current body eagerly. After the versioned Dict
-envelope is added to Value/Contract encoding, Dicts inside that body may remain
-witnessed and hydrate lazily.
+Both use content-addressed Cell bodies and authenticated paths. The current
+Contract design authenticates its root eagerly but leaves nested Dict branches
+lazy; their bodies are resolved through the same scoped context. A separate
+versioned Dict envelope is not required.
 
 ## Contextual witness architecture
 
@@ -656,27 +655,30 @@ Only Utreexo retains the specialized `merkle` accumulator machinery. See
 
 ### Contract API
 
-The implemented carrier is `CellValue::contract(contract)`, whose public
-zero-ref Cell contains only the 32-byte ContractID. Its optional direct
+The implemented fallible carrier is `CellValue::contract(contract)`, whose public
+Cell is the canonical Contract root, including references for its typed payload.
+Its factual CellID is the ContractID. Its optional direct
 `CellWitness::Contract` retains private commitment openings; no separate
-String or ContractRef wrapper exists. `ScriptBuilder::push_literal` lowers
-this Cell to a program reference consumed by `pushcell`, while collecting the
+String or ContractRef wrapper exists. `ScriptBuilder::push_cell` supplies
+this root as a program reference consumed by `pushcell`, while collecting the
 Contract's public bodies into the transaction's committed execution hierarchy.
 
-`input` reads the exact ID from a zero-ref Cell/Slice/Builder payload, resolves
-and authenticates the public Contract body, and only then restores matching
+`input` consumes that Cell handle, resolves
+and authenticates its public Contract body, and only then restores matching
 private atomic witnesses. A private annotation cannot replace missing public
 data. Dict branches may remain pruned and resolve lazily through the same
 execution context; raw Cell parsing never instantiates owned Tokens.
 
 ```text
-_contract_id:bytes32_ input -> _contract_
+_contract_cell_ input -> _contract_
 ```
 
 Resolution charges bounded lookup, decode and materialization work. It does
 not prove that the Contract is unspent: Utreexo membership/delete verification
 and duplicate-input rejection remain separate chain-layer checks. The
-Contract-ID operand format is unchanged by the CellValue migration.
+CellID identifies the claim; a 32-byte payload is no longer an input selector.
+Host programs use `push_cell(CellValue::contract(contract)?)` and preserve the
+native graph through `to_cell`/`build_tx`, not a byte-only source round trip.
 
 ### Predicate API
 
@@ -697,8 +699,10 @@ Cell paths; the VM does not separately select or decode a Taproot leaf.
 `PredicateTree::opening_for` and `ScriptBuilder::push_taproot_proof` are optional
 host helpers that produce an executable partial root and retain matching
 private instruction overlays outside its public identity. `CellWitness::Script`
-instead retains the existing bounded source-byte program operand for
-`signcall`; it is not a ProgramRef or a new graph-aware signature format.
+also represents a native program graph, with its private instruction assignments
+outside the encoding. `signcall` signs the factual CellID, including supplied
+and pruned branches, using the existing transcript domain and labels. The
+semantic hash(0) rule belongs to Taproot `open`, not `signcall`.
 
 On entered-call failure, the original Contract and explicit arguments are
 restored, with count `k` excluding the Contract and status `0`. Unused child
@@ -739,7 +743,7 @@ rollback restores a complete record.
 
 ```rust
 ActorRegistry::load_code(actor, cx: &mut dyn WitnessContext)
-    -> Result<Vec<u8>, VMError>
+    -> Result<Cell, VMError>
 ActorRegistry::load_state(actor, cx: &mut dyn WitnessContext)
     -> Result<Value, VMError>
 ```
@@ -751,13 +755,16 @@ then atomically checks out the uniquely owned state. A decoded top-level state
 can contain Dicts whose inner links remain witnessed; later key accesses
 recursively reuse the same context.
 
-The current actor state root hashes one fully flat `Value`, so partial Dict
-hydration requires a versioned Merkleized state commitment. Actor code can keep
-its current flat `code_root` because it is restored as one bounded blob. The
-migration also changes `TxEntry::ActorSave`, its encoding/Merkle commitment,
-registry replay, and storage sizing: all currently carry or inspect the full
-flat `Value`, and must instead preserve the committed state envelope and its
-availability frontier.
+The implemented actor state root commits a tagged Cell-based Value; nested
+Dicts hydrate lazily through authenticated Cell paths. Code is also a native
+Cell graph. `setcode` resolves every supplied ordinary descendant before
+persisting the graph, retaining explicit pruned children as terminals and
+rejecting missing ordinary bodies. Registry/effect APIs carry Cells; RPC code
+uses CellEnvelope graph transport. Code-byte admission currently counts root
+payload bytes, while rent counts all unique retained code/state records.
+Actor addressing retains its existing byte interface for a separate redesign.
+The request-oriented signatures above are historical sketches; concrete readers
+and storage envelopes are specified in [cells.md](cells.md) and [encoding.md](encoding.md).
 
 ### Dict API and explicit pruning
 
@@ -923,13 +930,17 @@ Privacy, encryption, and zero-knowledge access are separate concerns.
   scope.
 - How successful `ArchiveBlob`s are exposed for archival, and who is
   responsible for retaining them after actor-controlled Dict pruning.
-- Maximum String and program sizes, so large portable data has one canonical
-  chunking path through Dicts.
+- Further program graph-size admission policy beyond root-payload byte limits;
+  Cell capacity, graph transport bounds and execution gas already apply.
 - Which witness bytes are retained across reorganization and archival pruning.
 - How much implementation Utreexo and Taproot can share without replacing
   their useful domain-specific wrappers.
 
-## Proposed work order
+## Historical proposed work order
+
+This request-manifest/Tree plan is superseded by [the Cell implementation plan](plan.md).
+It is retained as design history, not an active list of additional wrappers,
+schema versions, or witness formats to add.
 
 1. Fix the canonical `WitnessRequest`, `RequestID`, `WitnessID`, manifest root,
    size bounds, and error classification. Keep the first table in

@@ -285,7 +285,7 @@ impl Node {
             state_size: info.state_size,
             storage_used: info.storage_used,
             storage_capacity: info.storage_capacity,
-            code: info.code.map(ActorCode),
+            code: info.code.map(|code| ActorCode(code.encode())),
             state: info.state.map(|state| ActorStateEnvelope(state.encode())),
             decoded_state: None,
             state_error: None,

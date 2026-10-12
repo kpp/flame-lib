@@ -8,7 +8,8 @@ use flamed_rpc::{
 };
 use flamevm::{
     read_cell, resolve_cell, ActorID, Anchor, Cell, CellDecode, CellEncode, CellEnvelope,
-    CellError, CellRef, CellSlice, Contract, Instruction, Predicate, Scalar, Trie, TxEntry, Value,
+    CellError, CellIndex, CellRef, CellSlice, Contract, Instruction, Predicate, Scalar, Trie,
+    TxEntry, Value,
 };
 
 /// Decodes an archived contract's public payload.
@@ -71,11 +72,21 @@ pub fn actor(mut result: ActorResult) -> ActorResult {
 }
 
 fn disassemble(code: &[u8]) -> (Vec<InstructionView>, Option<String>) {
+    let mut gas = u64::MAX;
+    let envelope = match CellEnvelope::decode(code, code.len(), &mut gas) {
+        Ok(envelope) => envelope,
+        Err(error) => return (Vec::new(), Some(error.to_string())),
+    };
+    let root = match envelope.cells().get(&envelope.root()) {
+        Some(root) => root,
+        None => return (Vec::new(), Some("Code root is unavailable".into())),
+    };
     let mut instructions = Vec::new();
-    let mut remaining = code;
+    let mut remaining = root.payload();
+    let mut refs = root.refs().iter();
     while !remaining.is_empty() {
-        let offset = (code.len() - remaining.len()) as u64;
-        let op = match Instruction::parse_source(&mut remaining) {
+        let offset = (root.payload().len() - remaining.len()) as u64;
+        let op = match Instruction::parse(&mut remaining) {
             Ok(op) => op,
             Err(error) => {
                 return (instructions, Some(format!("Byte {offset}: {error}")));
@@ -83,15 +94,15 @@ fn disassemble(code: &[u8]) -> (Vec<InstructionView>, Option<String>) {
         };
         let text = match op {
             Instruction::PushInt(n) => format!("push {}", scalar(n)),
-            Instruction::CellLiteral(cell) => {
-                format!(
-                    "pushcell bytes 0x{}",
-                    hex::encode(
-                        cell.payload()
-                            .expect("parsed literal has a resident byte payload")
+            Instruction::PushCell(_) => match refs.next() {
+                Some(reference) => format!("pushcell 0x{}", hex::encode(reference.id())),
+                None => {
+                    return (
+                        instructions,
+                        Some(format!("Byte {offset}: missing reference")),
                     )
-                )
-            }
+                }
+            },
             Instruction::PushPoint(p) => format!("pushpoint 0x{}", hex::encode(p.to_bytes())),
             Instruction::DupK(k) => format!("dup:{k}"),
             Instruction::RollK(k) => format!("roll:{k}"),
@@ -150,6 +161,25 @@ fn effect_from_cell(cell: &Cell, envelope: &mut CellEnvelope) -> Result<RpcTxEnt
     let mut slice = CellSlice::new(cell);
     // Archived logs can omit old state cells. Keep their hashes and all available bodies.
     let effect = match slice.load_u8()? {
+        tag @ (TxEntry::TAG_ACTOR_DEPLOY | TxEntry::TAG_SET_CODE) => {
+            let actor = ActorId(<[u8; 32]>::decode(&mut slice, envelope)?);
+            let reference = slice.load_ref()?;
+            let code =
+                CellEnvelope::new(reference.id(), available_index(&reference, envelope)?)?.encode();
+            if tag == TxEntry::TAG_ACTOR_DEPLOY {
+                RpcTxEntry::ActorDeploy {
+                    actor,
+                    code,
+                    code_hash: reference.id(),
+                }
+            } else {
+                RpcTxEntry::SetCode {
+                    actor,
+                    code,
+                    code_hash: reference.id(),
+                }
+            }
+        }
         TxEntry::TAG_ACTOR_SAVE => {
             let actor = ActorId(<[u8; 32]>::decode(&mut slice, envelope)?);
             let state = slice.load_ref()?;
@@ -291,8 +321,9 @@ fn render_effect(entry: &TxEntry, envelope: &mut CellEnvelope) -> Result<RpcTxEn
         },
         TxEntry::ActorDeploy { actor, code } => RpcTxEntry::ActorDeploy {
             actor: ActorId(actor.to_hash()),
-            code: code.clone(),
-            code_hash: flamevm::code_root(code),
+            code: CellEnvelope::new(code.id(), available_index(&code.clone().into(), envelope)?)?
+                .encode(),
+            code_hash: code.id(),
         },
         TxEntry::ActorSave { actor, state } => RpcTxEntry::ActorSave {
             actor: ActorId(actor.to_hash()),
@@ -301,8 +332,9 @@ fn render_effect(entry: &TxEntry, envelope: &mut CellEnvelope) -> Result<RpcTxEn
         },
         TxEntry::SetCode { actor, code } => RpcTxEntry::SetCode {
             actor: ActorId(actor.to_hash()),
-            code: code.clone(),
-            code_hash: flamevm::code_root(code),
+            code: CellEnvelope::new(code.id(), available_index(&code.clone().into(), envelope)?)?
+                .encode(),
+            code_hash: code.id(),
         },
         TxEntry::ActorDestroy { actor } => RpcTxEntry::ActorDestroy {
             actor: ActorId(actor.to_hash()),
@@ -377,10 +409,13 @@ fn render_value(value: &Value, envelope: &mut CellEnvelope) -> Result<TxValue, C
     })
 }
 
-fn available_cells(reference: &CellRef, envelope: &mut CellEnvelope) -> Result<TxValue, CellError> {
+fn available_index(
+    reference: &CellRef,
+    envelope: &mut CellEnvelope,
+) -> Result<CellIndex, CellError> {
     let mut pending = vec![reference.clone()];
     let mut seen = HashSet::new();
-    let mut cells = Vec::new();
+    let mut cells = CellIndex::new();
     while let Some(reference) = pending.pop() {
         if !seen.insert(reference.id()) {
             continue;
@@ -388,17 +423,28 @@ fn available_cells(reference: &CellRef, envelope: &mut CellEnvelope) -> Result<T
         match read_cell(envelope, &reference) {
             Ok(cell) => {
                 pending.extend(cell.refs().iter().cloned());
-                cells.push(ValueCell {
-                    id: CellId(cell.id()),
-                    data: cell.payload().to_vec(),
-                    refs: cell.refs().iter().map(|r| CellId(r.id())).collect(),
-                });
+                cells.insert(cell)?;
             }
             Err(CellError::MissingCell(_)) => {}
             Err(error) => return Err(error),
         }
     }
-    cells.sort_unstable_by_key(|cell| cell.id);
+    Ok(cells)
+}
+
+fn available_cells(reference: &CellRef, envelope: &mut CellEnvelope) -> Result<TxValue, CellError> {
+    let cells = available_index(reference, envelope)?
+        .iter()
+        .map(|(_, cell)| ValueCell {
+            id: CellId(cell.id()),
+            data: cell.payload().to_vec(),
+            refs: cell
+                .refs()
+                .iter()
+                .map(|reference| CellId(reference.id()))
+                .collect(),
+        })
+        .collect();
 
     Ok(TxValue::Cells {
         root: CellId(reference.id()),
@@ -409,6 +455,23 @@ fn available_cells(reference: &CellRef, envelope: &mut CellEnvelope) -> Result<T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_code_projection_keeps_refs_even_when_child_bodies_are_unavailable() {
+        let child = Cell::new(vec![0x1d], vec![]).unwrap();
+        let root = Cell::new(vec![0xa6, 0xa7], vec![child.clone().into()]).unwrap();
+        let mut cells = CellIndex::new();
+        cells.insert(root.clone().into()).unwrap();
+        let snapshot = CellEnvelope::new(root.id(), cells).unwrap();
+        let (instructions, error) = disassemble(&snapshot.encode());
+        assert!(error.is_none());
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(
+            instructions[0].text,
+            format!("pushcell 0x{}", hex::encode(child.id()))
+        );
+        assert_eq!(instructions[1].text, "exec");
+    }
 
     #[test]
     fn raw_cell_effect_values_render_their_available_graph() {
@@ -572,7 +635,11 @@ mod tests {
 
     #[test]
     fn archived_effects_keep_order_precision_and_full_data() {
-        let code = vec![0xcd; 257];
+        let code = Cell::new(vec![0xcd; 257], vec![]).unwrap();
+        let code_bytes =
+            CellEnvelope::new(code.id(), CellIndex::collect(code.clone().into()).unwrap())
+                .unwrap()
+                .encode();
         let log = TxLog::from(vec![
             TxEntry::Data(vec![0xab; 257]),
             TxEntry::Fee(u64::MAX),
@@ -598,8 +665,8 @@ mod tests {
                     "kind": "set_code",
                     "data": {
                         "actor": "11".repeat(32),
-                        "code": "zc3N".repeat(85) + "zc0=",
-                        "code_hash": hex::encode(flamevm::code_root(&code)),
+                        "code": serde_json::to_value(flamed_rpc::ActorCode(code_bytes)).unwrap(),
+                        "code_hash": hex::encode(code.id()),
                     },
                 },
             ])
@@ -638,7 +705,7 @@ mod tests {
             ),
             TxEntry::ActorDeploy {
                 actor: actor.clone(),
-                code: vec![0xef; 257],
+                code: Cell::new(vec![0xef; 257], vec![]).unwrap(),
             },
             TxEntry::ActorSave {
                 actor: actor.clone(),
@@ -681,7 +748,16 @@ mod tests {
             json[3]["data"]["payload"]["entries"][0]["value"]["cells"][0]["data"],
             "q6ur".repeat(85) + "q6s="
         );
-        assert_eq!(json[4]["data"]["code"], "7+/v".repeat(85) + "7+8=");
+        let RpcTxEntry::ActorDeploy {
+            code, code_hash, ..
+        } = &decoded[4]
+        else {
+            panic!("expected native code effect");
+        };
+        let mut gas = u64::MAX;
+        let code = CellEnvelope::decode(code, code.len(), &mut gas).unwrap();
+        assert_eq!(code.root(), *code_hash);
+        assert_eq!(code.cells().get(code_hash).unwrap().payload(), &[0xef; 257]);
         assert_eq!(json[5]["data"]["state"], json[3]["data"]["payload"]);
         assert_eq!(
             json[6]["data"],
