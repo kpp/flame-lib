@@ -34,6 +34,8 @@ pub trait TransactionSigner: Send + Sync {
 
     async fn fund_and_sign(
         &self,
-        request: SignTransactionRequest,
-    ) -> Result<Transaction, Self::Error>;
+        _request: SignTransactionRequest,
+    ) -> Result<Transaction, Self::Error> {
+        unimplemented!()
+    }
 }

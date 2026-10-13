@@ -71,35 +71,64 @@ pub struct BtcSignedTransaction {
 /// Coin selection, retries and operations combining calls belong to BitcoinFacade.
 #[async_trait]
 pub trait RpcApi: Send + Sync {
-    async fn best_block_tip(&self) -> Result<BtcBlockTip>;
-    async fn block_header_info(&self, block_hash: BlockHash) -> Result<BtcBlockHeaderInfo>;
-    async fn transactions_in_block(&self, block_hash: BlockHash) -> Result<Vec<Transaction>>;
+    async fn best_block_tip(&self) -> Result<BtcBlockTip> {
+        unimplemented!()
+    }
+
+    async fn block_header_info(&self, _block_hash: BlockHash) -> Result<BtcBlockHeaderInfo> {
+        unimplemented!()
+    }
+
+    async fn transactions_in_block(&self, _block_hash: BlockHash) -> Result<Vec<Transaction>> {
+        unimplemented!()
+    }
+
     async fn transactions_with_prevouts_in_block(
         &self,
-        block_hash: BlockHash,
-    ) -> Result<Vec<BtcTransactionWithPrevouts>>;
-    async fn block_hash_at_height(&self, height: u64) -> Result<BlockHash>;
+        _block_hash: BlockHash,
+    ) -> Result<Vec<BtcTransactionWithPrevouts>> {
+        unimplemented!()
+    }
+
+    async fn block_hash_at_height(&self, _height: u64) -> Result<BlockHash> {
+        unimplemented!()
+    }
+
     /// A single long-poll request; a timeout may return the unchanged tip.
     async fn wait_for_new_block(
         &self,
-        current_tip: BlockHash,
-        timeout_ms: u64,
-    ) -> Result<BtcBlockTip>;
+        _current_tip: BlockHash,
+        _timeout_ms: u64,
+    ) -> Result<BtcBlockTip> {
+        unimplemented!()
+    }
+
     async fn send_raw_transaction(
         &self,
-        transaction: &Transaction,
-        max_burn_amount: Option<Amount>,
-    ) -> Result<Txid>;
-    async fn list_unspent(&self) -> Result<Vec<BtcUnspentOutput>>;
+        _transaction: &Transaction,
+        _max_burn_amount: Option<Amount>,
+    ) -> Result<Txid> {
+        unimplemented!()
+    }
+
+    async fn list_unspent(&self) -> Result<Vec<BtcUnspentOutput>> {
+        unimplemented!()
+    }
+
     async fn fund_raw_transaction(
         &self,
-        transaction: &Transaction,
-        options: &BtcFundOptions,
-    ) -> Result<Transaction>;
+        _transaction: &Transaction,
+        _options: &BtcFundOptions,
+    ) -> Result<Transaction> {
+        unimplemented!()
+    }
+
     async fn sign_raw_transaction_with_wallet(
         &self,
-        transaction: &Transaction,
-    ) -> Result<BtcSignedTransaction>;
+        _transaction: &Transaction,
+    ) -> Result<BtcSignedTransaction> {
+        unimplemented!()
+    }
 }
 
 #[derive(Debug)]

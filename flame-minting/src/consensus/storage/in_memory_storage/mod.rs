@@ -9,10 +9,10 @@ use flamechain::{BlockTip, CoreBlockTip, CoreFlameHeight};
 
 use crate::consensus::{
     DoubleSign, IncludedAcquisition, IncludedEndorsement, MintingProtocolParams,
-    WeightedBlockHeader, WeightedEndorsement,
+    PendingEndorsements, WeightedBlockHeader, WeightedEndorsement,
 };
 
-use super::{ConsensusStorage, MinterAcquisitions};
+use super::{AcquisitionIndex, ConsensusStorage, EndorsementIndex, MinterAcquisitions};
 
 mod acquisition_storage;
 mod double_sign_storage;
@@ -76,6 +76,23 @@ fn insert_unique<K: Ord, V: PartialEq>(
 
 impl ConsensusStorage for InMemoryConsensusStorage {
     type Error = InMemoryConsensusStorageError;
+
+    async fn get_acquisition(
+        &self,
+        index: AcquisitionIndex,
+    ) -> Result<Option<IncludedAcquisition>, Self::Error> {
+        Ok(self.read_state()?.acquisitions.get_acquisition(index))
+    }
+
+    async fn restore_acquisition(
+        &self,
+        index: AcquisitionIndex,
+        previous: Option<&IncludedAcquisition>,
+    ) -> Result<(), Self::Error> {
+        self.write_state()?
+            .acquisitions
+            .restore_acquisition(index, previous)
+    }
 
     async fn store_acquisition(
         &self,
@@ -161,6 +178,49 @@ impl ConsensusStorage for InMemoryConsensusStorage {
             .store_pending_endorsement(tip, endorsement)
     }
 
+    async fn restore_endorsement(
+        &self,
+        minter: &MinterP2wsh,
+        flame_height: CoreFlameHeight,
+        previous: Option<&WeightedEndorsement>,
+    ) -> Result<(), Self::Error> {
+        self.write_state()?
+            .endorsements
+            .restore_endorsement(minter, flame_height, previous)
+    }
+
+    async fn get_pending_endorsement(
+        &self,
+        tip: CoreBlockTip,
+        index: EndorsementIndex,
+    ) -> Result<Option<IncludedEndorsement>, Self::Error> {
+        Ok(self
+            .read_state()?
+            .endorsements
+            .get_pending_endorsement(tip, index))
+    }
+
+    async fn restore_pending_endorsement(
+        &self,
+        tip: CoreBlockTip,
+        index: EndorsementIndex,
+        previous: Option<&IncludedEndorsement>,
+    ) -> Result<(), Self::Error> {
+        self.write_state()?
+            .endorsements
+            .restore_pending_endorsement(tip, index, previous)
+    }
+
+    async fn get_pending_endorsements_for_block(
+        &self,
+        tip: CoreBlockTip,
+    ) -> Result<PendingEndorsements, Self::Error> {
+        Ok(self
+            .read_state()?
+            .endorsements
+            .get_pending_endorsements_for_block(tip))
+    }
+
     async fn get_block_tip_with_most_weight(&self) -> Result<Option<BlockTip>, Self::Error> {
         Ok(self
             .read_state()?
@@ -188,6 +248,16 @@ impl ConsensusStorage for InMemoryConsensusStorage {
             .store_cumulative_weight(tip, weighted_block)
     }
 
+    async fn restore_cumulative_weight(
+        &self,
+        tip: BlockTip,
+        previous: Option<&WeightedBlockHeader>,
+    ) -> Result<(), Self::Error> {
+        self.write_state()?
+            .weighted_headers
+            .restore_cumulative_weight(tip, previous)
+    }
+
     async fn add_double_sign(&self, double_sign: &DoubleSign) -> Result<(), Self::Error> {
         self.write_state()?
             .double_signs
@@ -211,15 +281,30 @@ impl ConsensusStorage for InMemoryConsensusStorage {
             .double_signs
             .is_minter_double_signed(minter))
     }
+
+    async fn restore_double_sign(
+        &self,
+        minter: &MinterP2wsh,
+        flame_height: CoreFlameHeight,
+        previous: Option<&DoubleSign>,
+    ) -> Result<(), Self::Error> {
+        self.write_state()?
+            .double_signs
+            .restore_double_sign(minter, flame_height, previous)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InMemoryConsensusStorageError {
     LockPoisoned,
     BitcoinBlockMismatch,
+    AcquisitionKeyMismatch,
+    EndorsementKeyMismatch,
+    PendingEndorsementKeyMismatch,
     CoreBlockMismatch,
     BlockTipMismatch,
     ConflictingRecord,
+    DoubleSignKeyMismatch,
     InvalidDoubleSign,
 }
 
@@ -230,6 +315,18 @@ impl fmt::Display for InMemoryConsensusStorageError {
             Self::BitcoinBlockMismatch => {
                 write!(formatter, "Bitcoin block does not match the record")
             }
+            Self::AcquisitionKeyMismatch => {
+                write!(formatter, "acquisition key does not match the record")
+            }
+            Self::EndorsementKeyMismatch => {
+                write!(formatter, "endorsement key does not match the record")
+            }
+            Self::PendingEndorsementKeyMismatch => {
+                write!(
+                    formatter,
+                    "pending endorsement key does not match the record"
+                )
+            }
             Self::CoreBlockMismatch => {
                 write!(formatter, "core block does not match the endorsement")
             }
@@ -237,6 +334,9 @@ impl fmt::Display for InMemoryConsensusStorageError {
                 write!(formatter, "block tip does not match the weighted header")
             }
             Self::ConflictingRecord => write!(formatter, "conflicting consensus storage record"),
+            Self::DoubleSignKeyMismatch => {
+                write!(formatter, "double sign key does not match the record")
+            }
             Self::InvalidDoubleSign => write!(
                 formatter,
                 "double sign must contain conflicting endorsements from the specified minter at the specified height"

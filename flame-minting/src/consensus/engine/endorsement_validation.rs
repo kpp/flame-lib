@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use btc_integration::{AuthenticatedMintingEndorsement, IndexedBlock, MinterIdentity};
+use btc_integration::MinterIdentity;
 use flame_storage::ChainStorage;
 use flamechain::CoreFlameHeight;
 
@@ -10,7 +10,7 @@ use crate::consensus::{
 };
 
 pub struct EndorsementValidator<'a, C, H> {
-    pub new_block: &'a IndexedBlock,
+    pub endorsements: &'a [IncludedEndorsement],
     pub protocol_params: &'a MintingProtocolParams,
     pub consensus_storage: &'a C,
     pub chain_storage: &'a H,
@@ -23,7 +23,7 @@ impl<C: ConsensusStorage, H: ChainStorage> EndorsementValidator<'_, C, H> {
     ) -> Result<EndorsementValidationResult, EndorsementValidationError<C::Error, H::Error>> {
         let mut minters: HashMap<MinterIdentity, MinterEndorsements> = HashMap::new();
 
-        for endorsement in &self.new_block.endorsements {
+        for endorsement in self.endorsements {
             match self.check_eligibility(endorsement).await? {
                 EndorsementEligibility::Rejected => {}
                 EndorsementEligibility::Pending(endorsement) => {
@@ -64,13 +64,10 @@ impl<C: ConsensusStorage, H: ChainStorage> EndorsementValidator<'_, C, H> {
 
     async fn check_eligibility(
         &self,
-        endorsement: &AuthenticatedMintingEndorsement,
+        included: &IncludedEndorsement,
     ) -> Result<EndorsementEligibility, EndorsementValidationError<C::Error, H::Error>> {
+        let endorsement = &included.endorsement;
         let minter = endorsement.auth().minter().p2wsh();
-        let included = IncludedEndorsement {
-            btc_block: self.new_block.btc_block_tip,
-            endorsement: endorsement.clone(),
-        };
         let Some(core) = self
             .chain_storage
             .get_core_block_header(endorsement.block_tip())
@@ -85,7 +82,7 @@ impl<C: ConsensusStorage, H: ChainStorage> EndorsementValidator<'_, C, H> {
             {
                 return Ok(EndorsementEligibility::Rejected);
             }
-            return Ok(EndorsementEligibility::Pending(included));
+            return Ok(EndorsementEligibility::Pending(included.clone()));
         };
         let target = u64::from(core.target_btc_height);
         if included.btc_block.height < target {
@@ -107,7 +104,7 @@ impl<C: ConsensusStorage, H: ChainStorage> EndorsementValidator<'_, C, H> {
             return Ok(EndorsementEligibility::Rejected);
         }
 
-        Ok(EndorsementEligibility::Eligible(included))
+        Ok(EndorsementEligibility::Eligible(included.clone()))
     }
 }
 

@@ -6,9 +6,9 @@ use std::{
 
 use flamechain::CoreFlameHeight;
 
-use super::{PendingReward, RewardsStorage};
+use super::{PendingReward, RewardIndex, RewardsStorage};
 
-type RewardsByPredicate = BTreeMap<([u8; 32], [u8; 32]), PendingReward>;
+type RewardsByPredicate = BTreeMap<RewardIndex, PendingReward>;
 
 #[derive(Clone, Default)]
 pub struct InMemoryRewardsStorage {
@@ -32,7 +32,7 @@ impl InMemoryRewardsStorage {
             .get(&target_block_height)
             .into_iter()
             .flat_map(|rewards| rewards.values())
-            .map(clone_reward)
+            .cloned()
             .collect())
     }
 }
@@ -40,22 +40,63 @@ impl InMemoryRewardsStorage {
 impl RewardsStorage for InMemoryRewardsStorage {
     type Error = InMemoryRewardsStorageError;
 
+    async fn get_pending_reward(
+        &self,
+        target_block_height: CoreFlameHeight,
+        index: RewardIndex,
+    ) -> Result<Option<PendingReward>, Self::Error> {
+        let rewards = self.rewards.read().map_err(|_| Self::Error::LockPoisoned)?;
+        Ok(rewards
+            .get(&target_block_height)
+            .and_then(|rewards| rewards.get(&index))
+            .cloned())
+    }
+
+    async fn restore_pending_reward(
+        &self,
+        target_block_height: CoreFlameHeight,
+        index: RewardIndex,
+        previous: Option<&PendingReward>,
+    ) -> Result<(), Self::Error> {
+        if previous.is_some_and(|reward| RewardIndex::from(reward) != index) {
+            return Err(Self::Error::RewardKeyMismatch);
+        }
+        let mut rewards = self
+            .rewards
+            .write()
+            .map_err(|_| Self::Error::LockPoisoned)?;
+        match previous {
+            Some(previous) => {
+                rewards
+                    .entry(target_block_height)
+                    .or_default()
+                    .insert(index, previous.clone());
+            }
+            None => {
+                if let Entry::Occupied(mut entry) = rewards.entry(target_block_height) {
+                    entry.get_mut().remove(&index);
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn store_pending_reward(
         &self,
         target_block_height: CoreFlameHeight,
         reward: &PendingReward,
     ) -> Result<(), Self::Error> {
-        let key = (
-            reward.flame_predicate.to_point().to_bytes(),
-            reward.access_predicate.to_point().to_bytes(),
-        );
+        let key = RewardIndex::from(reward);
         let mut rewards = self
             .rewards
             .write()
             .map_err(|_| Self::Error::LockPoisoned)?;
         match rewards.entry(target_block_height).or_default().entry(key) {
             Entry::Vacant(entry) => {
-                entry.insert(clone_reward(reward));
+                entry.insert(reward.clone());
                 Ok(())
             }
             Entry::Occupied(entry) if entry.get().amount == reward.amount => Ok(()),
@@ -68,17 +109,10 @@ impl RewardsStorage for InMemoryRewardsStorage {
     }
 }
 
-fn clone_reward(reward: &PendingReward) -> PendingReward {
-    PendingReward {
-        flame_predicate: reward.flame_predicate.clone(),
-        access_predicate: reward.access_predicate.clone(),
-        amount: reward.amount,
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum InMemoryRewardsStorageError {
     LockPoisoned,
+    RewardKeyMismatch,
     ConflictingReward {
         target_block_height: CoreFlameHeight,
         stored_amount: u64,
@@ -90,6 +124,7 @@ impl fmt::Display for InMemoryRewardsStorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LockPoisoned => write!(formatter, "rewards storage lock poisoned"),
+            Self::RewardKeyMismatch => write!(formatter, "reward does not match the requested key"),
             Self::ConflictingReward {
                 target_block_height,
                 stored_amount,

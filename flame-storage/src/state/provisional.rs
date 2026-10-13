@@ -8,11 +8,16 @@ pub trait ProvisionalStorage {
 
     fn get_state(
         &self,
-        tip: BlockHash,
-    ) -> impl Future<Output = Result<Option<Self::State>, Self::Error>> + Send;
+        _tip: BlockHash,
+    ) -> impl Future<Output = Result<Option<Self::State>, Self::Error>> + Send {
+        async { unimplemented!() }
+    }
+
     fn store_state(
         &self,
-        tip: BlockHash,
-        state: &Self::State,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        _tip: BlockHash,
+        _state: &Self::State,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { unimplemented!() }
+    }
 }

@@ -1,6 +1,7 @@
 use super::weighter::{add_acquisition, add_block, header, included, params};
 use super::*;
-use crate::consensus::engine::weighter::WeighterError;
+use crate::consensus::{ConsensusOutcome, engine::weighter::WeighterError};
+use std::collections::BTreeMap;
 
 fn outcome_engine(
     storage: Storage,
@@ -48,21 +49,21 @@ async fn produces_an_outcome_with_weighted_endorsements_acquisitions_pending_end
     );
     let outcome = engine.get_minting_outcome().await.unwrap();
     assert_eq!(
-        outcome.accepted_endorsements,
+        outcome.consensus.accepted_endorsements,
         vec![WeightedEndorsement {
             original: accepted,
             effective_minting_power: 8
         }]
     );
     assert_eq!(
-        outcome.accepted_acquisitions,
+        outcome.consensus.accepted_acquisitions,
         vec![IncludedAcquisition {
             btc_block: btc_tip(100),
             acquisition
         }]
     );
-    assert_eq!(outcome.pending_endorsements.len(), 1);
-    let pending_group = &outcome.pending_endorsements[&pending.block_tip()];
+    assert_eq!(outcome.consensus.pending_endorsements.len(), 1);
+    let pending_group = &outcome.consensus.pending_endorsements[&pending.block_tip()];
     assert_eq!(pending_group.len(), 2);
     for endorsement in [pending, another_pending] {
         assert!(pending_group.contains(&IncludedEndorsement {
@@ -70,15 +71,15 @@ async fn produces_an_outcome_with_weighted_endorsements_acquisitions_pending_end
             endorsement
         }));
     }
-    assert!(outcome.removed_endorsements.is_empty());
-    assert!(outcome.double_signs.is_empty());
+    assert!(outcome.consensus.removed_endorsements.is_empty());
+    assert!(outcome.consensus.double_signs.is_empty());
     assert_eq!(outcome.next_btc_cursor, btc_tip(100));
     assert_eq!(
-        outcome.weighted_blocks[&root.block_tip()].effective_power,
+        outcome.consensus.weighted_blocks[&root.block_tip()].effective_power,
         9
     );
     assert_eq!(
-        outcome.weighted_blocks[&child.block_tip()].parent_weight,
+        outcome.consensus.weighted_blocks[&child.block_tip()].parent_weight,
         13
     );
     assert_eq!(
@@ -105,20 +106,20 @@ async fn double_sign_removes_the_stored_endorsement_and_decreases_descendant_wei
     let mut engine = outcome_engine(storage, vec![included(1, &fork, 101).endorsement], vec![]);
     Arc::make_mut(&mut engine.new_block).btc_block_tip = btc_tip(101);
     let outcome = engine.get_minting_outcome().await.unwrap();
-    assert!(outcome.accepted_endorsements.is_empty());
-    assert_eq!(outcome.removed_endorsements, vec![stored.clone()]);
-    assert_eq!(outcome.double_signs.len(), 1);
+    assert!(outcome.consensus.accepted_endorsements.is_empty());
+    assert_eq!(outcome.consensus.removed_endorsements, vec![stored.clone()]);
+    assert_eq!(outcome.consensus.double_signs.len(), 1);
     assert_eq!(
-        outcome.double_signs[0].endorsements,
+        outcome.consensus.double_signs[0].endorsements,
         vec![stored.original, included(1, &fork, 101)]
     );
-    assert_eq!(outcome.weighted_blocks.len(), 2);
+    assert_eq!(outcome.consensus.weighted_blocks.len(), 2);
     assert_eq!(
-        outcome.weighted_blocks[&root.block_tip()].effective_power,
+        outcome.consensus.weighted_blocks[&root.block_tip()].effective_power,
         0
     );
     assert_eq!(
-        outcome.weighted_blocks[&child.block_tip()].parent_weight,
+        outcome.consensus.weighted_blocks[&child.block_tip()].parent_weight,
         10
     );
     assert_eq!(outcome.next_btc_cursor, btc_tip(101));
@@ -140,14 +141,14 @@ async fn counts_current_block_acquisitions_when_maturity_is_zero() {
     Arc::make_mut(&mut engine.protocol_params).acquisition_maturity = 0;
     let outcome = engine.get_minting_outcome().await.unwrap();
     assert_eq!(
-        outcome.accepted_endorsements,
+        outcome.consensus.accepted_endorsements,
         vec![WeightedEndorsement {
             original: endorsement,
             effective_minting_power: 3
         }]
     );
     assert_eq!(
-        outcome.weighted_blocks[&root.block_tip()].effective_power,
+        outcome.consensus.weighted_blocks[&root.block_tip()].effective_power,
         3
     );
     assert!(engine.consensus_storage.acquisitions.is_empty());
@@ -167,12 +168,15 @@ async fn returns_empty_outcome_without_reading_storage() {
     assert_eq!(
         outcome,
         MintingOutcome {
-            accepted_endorsements: vec![],
-            removed_endorsements: vec![],
-            weighted_blocks: HashMap::new(),
-            accepted_acquisitions: vec![],
-            double_signs: vec![],
-            pending_endorsements: BTreeMap::new(),
+            consensus: ConsensusOutcome {
+                accepted_endorsements: vec![],
+                removed_endorsements: vec![],
+                weighted_blocks: HashMap::new(),
+                accepted_acquisitions: vec![],
+                double_signs: vec![],
+                pending_endorsements: BTreeMap::new(),
+                removed_pending_endorsements: Default::default(),
+            },
             next_btc_cursor: btc_tip(100),
         }
     );

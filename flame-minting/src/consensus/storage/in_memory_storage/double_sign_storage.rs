@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 
 use btc_integration::MinterP2wsh;
 use flamechain::CoreFlameHeight;
@@ -47,6 +47,35 @@ impl DoubleSignStorage {
     pub(super) fn is_minter_double_signed(&self, minter: &MinterP2wsh) -> bool {
         self.signs.contains_key(minter)
     }
+
+    pub(super) fn restore_double_sign(
+        &mut self,
+        minter: &MinterP2wsh,
+        flame_height: CoreFlameHeight,
+        previous: Option<&DoubleSign>,
+    ) -> Result<(), InMemoryConsensusStorageError> {
+        match previous {
+            Some(previous) => {
+                if previous.minter != *minter || previous.target_flame_height != flame_height {
+                    return Err(InMemoryConsensusStorageError::DoubleSignKeyMismatch);
+                }
+                validate_double_sign(previous)?;
+                self.signs
+                    .entry(*minter)
+                    .or_default()
+                    .insert(flame_height, previous.clone());
+            }
+            None => {
+                if let Entry::Occupied(mut entry) = self.signs.entry(*minter) {
+                    entry.get_mut().remove(&flame_height);
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_double_sign(double_sign: &DoubleSign) -> Result<(), InMemoryConsensusStorageError> {
@@ -66,3 +95,6 @@ fn validate_double_sign(double_sign: &DoubleSign) -> Result<(), InMemoryConsensu
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

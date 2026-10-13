@@ -22,7 +22,9 @@ use crate::{
 pub trait SecretStorage: Send + Sync {
     type Error: Error + Send + Sync + 'static;
 
-    async fn get_secret_key(&self) -> Result<SecretKey, Self::Error>;
+    async fn get_secret_key(&self) -> Result<SecretKey, Self::Error> {
+        unimplemented!()
+    }
 }
 
 #[async_trait]

@@ -5,6 +5,8 @@ pub trait CoreBlockNotifier {
 
     fn notify_core_block_needed(
         &mut self,
-        btc_block_height: u64,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        _btc_block_height: u64,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { unimplemented!() }
+    }
 }

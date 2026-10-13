@@ -102,6 +102,7 @@ impl ProtocolSnapshotBuilder<'_> {
         for acquisition in &record.block.acquisitions {
             let accepted = record
                 .outcome
+                .consensus
                 .accepted_acquisitions
                 .iter()
                 .find(|accepted| &accepted.acquisition == acquisition);
@@ -127,13 +128,19 @@ impl ProtocolSnapshotBuilder<'_> {
                 EndorsementProcessingStatus::Rejected,
             );
         }
-        for endorsement in record.outcome.pending_endorsements.values().flatten() {
+        for endorsement in record
+            .outcome
+            .consensus
+            .pending_endorsements
+            .values()
+            .flatten()
+        {
             self.set_endorsement_status(
                 &endorsement.endorsement,
                 EndorsementProcessingStatus::PendingBlock,
             );
         }
-        for endorsement in &record.outcome.accepted_endorsements {
+        for endorsement in &record.outcome.consensus.accepted_endorsements {
             self.set_endorsement_status(
                 &endorsement.original.endorsement,
                 EndorsementProcessingStatus::Accepted {
@@ -141,13 +148,13 @@ impl ProtocolSnapshotBuilder<'_> {
                 },
             );
         }
-        for endorsement in &record.outcome.removed_endorsements {
+        for endorsement in &record.outcome.consensus.removed_endorsements {
             self.set_endorsement_status(
                 &endorsement.original.endorsement,
                 EndorsementProcessingStatus::InvalidatedByDoubleSign,
             );
         }
-        for sign in &record.outcome.double_signs {
+        for sign in &record.outcome.consensus.double_signs {
             let Some(&minter) = self.minters.get(&sign.minter) else {
                 continue;
             };

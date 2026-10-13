@@ -5,7 +5,9 @@ use crate::{Block, Blockchain, ChainError};
 pub trait FlameBlockValidator {
     fn validate_flame_block(
         &self,
-        parent: &Blockchain,
-        block: Arc<Block>,
-    ) -> Result<(), ChainError>;
+        _parent: &Blockchain,
+        _block: Arc<Block>,
+    ) -> Result<(), ChainError> {
+        unimplemented!()
+    }
 }

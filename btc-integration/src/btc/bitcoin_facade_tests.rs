@@ -18,24 +18,6 @@ struct StubRpc {
 
 #[async_trait]
 impl RpcApi for StubRpc {
-    async fn best_block_tip(&self) -> Result<BtcBlockTip> {
-        unreachable!()
-    }
-    async fn block_header_info(&self, _: BlockHash) -> Result<BtcBlockHeaderInfo> {
-        unreachable!()
-    }
-    async fn transactions_in_block(&self, _: BlockHash) -> Result<Vec<Transaction>> {
-        unreachable!()
-    }
-    async fn transactions_with_prevouts_in_block(
-        &self,
-        _: BlockHash,
-    ) -> Result<Vec<BtcTransactionWithPrevouts>> {
-        unreachable!()
-    }
-    async fn block_hash_at_height(&self, _: u64) -> Result<BlockHash> {
-        unreachable!()
-    }
     async fn send_raw_transaction(&self, _: &Transaction, _: Option<Amount>) -> Result<Txid> {
         panic!("funding and signing must not publish")
     }

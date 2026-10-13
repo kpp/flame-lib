@@ -1,18 +1,42 @@
 use std::collections::{BTreeMap, HashMap};
 
 use btc_integration::{BtcBlockTip, MinterP2wsh};
-use corepc_client::bitcoin::Txid;
 
-use crate::consensus::{IncludedAcquisition, MinterAcquisitions, MintingProtocolParams};
+use crate::consensus::{
+    AcquisitionIndex, IncludedAcquisition, MinterAcquisitions, MintingProtocolParams,
+};
 
 use super::{InMemoryConsensusStorageError, insert_unique};
 
 #[derive(Default)]
 pub(super) struct AcquisitionStorage {
-    acquisitions: BTreeMap<(Txid, usize), IncludedAcquisition>,
+    acquisitions: BTreeMap<AcquisitionIndex, IncludedAcquisition>,
 }
 
 impl AcquisitionStorage {
+    pub(super) fn get_acquisition(&self, index: AcquisitionIndex) -> Option<IncludedAcquisition> {
+        self.acquisitions.get(&index).cloned()
+    }
+
+    pub(super) fn restore_acquisition(
+        &mut self,
+        index: AcquisitionIndex,
+        previous: Option<&IncludedAcquisition>,
+    ) -> Result<(), InMemoryConsensusStorageError> {
+        match previous {
+            Some(previous) => {
+                if AcquisitionIndex::from(&previous.acquisition) != index {
+                    return Err(InMemoryConsensusStorageError::AcquisitionKeyMismatch);
+                }
+                self.acquisitions.insert(index, previous.clone());
+            }
+            None => {
+                self.acquisitions.remove(&index);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn store_acquisition(
         &mut self,
         btc_block: BtcBlockTip,
@@ -21,11 +45,8 @@ impl AcquisitionStorage {
         if btc_block != acquisition.btc_block {
             return Err(InMemoryConsensusStorageError::BitcoinBlockMismatch);
         }
-        let key = (
-            acquisition.acquisition.txid(),
-            acquisition.acquisition.output_index(),
-        );
-        insert_unique(&mut self.acquisitions, key, acquisition.clone())
+        let index = AcquisitionIndex::from(&acquisition.acquisition);
+        insert_unique(&mut self.acquisitions, index, acquisition.clone())
     }
 
     pub(super) fn get_acquisitions_by_minters(
@@ -68,3 +89,6 @@ impl AcquisitionStorage {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

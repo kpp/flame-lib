@@ -8,38 +8,35 @@ use btc_integration::{
 use flame_chain_service::InMemoryChain;
 use flame_minting::{
     MintingOrchestrator,
+    block_processing::{BitcoinBlockProcessor, journal::InMemoryBitcoinBlockJournal},
     consensus::{
-        MintingOutcome, MintingOutcomeApplier, MintingProtocolParams,
-        applier::journal::InMemoryMintingJournal, storage::InMemoryConsensusStorage,
+        ConsensusEngine, ConsensusOutcome, IncludedEndorsement, MintingEngineFactory,
+        MintingOutcome, MintingProtocolParams, storage::InMemoryConsensusStorage,
     },
     core_block_notifier::CoreBlockNotifier,
     minter::{EndorsementPolicy, MinterManager, journal::in_memory::InMemoryMinterJournal},
     orchestrator::{
-        consensus::ConsensusLoop,
-        cursor_storage::in_memory::InMemoryCursorStorage,
-        ports::{ConsensusEngine, MintingEngineFactory},
+        consensus::ConsensusLoop, cursor_storage::in_memory::InMemoryCursorStorage,
         sender::MintingSender,
     },
-    rewards::{RewardsApplier, RewardsEngine, storage::in_memory::InMemoryRewardsStorage},
+    rewards::{RewardsEngine, storage::in_memory::InMemoryRewardsStorage},
 };
 use flame_storage::{chain::InMemoryChainStorage, state::canonical::InMemoryCanonicalStorage};
 use tokio::sync::Mutex;
 
 type Engine =
     MintingEngineFactory<InMemoryConsensusStorage, InMemoryChainStorage, InMemoryCanonicalStorage>;
-type Applier = MintingOutcomeApplier<
-    InMemoryConsensusStorage,
-    InMemoryChain,
-    InMemoryMintingJournal,
-    InMemoryCanonicalStorage,
->;
 type DemoLoop = ConsensusLoop<
-    RecordingEngine,
-    Applier,
-    InMemoryCursorStorage,
-    InMemoryRewardsStorage,
-    InMemoryChainStorage,
-    InMemoryConsensusStorage,
+    BitcoinBlockProcessor<
+        RecordingEngine,
+        InMemoryConsensusStorage,
+        InMemoryChain,
+        InMemoryBitcoinBlockJournal,
+        InMemoryCanonicalStorage,
+        InMemoryRewardsStorage,
+        InMemoryCursorStorage,
+        InMemoryChainStorage,
+    >,
 >;
 type Orchestrator = MintingOrchestrator<
     Arc<MintingSender>,
@@ -63,6 +60,13 @@ pub(super) struct RecordingEngine {
 
 impl ConsensusEngine for RecordingEngine {
     type Error = <Engine as ConsensusEngine>::Error;
+
+    async fn get_endorsements_outcome(
+        &self,
+        endorsements: Vec<IncludedEndorsement>,
+    ) -> Result<ConsensusOutcome, Self::Error> {
+        self.inner.get_endorsements_outcome(endorsements).await
+    }
 
     async fn get_minting_outcome(
         &self,
@@ -113,6 +117,7 @@ impl DemoRuntime {
         let blocks = InMemoryChainStorage::new();
         let consensus = InMemoryConsensusStorage::new();
         let canonical = InMemoryCanonicalStorage::new();
+        let journal = InMemoryBitcoinBlockJournal::new(cursor);
         let cursor = InMemoryCursorStorage::new(cursor);
         let history = Arc::new(Mutex::new(Vec::new()));
         let identity_manager = Arc::new(IdentityManager::new(
@@ -126,7 +131,7 @@ impl DemoRuntime {
             )?),
         ))));
         let btc_sender = Arc::new(MintingSender::new(bitcoin, identity_manager.clone()));
-        let consensus_manager = ConsensusLoop::new(
+        let consensus_manager = ConsensusLoop::new(BitcoinBlockProcessor::new(
             RecordingEngine {
                 inner: Engine {
                     protocol_params: parameters.clone(),
@@ -136,22 +141,18 @@ impl DemoRuntime {
                 },
                 history: history.clone(),
             },
-            MintingOutcomeApplier {
-                consensus_storage: consensus.clone(),
-                chain: chain.clone(),
-                journal: InMemoryMintingJournal::new(),
-                canonical_storage: canonical.clone(),
-            },
+            consensus.clone(),
+            chain.clone(),
+            journal,
+            canonical.clone(),
+            InMemoryRewardsStorage::new(),
             cursor.clone(),
             RewardsEngine {
                 chain_storage: Arc::new(blocks.clone()),
                 consensus_storage: Arc::new(consensus.clone()),
                 protocol_params: parameters.clone(),
             },
-            RewardsApplier {
-                rewards_storage: InMemoryRewardsStorage::new(),
-            },
-        );
+        ));
         let minter_manager = MinterManager::new(
             Arc::new(chain.clone()),
             btc_sender.clone(),

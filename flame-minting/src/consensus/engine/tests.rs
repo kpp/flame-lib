@@ -1,4 +1,10 @@
 use super::*;
+use super::{
+    acquisition_provider::AcquisitionProvider,
+    endorsement_validation::{
+        EndorsementValidationError, EndorsementValidationResult, EndorsementValidator,
+    },
+};
 use crate::consensus::{
     DoubleSign, IncludedEndorsement, MinterAcquisitions, WeightedBlockHeader, WeightedEndorsement,
 };
@@ -17,6 +23,34 @@ use flamechain::{
 use flamevm::Predicate;
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+impl MintingEngine<Storage, Storage, Storage> {
+    async fn validate_endorsements(
+        &self,
+        new_acquisitions: &[IncludedAcquisition],
+    ) -> Result<EndorsementValidationResult, EndorsementValidationError<&'static str, &'static str>>
+    {
+        let endorsements: Vec<_> = self
+            .new_block
+            .endorsements
+            .iter()
+            .cloned()
+            .map(|endorsement| IncludedEndorsement {
+                btc_block: self.new_block.btc_block_tip,
+                endorsement,
+            })
+            .collect();
+        EndorsementValidator {
+            endorsements: &endorsements,
+            protocol_params: &self.protocol_params,
+            consensus_storage: self.consensus_storage.as_ref(),
+            chain_storage: self.chain_storage.as_ref(),
+            new_acquisitions,
+        }
+        .validate()
+        .await
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Storage {
@@ -40,10 +74,6 @@ pub(crate) struct Storage {
 
 impl ConsensusStorage for Storage {
     type Error = &'static str;
-
-    async fn get_block_tip_with_most_weight(&self) -> Result<Option<BlockTip>, Self::Error> {
-        unreachable!()
-    }
 
     async fn get_active_minter_acquisitions_at_height(
         &self,
@@ -84,22 +114,6 @@ impl ConsensusStorage for Storage {
         Ok(self.cummulative_weights.get(&tip).cloned())
     }
 
-    async fn store_cumulative_weight(
-        &self,
-        _: BlockTip,
-        _: &WeightedBlockHeader,
-    ) -> Result<(), Self::Error> {
-        unreachable!()
-    }
-
-    async fn store_acquisition(
-        &self,
-        _: BtcBlockTip,
-        _: &crate::consensus::IncludedAcquisition,
-    ) -> Result<(), Self::Error> {
-        unreachable!()
-    }
-
     async fn get_acquisitions_by_minters(
         &self,
         btc_height: u64,
@@ -117,14 +131,6 @@ impl ConsensusStorage for Storage {
         Ok(minters)
     }
 
-    async fn store_endorsement(
-        &self,
-        _: BtcBlockTip,
-        _: &WeightedEndorsement,
-    ) -> Result<(), Self::Error> {
-        unreachable!()
-    }
-
     async fn get_endorsements_for_block(
         &self,
         tip: CoreBlockTip,
@@ -138,22 +144,6 @@ impl ConsensusStorage for Storage {
             .filter(|endorsement| endorsement.original.endorsement.block_tip() == tip)
             .cloned()
             .collect())
-    }
-
-    async fn remove_endorsement(&self, _: &WeightedEndorsement) -> Result<(), Self::Error> {
-        unreachable!()
-    }
-
-    async fn store_pending_endorsement(
-        &self,
-        _: CoreBlockTip,
-        _: &IncludedEndorsement,
-    ) -> Result<(), Self::Error> {
-        unreachable!()
-    }
-
-    async fn add_double_sign(&self, _: &DoubleSign) -> Result<(), Self::Error> {
-        unreachable!()
     }
 
     async fn get_double_sign(
@@ -200,10 +190,6 @@ impl ConsensusStorage for Storage {
 
 impl ChainStorage for Storage {
     type Error = &'static str;
-
-    async fn add_block(&self, _: Arc<Block>) -> Result<(), Self::Error> {
-        unreachable!()
-    }
 
     async fn get_block(&self, tip: BlockTip) -> Result<Option<Arc<Block>>, Self::Error> {
         if self.fail_blocks {
@@ -296,18 +282,6 @@ impl ChainStorage for Storage {
 
 impl CanonicalStorage for Storage {
     type Error = &'static str;
-
-    async fn get_tip(&self) -> Result<Option<BlockTip>, Self::Error> {
-        unreachable!()
-    }
-
-    async fn get_state(&self) -> Result<Option<(BlockHash, Blockchain)>, Self::Error> {
-        unreachable!()
-    }
-
-    async fn commit_state(&self, _: &Blockchain) -> Result<(), Self::Error> {
-        unreachable!()
-    }
 }
 
 fn btc_tip(height: u64) -> BtcBlockTip {
@@ -341,7 +315,7 @@ pub(crate) fn endorsement_for_tip(
     payload.extend_from_slice(tip.hash.as_bytes());
     let tx = Transaction {
         version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
+        lock_time: absolute::LockTime::from_consensus(u32::from(minter)),
         input: vec![TxIn {
             witness: Witness::from_slice(&[witness_script.as_bytes()]),
             ..TxIn::default()
@@ -1312,5 +1286,6 @@ async fn preserves_double_sign_evidence_at_multiple_heights() {
 
 mod acquisition_provider;
 mod endorsement_weight;
+mod endorsements_outcome;
 mod outcome;
 mod weighter;

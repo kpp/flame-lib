@@ -2,7 +2,6 @@ use std::convert::Infallible;
 
 use corepc_client::bitcoin::Txid;
 use flame_chain_service::InMemoryChain;
-use flamechain::BlockHash;
 
 use super::*;
 use crate::minter::journal::in_memory::InMemoryMinterJournal;
@@ -12,10 +11,6 @@ struct UnusedSender;
 impl EndorsementSender for UnusedSender {
     type Error = Infallible;
     type TransactionId = Txid;
-
-    async fn send_endorsement(&self, _: u32, _: BlockHash) -> Result<Txid, Self::Error> {
-        unreachable!()
-    }
 }
 
 fn manager(

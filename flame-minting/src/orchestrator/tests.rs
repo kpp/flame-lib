@@ -1,15 +1,11 @@
 use std::{
     convert::Infallible,
-    num::NonZeroUsize,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use btc_integration::{HistoryError, HistoryUpdate, ShutdownError, StartupError};
+use btc_integration::{ShutdownError, StartupError};
 use corepc_client::{bitcoin::hashes::Hash, client_sync::Auth};
-use flame_chain_service::{ChainPath, ImportOutcome};
-use flamechain::{Block, BlockTip};
 use flamevm::Predicate;
-use tokio::sync::watch;
 
 use super::*;
 
@@ -18,41 +14,27 @@ struct Chain;
 
 impl ChainAccess for Chain {
     type Error = Infallible;
-
-    async fn get_block(&self, _: BlockTip) -> Result<Option<Arc<Block>>, Self::Error> {
-        unreachable!()
-    }
-
-    async fn get_chain_path(&self, _: BlockTip, _: BlockTip) -> Result<ChainPath, Self::Error> {
-        unreachable!()
-    }
-
-    async fn import_block(&mut self, _: Arc<Block>) -> Result<ImportOutcome, Self::Error> {
-        unreachable!()
-    }
 }
 
 struct Source;
 
 impl CoreBlockSource for Source {
     type Error = Infallible;
-
-    async fn get_core_block(&self, _: u64) -> Result<Option<Arc<Block>>, Self::Error> {
-        unreachable!()
-    }
-
-    async fn wait_core_block(&self, _: u64) -> Result<Option<Arc<Block>>, Self::Error> {
-        unreachable!()
-    }
 }
 
 struct Notifier;
 
 impl CoreBlockNotifier for Notifier {
     type Error = Infallible;
+}
 
-    async fn notify_core_block_needed(&mut self, _: u64) -> Result<(), Self::Error> {
-        unreachable!()
+struct UnexpectedFlameBlockArrival;
+
+impl FlameBlockArrivalHandler for UnexpectedFlameBlockArrival {
+    type Error = Infallible;
+
+    async fn on_flame_block_arrival(&self, _: flamechain::BlockTip) -> Result<(), Self::Error> {
+        panic!("Flame block arrival is not expected in startup tests")
     }
 }
 
@@ -67,18 +49,6 @@ impl ports::ConsensusIndexer for StartupProbe {
 
     async fn shutdown(&self) -> Result<(), ShutdownError> {
         Ok(())
-    }
-
-    fn subscribe(&self) -> watch::Receiver<Option<BtcBlockTip>> {
-        unreachable!()
-    }
-
-    async fn get_history(
-        &self,
-        _: BtcBlockTip,
-        _: NonZeroUsize,
-    ) -> Result<HistoryUpdate, HistoryError> {
-        unreachable!()
     }
 }
 
@@ -123,6 +93,7 @@ async fn check_startup(fail_sender: bool) {
         Notifier,
         Source,
         Chain,
+        UnexpectedFlameBlockArrival,
         BitcoinConfig {
             node_rpc_url: "http://127.0.0.1:1".into(),
             auth: Auth::UserPass("test".into(), "test".into()),

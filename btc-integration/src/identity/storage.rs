@@ -8,12 +8,16 @@ use super::SecretKeyGuard;
 
 #[async_trait]
 pub trait IdentitySecretStorage: SecretStorage {
-    async fn load_secret_key(&self) -> Result<Option<SecretKey>, Self::Error>;
+    async fn load_secret_key(&self) -> Result<Option<SecretKey>, Self::Error> {
+        unimplemented!()
+    }
 
     async fn store_secret_key_if_absent(
         &self,
-        secret_key: &SecretKey,
-    ) -> Result<SecretKey, Self::Error>;
+        _secret_key: &SecretKey,
+    ) -> Result<SecretKey, Self::Error> {
+        unimplemented!()
+    }
 }
 
 #[derive(Default)]

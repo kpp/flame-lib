@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use corepc_client::{
     bitcoin::{
-        Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
         absolute, transaction,
     },
     client_sync::{Error, Result},
@@ -110,25 +110,6 @@ impl FakeRpc {
 
 #[async_trait]
 impl RpcApi for FakeRpc {
-    async fn list_unspent(
-        &self,
-    ) -> corepc_client::client_sync::Result<Vec<crate::btc::rpc::BtcUnspentOutput>> {
-        unreachable!("wallet RPC not used by this test")
-    }
-    async fn fund_raw_transaction(
-        &self,
-        _: &Transaction,
-        _: &crate::btc::rpc::BtcFundOptions,
-    ) -> corepc_client::client_sync::Result<Transaction> {
-        unreachable!("wallet RPC not used by this test")
-    }
-    async fn sign_raw_transaction_with_wallet(
-        &self,
-        _: &Transaction,
-    ) -> corepc_client::client_sync::Result<crate::btc::rpc::BtcSignedTransaction> {
-        unreachable!("wallet RPC not used by this test")
-    }
-
     async fn best_block_tip(&self) -> Result<BtcBlockTip> {
         Ok(*self.best_tip.read().await)
     }
@@ -200,14 +181,6 @@ impl RpcApi for FakeRpc {
             .recv()
             .await
             .ok_or_else(|| Error::Returned("test announcement channel closed".to_owned()))
-    }
-
-    async fn send_raw_transaction(
-        &self,
-        _transaction: &Transaction,
-        _max_burn_amount: Option<Amount>,
-    ) -> Result<Txid> {
-        unreachable!("not used by protocol indexer tests")
     }
 }
 

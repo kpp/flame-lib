@@ -54,10 +54,6 @@ impl TestChainStorage {
 impl ChainStorage for TestChainStorage {
     type Error = &'static str;
 
-    async fn add_block(&self, _: Arc<Block>) -> Result<(), Self::Error> {
-        unreachable!()
-    }
-
     async fn get_block(&self, tip: BlockTip) -> Result<Option<Arc<Block>>, Self::Error> {
         self.reads.lock().unwrap().push(tip);
         if self.fail {
@@ -80,24 +76,6 @@ impl ChainStorage for TestChainStorage {
             return Err("chain storage unavailable");
         }
         Ok(self.blocks.get(&tip).cloned())
-    }
-
-    async fn get_core_block_header(
-        &self,
-        _: CoreBlockTip,
-    ) -> Result<Option<CoreBlockHeader>, Self::Error> {
-        unreachable!()
-    }
-
-    async fn get_block_header(&self, _: CoreBlockTip) -> Result<Option<BlockHeader>, Self::Error> {
-        unreachable!()
-    }
-
-    async fn get_core_block_header_with_core_descendants(
-        &self,
-        _: CoreBlockTip,
-    ) -> Result<Option<(BlockHeader, Vec<BlockHeader>)>, Self::Error> {
-        unreachable!()
     }
 }
 

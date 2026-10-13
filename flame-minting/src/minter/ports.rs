@@ -10,9 +10,11 @@ pub trait EndorsementSender: Send + Sync + 'static {
 
     fn send_endorsement(
         &self,
-        height: u32,
-        hash: BlockHash,
-    ) -> impl Future<Output = Result<Self::TransactionId, Self::Error>> + Send;
+        _height: u32,
+        _hash: BlockHash,
+    ) -> impl Future<Output = Result<Self::TransactionId, Self::Error>> + Send {
+        async { unimplemented!() }
+    }
 }
 
 impl<R, S> EndorsementSender for Sender<R, S>

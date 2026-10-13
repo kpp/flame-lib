@@ -28,6 +28,20 @@ impl WeightedHeaderStorage {
         self.headers.get(&tip).cloned()
     }
 
+    pub(super) fn restore_cumulative_weight(
+        &mut self,
+        tip: BlockTip,
+        previous: Option<&WeightedBlockHeader>,
+    ) -> Result<(), InMemoryConsensusStorageError> {
+        match previous {
+            Some(previous) => self.store_cumulative_weight(tip, previous),
+            None => {
+                self.headers.remove(&tip);
+                Ok(())
+            }
+        }
+    }
+
     pub(super) fn get_block_tip_with_most_weight(&self) -> Option<BlockTip> {
         self.headers
             .iter()
@@ -44,3 +58,6 @@ fn chain_weight(weighted: &WeightedBlockHeader) -> u128 {
     };
     u128::from(weighted.parent_weight) + u128::from(block_weight)
 }
+
+#[cfg(test)]
+mod tests;

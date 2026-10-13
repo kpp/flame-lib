@@ -18,17 +18,23 @@ pub trait MinterJournal {
 
     fn write_reserve_endorsement(
         &self,
-        endorsement: &MintingEndorsementData,
-    ) -> impl Future<Output = Result<EndorsementReservation, Self::Error>> + Send;
+        _endorsement: &MintingEndorsementData,
+    ) -> impl Future<Output = Result<EndorsementReservation, Self::Error>> + Send {
+        async { unimplemented!() }
+    }
 
     fn write_sent_endorsement(
         &self,
-        endorsement: &MintingEndorsementData,
-        transaction_id: &Self::TransactionId,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        _endorsement: &MintingEndorsementData,
+        _transaction_id: &Self::TransactionId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { unimplemented!() }
+    }
 
     fn write_committed_endorsement(
         &self,
-        endorsement: &AuthenticatedMintingEndorsement,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        _endorsement: &AuthenticatedMintingEndorsement,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { unimplemented!() }
+    }
 }

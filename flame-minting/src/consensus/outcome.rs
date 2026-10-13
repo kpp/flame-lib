@@ -1,13 +1,19 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use btc_integration::{Acquisition, AuthenticatedMintingEndorsement, BtcBlockTip, MinterP2wsh};
 use flamechain::{BlockHash, BlockTip, CoreBlockTip, CoreFlameHeight};
 
-use super::{MintingProtocolParams, WeightedBlockHeader};
+use super::{EndorsementIndex, MintingProtocolParams, WeightedBlockHeader};
 
 /// Outcome for 1 new BTC block
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MintingOutcome {
+    pub consensus: ConsensusOutcome,
+    pub next_btc_cursor: BtcBlockTip,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConsensusOutcome {
     /// New valid endorsements.
     pub accepted_endorsements: Vec<WeightedEndorsement>,
     /// Previously counted endorsements invalidated by double signing.
@@ -20,8 +26,7 @@ pub struct MintingOutcome {
     pub double_signs: Vec<DoubleSign>,
     /// Endorsements for the blocks that node doesn't yet have.
     pub pending_endorsements: BTreeMap<CoreBlockTip, PendingEndorsements>,
-    /// The processed cursor.
-    pub next_btc_cursor: BtcBlockTip,
+    pub removed_pending_endorsements: BTreeSet<(CoreBlockTip, EndorsementIndex)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

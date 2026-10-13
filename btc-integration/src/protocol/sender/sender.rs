@@ -247,10 +247,7 @@ mod tests {
 
     use async_trait::async_trait;
     use corepc_client::{
-        bitcoin::{
-            Amount, BlockHash as BitcoinBlockHash, OutPoint, ScriptBuf, Sequence, Transaction,
-            TxIn, TxOut, Txid, Witness,
-        },
+        bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness},
         client_sync::Result as RpcResult,
     };
     use flamechain::BlockHash;
@@ -260,7 +257,7 @@ mod tests {
     use super::{MintingSendError, Sender, SignerContractViolation};
     use crate::btc::bitcoin_facade::BitcoinFacade;
     use crate::{
-        btc::rpc::{BtcBlockHeaderInfo, BtcBlockTip, RpcApi},
+        btc::rpc::RpcApi,
         protocol::{
             MinterIdentity, MintingEndorsementData, RequiredInput, SignTransactionRequest,
             TransactionSigner, minter_witness_script,
@@ -341,58 +338,6 @@ mod tests {
 
     #[async_trait]
     impl RpcApi for RecordingRpc {
-        async fn transactions_with_prevouts_in_block(
-            &self,
-            _: BitcoinBlockHash,
-        ) -> RpcResult<Vec<crate::btc::rpc::BtcTransactionWithPrevouts>> {
-            unreachable!("not used by sender tests")
-        }
-
-        async fn list_unspent(
-            &self,
-        ) -> corepc_client::client_sync::Result<Vec<crate::btc::rpc::BtcUnspentOutput>> {
-            unreachable!("wallet RPC not used by this test")
-        }
-        async fn fund_raw_transaction(
-            &self,
-            _: &Transaction,
-            _: &crate::btc::rpc::BtcFundOptions,
-        ) -> corepc_client::client_sync::Result<Transaction> {
-            unreachable!("wallet RPC not used by this test")
-        }
-        async fn sign_raw_transaction_with_wallet(
-            &self,
-            _: &Transaction,
-        ) -> corepc_client::client_sync::Result<crate::btc::rpc::BtcSignedTransaction> {
-            unreachable!("wallet RPC not used by this test")
-        }
-
-        async fn best_block_tip(&self) -> RpcResult<BtcBlockTip> {
-            unreachable!("not used by sender tests")
-        }
-
-        async fn block_header_info(
-            &self,
-            _block_hash: BitcoinBlockHash,
-        ) -> RpcResult<BtcBlockHeaderInfo> {
-            unreachable!("not used by sender tests")
-        }
-
-        async fn transactions_in_block(
-            &self,
-            _block_hash: BitcoinBlockHash,
-        ) -> RpcResult<Vec<Transaction>> {
-            unreachable!("not used by sender tests")
-        }
-
-        async fn block_hash_at_height(&self, _: u64) -> RpcResult<BitcoinBlockHash> {
-            unreachable!("not used by sender tests")
-        }
-
-        async fn wait_for_new_block(&self, _: BitcoinBlockHash, _: u64) -> RpcResult<BtcBlockTip> {
-            unreachable!("not used by sender tests")
-        }
-
         async fn send_raw_transaction(
             &self,
             transaction: &Transaction,

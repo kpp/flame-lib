@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 
 use btc_integration::{BtcBlockTip, MinterP2wsh};
-use corepc_client::bitcoin::Txid;
 use flamechain::{CoreBlockTip, CoreFlameHeight};
 
-use crate::consensus::{IncludedEndorsement, WeightedEndorsement};
+use crate::consensus::{
+    EndorsementIndex, IncludedEndorsement, PendingEndorsements, WeightedEndorsement,
+};
 
 use super::{InMemoryConsensusStorageError, insert_unique};
 
@@ -12,7 +13,7 @@ use super::{InMemoryConsensusStorageError, insert_unique};
 pub(super) struct EndorsementStorage {
     endorsements: BTreeMap<(MinterP2wsh, CoreFlameHeight), WeightedEndorsement>,
     pub(super) pending_endorsements:
-        BTreeMap<CoreBlockTip, BTreeMap<(Txid, usize), IncludedEndorsement>>,
+        BTreeMap<CoreBlockTip, BTreeMap<EndorsementIndex, IncludedEndorsement>>,
 }
 
 impl EndorsementStorage {
@@ -76,14 +77,93 @@ impl EndorsementStorage {
         if tip != endorsement.endorsement.block_tip() {
             return Err(InMemoryConsensusStorageError::CoreBlockMismatch);
         }
-        let key = (
-            endorsement.endorsement.txid(),
-            endorsement.endorsement.auth().input_index,
-        );
+        let index = EndorsementIndex::from(&endorsement.endorsement);
         insert_unique(
             self.pending_endorsements.entry(tip).or_default(),
-            key,
+            index,
             endorsement.clone(),
         )
     }
+
+    pub(super) fn restore_endorsement(
+        &mut self,
+        minter: &MinterP2wsh,
+        flame_height: CoreFlameHeight,
+        previous: Option<&WeightedEndorsement>,
+    ) -> Result<(), InMemoryConsensusStorageError> {
+        let key = (*minter, flame_height);
+        match previous {
+            Some(previous) => {
+                if previous.original.endorsement.auth().minter().p2wsh() != *minter
+                    || previous.original.block_height() != flame_height
+                {
+                    return Err(InMemoryConsensusStorageError::EndorsementKeyMismatch);
+                }
+                self.endorsements.insert(key, previous.clone());
+            }
+            None => {
+                self.endorsements.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn get_pending_endorsement(
+        &self,
+        tip: CoreBlockTip,
+        index: EndorsementIndex,
+    ) -> Option<IncludedEndorsement> {
+        self.pending_endorsements.get(&tip)?.get(&index).cloned()
+    }
+
+    pub(super) fn get_pending_endorsements_for_block(
+        &self,
+        tip: CoreBlockTip,
+    ) -> PendingEndorsements {
+        let Some(pending) = self.pending_endorsements.get(&tip) else {
+            return Vec::new();
+        };
+        let mut endorsements: Vec<_> = pending.values().cloned().collect();
+        endorsements.sort_by_key(|included| {
+            (
+                included.btc_block.height,
+                EndorsementIndex::from(&included.endorsement),
+            )
+        });
+        endorsements
+    }
+
+    pub(super) fn restore_pending_endorsement(
+        &mut self,
+        tip: CoreBlockTip,
+        index: EndorsementIndex,
+        previous: Option<&IncludedEndorsement>,
+    ) -> Result<(), InMemoryConsensusStorageError> {
+        match previous {
+            Some(previous) => {
+                if previous.endorsement.block_tip() != tip {
+                    return Err(InMemoryConsensusStorageError::CoreBlockMismatch);
+                }
+                if EndorsementIndex::from(&previous.endorsement) != index {
+                    return Err(InMemoryConsensusStorageError::PendingEndorsementKeyMismatch);
+                }
+                self.pending_endorsements
+                    .entry(tip)
+                    .or_default()
+                    .insert(index, previous.clone());
+            }
+            None => {
+                if let Entry::Occupied(mut entry) = self.pending_endorsements.entry(tip) {
+                    entry.get_mut().remove(&index);
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+mod tests;

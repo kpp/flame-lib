@@ -4,35 +4,45 @@ use btc_integration::BtcBlockTip;
 use flame_chain_service::ChainAccess;
 use flame_storage::{chain::InMemoryChainStorage, state::canonical::InMemoryCanonicalStorage};
 
-use crate::consensus::{
-    MintingOutcomeApplier, MintingProtocolParams,
-    applier::journal::in_memory::InMemoryMintingJournal, storage::InMemoryConsensusStorage,
+use super::{consensus::ConsensusLoop, cursor_storage::InMemoryCursorStorage};
+use crate::{
+    FlameBlockArrivalHandler,
+    block_processing::{
+        BitcoinBlockProcessor, ConsensusManager, journal::InMemoryBitcoinBlockJournal,
+    },
+    consensus::{MintingEngineFactory, MintingProtocolParams, storage::InMemoryConsensusStorage},
+    rewards::{RewardsEngine, storage::InMemoryRewardsStorage},
 };
-use crate::rewards::{RewardsApplier, RewardsEngine, storage::in_memory::InMemoryRewardsStorage};
 
-use super::{
-    consensus::ConsensusLoop, cursor_storage::in_memory::InMemoryCursorStorage,
-    ports::MintingEngineFactory,
-};
-
-pub type DefaultConsensusLoop<H> = ConsensusLoop<
-    MintingEngineFactory<InMemoryConsensusStorage, InMemoryChainStorage, InMemoryCanonicalStorage>,
-    MintingOutcomeApplier<
-        InMemoryConsensusStorage,
-        H,
-        InMemoryMintingJournal,
-        InMemoryCanonicalStorage,
+pub type DefaultConsensusLoop<H, F> = ConsensusLoop<
+    ConsensusManager<
+        BitcoinBlockProcessor<
+            MintingEngineFactory<
+                InMemoryConsensusStorage,
+                InMemoryChainStorage,
+                InMemoryCanonicalStorage,
+            >,
+            InMemoryConsensusStorage,
+            H,
+            InMemoryBitcoinBlockJournal,
+            InMemoryCanonicalStorage,
+            InMemoryRewardsStorage,
+            InMemoryCursorStorage,
+            InMemoryChainStorage,
+        >,
+        F,
     >,
-    InMemoryCursorStorage,
-    InMemoryRewardsStorage,
-    InMemoryChainStorage,
-    InMemoryConsensusStorage,
 >;
 
-pub(super) fn consensus_loop<H>(chain: H, initial_cursor: BtcBlockTip) -> DefaultConsensusLoop<H>
+pub(super) fn consensus_loop<H, F>(
+    chain: H,
+    initial_cursor: BtcBlockTip,
+    flame_handler: F,
+) -> DefaultConsensusLoop<H, F>
 where
     H: ChainAccess + Send + Sync + 'static,
     H::Error: Send + 'static,
+    F: FlameBlockArrivalHandler,
 {
     let protocol_params = Arc::new(MintingProtocolParams {
         acquisition_maturity: 1,
@@ -44,27 +54,24 @@ where
     let chain_storage = Arc::new(InMemoryChainStorage::new());
     let canonical_storage = InMemoryCanonicalStorage::new();
 
-    ConsensusLoop::new(
+    let bitcoin_processor = BitcoinBlockProcessor::new(
         MintingEngineFactory {
             protocol_params: protocol_params.clone(),
             consensus_storage: Arc::new(consensus_storage.clone()),
             chain_storage: chain_storage.clone(),
             canonical_storage: Arc::new(canonical_storage.clone()),
         },
-        MintingOutcomeApplier {
-            consensus_storage: consensus_storage.clone(),
-            chain,
-            journal: InMemoryMintingJournal::new(),
-            canonical_storage,
-        },
+        consensus_storage.clone(),
+        chain,
+        InMemoryBitcoinBlockJournal::new(initial_cursor),
+        canonical_storage,
+        InMemoryRewardsStorage::new(),
         InMemoryCursorStorage::new(initial_cursor),
         RewardsEngine {
             chain_storage,
             consensus_storage: Arc::new(consensus_storage),
             protocol_params,
         },
-        RewardsApplier {
-            rewards_storage: InMemoryRewardsStorage::new(),
-        },
-    )
+    );
+    ConsensusLoop::new(ConsensusManager::new(bitcoin_processor, flame_handler))
 }

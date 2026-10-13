@@ -108,3 +108,135 @@ async fn conflicting_amount_does_not_overwrite_a_stored_reward() {
         contents(&[reward(1, 2, 10)])
     );
 }
+
+#[tokio::test]
+async fn restores_replaced_and_deleted_rewards_from_independent_snapshots() {
+    let storage = InMemoryRewardsStorage::new();
+    let original = reward(1, 2, 10);
+    let index = RewardIndex::from(&original);
+    assert!(
+        storage
+            .get_pending_reward(200.into(), index)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    storage
+        .store_pending_reward(200.into(), &original)
+        .await
+        .unwrap();
+    let previous = storage.get_pending_reward(200.into(), index).await.unwrap();
+    let mut snapshot = previous.clone().unwrap();
+    snapshot.amount = 999;
+    snapshot.flame_predicate = predicate(9);
+    assert_eq!(
+        contents(&[storage
+            .get_pending_reward(200.into(), index)
+            .await
+            .unwrap()
+            .unwrap()]),
+        contents(&[original.clone()])
+    );
+
+    for replacement in [Some(reward(1, 2, u64::MAX)), None] {
+        storage
+            .restore_pending_reward(200.into(), index, replacement.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_pending_reward(200.into(), index)
+                .await
+                .unwrap()
+                .map(|reward| reward.amount),
+            replacement.as_ref().map(|reward| reward.amount)
+        );
+        for _ in 0..2 {
+            storage
+                .restore_pending_reward(200.into(), index, previous.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(
+                contents(&storage.get_pending_rewards(200.into()).await.unwrap()),
+                contents(&[original.clone()])
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn removing_a_reward_preserves_other_predicates_and_heights() {
+    let storage = InMemoryRewardsStorage::new();
+    let removed = reward(1, 2, 0);
+    let index = RewardIndex::from(&removed);
+    let others = vec![reward(1, 3, 20), reward(3, 2, 30)];
+    for reward in others.iter().chain([&removed]) {
+        storage
+            .store_pending_reward(200.into(), reward)
+            .await
+            .unwrap();
+    }
+    storage
+        .store_pending_reward(300.into(), &removed)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        storage
+            .restore_pending_reward(200.into(), index, None)
+            .await
+            .unwrap();
+        storage
+            .restore_pending_reward(400.into(), index, None)
+            .await
+            .unwrap();
+    }
+    let mut expected = contents(&others);
+    expected.sort();
+    assert_eq!(
+        contents(&storage.get_pending_rewards(200.into()).await.unwrap()),
+        expected
+    );
+    assert_eq!(
+        contents(&storage.get_pending_rewards(300.into()).await.unwrap()),
+        contents(&[removed])
+    );
+    storage
+        .restore_pending_reward(300.into(), index, None)
+        .await
+        .unwrap();
+    let state = storage.rewards.read().unwrap();
+    assert!(!state.contains_key(&300.into()));
+    assert!(!state.contains_key(&400.into()));
+}
+
+#[tokio::test]
+async fn mismatched_predicates_are_rejected_without_changing_storage() {
+    let storage = InMemoryRewardsStorage::new();
+    let original = reward(1, 2, 10);
+    let index = RewardIndex::from(&original);
+    storage
+        .store_pending_reward(200.into(), &original)
+        .await
+        .unwrap();
+    for wrong in [reward(3, 2, 20), reward(1, 3, 20)] {
+        for height in [200, 300] {
+            assert_eq!(
+                storage
+                    .restore_pending_reward(height.into(), index, Some(&wrong))
+                    .await,
+                Err(InMemoryRewardsStorageError::RewardKeyMismatch)
+            );
+        }
+    }
+    assert_eq!(
+        contents(&storage.get_pending_rewards(200.into()).await.unwrap()),
+        contents(&[original])
+    );
+    assert!(
+        storage
+            .get_pending_rewards(300.into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
