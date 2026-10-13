@@ -12,7 +12,10 @@ use core::mem;
 use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::scalar::Scalar as DalekScalar;
 use merlin::Transcript;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::actor::{empty_state, ActorAddress, ActorID, ActorRegistry};
 use crate::cell_value::array32;
@@ -178,6 +181,10 @@ const GAS_PER_INSTRUCTION: u64 = 1;
 /// upper bound on peak live allocation.
 const GAS_PER_ALLOC_BYTE: u64 = 1;
 const GAS_PER_ALLOC_ITEM: u64 = 1;
+
+/// Warm reads still validate/decode; discount their body work by four, not to zero.
+const GAS_CELL_READ: u64 = 1;
+const GAS_CELL_WARM_DIVISOR: u64 = 4;
 
 // Calibrated with `cargo bench -p flamevm --bench gas` on 2026-08-23.
 // One gas represents roughly 100 ns of verifier work on the reference machine;
@@ -719,6 +726,9 @@ pub(crate) struct VM {
     current_call: CallFrame,
     call_stack: Vec<CallFrame>,
 
+    /// Pricing history for this execution, not a source of available Cell bodies.
+    resolved_cells: BTreeSet<CellID>,
+
     /// Effects committed by the external body or the derived internal ID.
     pub(crate) txlog: Vec<TxEntry>,
 
@@ -735,13 +745,14 @@ pub(crate) struct VM {
     debug_error: Option<std::string::String>,
 }
 
-/// Execution-local resolution, priced identically for resident and unloaded refs.
-/// A cache hit cannot turn an absent transaction witness into an available one.
+/// Logical cold/warm pricing is independent of host residency. Warmth never
+/// authorizes a body absent from the current actor/transaction scope.
 struct ExecutionCells<'a> {
     external: &'a CellIndex,
     actor: &'a CellIndex,
     // Explicit address witnesses can use sender storage; callee execution cannot.
     address_sender: Option<&'a CellIndex>,
+    resolved_cells: &'a mut BTreeSet<CellID>,
     gas_used: &'a mut u64,
     gas_limit: u64,
 }
@@ -761,7 +772,7 @@ impl ExecutionCells<'_> {
 
 impl CellReader for ExecutionCells<'_> {
     fn read(&mut self, id: CellID, resident: Option<&Arc<Cell>>) -> Result<Arc<Cell>, CellError> {
-        self.charge(1)?;
+        self.charge(GAS_CELL_READ)?;
         let cell = match resident {
             Some(cell) => Arc::clone(cell),
             None => self
@@ -771,7 +782,22 @@ impl CellReader for ExecutionCells<'_> {
                 .or_else(|| self.external.get(&id))
                 .ok_or(CellError::MissingCell(id))?,
         };
-        self.charge((cell.record_size() as u64).saturating_add(cell.refs().len() as u64))?;
+        if cell.id() != id {
+            return Err(CellError::CellHashMismatch {
+                expected: id,
+                actual: cell.id(),
+            });
+        }
+        let body_gas = (cell.record_size() as u64).saturating_add(cell.refs().len() as u64);
+        let warm = self.resolved_cells.contains(&id);
+        self.charge(if warm {
+            (body_gas + GAS_CELL_WARM_DIVISOR - 1) / GAS_CELL_WARM_DIVISOR
+        } else {
+            body_gas
+        })?;
+        if !warm {
+            self.resolved_cells.insert(id);
+        }
         Ok(cell)
     }
 }
@@ -799,6 +825,7 @@ fn prepare_actor_address(
     address: &ActorAddress,
     external: &CellIndex,
     sender: Option<&CellIndex>,
+    resolved_cells: &mut BTreeSet<CellID>,
     gas_used: &mut u64,
     gas_limit: u64,
 ) -> Result<Option<TxEntry>, VMError> {
@@ -813,6 +840,7 @@ fn prepare_actor_address(
         external,
         actor: &actor_cells,
         address_sender: sender,
+        resolved_cells,
         gas_used,
         gas_limit,
     });
@@ -846,6 +874,7 @@ impl VM {
             external: &self.cells,
             actor: &self.current_call.actor_cells,
             address_sender: None,
+            resolved_cells: &mut self.resolved_cells,
             gas_limit: self.current_call.gas_limit,
             gas_used: &mut self.current_call.gas_used,
         }
@@ -987,6 +1016,7 @@ impl VM {
             return Err(VMError::OutOfGas);
         }
 
+        let mut resolved_cells = BTreeSet::new();
         registry.push_checkpoint();
         let result = (|| {
             let target = message.target.to_actor_id();
@@ -995,6 +1025,7 @@ impl VM {
                 &message.target,
                 &cells,
                 None,
+                &mut resolved_cells,
                 &mut initial_gas,
                 message.gas,
             )?;
@@ -1011,6 +1042,7 @@ impl VM {
                 external: &cells,
                 actor: &actor_cells,
                 address_sender: None,
+                resolved_cells: &mut resolved_cells,
                 gas_used: &mut initial_gas,
                 gas_limit: message.gas,
             };
@@ -1025,6 +1057,7 @@ impl VM {
             frame.charge_gas(initial_gas)?;
             frame.stack.push(payload);
             let mut vm = Self::new(header, frame).with_cells(cells)?;
+            vm.resolved_cells = resolved_cells;
             vm.block_height = block.height;
             vm.txlog.push(TxEntry::Receive(message_cell.id()));
             if let Some(effect) = address_effect {
@@ -1075,6 +1108,7 @@ impl VM {
             last_anchor,
             current_call: initial_call,
             call_stack: Vec::new(),
+            resolved_cells: BTreeSet::new(),
             txlog,
             total_fee: CheckedFee::zero(),
             deferred_sigs: Vec::new(),
@@ -3330,6 +3364,7 @@ impl VM {
                 &address,
                 &self.cells,
                 Some(&self.current_call.actor_cells),
+                &mut self.resolved_cells,
                 &mut initial_gas,
                 gas,
             )?;
@@ -3348,6 +3383,7 @@ impl VM {
                 external: &self.cells,
                 actor: &actor_cells,
                 address_sender: None,
+                resolved_cells: &mut self.resolved_cells,
                 gas_used: &mut initial_gas,
                 gas_limit: gas,
             };
@@ -4211,7 +4247,7 @@ mod cell_execution_tests {
             }
         }
         assert_eq!(&costs[..4], &[3; 4]);
-        assert_eq!(costs[4], costs[5]);
+        assert!(costs[4] > costs[5]);
         assert!(costs[4] > 10 * costs[0]);
     }
 
@@ -4296,7 +4332,8 @@ mod cell_execution_tests {
                 Err(VMError::Cell(CellError::MissingCell(_)))
             ));
         }
-        assert!(costs.iter().all(|cost| *cost == costs[0]));
+        assert_eq!(&costs[..2], &costs[2..]);
+        assert!(costs[0] > costs[1]);
     }
 
     #[test]
@@ -4399,10 +4436,12 @@ mod cell_execution_tests {
             (None, &empty, &empty, Some(&bag)),
         ] {
             let mut gas = 0;
+            let mut resolved_cells = BTreeSet::new();
             let mut resolver = ExecutionCells {
                 external,
                 actor,
                 address_sender,
+                resolved_cells: &mut resolved_cells,
                 gas_used: &mut gas,
                 gas_limit: 1000,
             };
@@ -4417,14 +4456,96 @@ mod cell_execution_tests {
     }
 
     #[test]
-    fn cell_read_misses_are_scoped_and_charge_attempts_before_lookup() {
+    fn cell_read_warmth_uses_physical_ids_and_resets_for_each_execution() {
+        let cell = Arc::new(Cell::new(vec![7; 128], vec![]).unwrap());
+        let same = Arc::new(Cell::new(vec![7; 128], vec![]).unwrap());
+        assert!(!Arc::ptr_eq(&cell, &same));
+        let pruned = Arc::new(cell.prune(1).unwrap());
+        assert_eq!(cell.hash(0).unwrap(), pruned.hash(0).unwrap());
+        assert_ne!(cell.id(), pruned.id());
+        for _ in 0..2 {
+            let frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 10_000);
+            let mut vm = VM::new(TxHeader { version: 1, locktime: 0 }, frame);
+            let mut costs = Vec::new();
+            for body in [&cell, &same, &pruned, &pruned] {
+                let before = vm.current_call.gas_used;
+                read_cell(&mut vm.resolver(), &CellRef::resident(body.clone())).unwrap();
+                costs.push(vm.current_call.gas_used - before);
+            }
+            assert_eq!(costs, vec![131, 34, 37, 10]);
+            assert_eq!(vm.resolved_cells.len(), 2);
+        }
+    }
+
+    #[test]
+    fn warm_cells_never_supply_bodies_outside_the_current_scope() {
+        let body = Arc::new(Cell::new(vec![7; 128], vec![]).unwrap());
+        let bag = CellIndex::collect(body.clone()).unwrap();
         let empty = CellIndex::new();
-        let id = [9; 32];
+        let mut resolved_cells = BTreeSet::new();
         let mut gas = 0;
+        {
+            let mut reader = ExecutionCells {
+                external: &empty,
+                actor: &empty,
+                address_sender: Some(&bag),
+                resolved_cells: &mut resolved_cells,
+                gas_used: &mut gas,
+                gas_limit: 10_000,
+            };
+            cells::resolve_cell(&mut reader, body.id()).unwrap();
+        }
+        assert!(resolved_cells.contains(&body.id()));
+        let before = gas;
         let mut reader = ExecutionCells {
             external: &empty,
             actor: &empty,
             address_sender: None,
+            resolved_cells: &mut resolved_cells,
+            gas_used: &mut gas,
+            gas_limit: 10_000,
+        };
+        assert_eq!(
+            read_cell(&mut reader, &CellRef::resident(body.clone()).to_unloaded()).unwrap_err(),
+            CellError::MissingCell(body.id())
+        );
+        assert_eq!(gas - before, GAS_CELL_READ);
+    }
+
+    #[test]
+    fn unpaid_or_mismatched_body_reads_do_not_warm_cells() {
+        let cell = Arc::new(Cell::new(vec![7; 128], vec![]).unwrap());
+        let empty = CellIndex::new();
+        for (id, limit, expected) in [
+            (cell.id(), 130, CellError::ResourceExhausted),
+            ([9; 32], 1000, CellError::CellHashMismatch { expected: [9; 32], actual: cell.id() }),
+        ] {
+            let mut gas = 0;
+            let mut resolved_cells = BTreeSet::new();
+            let mut reader = ExecutionCells {
+                external: &empty,
+                actor: &empty,
+                address_sender: None,
+                resolved_cells: &mut resolved_cells,
+                gas_used: &mut gas,
+                gas_limit: limit,
+            };
+            assert_eq!(reader.read(id, Some(&cell)).unwrap_err(), expected);
+            assert!(resolved_cells.is_empty());
+        }
+    }
+
+    #[test]
+    fn cell_read_misses_are_scoped_and_charge_attempts_before_lookup() {
+        let empty = CellIndex::new();
+        let id = [9; 32];
+        let mut gas = 0;
+        let mut resolved_cells = BTreeSet::new();
+        let mut reader = ExecutionCells {
+            external: &empty,
+            actor: &empty,
+            address_sender: None,
+            resolved_cells: &mut resolved_cells,
             gas_used: &mut gas,
             gas_limit: 1000,
         };
@@ -4433,14 +4554,17 @@ mod cell_execution_tests {
             CellError::MissingCell(id)
         );
         assert_eq!(gas, 1);
+        assert!(resolved_cells.is_empty());
 
         let cell = Arc::new(Cell::new(vec![7], vec![]).unwrap());
         for reference in [Some(CellRef::resident(cell.clone())), None] {
             let mut gas = 0;
+            let mut resolved_cells = BTreeSet::new();
             let mut reader = ExecutionCells {
                 external: &empty,
                 actor: &empty,
                 address_sender: None,
+                resolved_cells: &mut resolved_cells,
                 gas_used: &mut gas,
                 gas_limit: 0,
             };

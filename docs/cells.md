@@ -872,8 +872,10 @@ Opening or copying a Slice shares its body and charges only cursor/reference
 work plus the standard logical resolution charge. Any explicit conversion
 from an existing Cell into a writable Builder charges for copying its bounded
 payload and refs. A cached Cell ID is cheap to read; finalizing new content
-pays for its hash. Physical residency, private prover metadata, and cache hits
-must not change consensus gas or which bodies are visible.
+pays for its hash. Physical residency, private prover metadata, and host cache
+hits must not change consensus gas or which bodies are visible. The VM separately
+tracks successful logical body reads within each transaction: first reads pay
+the cold tariff and later reads of the same physical CellID pay the warm tariff.
 
 ### Implemented migration
 
@@ -1021,6 +1023,13 @@ canonical Trie without changing the Dict's runtime mode. Decoded Dicts remain
 cell-backed, with authenticated lazy reads and the existing path-update rules.
 Their loaded-value cache is incomplete and never establishes key absence.
 There is no separate Dict2 type or list-mode encoding.
+
+Native map operations pay their map-work charge without inventing Cell reads.
+Cell-backed operations meter each visited Cell using the transaction's logical
+cold/warm read history, even when a typed value is cached. Materialization,
+path rebuilding, Value encoding, and rollback cloning retain their separate
+charges; the read discount does not cover that work. No gas-accounting fields
+are added to the Dict encoding.
 
 The expected Dict encoding has no repeated type tag or key width: payload
 `count:u64 LE | flags:u8`, plus an optional Trie-root reference. The flags
@@ -1360,14 +1369,43 @@ currently loaded subset.
 
 Lookup order cannot affect the decoded value because every source is verified
 against the same CellID and, for an unloaded reference, its full commitment
-summary. The initial gas rule charges every logical resolution
-from the canonical Cell size, including a physical cache hit. It can be refined
-later, but consensus cost must never depend on wall-clock cache behavior.
+summary. Gas follows the logical read history below, never wall-clock cache
+behavior or which permitted source supplied the body.
 
 `MissingCell(CellID)` means no permitted source contains the requested body.
 A malformed generic Cell record invalidates the Cell hierarchy before VM execution. A
 valid Cell whose payload is invalid for the type expected by the caller fails
 at that typed operation; `cells` does not know the business meaning.
+
+### Cold and warm body reads
+
+The VM keeps a set of successfully resolved physical CellIDs, initially empty
+for each external or internal transaction and shared by its synchronous frames.
+The first successful read costs `1 + record_size + ref_count`; subsequent reads
+of the same physical ID cost `1 + ceil((record_size + ref_count) / 4)`. The
+remaining quarter-size charge bounds repeated record work rather than treating
+a warm read as free. The initial unit is charged before attempting resolution.
+Failed body resolution costs that unit and does not warm the ID; neither does
+a cold read whose remaining charge fails with out-of-gas.
+
+Warmth is logical execution state, not a node's RAM cache. Every read still
+checks current source availability and identity, and the caller still checks
+the full reference commitment and typed encoding. The warm set stores no bodies
+and confers no storage authority: reading actor A's body cannot make it available
+from actor B, and semantic-hash equality cannot substitute a different physical
+CellID. Resident and unloaded handles use the same rule; creating a Cell does
+not itself warm it.
+
+Successful reads stay warm after a synchronous failure or rollback, like the
+gas already consumed. A later typed-operation failure does not undo successful
+body reads. An asynchronous message delivery starts with an empty set regardless
+of its sender's or earlier messages' reads. Host cache eviction never resets
+logical warmth, and pre-existing host caches never seed it.
+
+This discount applies only to resolution, not to allocation, copying, typed
+decoding, construction/hashing, Trie rebuilding, or rollback cloning. Those
+retain their own bounded charges. The low-level `cells` crate does not prescribe
+this VM policy; its `CellReader` boundary exposes each logical read to the meter.
 
 ### Atomic access and linear values
 
@@ -1387,8 +1425,8 @@ In particular:
 - `send` validates portability and captures its payload before emitting the
   Message; a later internal failure follows the normal bounce path and returns
   that owned payload.
-- Resolver cache entries are monotonic read-only facts and need not roll back,
-  because they cannot change Cell identity or persistent availability.
+- The logical warm-ID set is monotonic within a transaction and is not rolled
+  back. It cannot change Cell identity, read authority, or persistent availability.
 
 ### Prover and verifier
 
@@ -1680,7 +1718,9 @@ change VM, proof, actor, and block commitments as one format.
 - Traversal is iterative where depth may be attacker-controlled and otherwise
   has an explicit small bound.
 - Hydration is a read cache operation, not a persistent state mutation.
-- Consensus gas depends on canonical work, not physical cache hits.
+- Consensus gas depends on canonical work and transaction-local logical
+  cold/warm read history, never physical cache hits. Warmth never grants access
+  to a body absent from the current permitted sources.
 
 ## Non-goals of the implemented migration
 

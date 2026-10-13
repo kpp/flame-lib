@@ -490,12 +490,17 @@ preserves untouched references, including explicit pruning. No private or host
 cache can hydrate a publicly missing branch. Serialization never makes subsequent
 native access more expensive or changes its availability semantics.
 
-**Native gas.** Each native lookup, insertion, replacement, removal or ordered
+**Dict gas.** Each native lookup, insertion, replacement, removal or ordered
 navigation charges `1 + ceil(log2(n+1))`, where `n` is the entry count before the
 operation, in addition to the instruction and applicable allocation/copy charges.
 `dict` charges this for each insertion. Native operations do not prepay Value
-encoding; commitment/admission boundaries do. Cell-backed operations retain
-their logical Cell-read charges regardless of cache residency.
+encoding; commitment/admission boundaries do. They create no synthetic Cell
+reads. Cell-backed operations pay the [cold/warm Cell-read tariff](#cell-read-gas)
+for each visited Cell, including when a typed value is already cached. The first
+successful body read warms that physical CellID for this transaction; repeated
+reads cost less. Host cache residency alone never makes a read warm. This prices
+the logical work of each runtime representation, not an imaginary Trie traversal
+for a native map.
 
 Native materialization adds a conservative path-work bound, without constructing
 Cells to estimate it: `n * 2*(h+1) * (38 + r*(3 + 34*(1+m)))`, or zero if empty.
@@ -960,7 +965,8 @@ The stack, caller/actor identity, external/internal permissions, anchor, gas
 budget, call depth and failure escrow are unchanged. `return` still returns
 from the original call. Missing/pruned targets and gas exhaustion use that
 call's ordinary failure rollback and argument recovery; root failures reject
-the transaction. Resident and unloaded targets pay the same read charge.
+the transaction. Resident and unloaded targets use the same cold/warm read
+tariff; their logical read history, not handle residency, determines the charge.
 
 Thus `pushcell exec` is explicit continuation. No program length prefix,
 implicit child traversal or new call frame is involved. The builder
@@ -1084,8 +1090,8 @@ Peeks a **Cell, Slice or Builder** and pushes five Scalars in this order (`prune
 | `level` | Highest significant hash level, not the number of set mask bits. |
 | `pruned` | `1` for an explicit pruned Cell; `0` for ordinary Cells, Slices and Builders. |
 
-Resolves the Cell's own record through the metered resolver, equally priced for
-resident and unloaded handles. Child bodies are not loaded. The original handle
+Resolves the Cell's own record through the metered resolver, using the same
+cold/warm tariff for resident and unloaded handles. Child bodies are not loaded. The original handle
 and its private annotations stay unchanged. Slices use only their unread byte/ref
 streams, not the original backing Cell's metadata; Builders use their current
 contents. Their level is the highest set bit's level in the union of remaining
@@ -2169,8 +2175,9 @@ Pushes the current call's remaining gas budget — i.e. `gaslimit − gas_used` 
 executed instructions and instructions scanned while seeking a forward label
 cost the same. Thus a clean program with `N` instructions consumes at least
 `N + 1` gas. Prover-side decoded instructions and verifier/internal byte streams
-walk the same sequence. Label tables are collected afresh per frame, so gas is
-a pure function of code and inputs rather than cache history.
+walk the same sequence. Label tables are collected afresh per frame. Gas depends
+on code, consensus inputs, and the logical execution history below, never on a
+node's pre-existing caches.
 
 Variable-size allocation work is additional gas: canonical code and decoded
 payload activation, Builder byte/ref growth, Dict/collection growth, rollback
@@ -2182,6 +2189,44 @@ memory is freed; this is a deterministic logical-work bound, not a dependency
 on Rust object sizes or allocator behavior. Prover-only witness presence never
 changes gas. Exhaustion hard-fails `OutOfGas`.
 
+#### Cell-read gas
+
+Each external or internal transaction starts with an empty set of resolved
+physical CellIDs. All synchronous frames share this set. Every logical body
+read first checks the current permitted sources and the requested identity;
+an ID in the set is never itself a source of a body or permission to read one.
+The caller still validates the complete reference commitment and the expected
+typed encoding. This preserves pruning and actor-storage scope on warm reads.
+
+| Body read | Gas, in addition to the instruction and other work |
+| --- | --- |
+| First successful read of a physical CellID | `1 + cell.record_size() + cell.refs().len()` |
+| Subsequent successful read of that CellID in the same transaction | `1 + ceil((cell.record_size() + cell.refs().len()) / 4)` |
+| Failed body resolution | `1`; the attempt does not warm the ID |
+
+This follows [TON's 100/25 first/repeat Cell-load pricing pattern](https://docs.ton.org/tvm/gas),
+not its absolute gas units. Warm reads keep a quarter of the bounded record-work
+charge because validated access still does work; the discount is not a free read.
+
+The initial `1` is charged before resolution. A first read enters the set only
+after its full cold charge succeeds; out-of-gas never partially warms it.
+Distinct physical IDs remain distinct even if their lower semantic hashes
+match. Resident handles, actor storage, and transaction witnesses use the same
+tariff. A newly constructed Cell is not warm merely because it exists in RAM.
+
+Successful reads and consumed gas survive synchronous-call failure and rollback.
+A later typed-operation failure does not undo preceding successful body reads.
+Each asynchronous delivery starts a fresh set, even when the sender or an
+earlier message read the same Cells. Prover and verifier follow the same logical
+read sequence; local decoding and physical cache eviction do not alter it.
+
+The discount covers body resolution only. Allocation, copying, typed decoding,
+Trie rebuilding, serialization/hashing, and rollback cloning retain their
+separate bounded charges. There is no new serialized size summary or gas-cache
+metadata in a Dict or Cell.
+
+#### Other metered work
+
 Expensive deterministic work is prepaid where it is requested, even when the
 actual cryptographic check is deferred until transaction finalization. External
 roots prepay proof-finalization overhead; hashing is charged by compression
@@ -2190,7 +2235,7 @@ signature verification; R1CS-building instructions charge estimated
 multipliers/items; and MSM/decrypt verification charges decompression plus the
 scheduled final MSM. Prover and verifier take the same charges.
 
-The current schedule was calibrated with
+The reference cryptographic operation costs were calibrated with
 `cargo bench -p flamevm --bench gas` on 2026-08-23 on an arm64 machine. One gas
 was conservatively treated as approximately 100 ns of reference verifier work.
 Representative medians were:

@@ -176,7 +176,14 @@ portability and linearity metadata when their descendants are absent.
 Storage reads decode canonical Cells even when an in-memory Value cache exists.
 This prevents earlier executions' private witnesses or loaded Dict branches
 from changing behavior after a restart. Each logical root/continuation access
-still goes through the metered resolver. Failure and re-entrancy checks preserve
+still goes through the metered resolver. The first successful body read of a
+physical CellID in a transaction pays `1 + record_size + ref_count`; later reads
+pay `1 + ceil((record_size + ref_count) / 4)`, independent of physical cache
+residency. Synchronous calls share this logical warm-ID set, including after
+rollback; each asynchronous delivery starts fresh. Warmth does not grant access
+to another actor's storage or preserve access after pruning: every read rechecks
+its permitted sources and commitments.
+Failure and re-entrancy checks preserve
 checkout ownership: successful `load` checks out the state once, `save` requires
 that checkout, and enclosing call/transaction rollback restores it.
 

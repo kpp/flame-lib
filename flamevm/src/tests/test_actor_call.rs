@@ -450,6 +450,78 @@ fn call_refunds_leftover_gas_to_caller() {
     );
 }
 
+#[test]
+fn cell_read_warmth_survives_call_exit_without_leaking_actor_storage() {
+    let shared = Cell::new(
+        vec![0x51; 17],
+        vec![Cell::new(vec![0x52], vec![]).unwrap().into()],
+    )
+    .unwrap();
+    let private = Cell::new(vec![0x53; 13], vec![]).unwrap();
+    let shared_ref = CellRef::from(shared.clone()).to_unloaded();
+    let private_ref = CellRef::from(private.clone()).to_unloaded();
+    let external = Arc::new(CellIndex::collect(Arc::new(shared.clone())).unwrap());
+
+    for succeeds in [true, false] {
+        let mut registry = MemRegistry::new();
+        let child_code = if succeeds {
+            ScriptBuilder::new().return_().to_bytecode()
+        } else {
+            ScriptBuilder::new().push_int(0u64).verify().to_bytecode()
+        };
+        let child = ActorID::from(crate::code_cell(&child_code).unwrap().id());
+        registry
+            .deploy(child, child_code, Value::Cell(private.clone().into()), 10_000)
+            .unwrap();
+        let caller_code = call_script(&child, 10_000);
+        let caller = deploy_recv(&mut registry, caller_code.clone(), 10_000);
+        let mut vm = vm_for_actor(caller, caller_code.clone())
+            .with_cells(Arc::clone(&external))
+            .unwrap();
+
+        while vm.call_stack.is_empty() {
+            vm.step_internal_with_registry(&mut registry).unwrap();
+        }
+        for (reference, cell) in [(&shared_ref, &shared), (&private_ref, &private)] {
+            assert!(!vm.resolved_cells.contains(&cell.id()));
+            let before = vm.current_call.gas_used;
+            cells::read_cell(&mut vm.resolver(), reference).unwrap();
+            assert_eq!(
+                vm.current_call.gas_used - before,
+                1 + cell.record_size() as u64 + cell.refs().len() as u64,
+            );
+        }
+        while !vm.call_stack.is_empty() {
+            vm.step_internal_with_registry(&mut registry).unwrap();
+        }
+        assert_int(
+            vm.current_call.stack.last().unwrap(),
+            Scalar::from(u64::from(succeeds)),
+        );
+        assert!(vm.resolved_cells.contains(&shared.id()));
+        assert!(vm.resolved_cells.contains(&private.id()));
+
+        let before = vm.current_call.gas_used;
+        cells::read_cell(&mut vm.resolver(), &shared_ref).unwrap();
+        let body_gas = shared.record_size() as u64 + shared.refs().len() as u64;
+        assert_eq!(vm.current_call.gas_used - before, 1 + (body_gas + 3) / 4);
+
+        let before = vm.current_call.gas_used;
+        assert!(matches!(
+            cells::read_cell(&mut vm.resolver(), &private_ref),
+            Err(CellError::MissingCell(id)) if id == private.id()
+        ));
+        assert_eq!(vm.current_call.gas_used - before, 1);
+
+        let mut fresh = vm_for_actor(caller, caller_code)
+            .with_cells(Arc::clone(&external))
+            .unwrap();
+        let before = fresh.current_call.gas_used;
+        cells::read_cell(&mut fresh.resolver(), &shared_ref).unwrap();
+        assert_eq!(fresh.current_call.gas_used - before, 1 + body_gas);
+    }
+}
+
 /// Read-only re-entrancy is not expressible (the strongest property of
 /// the checkout lock): a re-entrant *view* method that `load`s the
 /// mid-update state is blocked exactly like a writer — there is no
