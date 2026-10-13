@@ -37,12 +37,14 @@ TxID commits the body: header, supplied program graph, and a pruned commitment
 to the ordered effects. Internal IDs retain their computed effect root.
 
 Every `open`, `signcall`, and actor `call` runs in an isolated frame with its own
-stack, control flow, and gas budget. Successful calls return only explicitly
-selected values. Failed calls restore state effects, constraints, deferred
+stack, control flow, and gas budget. Each invocation passes one portable
+application Value, and successful calls return one application Value followed
+by status `1`. Use a Dict to group fields, or Scalar `0` as unit when there is
+no application input/result. Failed calls restore state effects, constraints, deferred
 signatures, fees, and batch-verification work to their entry checkpoints. They
-also return entry-owned values: actor calls return their arguments, while Contract
+also return entry-owned values: actor calls return their argument, while Contract
 predicate calls return the original locked Contract followed by their explicit
-arguments.
+argument. Failure status `0` follows those restored values; there is no count.
 All downward call arguments must be portable, just like asynchronous `send`
 payloads. Return values are unrestricted: non-portable liabilities and
 VM-local values may travel upward so the caller can resolve them, but they may
@@ -104,7 +106,7 @@ Internal transactions do not have a pre-determined effect and therefore do not s
 
 Like external, internal transactions produce effects:
 
-1. `Receive(MessageID)` (txlog variant `TxEntry::Receive`) — the consumed Send's id. Emitted automatically as the first effect after `Header` by `VM::execute_internal`, committing the originating `MessageID` (canonical 32-byte hash of the whole Send: anchor, target, caller, payload, gas, refund predicate — analogous to `ContractID` for contracts) into the Internal TxID merkle root. Symmetric with `Input` for external transactions. The message **payload is delivered onto the recv frame's stack** in payload order before code runs — symmetric with `op_call` pushing its args; a conventional dispatch selector rides as the topmost payload arg.
+1. `Receive(MessageID)` (txlog variant `TxEntry::Receive`) — the consumed Send's id. Emitted automatically after `Header`, committing the whole Message (anchor, target, caller, payload, gas, refund predicate) into the internal effect root. The **single payload Value** is the initial stack item. A selector may be the entire Value or a field of an application-defined Dict; the VM imposes no method layout.
 2. Actor activation — first use of `Init` emits `ActorDeploy { actor, code }` with empty initial data; authenticated `Restore` emits `ActorRestore { actor, state }` with the supplied partial code/data proof. Both effects commit only with successful execution and sufficient storage.
 3. Outputs — creation of new entries in the Utreexo.
 4. Sends — messages sent to actors that produce other internal transactions.
@@ -470,8 +472,48 @@ Dict is a versatile data structure for representing lists, dictionaries and even
 
 Keys are `Scalar` values. Canonical iteration follows unsigned numeric order
 of residues in `[0, ℓ)`: a near-order key such as `ℓ-1` sorts after small keys.
-All dictionaries use the same `cells::Trie`, with fixed 32-byte big-endian
-paths. Sequential keys `0..n-1` are a list convention, not another encoding.
+All serialized dictionaries use the same `cells::Trie`, with fixed 32-byte
+big-endian paths. Sequential keys `0..n-1` are a list convention, not another encoding.
+
+**Runtime representations.** `dict` and host construction create a native ordered
+map whose entries are complete. Native insertion, lookup, extraction and ordered
+navigation do not encode Values or build/hash Cells. Decoding creates a cell-backed
+Dict: its authenticated Trie is authoritative and its typed-value cache may be
+incomplete. Cell-backed operations retain resolver-aware path validation and
+eager path rebuilding; a missing cache entry is never evidence of an absent key.
+Deleting a branch may require resolving its surviving sibling for compression.
+There is no deferred-write/tombstone overlay over stored data.
+
+Native serialization builds the canonical Trie from sorted keys without changing
+the runtime representation or discarding typed witnesses. Cell-backed serialization
+preserves untouched references, including explicit pruning. No private or host
+cache can hydrate a publicly missing branch. Serialization never makes subsequent
+native access more expensive or changes its availability semantics.
+
+**Native gas.** Each native lookup, insertion, replacement, removal or ordered
+navigation charges `1 + ceil(log2(n+1))`, where `n` is the entry count before the
+operation, in addition to the instruction and applicable allocation/copy charges.
+`dict` charges this for each insertion. Native operations do not prepay Value
+encoding; commitment/admission boundaries do. Cell-backed operations retain
+their logical Cell-read charges regardless of cache residency.
+
+Native materialization adds a conservative path-work bound, without constructing
+Cells to estimate it: `n * 2*(h+1) * (38 + r*(3 + 34*(1+m)))`, or zero if empty.
+Here `h = min(n, 1+d)`, `d` counts radix-4 key positions that differ from the first
+key, `r = min(n,4)`, and `m` is the number of bits in the union of public referenced
+Cell masks (including nested cached Dict values and backed roots). Recursive Value
+encoding is charged separately. All arithmetic is checked. Runtime-only values
+remain usable until a boundary requires encoding; encoding depth remains bounded.
+
+**Owned runtime depth.** Cheap construction must not permit unbounded recursive
+cloning or disposal. Each Dict tracks a conservative owned-depth watermark:
+an empty/lazy Dict starts at 1; an inserted or hydrated child Dict contributes
+its watermark plus 1, and a Contract contributes its payload's owned depth plus
+one Contract wrapper plus the enclosing Dict. Other Values contribute no owned
+Dict/Contract nesting. Insertion/hydration above 256 fails `CellError::LimitExceeded`
+without transferring the rejected value. While nonempty the watermark never
+decreases; fully draining the Dict resets it to 1. It is not serialized. This
+runtime bound is distinct from the unchanged typed encoding-depth bound of 128.
 
 **Dicts are never copyable**: `dup`/`getdup` of a Dict value always fails `TypeNotCopyable`. Each Dict carries independent sticky `portable` and `droppable` flags. A newly constructed empty Dict starts with both flags true. Every successful insertion applies `dict.portable &= value.is_portable()` and `dict.droppable &= value.is_droppable()`. Removal and replacement never restore a cleared flag; a rejected strict insertion does not change either flag. Emptiness overrides only droppability: after every member is extracted, the empty Dict can be dropped while the extracted bearer values remain owned by the script. Portability remains sticky because it governs domain admission rather than disposal.
 
@@ -584,7 +626,9 @@ reserves one of Cells' fifteen pruning levels for whole-root freezing.
 
 ## Messages
 
-Messages execute “method calls” asynchronously. Each message contains a predicate for bouncing its arguments in case of actor failure. If the method called through a message returns any values, the call fails and the original arguments are bounced.
+Messages execute asynchronously with one portable payload Value. Each contains a
+predicate for bouncing that exact payload in case of actor failure. A message-root
+frame must finish with an empty stack; it cannot return to a caller.
 
 Messages are unique by construction, not by a duplicate-message table. Each
 accepted `send` embeds the left child of the current anchor ratchet and leaves
@@ -595,10 +639,17 @@ does not enqueue another Message. Failure to apply that refund rejects the
 whole candidate, so the originating Send does not commit.
 
 A Message's payload is immutable and is created through a checked constructor.
-Construction scans its top-level values and rejects any non-portable item;
-checking a nested Dict is O(1) through its sticky `portable` flag. Message
+Construction rejects a non-portable payload and validates encodability;
+checking a Dict is O(1) through its sticky `portable` flag. Message
 encoding is representation-only and relies on this prior asynchronous-domain
 admission.
+
+Before delivery, the admitted payload is encoded and trusted-decoded from its
+public representation, retaining lazy authenticated branches but clearing private
+openings and typed caches. This normalization happens before delivery gas is
+computed: a locally queued native Dict and the same Message decoded from transport
+must have identical execution, gas and pruning failures. Encoding is prepaid at
+Message admission; normalization must not read unrelated hidden branches.
 
 Not only users, but also actors can send async messages to each other. This allows an actor to commit intermediate results between transactions.
 
@@ -608,6 +659,16 @@ Human-readable wallet/actor address formatting is specified in
 [address.md](address.md), using [Bech32f](bech32f.md). Key derivation is separate
 in [FlameKD](flamekd.md). VM routing uses the ActorAddress schema above;
 payment formatting does not add another instruction-level destination format.
+
+## Single-Value ABI compatibility
+
+The single-Value call/return convention replaces counted stack arguments and
+results; the opcode numbers do not change. Existing programs must be regenerated
+for this ABI, including their predicate/code commitments. Message and routing
+Address payloads now reference one tagged Value directly, changing their wire
+format and IDs; RPC Send payloads are one Value object rather than an array.
+No legacy counted-ABI or list-wrapper decoder is provided. Native Dict gas is a
+consensus change, although equivalent Dict contents/flags retain their Cell format.
 
 ## Storage
 
@@ -764,7 +825,7 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | a1 | [label](#label) | | ø → ø | Mark a jump target (operand: label number); labels number 0,1,2… in order. |
 | a2 | [jump](#jump) | | ø → ø | Unconditional jump to a label (operand: label number). |
 | a3 | [jumpif](#jumpif) | | x → ø | Pop a scalar; jump to a label iff non-zero (operand: label number). |
-| a4 | [return](#return) | | a\_{k-1} … a\_0 k → ø | Exit current call frame, returning `k` items to the parent. |
+| a4 | [return](#return) | | result → ø | Exit current call frame, returning one Value to the parent. |
 | a5 | [type](#type) | | x → x code | Push the type code of the top value (peek). |
 | a6 | [pushcell](#pushcell) | | ø → cell | Consume the next reference from the current program Cell. |
 | a7 | [exec](#exec) | | cell → ø | Replace the current program Cell, preserving this frame. |
@@ -779,12 +840,12 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | c0 | [input](#input) | ext. | cell → contract | Decode an admitted Contract root through the execution witness hierarchy; its CellID is the input ID. |
 | c1 | [contract](#contract) | | payload pred → contract | Lock one portable Value under the predicate. |
 | c2 | [output](#output) | | payload pred → ø | Like `contract`, but emits an Output. |
-| c3 | [open](#open) | | contract ik program gas args… k → {results… k' 1 \| contract args… k 0} | Authenticate the program Cell's hash(0) and run an isolated frame. |
+| c3 | [open](#open) | | contract ik program gas arg → {result 1 \| contract arg 0} | Authenticate the program Cell's hash(0) and run an isolated frame. |
 | c4 | [signtx](#signtx) | ext. | contract → payload | Authorize TxID and unwrap the single payload Value. |
-| c5 | [signcall](#signcall) | | contract script sig gas args… m → {results… k' 1 \| contract args… m 0} | Run a script signed by the contract predicate in an isolated frame. |
+| c5 | [signcall](#signcall) | | contract script sig gas arg → {result 1 \| contract arg 0} | Run a script signed by the contract predicate in an isolated frame. |
 |    | **Actors** | | | |
-| d0 | [send](#send) | | args… k refund gas addr → ø | Queue an asynchronous actor message. |
-| d1 | [call](#call) | actor | args… k gas addr → {results… k' 1 \| args… k 0} | Synchronously call an actor. |
+| d0 | [send](#send) | | arg refund gas addr → ø | Queue an asynchronous actor message. |
+| d1 | [call](#call) | actor | arg gas addr → {result 1 \| arg 0} | Synchronously call an actor. |
 | d2 | [load](#load) | actor | ø → value | Check out the actor's state (any portable Value; moves it out, locks re-entry). |
 | d3 | [save](#save) | actor | value → ø | Move the state value back in (requires checkout; unlocks). |
 | d4 | [setcode](#setcode) | actor | cell → ø | Replace the actor's native code graph (author-gated upgrade). |
@@ -843,9 +904,9 @@ Canonical failure-shape vectors (stack order is bottom-to-top):
 | `merge`: `CT(1,7), CT(2,8)` | `CT(1,7), CT(2,8), 0` | neither token |
 | `merge`: `CT(H,7), CT(1,7)` | `CT(H,7), CT(1,7), 0` | neither token (`H = (ℓ-1)/2`) |
 | unavailable `addstorage` / `quotestorage`: `q` | `0` | request `q` |
-| failed entered `call`: `A, B` with `k=2` | `A, B, 2, 0` | address and gas; arguments are restored and count is re-emitted |
-| failed entered `open`: `Contract, A, B` with `k=2` | `Contract, A, B, 2, 0` | proof/script/gas operands; Contract and arguments are restored, count excludes Contract |
-| failed entered `signcall`: `Contract, A, B` with `k=2` | `Contract, A, B, 2, 0` | script/signature/gas operands; Contract and arguments are restored, count excludes Contract |
+| failed entered `call`: `arg` | `arg, 0` | address and gas; original argument restored |
+| failed entered `open`: `Contract, arg` | `Contract, arg, 0` | proof/script/gas operands; locked Contract and original argument restored |
+| failed entered `signcall`: `Contract, arg` | `Contract, arg, 0` | script/signature/gas operands; locked Contract and original argument restored |
 
 Thus count and lookup-key operands do not need restitution: they are copyable
 control data, not linear values. The source Slice, Dict, tokens, Contract, and call
@@ -1695,16 +1756,22 @@ the top value is not a scalar.
 
 ### return
 
-_a_{k-1} … a_0 k_ → ø
+_result_ → ø
 
 Atomic cross-frame return:
 
-1. Pops `k` (Scalar, whose canonical residue must fit the argument-count limit).
-2. Asserts an enclosing call frame exists (otherwise `ReturnAtRoot`).
-3. Asserts the callee stack has exactly `k` items left (otherwise `BadReturnArity` or `StackNotClean`).
-4. Pops the call frame.
-5. Refunds leftover gas to the parent.
-6. Pushes the `k` items onto the parent's stack, then the count `k`, then a **success marker `1`** — the parent observes `results… k 1`. A clean run-off-the-end exit pushes `0 1`. A failed child instead restores its entry escrow followed by the escrow count and `0`; callers branch on this trailing status. Actor calls escrow their arguments. `open` and `signcall` escrow the original locked Contract plus their explicit arguments, never the Contract payload separately.
+1. Asserts an enclosing call frame exists (otherwise `ReturnAtRoot`).
+2. Asserts the callee stack contains exactly one Value (`BadReturnArity` if empty,
+   `StackNotClean` if additional values remain), and validates actor storage.
+3. Pops the frame and refunds leftover gas to the parent.
+4. Pushes the result followed by success marker `1`; no count is emitted.
+
+An empty-stack run-off-the-end child exit returns Scalar `0` (unit) followed by
+`1`. A failed child restores its entry escrow followed by `0`: one original
+argument for actor calls, or the original locked Contract and argument for
+`open`/`signcall`. The Contract payload is never returned separately on failure.
+Use a Dict for multiple application results. Error recovery uses prebuilt
+entry snapshots and requires no new encoding or Cell resolution.
 
 `return` deliberately performs no portability check. Non-portable values,
 including negative `ClearToken`s and `WideToken`s, may move upward to the
@@ -1712,7 +1779,7 @@ caller, which owns responsibility for balancing or consuming them. Every
 downward boundary (`call`, `open`, `signcall`, and asynchronous `send`) accepts
 portable values only.
 
-At the outermost call frame, `return` always errors regardless of `k`; a script terminates cleanly by running off the end of its instructions with an empty stack (jump to a trailing label to short-circuit).
+At the outermost call frame, `return` always errors; a script terminates cleanly by running off the end of its instructions with an empty stack (jump to a trailing label to short-circuit).
 
 ### type
 
@@ -1775,10 +1842,10 @@ Same construction as [contract](#contract), but emits an Output effect.
 
 ### open
 
-_contract internal_key program_cell gas args… k_ →
-_{results… k' 1 | contract args… k 0}_
+_contract internal_key program_cell gas arg_ →
+_{result 1 | contract arg 0}_
 
-Pops the explicit argument count and portable arguments, gas grant, program
+Pops one portable argument, gas grant, program
 Cell, internal key (Point), and Contract. Resolves the program's own record and
 checks `P = X + h(X, program_cell.hash(0))·B`, then executes its raw bytecode.
 There is no native branch index, Trie lookup, or leaf tag. A single Cell can hold
@@ -1801,17 +1868,16 @@ nested lookup witnesses. The inline graph is not duplicated in the lookup index.
 directly, including after a CellEnvelope transport roundtrip.
 
 On success, an isolated ContractOpen frame receives the **single payload**
-followed by the explicit arguments. Its starting anchor is split from the
+followed by the single explicit argument. Its starting anchor is split from the
 parent. The frame has only the immediate caller's actor ID for attribution,
 never actor-state authority. Actor state/storage/code, public issuance,
 `selfid`, and synchronous `call` hard-fail. Nested ContractOpen callerid
 does not transitively inherit an earlier actor. Anonymous async `send` remains
 available. CS access follows external/internal execution context.
 
-Successful return yields `results… k' 1`; clean fall-through yields `0 1`.
+Successful return yields `result 1`; clean empty-stack fall-through yields `0 1`.
 An entered child's failure rolls back effects and returns the original locked
-Contract followed by the explicit arguments, their original count `k`, and
-status zero. The Contract is not counted and its payload is not returned
+Contract followed by the original argument and status zero. Its payload is not returned
 separately. Unused child gas is refunded on both success and failure; consumed
 instruction, allocation and resolution work remains charged.
 
@@ -1821,7 +1887,7 @@ Missing data after entry follows normal child-failure escrow recovery.
 
 ### send
 
-_args… k refund gas addr_ → ø
+_arg refund gas addr_ → ø
 
 Asynchronous message-send. Pops operands top-first:
 
@@ -1829,9 +1895,9 @@ Asynchronous message-send. Pops operands top-first:
    their native constructor/state reference.
 2. `gas` (`Scalar`) — gas allotment.
 3. `refund` (32-byte zero-ref payload) — bounce predicate point.
-4. `k` (`Scalar`) — args count.
-5. `args…` — k portable values, delivery payload. A caller may include Flame
-   here for the destination actor to spend with `addstorage`.
+4. `arg` — one portable Value, delivered as the initial stack item. A caller
+   may pass a Flame Token directly or group it with other fields in a Dict
+   for the destination actor to spend with `addstorage`.
 
 The full `gas` grant is debited from the active frame before the Send effect is
 recorded. Insufficient remaining gas hard-fails `OutOfGas` and no message is
@@ -1849,13 +1915,13 @@ internal deliveries. An actor frame contributes its actor id as
 transaction.”
 
 The payload is admitted by `Message::new`, not by `Message::encode`.
-`Message::new` scans top-level arguments and uses the sticky Dict flag for O(1)
-nested checks; once constructed, the payload cannot be replaced.
+`Message::new` checks the single payload and uses the sticky Dict flag for O(1)
+nested checks, then establishes encodability; the payload cannot be replaced.
 
 The send's identity is the canonical Message root CellID. Its payload contains
 anchor:32, ActorAddress, caller-presence:u8 and optional raw ActorID:32,
-refund Predicate:32, and gas:u64 LE. Its argument list is a referenced Dict
-with consecutive keys; constructor or restoration data uses an earlier ref.
+refund Predicate:32, and gas:u64 LE. Its payload is a referenced tagged Value
+Cell, without an implicit list/Dict wrapper; constructor or restoration data uses an earlier ref.
 The Send TxEntry references that Message Cell. Anchor ratcheting makes every
 distinct send unique by construction. See [Data encoding](encoding.md).
 Available in both contexts. Hard-fails with a Cell decoding error when `addr`
@@ -1864,15 +1930,16 @@ has the wrong size; `NonPortableInSend` on non-portable args; and `InvalidBitran
 gas allotment outside the `u64` range. It hard-fails `OutOfGas` when the active
 frame cannot prepay the requested grant.
 
-On delivery failure, consensus seals the original argument list as a Dict in one fresh Contract under `refund_predicate` and emits an Output effect.
+On delivery failure, consensus seals the original payload Value unchanged in one
+fresh Contract under `refund_predicate` and emits an Output effect.
 
 ### call
 
-_args… k gas addr_ → _{results… k' 1 | args… k 0}_
+_arg gas addr_ → _{result 1 | arg 0}_
 
 Synchronous actor-to-actor call. Same operand shape as [`send`](#send) minus
 `refund` and, likewise, no method selector. A caller that wants the callee to
-purchase storage passes Flame among the ordinary arguments; allocation remains
+purchase storage passes Flame as its argument or inside an argument Dict; allocation remains
 the callee's explicit decision. Init may provision an absent actor; Restore may
 authenticate and retain a partial state tree. Both commit only if the callee
 succeeds and retained usage fits its own leases. See [Actors](#actors).
@@ -1882,8 +1949,8 @@ Only `InternalRoot` and `ActorCall` may invoke `call`. `ExternalRoot` and
 caller attribution stored in a `ContractOpen` is read-only and is never used to
 fabricate an actor caller.
 
-Before entering the callee, `call` rejects every non-portable argument with
-`NonPortableInCall`. This is a top-level scan; a nested Dict is checked in O(1)
+Before entering the callee, `call` rejects a non-portable argument with
+`NonPortableInCall`. A Dict is checked in O(1)
 through its sticky flag.
 
 **Re-entrancy:** state is reachable **only** via `load`, which acquires the
@@ -1899,13 +1966,13 @@ concurrency guarantee the VM can infer. Nested call depth is capped at
 
 Creates an isolated `CallKind::ActorCall { actor, caller }` frame (the frame's starting anchor lives in `CallFrame.anchor` — todo #4) with the popped gas allotment. The frame has the callee's actor identity — `op_load`/`op_save`/`op_call`/`op_send` operate on the callee.
 
-Successful return is `results… k' 1`; clean fall-through is `0 1`. Before
+Successful return is `result 1`; clean empty-stack fall-through is `0 1`. Before
 entry, missing/frozen/checked-out actors, invalid restoration proofs, depth
 rejection, and a grant too small to activate
-the callee return the original `args… k 0`. Before or after entry, unused gas
+the callee return the original `arg 0`. Before or after entry, unused gas
 returns to the caller; pre-entry code-loading work remains charged. An undersized
 child grant or runtime exhaustion consumes the full grant. Every runtime failure
-rolls back the child and returns the same escrowed arguments and failure suffix;
+rolls back the child and returns the same escrowed argument and failure suffix;
 the failed child's current stack is discarded. `RegistryUnavailable`, malformed
 operands, non-portable arguments, or inability of the caller to fund the grant
 hard-fail the current frame before this soft boundary.
@@ -2034,12 +2101,12 @@ The deferred signature is verified at finalize: the prover aggregates all `TxBou
 
 ### signcall
 
-_contract script sig gas args… m_ →
-_{results… k' 1 | contract args… m 0}_
+_contract script sig gas arg_ →
+_{result 1 | contract arg 0}_
 
 Same call-frame mechanics as [`open`](#open) — taproot reveal is replaced by signature verification:
 
-1. Pops `m` (Scalar), `args` (m portable values), and `gas`. A non-portable
+1. Pops `arg` (one portable Value) and `gas`. A non-portable
    argument hard-fails `NonPortableInCall` before child entry.
 2. Pops `sig` (zero-ref byte source, exactly 64 bytes — Schnorr signature).
 3. Pops `script` (Cell reference), resolves its executable root, and pops `contract`.
@@ -2053,12 +2120,12 @@ Same call-frame mechanics as [`open`](#open) — taproot reveal is replaced by s
    `BadSignatureBytes`, while a validly encoded but incorrect signature fails
    `SignatureVerificationFailed`. Internal execution records no deferred item.
 6. After verification or deferral, snapshots rollback state, creates the
-   isolated `ContractOpen` frame, and pours payload + args into the signed script.
+   isolated `ContractOpen` frame with stored payload followed by the argument.
 
 External deferred signatures are batch-verified at finalize alongside any
 `signtx` items. Entered-child failure removes an external deferred signature
-and returns the original Contract plus explicit arguments using the same failure
-shape as `open`; the count is `m`, excluding the contextual Contract. Internal
+and returns the original Contract plus argument using the same failure
+shape as `open`, followed by status zero without a count. Internal
 signature failure occurs before child entry and hard-fails the current frame.
 
 This changes the signed statement from source bytes to the factual program

@@ -250,7 +250,7 @@ delta; per-actor or per-transaction purchase limits do not solve the sybil case.
 ## Purchasing and quoting
 
 Only an actor may purchase storage. It may fund itself from Flame in its state,
-its call arguments, or a delivered message. There is no transferable virtual-
+its one call argument, or a delivered message. There is no transferable virtual-
 byte asset and callers do not allocate storage directly to callees.
 
 For a valid byte request `q`, [`quotestorage`](flamevm.md#quotestorage) returns

@@ -1157,21 +1157,21 @@ fn public_cell_operation_execution_has_identical_prover_and_verifier_gas() {
 fn cursor_and_builder_values_can_return_upward_but_cannot_be_call_arguments() {
     for value in [slice_value(bytes(&[7])), builder_value(&[7], &[])] {
         assert!(matches!(
-            VM::require_portable_call_args(&[value]),
+            VM::require_portable_call_arg(&value),
             Err(VMError::NonPortableInCall)
         ));
     }
     let branch = ScriptBuilder::new()
+        .drop_() // unit request
         .builder()
         .push_int(7u64)
         .push_int(1u64)
         .write_uint()
-        .push_int(1u64)
         .return_();
     let mut registry = StubRegistry {
         script: branch.to_bytecode(),
     };
-    let mut vm = vm_with_script(call_to(&ActorID::from([9; 32])).verify().drop_());
+    let mut vm = vm_with_script(call_to(&ActorID::from([9; 32])).verify());
     vm.last_anchor = Some(Anchor([3; 32]));
     while !vm.current_call.is_finished() || !vm.call_stack.is_empty() {
         vm.step_internal_with_registry(&mut registry).unwrap();

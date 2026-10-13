@@ -242,7 +242,7 @@ fn taproot_exec_failure_returns_the_contract_and_cell_argument() {
         .to_cell()
         .unwrap();
     let branch = ScriptBuilder::new().push_cell(failure).exec();
-    let recovery = ScriptBuilder::new().push_int(1u64).return_();
+    let recovery = ScriptBuilder::new().drop_().return_();
     let tree = PredicateTree::from_scripts(None, vec![branch, recovery], [7; 32]).unwrap();
     let contract = Contract::new(
         Predicate::tree(tree.clone()),
@@ -258,14 +258,8 @@ fn taproot_exec_failure_returns_the_contract_and_cell_argument() {
         .unwrap()
         .push_int(10_000u64)
         .push_cell(arg)
-        .push_int(1u64)
         .open()
         .push_int(0u64)
-        .eq()
-        .verify()
-        .drop_()
-        .drop_()
-        .push_int(1u64)
         .eq()
         .verify()
         .drop_()
@@ -277,7 +271,6 @@ fn taproot_exec_failure_returns_the_contract_and_cell_argument() {
         .push_int(0u64)
         .open()
         .verify()
-        .drop_()
         .push_point(*Predicate::unspendable_key().as_bytes())
         .output();
     let tx = source
@@ -321,19 +314,17 @@ fn exec_failure_restores_entry_assets_without_touching_the_parent_loan() {
         Scalar::from(3u64),
     )));
     parent.snap_failure_values = vec![credit];
-    parent.snap_failure_arg_count = 1;
     while !vm.call_stack.is_empty() {
         vm.step_internal().unwrap();
     }
-    assert_eq!(vm.current_call.stack.len(), 4);
+    assert_eq!(vm.current_call.stack.len(), 3);
     for (value, quantity) in vm.current_call.stack[..2].iter().zip([-5i64, 5]) {
         match value {
             Value::ClearToken(token) => assert_eq!(token.qty(), Scalar::from(quantity)),
             _ => panic!("expected loan counterpart"),
         }
     }
-    assert_int(&vm.current_call.stack[2], Scalar::ONE);
-    assert_int(&vm.current_call.stack[3], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[2], Scalar::ZERO);
 }
 
 #[test]

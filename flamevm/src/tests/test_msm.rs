@@ -243,10 +243,9 @@ fn evalpoint_failure_restores_locked_payload_arguments_and_parent_debt() {
         Value::Cell(code.into()),
         Value::Scalar(Scalar::from(10_000u64)),
         Value::ClearToken(ClearToken::new(Scalar::from(9u64), FLAME_FLAVOR)),
-        Value::Scalar(Scalar::ONE),
     ];
     run_to_end(&mut vm).unwrap();
-    assert_eq!(vm.current_call.stack.len(), 5);
+    assert_eq!(vm.current_call.stack.len(), 4);
     assert!(
         matches!(&vm.current_call.stack[0], Value::ClearToken(t) if t.qty() == Scalar::from(-9i64))
     );
@@ -254,8 +253,7 @@ fn evalpoint_failure_restores_locked_payload_arguments_and_parent_debt() {
     assert!(
         matches!(&vm.current_call.stack[2], Value::ClearToken(t) if t.qty() == Scalar::from(9u64))
     );
-    assert_int(&vm.current_call.stack[3], Scalar::ONE);
-    assert_int(&vm.current_call.stack[4], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[3], Scalar::ZERO);
     assert!(vm.current_call.gas_used < 10_000);
 }
 
@@ -752,7 +750,7 @@ fn clean_call_msm_propagates_to_parent_batch() {
         .return_();
     let outer = open_with_inner(inner, false)
         .verify() // pop success marker
-        .drop_(); // drop count
+        .drop_(); // drop unit result
 
     let result = Prover::prove(&pc_gens, outer, dummy_header(), 1_000_000)
         .expect("prove ok (prover always builds something)");

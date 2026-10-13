@@ -346,7 +346,7 @@ fn issuepub_at_external_root_errors_actor_context() {
 fn issuepriv_emits_token_with_predicate_bound_flavor() {
     // Inside a ContractOpen frame in external context: push a blinded
     // commitment as a witness-bearing Point, lift it to a Variable
-    // via `commit`, push a tag, run `issuepriv`. Then `push:1 return`
+    // via `commit`, push a tag, run `issuepriv`. Then `return`
     // so the Token returns to the parent frame cleanly. The opcode
     // does:
     //   1. Register the qty commitment with the CS.
@@ -372,7 +372,6 @@ fn issuepriv_emits_token_with_predicate_bound_flavor() {
         .commit()
         .push_literal(tag_str.clone())
         .issuepriv()
-        .push_int(1u64)
         .return_();
     let parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 20_000);
     let child_kind = CallKind::ContractOpen {
@@ -390,10 +389,10 @@ fn issuepriv_emits_token_with_predicate_bound_flavor() {
         vm.step_external(&mut prover).expect("step ok");
     }
 
-    // After `return k=1`: parent stack = [Token, k=1, success=1].
+    // After `return`: parent stack = [Token, success=1].
     let predicate = Predicate::opaque(curve25519_dalek::ristretto::CompressedRistretto([0u8; 32]));
     let expected_flv = flavor_from_predicate(&predicate, tag_str.payload().unwrap());
-    assert_eq!(vm.current_call.stack.len(), 3);
+    assert_eq!(vm.current_call.stack.len(), 2);
     match &vm.current_call.stack[0] {
         Value::Token(t) => {
             assert_eq!(t.qty.assignment(), Some(qty_int), "qty witness preserved");
@@ -412,7 +411,6 @@ fn issuepriv_emits_token_with_predicate_bound_flavor() {
         other => panic!("expected Token, got {}", value_kind(other)),
     }
     assert_int(&vm.current_call.stack[1], Scalar::from(1u64));
-    assert_int(&vm.current_call.stack[2], Scalar::from(1u64));
 
     // External log: Header + IssuePriv.
     assert_eq!(vm.txlog.len(), 2);
@@ -452,12 +450,13 @@ fn issuepriv_in_internal_context_yields_failure_marker() {
     // ContractOpen with external_context: false: `require_external()` in
     // op_issuepriv errors `ExternalOnly`. Since it's inside a nested
     // frame, `fail_current_call` swallows the error and pushes
-    // `[count=0, status=0]` onto the parent's stack — mirrors the
+    // `[unit=0, status=0]` onto the parent's stack — mirrors the
     // `op_open_cs_blocked_when_external_context_false` pattern in
     // test_contracts.rs.
     use crate::vm::{Anchor, CallFrame, CallKind, VM};
     use curve25519_dalek::ristretto::CompressedRistretto;
-    let parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    let mut parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    parent.snap_failure_values = vec![Value::Scalar(Scalar::ZERO)];
     let script = ScriptBuilder::new().issuepriv().to_bytecode();
     let child_kind = CallKind::ContractOpen {
         predicate: Predicate::opaque(CompressedRistretto([0u8; 32])),
@@ -478,7 +477,7 @@ fn issuepriv_in_internal_context_yields_failure_marker() {
         .expect("step ok — error swallowed into marker");
     // Child frame unwound back into parent (ExternalRoot).
     assert!(vm.call_stack.is_empty());
-    // Parent carries `[count=0, success=0]` (this direct child has no escrow).
+    // Parent recovers its unit request followed by the failure status.
     assert_eq!(vm.current_call.stack.len(), 2);
     assert_int(&vm.current_call.stack[0], Scalar::ZERO);
     assert_int(&vm.current_call.stack[1], Scalar::ZERO);
@@ -504,12 +503,12 @@ fn issuepriv_prove_then_verify_end_to_end() {
     let tag_str = CellValue::from_bytes(b"gold".to_vec()).unwrap();
 
     // Leaf script — runs inside the isolated ContractOpen frame on open:
-    //   stack at entry: [qty_witness_point]  (k=1 arg from `open`)
+    //   stack at entry: [payload, qty_witness_point]
     //   commit:    pop Point → Variable
     //   pushstr:   tag
     //   issuepriv: Variable + tag → Token  (TxEntry::IssuePriv)
     //   retire:    Token → ø                 (TxEntry::Retire)
-    //   push:0 return: exit with 0 results
+    //   push:0 return: return the unit result
     let inner = ScriptBuilder::new()
         .roll_k(1)
         .drop_() // discard the empty Contract payload below the argument
@@ -541,8 +540,8 @@ fn issuepriv_prove_then_verify_end_to_end() {
     //   pushstr(program_trie_root); push(program_index);
     //   branch cells and private script witnesses attached to the builder;
     //   gas=20_000;
-    //   pushstr(qty_witness); k=1; open;
-    //   verify; drop  (consume the success + count markers)
+    //   pushpoint(qty_witness); open;
+    //   verify; drop  (consume the success and unit result)
     let outer = ScriptBuilder::new()
         .push_cell(CellValue::contract(contract).unwrap())
         .input()
@@ -551,10 +550,9 @@ fn issuepriv_prove_then_verify_end_to_end() {
     let outer = push_taproot_proof_to_program(outer, &cp)
         .push_int(20_000u64) // gas
         .push_point_typed(Point::commitment(qty_commit.clone())) // qty witness arg
-        .push_int(1u64) // k = 1 arg
         .open()
         .verify() // pops success marker (1)
-        .drop_(); // pops count (0)
+        .drop_(); // pops the unit result
 
     // Prove.
     let result = Prover::prove(&pc_gens, outer, dummy_header(), 1_000_000).expect("prove ok");

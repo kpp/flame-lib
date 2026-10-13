@@ -8,7 +8,6 @@ use cells::CellEncode;
 fn send_script(target: &ActorID, refund: [u8; 32], selector: u64, gas: u64) -> Vec<u8> {
     ScriptBuilder::new()
         .push_int(selector)
-        .push_int(1u64)
         .push_literal(CellValue::from_bytes(refund.to_vec()).unwrap())
         .push_int(gas)
         .push_literal(actor_address(&target))
@@ -30,7 +29,13 @@ fn send_commits_message_fields() {
     let target = ActorID::from([0xbb; 32]);
     let refund = [0x77; 32];
     let mut reg = MemRegistry::new();
-    let sender = deploy_actor(&mut reg, send_script(&target, refund, 3, 10_000));
+    let sender = deploy_actor(
+        &mut reg,
+        ScriptBuilder::parse(&send_script(&target, refund, 3, 10_000))
+            .unwrap()
+            .drop_()
+            .to_bytecode(),
+    );
     let log = deliver(&mut reg, msg_to(sender.clone()));
 
     let messages = sends(&log);
@@ -43,7 +48,7 @@ fn send_commits_message_fields() {
     assert_eq!(message.anchor, Anchor([0u8; 32]).split().0);
     assert!(matches!(
         message.payload(),
-        [Value::Scalar(value)] if *value == Scalar::from(3u64)
+        Value::Scalar(value) if *value == Scalar::from(3u64)
     ));
 }
 
@@ -52,6 +57,7 @@ fn sequential_sends_get_distinct_anchors_and_ids() {
     let target = ActorID::from([0xcc; 32]);
     let mut code = send_script(&target, [0; 32], 0, 1);
     code.extend(send_script(&target, [0; 32], 0, 1));
+    code.extend(ScriptBuilder::new().drop_().to_bytecode());
     let mut reg = MemRegistry::new();
     let actor = deploy_actor(&mut reg, code);
     let log = deliver(&mut reg, msg_to(actor));
@@ -67,12 +73,24 @@ fn sequential_sends_get_distinct_anchors_and_ids() {
 fn send_payload_changes_transaction_id() {
     let target = ActorID::from([0xee; 32]);
     let mut reg = MemRegistry::new();
-    let first = deploy_actor(&mut reg, send_script(&target, [0; 32], 7, 1));
-    let second = deploy_actor(&mut reg, send_script(&target, [0; 32], 9, 1));
+    let first = deploy_actor(
+        &mut reg,
+        ScriptBuilder::parse(&send_script(&target, [0; 32], 7, 1))
+            .unwrap()
+            .drop_()
+            .to_bytecode(),
+    );
+    let second = deploy_actor(
+        &mut reg,
+        ScriptBuilder::parse(&send_script(&target, [0; 32], 9, 1))
+            .unwrap()
+            .drop_()
+            .to_bytecode(),
+    );
     let first = deliver(&mut reg, msg_to(first));
     let second = deliver(&mut reg, msg_to(second));
     let payload_int = |log: &[TxEntry]| match sends(log)[0].payload() {
-        [Value::Scalar(value)] => *value,
+        Value::Scalar(value) => *value,
         other => panic!("unexpected payload: {:?}", other),
     };
     assert_ne!(payload_int(&first), payload_int(&second));
@@ -127,7 +145,6 @@ fn send_rejects_nested_nonportable_payload() {
     outer.insert(Scalar::ZERO, Value::Dict(inner));
     vm.current_call.stack = vec![
         Value::Dict(outer),
-        Value::Scalar(Scalar::ONE),
         witness_cell(CellValue::from_bytes(vec![0u8; 32]).unwrap()),
         Value::Scalar(Scalar::ONE),
         witness_cell(actor_address(&ActorID::from([0; 32]))),
@@ -143,7 +160,6 @@ fn send_rejects_widetoken_payload() {
     let script = ScriptBuilder::new()
         .push_int(1u64)
         .fee()
-        .push_int(1u64)
         .push_literal(CellValue::from_bytes(vec![0u8; 32]).unwrap())
         .push_int(1u64)
         .push_literal(actor_address(&ActorID::from([0; 32])))
@@ -224,9 +240,9 @@ fn send_cannot_reserve_more_than_the_remaining_frame_gas() {
         ActorID::from([0x62; 32]),
     );
 
-    // Execute the five operand pushes, then leave enough gas for the send
+    // Execute the four operand pushes, then leave enough gas for the send
     // instruction itself but one unit less than its requested grant.
-    for _ in 0..5 {
+    for _ in 0..4 {
         assert!(vm.step_internal().expect("operand push succeeds"));
     }
     vm.current_call.gas_limit = vm.current_call.gas_used + grant;
@@ -244,7 +260,7 @@ fn internal_send_cannot_mint_a_larger_descendant_budget() {
         sender,
         None,
         Anchor([0x64; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         500,
         Predicate::opaque(Predicate::unspendable_key()),
     )

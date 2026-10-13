@@ -857,7 +857,7 @@ impl ScriptBuilder {
     /// assembly of a separate witness bag is needed before `build_tx`.
     ///
     /// `program_index` selects a program in logical input order, not a blinded
-    /// tree position. Push the gas grant, arguments, and count before `open`.
+    /// tree position. Push the gas grant and one portable argument before `open`.
     pub fn push_taproot_proof(
         mut self,
         tree: &PredicateTree,

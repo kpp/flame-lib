@@ -1100,7 +1100,7 @@ mod envelope_tests {
         let dict = crate::Dict::from_trusted_cell(&dict, &mut ()).unwrap();
         let tree = PredicateTree::from_scripts(
             None,
-            vec![ScriptBuilder::new().push_int(1u64).return_()],
+            vec![ScriptBuilder::new().drop_().return_()],
             [7; 32],
         )
         .unwrap();
@@ -1120,7 +1120,6 @@ mod envelope_tests {
                 .push_int(0u64)
                 .open()
                 .verify()
-                .drop_()
                 .push_point(*Predicate::unspendable_key().as_bytes())
                 .output(),
         );
@@ -1214,6 +1213,7 @@ mod envelope_tests {
     #[test]
     fn embedded_nested_witnesses_roundtrip_from_prover_to_verifier() {
         let leaf = ScriptBuilder::new()
+            .drop_() // unit argument
             .drop_()
             .alloc(Some(Scalar::from(7u64)))
             .expr()
@@ -1233,6 +1233,7 @@ mod envelope_tests {
         .unwrap();
         let inner_contract_id = inner_contract.id();
         let branch = ScriptBuilder::new()
+            .drop_() // unit argument
             .drop_()
             .push_literal(CellValue::contract(inner_contract).unwrap())
             .input()
@@ -1251,6 +1252,7 @@ mod envelope_tests {
         .unwrap();
         let hidden_id = hidden_contract.id();
         let unused = ScriptBuilder::new()
+            .drop_() // unit argument
             .drop_()
             .push_literal(CellValue::contract(hidden_contract).unwrap())
             .drop_();

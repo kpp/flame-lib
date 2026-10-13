@@ -7,7 +7,6 @@ use crate::contract::Predicate;
 use crate::errors::VMError;
 use crate::value::Value;
 use crate::vm::Anchor;
-use crate::{Dict, Scalar};
 
 /// Unique identity of a scheduled internal transaction (a queued `Send`).
 /// Uniqueness is inherited from the embedded `anchor`: each send consumes a
@@ -44,9 +43,8 @@ pub struct Message {
     /// `last_anchor`.
     pub anchor: Anchor,
 
-    /// Args to deliver to the method's stack. Walked at delivery time
-    /// and pushed in payload order before the dispatched method runs.
-    payload: Vec<Value>,
+    /// One portable application value delivered to the method's stack.
+    payload: Value,
 
     /// Gas allotment committed by the originator. Fully consumed
     /// regardless of internal-tx outcome; asynchronous sends have no
@@ -66,11 +64,11 @@ impl Message {
         target: impl Into<ActorAddress>,
         caller: Option<ActorID>,
         anchor: Anchor,
-        payload: Vec<Value>,
+        payload: Value,
         gas: u64,
         refund_predicate: Predicate,
     ) -> Result<Self, VMError> {
-        if payload.iter().any(|v| !v.is_portable()) {
+        if !payload.is_portable() {
             return Err(VMError::NonPortableInSend);
         }
         let message = Self {
@@ -88,12 +86,12 @@ impl Message {
     }
 
     /// Borrows the immutable payload.
-    pub fn payload(&self) -> &[Value] {
+    pub fn payload(&self) -> &Value {
         &self.payload
     }
 
     /// Consumes the message and returns its payload.
-    pub fn into_payload(self) -> Vec<Value> {
+    pub fn into_payload(self) -> Value {
         self.payload
     }
 
@@ -121,7 +119,7 @@ impl Message {
 ///    for Some.
 /// 4. `refund_predicate` — 32-byte compressed Ristretto.
 /// 5. `gas` — little-endian u64.
-/// 6. `payload` — reference to a Dict with consecutive keys `0..k`.
+/// 6. `payload` — reference to one tagged portable Value.
 ///
 /// Portability is enforced by
 /// [`Message::new`] before a payload enters the asynchronous domain.
@@ -138,9 +136,7 @@ impl CellEncode for Message {
             }
         }
         w.store(&self.refund_predicate)?.store_u64(self.gas)?;
-        w.store_ref(CellRef::resident(
-            Dict::from_values(self.payload.clone()).to_cell()?,
-        ))?;
+        w.store_ref(CellRef::resident(self.payload.to_cell()?))?;
         Ok(())
     }
 }
@@ -160,14 +156,7 @@ impl CellDecode for Message {
         let refund = Predicate::decode(s, cells)?;
         let gas = s.load_u64()?;
         let root = cells::read_cell(cells, &s.load_ref()?)?;
-        let mut dict = Dict::from_cell(&root, cells)?;
-        let mut payload = Vec::new();
-        for i in 0..dict.len() {
-            payload.push(
-                dict.remove_resolved(&Scalar::from(i as u64), cells)?
-                    .ok_or(CellError::InvalidFormat)?,
-            );
-        }
+        let payload = Value::from_cell(&root, cells)?;
         Self::new(target, caller, anchor, payload, gas, refund)
             .map_err(|_| CellError::InvalidFormat)
     }
@@ -179,7 +168,7 @@ mod tests {
 
     use curve25519_dalek::ristretto::CompressedRistretto;
 
-    use crate::{ClearToken, Dict, Scalar, FLAME_FLAVOR};
+    use crate::{ClearToken, Dict, FLAME_FLAVOR, Scalar};
 
     fn dummy_predicate() -> Predicate {
         Predicate::opaque(CompressedRistretto([0u8; 32]))
@@ -190,11 +179,50 @@ mod tests {
             ActorID::from([0x11; 32]),
             None,
             anchor,
-            Vec::new(),
+            Value::Scalar(Scalar::ZERO),
             1_000,
             dummy_predicate(),
         )
-        .expect("empty payload is portable")
+        .expect("unit payload is portable")
+    }
+
+    #[test]
+    fn payload_is_one_direct_value_and_roundtrips_without_a_list_wrapper() {
+        let mut dict = Dict::new();
+        dict.insert(Scalar::from(42u64), Value::Scalar(Scalar::from(7u64)));
+        let payloads = [
+            Value::Scalar(Scalar::from(9u64)),
+            Value::ClearToken(ClearToken::new(Scalar::from(5u64), FLAME_FLAVOR)),
+            Value::Dict(dict),
+        ];
+        for payload in payloads {
+            let expected = payload.to_cell().unwrap().id();
+            let message = Message::new(
+                ActorID::from([0x11; 32]),
+                None,
+                Anchor([0x22; 32]),
+                payload,
+                1_000,
+                dummy_predicate(),
+            )
+            .unwrap();
+            let cell = message.to_cell().unwrap();
+            assert_eq!(cell.refs().len(), 1);
+            assert_eq!(cell.refs()[0].id(), expected);
+            let decoded = Message::from_cell(&cell, &mut ()).unwrap();
+            assert_eq!(decoded.payload().to_cell().unwrap().id(), expected);
+            assert_eq!(decoded.id(), message.id());
+        }
+    }
+
+    #[test]
+    fn decoding_rejects_a_nonportable_single_value() {
+        let mut message = fixture_message(Anchor([0x22; 32]));
+        message.payload = Value::ClearToken(ClearToken::new(Scalar::from(-1i64), FLAME_FLAVOR));
+        assert!(matches!(
+            Message::from_cell(&message.to_cell().unwrap(), &mut ()),
+            Err(CellError::InvalidFormat)
+        ));
     }
 
     #[test]
@@ -274,7 +302,7 @@ mod tests {
                 ActorID::from([0x11; 32]),
                 None,
                 Anchor([0x22; 32]),
-                vec![Value::Dict(outer)],
+                Value::Dict(outer),
                 1_000,
                 dummy_predicate(),
             ),
@@ -294,7 +322,7 @@ mod tests {
                 ActorID::from([0x11; 32]),
                 None,
                 Anchor([0x22; 32]),
-                vec![value],
+                value,
                 1_000,
                 dummy_predicate(),
             ),

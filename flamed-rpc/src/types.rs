@@ -346,8 +346,8 @@ pub enum TxEntry {
         /// Message anchor.
         #[serde(with = "crate::codec::hex32")]
         anchor: [u8; 32],
-        /// Message arguments, in order.
-        payload: Vec<TxValue>,
+        /// One portable application value.
+        payload: TxValue,
         /// Gas limit as an exact decimal string.
         gas_limit: String,
         /// Predicate for the gas refund.

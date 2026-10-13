@@ -1012,10 +1012,15 @@ encoded proof path or the `merkle` crate. The current Trie traverses physical Ce
 `CellView` with an explicit virtualization cap is not yet integrated.
 
 The low-level Trie knows nothing about Scalar, VM Values, portability, or
-linear types. FlameVM has one `Dict` over this Trie. It reverses the canonical
+linear types. FlameVM has one `Dict` type whose committed form uses this Trie. It reverses the canonical
 32-byte little-endian Scalar bytes to obtain big-endian key paths, so bytewise
-Trie order agrees with unsigned numeric order. There is no separate Dict2,
-small-dictionary representation, or list-mode encoding.
+Trie order agrees with unsigned numeric order. A newly constructed Dict holds
+its complete contents in a native ordered map; insertion and extraction do not
+encode Values or hash Cells. Commitment/serialization materializes the same
+canonical Trie without changing the Dict's runtime mode. Decoded Dicts remain
+cell-backed, with authenticated lazy reads and the existing path-update rules.
+Their loaded-value cache is incomplete and never establishes key absence.
+There is no separate Dict2 type or list-mode encoding.
 
 The expected Dict encoding has no repeated type tag or key width: payload
 `count:u64 LE | flags:u8`, plus an optional Trie-root reference. The flags
@@ -1376,8 +1381,9 @@ In particular:
 
 - Contract opening, Predicate selection, Dict access/mutation, and
   byte reads must not consume a linear argument before a possible Cell failure.
-- A failed synchronous call returns exactly the caller's `k` arguments and
-  rolls back callee effects.
+- A failed synchronous call returns exactly the caller's one application
+  argument and failure status, plus the original locked Contract for `open`
+  and `signcall`, and rolls back callee effects.
 - `send` validates portability and captures its payload before emitting the
   Message; a later internal failure follows the normal bounce path and returns
   that owned payload.
@@ -1452,7 +1458,7 @@ same underlying Cells:
 | Contract | Native Contract root Cell supplied to `input`; its CellID is the ContractID | Inline program graph / external transaction witness hierarchy |
 | Actor code and state | Actor registry record | Actor's stored Cell hierarchy, then external transaction witness hierarchy for pruned bodies |
 | Predicate program branch | Predicate commitment | External transaction witness hierarchy |
-| Dict | Typed Dict wrapper with key width, length, and Trie root | Current resident graph/store, then external transaction witness hierarchy |
+| Dict | Native complete map, or typed cell-backed wrapper with count, sticky flags and Trie root | Native entries directly; cell-backed paths use the current resident graph/store, then external transaction witness hierarchy |
 | VM Cell | Its `CellRef` plus optional private `CellWitness` | Current resident graph/store, then external transaction witness hierarchy |
 | Raw byte blob | Zero-ref Cell, up to 4095 payload bytes without a length prefix | Current resident graph/store, then external transaction witness hierarchy |
 | Utreexo proof data | Existing Utreexo format, unchanged | Explicit legacy proof input; specialized accumulator verification applies; Cell migration deferred |
@@ -1520,7 +1526,7 @@ Failure behavior follows the existing execution boundary:
 
 - missing data in the external root makes that external transaction invalid;
 - missing data in a synchronous call returns the call's failure result and
-  arguments according to the call rollback rules;
+  original argument according to the call rollback rules;
 - missing data in an asynchronous message produces the ordinary failed-message
   bounce;
 - effects and actor mutations from a failed scope roll back, while the shared
@@ -1608,7 +1614,7 @@ because those sets are now committed by ordinary snapshot Cell roots.
 | Primitive and streaming API | `cells/src/cell.rs`, `builder.rs`, `slice.rs`, `codec.rs`: ordinary/pruned Cells, level masks and depths, shared read-only CellViews, exact codecs and bounded payload/reference operations |
 | Transport | `cells/src/transport.rs`: root-last ordered DAG, deduplication, backward indexes, bounded and metered decoding; `index.rs`: exact availability and typed Cell snapshots |
 | Trie | `cells/src/trie.rs`: one radix-4 Patricia format; resolver-backed get/insert/remove/ordered navigation; raw root wrapping/unwrapping |
-| Dict | `flamevm/src/dict.rs`: one Trie index, typed runtime witness cache, sticky summaries, lazy authenticated reads; no Dict2 |
+| Dict | `flamevm/src/dict.rs`: native ordered map for temporary records; canonical Trie materialization for commitments; cell-backed lazy authenticated reads and typed witness cache; sticky summaries; no Dict2 |
 | VM codecs | `flamevm/src/encoding.rs` plus type-owned codecs: fixed scalars/points/tokens, tagged Values, single-Value Contracts, actors, messages, scripts |
 | Predicates | `flamevm/src/contract.rs`: hash(0) authentication of executable policy Cells; optional salted bytecode-dispatch trees and partial openings |
 | Execution | `flamevm/src/vm.rs`: fixed Cell hierarchy before proving, scoped and metered resolution, public-path validation before restoring private witnesses |

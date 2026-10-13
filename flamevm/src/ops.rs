@@ -264,21 +264,21 @@ pub enum Instruction {
     Label(u32),   // ø label:n → ø  (operand: label number)
     Jump(u32),    // ø jump:n → ø   (unconditional)
     JumpIf(u32),  // x jumpif:n → ø (jump iff x ≠ 0)
-    Return,       // a(k-1) … a(0) k return → ø
+    Return,       // result return → ø (caller receives result 1)
     Type,         // x type → x code
     Input,        // s input → contract
     Contract,     // payload pred contract → contract
     Output,       // payload pred output → ø
-    Open,         // contract ik program gas portable-args… k open → results… k'
-    Send,         // portable-args… k refund gas addr send → ø (anonymous outside actor frames)
-    Call,         // portable-args… k gas addr call → results… k' 1 | args… k 0 (actor-only)
+    Open,         // contract ik program gas arg open → result 1 | contract arg 0
+    Send,         // arg refund gas addr send → ø (portable arg; anonymous outside actor frames)
+    Call,         // arg gas addr call → result 1 | arg 0 (portable arg; actor-only)
     Load,         // ø load → value (actor-only)
     Save,         // value save → ø (actor-only)
     Setcode,      // code setcode → ø (actor-only)
     AddStorage,   // q addstorage → {debt 1 | 0} (actor-only)
     QuoteStorage, // q quotestorage → {fee 1 | 0} (actor-only)
     Signtx,       // contract signtx → payload (external-only)
-    Signcall,     // contract script sig gas portable-args… m signcall → results… k'
+    Signcall,     // contract script sig gas arg signcall → result 1 | contract arg 0
     Timelock,     // ø timelock → n {0|1}
     Version,      // ø version → n
     Selfid,       // ø selfid → s (actor-only)

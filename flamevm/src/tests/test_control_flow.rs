@@ -384,8 +384,7 @@ fn allocation_gas_trips_on_pushstr_append_and_tread() {
 
 #[test]
 fn return_zero_at_root_errors() {
-    // push:0, return — root frame has no caller, so `return` errors even
-    // with k=0. Scripts terminate cleanly by running off the end instead.
+    // The root has no caller, including for a scalar-zero unit result.
     let mut vm = vm_with_script(ScriptBuilder::new().push_int(0u64).return_().to_bytecode());
     assert!(matches!(
         run_until_tx_done(&mut vm).unwrap_err(),
@@ -395,14 +394,8 @@ fn return_zero_at_root_errors() {
 
 #[test]
 fn return_nonzero_at_root_errors() {
-    // push:7, push:1, return — k=1 at root: nowhere for 7 to go.
-    let mut vm = vm_with_script(
-        ScriptBuilder::new()
-            .push_int(7u64)
-            .push_int(1u64)
-            .return_()
-            .to_bytecode(),
-    );
+    // A scalar result has nowhere to go at the transaction root.
+    let mut vm = vm_with_script(ScriptBuilder::new().push_int(7u64).return_().to_bytecode());
     assert!(matches!(
         run_until_tx_done(&mut vm).unwrap_err(),
         VMError::ReturnAtRoot
@@ -411,14 +404,11 @@ fn return_nonzero_at_root_errors() {
 
 #[test]
 fn return_with_dirty_leftover_errors() {
-    // Inside a child frame: push:9, push:7, push:1, return — k=1, two
-    // items below count → StackNotClean. Error is caught and translated
-    // to `[count=0, success=0]` on the parent.
+    // Two values are not a single result. Failure recovers the unit input.
     let mut vm = vm_with_nested_child_script(
         ScriptBuilder::new()
             .push_int(9u64)
             .push_int(7u64)
-            .push_int(1u64)
             .return_()
             .to_bytecode(),
     );
@@ -433,11 +423,8 @@ fn return_with_dirty_leftover_errors() {
 
 #[test]
 fn return_too_few_items_errors() {
-    // Inside a child frame: push:5, return — k=5 popped, zero items
-    // remain → BadReturnArity. The `step` wrapper catches the error,
-    // unwinds the child, and pushes `[count=0, success=0]` onto the parent.
-    let mut vm =
-        vm_with_nested_child_script(ScriptBuilder::new().push_int(5u64).return_().to_bytecode());
+    // Explicit return needs one value, even when that value is unit.
+    let mut vm = vm_with_nested_child_script(ScriptBuilder::new().return_().to_bytecode());
     while !vm.call_stack.is_empty() {
         vm.step_internal()
             .expect("step ok — error swallowed into marker");
@@ -449,12 +436,8 @@ fn return_too_few_items_errors() {
 
 #[test]
 fn return_transfers_values_to_parent() {
-    // Child script: push:7, push:1, return (k=1).
-    let child_script = ScriptBuilder::new()
-        .push_int(7u64)
-        .push_int(1u64)
-        .return_()
-        .to_bytecode();
+    // Child script returns one scalar directly.
+    let child_script = ScriptBuilder::new().push_int(7u64).return_().to_bytecode();
     let parent_frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
     let child_kind = CallKind::ContractOpen {
         predicate: Predicate::opaque(CompressedRistretto([0u8; 32])),
@@ -477,11 +460,10 @@ fn return_transfers_values_to_parent() {
         vm.step_internal().unwrap();
     }
 
-    // Parent received the 7 then the count (1) then the success marker (1).
-    assert_eq!(vm.current_call.stack.len(), 3);
+    // Parent received the result followed by the success marker.
+    assert_eq!(vm.current_call.stack.len(), 2);
     assert_int(&vm.current_call.stack[0], Scalar::from(7u64));
     assert_int(&vm.current_call.stack[1], Scalar::from(1u64));
-    assert_int(&vm.current_call.stack[2], Scalar::from(1u64));
 }
 
 #[test]
@@ -490,7 +472,11 @@ fn return_allows_negative_cleartokens_upward() {
         .push_int(7u64)
         .push_int(FLAME_FLAVOR)
         .borrow()
+        .push_int(1u64)
+        .roll_k(2)
+        .push_int(0u64)
         .push_int(2u64)
+        .dict()
         .return_()
         .to_bytecode();
     let mut vm = vm_with_nested_child_script(child);
@@ -500,15 +486,20 @@ fn return_allows_negative_cleartokens_upward() {
             .expect("return accepts non-portable results");
     }
 
-    assert_eq!(vm.current_call.stack.len(), 4);
+    assert_eq!(vm.current_call.stack.len(), 2);
+    let Value::Dict(result) = &vm.current_call.stack[0] else {
+        panic!("expected a single Dict result");
+    };
     assert!(matches!(
-        &vm.current_call.stack[0],
+        result.get(&Scalar::ZERO).unwrap(),
         Value::ClearToken(token)
             if token.qty() == Scalar::from(-7i64) && token.flv() == FLAME_FLAVOR
     ));
-    assert!(matches!(&vm.current_call.stack[1], Value::ClearToken(_)));
-    assert_int(&vm.current_call.stack[2], Scalar::from(2u64));
-    assert_int(&vm.current_call.stack[3], Scalar::ONE);
+    assert!(matches!(
+        result.get(&Scalar::ONE).unwrap(),
+        Value::ClearToken(_)
+    ));
+    assert_int(&vm.current_call.stack[1], Scalar::ONE);
 }
 
 #[test]
@@ -516,7 +507,6 @@ fn return_allows_widetokens_upward() {
     let child = ScriptBuilder::new()
         .push_int(1u64)
         .fee()
-        .push_int(1u64)
         .return_()
         .to_bytecode();
     let mut vm = vm_with_nested_child_script(child);
@@ -528,10 +518,9 @@ fn return_allows_widetokens_upward() {
             .expect("return accepts non-portable results");
     }
 
-    assert_eq!(vm.current_call.stack.len(), 3);
+    assert_eq!(vm.current_call.stack.len(), 2);
     assert!(matches!(&vm.current_call.stack[0], Value::WideToken(_)));
     assert_int(&vm.current_call.stack[1], Scalar::ONE);
-    assert_int(&vm.current_call.stack[2], Scalar::ONE);
 }
 
 // ── type ────────────────────────────────────────────────────

@@ -43,13 +43,17 @@ fn vm_for(actor: ActorID, script: Vec<u8>) -> VM {
 #[test]
 fn facade_internal_execute_tx_roundtrip() {
     let mut reg = MemRegistry::new();
-    let id = deploy_with_recv(&mut reg, ScriptBuilder::new().nop().to_bytecode(), 1_000);
+    let id = deploy_with_recv(
+        &mut reg,
+        ScriptBuilder::new().drop_().nop().to_bytecode(),
+        1_000,
+    );
     let mut reg = reg;
     let msg = Message::new(
         id,
         None,
         Anchor([1u8; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         1_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -94,10 +98,7 @@ fn constructor_buys_storage_and_is_reused() {
             target.clone(),
             None,
             Anchor([0x07; 32]),
-            vec![Value::ClearToken(ClearToken::new(
-                Scalar::from(77u64),
-                FLAME_FLAVOR,
-            ))],
+            Value::ClearToken(ClearToken::new(Scalar::from(77u64), FLAME_FLAVOR)),
             10_000,
             Predicate::opaque(Predicate::unspendable_key()),
         )
@@ -296,7 +297,7 @@ fn load_then_dismantle_emits_actor_destroy() {
     let mut reg = MemRegistry::new();
     let id = deploy_with_recv(
         &mut reg,
-        ScriptBuilder::new().load().drop_().to_bytecode(),
+        ScriptBuilder::new().drop_().load().drop_().to_bytecode(),
         10_000,
     );
     assert!(reg.exists(&id));
@@ -306,7 +307,7 @@ fn load_then_dismantle_emits_actor_destroy() {
         id.clone(),
         None,
         Anchor([0x07; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         1_000_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -336,7 +337,7 @@ fn token_survives_load_save_roundtrip_exactly_once() {
         Value::ClearToken(ClearToken::new(Scalar::from(5u64), Scalar::from(9u64))),
     );
     let state = Value::Dict(d);
-    let recv = ScriptBuilder::new().load().save().to_bytecode();
+    let recv = ScriptBuilder::new().drop_().load().save().to_bytecode();
     let id = ActorID::from(crate::code_cell(&recv).unwrap().id());
     reg.deploy(id.clone(), recv, state, 10_000).expect("deploy");
 
@@ -344,7 +345,7 @@ fn token_survives_load_save_roundtrip_exactly_once() {
         id.clone(),
         None,
         Anchor([0x11; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         100_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -402,7 +403,7 @@ fn dismantle_token_bearing_state_requires_retire() {
         id.clone(),
         None,
         Anchor([0x09; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         1_000_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -424,7 +425,7 @@ fn load_without_discharge_errors_stack_not_clean() {
         id.clone(),
         None,
         Anchor([0x08; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         1_000_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -443,7 +444,7 @@ fn load_followed_by_save_preserves_actor() {
     // recv = `load; save` — full pair. No self-destruct.
     let id = deploy_with_recv(
         &mut reg,
-        ScriptBuilder::new().load().save().to_bytecode(),
+        ScriptBuilder::new().drop_().load().save().to_bytecode(),
         10_000,
     );
 
@@ -452,7 +453,7 @@ fn load_followed_by_save_preserves_actor() {
         id.clone(),
         None,
         Anchor([0x02; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         1_000_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -481,14 +482,18 @@ fn receive_committed_as_first_effect_after_header() {
     let mut reg = MemRegistry::new();
     // Minimal recv: a single `nop`. The script does nothing, but
     // execute_internal still pushes Header + Receive into the txlog.
-    let id = deploy_with_recv(&mut reg, ScriptBuilder::new().nop().to_bytecode(), 10_000);
+    let id = deploy_with_recv(
+        &mut reg,
+        ScriptBuilder::new().drop_().nop().to_bytecode(),
+        10_000,
+    );
     let block = BlockContext { height: 100 };
     let known_anchor = [0xab; 32];
     let msg = Message::new(
         id.clone(),
         None,
         Anchor(known_anchor),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         1_000_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -525,13 +530,17 @@ fn receive_committed_as_first_effect_after_header() {
 fn receive_makes_internal_txid_bind_to_send_anchor() {
     fn run_with_anchor(anchor_bytes: [u8; 32]) -> TxID {
         let mut reg = MemRegistry::new();
-        let id = deploy_with_recv(&mut reg, ScriptBuilder::new().nop().to_bytecode(), 10_000);
+        let id = deploy_with_recv(
+            &mut reg,
+            ScriptBuilder::new().drop_().nop().to_bytecode(),
+            10_000,
+        );
         let block = BlockContext { height: 100 };
         let msg = Message::new(
             id,
             None,
             Anchor(anchor_bytes),
-            Vec::new(),
+            Value::Scalar(Scalar::ZERO),
             1_000_000,
             Predicate::opaque(Predicate::unspendable_key()),
         )

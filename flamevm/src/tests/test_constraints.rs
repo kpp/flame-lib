@@ -510,7 +510,7 @@ fn clean_call_cs_alloc_propagates_to_parent_proof() {
         .return_();
     let outer = open_with_inner(inner, false)
         .verify() // pop success marker (1)
-        .drop_(); // drop count
+        .drop_(); // drop unit result
 
     let result = Prover::prove(&pc_gens, outer, dummy_header(), 1_000_000)
         .expect("prover always builds something");
@@ -569,7 +569,7 @@ fn failed_call_rolls_back_every_state_lane() {
         .push_point([0xbb; 32])
         .output()
         // ── lane 2: TxLog (Send) ────────────────────────────────
-        .push_int(0u64) // k=0 args
+        .push_int(0u64) // unit request
         .push_literal(CellValue::from_bytes(vec![0u8; 32]).unwrap()) // refund (32 B)
         .push_int(1u64) // gas
         .push_literal(actor_address(&ActorID::from([0xcc; 32])))

@@ -8,7 +8,7 @@ use crate::state_root;
 #[test]
 fn open_executes_direct_policy_cell_with_semantic_authentication_and_bytecode_dispatch() {
     let selected = ScriptBuilder::new()
-        .push_int(1u64)
+        .drop_() // unit request; return the locked token payload
         .return_()
         .to_cell()
         .unwrap();
@@ -55,7 +55,6 @@ fn open_executes_direct_policy_cell_with_semantic_authentication_and_bytecode_di
         .push_int(0u64)
         .open()
         .verify()
-        .drop_()
         .push_point(*key.as_bytes())
         .output();
     let tx = program
@@ -74,6 +73,7 @@ fn open_executes_direct_policy_cell_with_semantic_authentication_and_bytecode_di
     assert!(!decoded.witnesses().contains(&hidden.id()));
     // No native branch lookup: a single program Cell works without a tree builder.
     let direct = ScriptBuilder::new()
+        .drop_()
         .drop_()
         .push_int(0u64)
         .return_()
@@ -113,7 +113,11 @@ fn open_executes_direct_policy_cell_with_semantic_authentication_and_bytecode_di
 #[test]
 fn open_pruned_exec_target_restores_contract_and_portable_linear_argument() {
     let branch = ScriptBuilder::new()
+        .push_int(1u64)
+        .roll_k(2)
+        .push_int(0u64)
         .push_int(2u64)
+        .dict()
         .return_()
         .to_cell()
         .unwrap();
@@ -143,15 +147,13 @@ fn open_pruned_exec_target_restores_contract_and_portable_linear_argument() {
         Value::Cell(partial.into()),
         Value::Scalar(Scalar::from(10_000u64)),
         Value::ClearToken(ClearToken::new(Scalar::from(9u64), FLAME_FLAVOR)),
-        Value::Scalar(Scalar::ONE),
     ];
     run_to_end(&mut vm).unwrap();
     assert!(matches!(&vm.current_call.stack[0], Value::Contract(c) if c.id() == id));
     assert!(
         matches!(&vm.current_call.stack[1], Value::ClearToken(t) if t.qty() == Scalar::from(9u64))
     );
-    assert_int(&vm.current_call.stack[2], Scalar::ONE);
-    assert_int(&vm.current_call.stack[3], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[2], Scalar::ZERO);
     assert!(vm.current_call.gas_used < 10_000);
 }
 
@@ -160,7 +162,11 @@ fn open_refunds_unused_gas_on_success_or_failure_but_not_exhaustion() {
     let key = Predicate::unspendable_key();
     for (code, success, exhausts) in [
         (
-            ScriptBuilder::new().drop_().push_int(0u64).return_(),
+            ScriptBuilder::new()
+                .drop_()
+                .drop_()
+                .push_int(0u64)
+                .return_(),
             true,
             false,
         ),
@@ -207,9 +213,9 @@ fn executable_predicate_helper_dispatches_all_branches_in_multilevel_trees() {
         let programs = (0..count)
             .map(|index| {
                 ScriptBuilder::new()
+                    .drop_() // unit request
                     .drop_()
                     .push_int(index as u64)
-                    .push_int(1u64)
                     .return_()
             })
             .collect();
@@ -227,10 +233,9 @@ fn executable_predicate_helper_dispatches_all_branches_in_multilevel_trees() {
                     .open(),
             );
             run_to_end(&mut vm).unwrap();
-            assert_eq!(vm.current_call.stack.len(), 3);
+            assert_eq!(vm.current_call.stack.len(), 2);
             assert_int(&vm.current_call.stack[0], Scalar::from(index as u64));
             assert_int(&vm.current_call.stack[1], Scalar::ONE);
-            assert_int(&vm.current_call.stack[2], Scalar::ONE);
         }
     }
 }
@@ -389,11 +394,10 @@ fn output_opcode_emits_to_txlog_without_pushing() {
 
 #[test]
 fn open_with_valid_taproot_proof_runs_program() {
-    // Contract payload: 5. Inner program: drop, push:0, return — drains
-    // the payload inside the isolated ContractOpen frame and returns 0
-    // items to parent (ADR 0013). On clean return parent's stack
-    // gets [count=0, success=1].
+    // Discard the unit request and payload, then return scalar-zero unit.
+    // The parent receives [unit=0, success=1].
     let inner_program = ScriptBuilder::new()
+        .drop_()
         .drop_()
         .push_int(0u64)
         .return_()
@@ -408,12 +412,12 @@ fn open_with_valid_taproot_proof_runs_program() {
     program = push_taproot_proof_to_program(program, &cp);
     let script = program
         .push_int(1024u64) // gas
-        .push_int(0u64) // k = 0 args
+        .push_int(0u64) // unit request
         .open();
     let mut vm = vm_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
     run_to_end(&mut vm).unwrap();
-    // Parent stack: [count=0, success=1].
+    // Parent stack: [unit=0, success=1].
     assert_eq!(vm.current_call.stack.len(), 2);
     assert_int(&vm.current_call.stack[0], Scalar::from(0u64));
     assert_int(&vm.current_call.stack[1], Scalar::from(1u64));
@@ -421,7 +425,7 @@ fn open_with_valid_taproot_proof_runs_program() {
 
 #[test]
 fn taproot_program_larger_than_one_cell_opens_through_continuations() {
-    let mut branch = ScriptBuilder::new().drop_();
+    let mut branch = ScriptBuilder::new().drop_().drop_();
     for _ in 0..=cells::MAX_CELL_PAYLOAD {
         branch = branch.nop();
     }
@@ -468,11 +472,13 @@ fn taproot_program_larger_than_one_cell_opens_through_continuations() {
 fn open_with_wrong_program_hard_fails() {
     let real = ScriptBuilder::new()
         .drop_()
+        .drop_()
         .push_int(0u64)
         .return_()
         .to_bytecode();
     let fake = ScriptBuilder::new()
         .nop()
+        .drop_()
         .drop_()
         .push_int(0u64)
         .return_()
@@ -499,6 +505,7 @@ fn open_with_wrong_program_hard_fails() {
 #[test]
 fn open_preserves_alloc_witnesses_from_predicate_builder() {
     let inner = ScriptBuilder::new()
+        .drop_() // unit request
         .drop_()
         .alloc(Some(Scalar::from(7u64)))
         .expr()
@@ -545,15 +552,23 @@ fn open_preserves_alloc_witnesses_from_predicate_builder() {
 }
 
 #[test]
-fn open_passes_args_after_payload() {
-    // Contract payload: [10]. args: [20, 30]. Inside the isolated ContractOpen
-    // frame the stack starts as [10, 20, 30] (payload then args). The
-    // leaf drops all three and exits via `return 0`.
+fn open_passes_one_dict_argument_after_payload() {
+    // The frame receives payload 10 and one Dict request with two fields.
+    // Extract both fields, add them to the payload, and return one scalar.
     let inner_program = ScriptBuilder::new()
-        .drop_()
-        .drop_()
-        .drop_()
         .push_int(0u64)
+        .get()
+        .roll_k(1)
+        .drop_()
+        .roll_k(1)
+        .push_int(1u64)
+        .get()
+        .roll_k(1)
+        .drop_()
+        .roll_k(1)
+        .drop_()
+        .add()
+        .add()
         .return_()
         .to_bytecode();
     let (tree, cp) = build_predicate_with_program(&inner_program, 11);
@@ -566,16 +581,18 @@ fn open_passes_args_after_payload() {
     program = push_taproot_proof_to_program(program, &cp);
     let script = program
         .push_int(1024u64) // gas
-        .push_int(20u64) // arg[0]
-        .push_int(30u64) // arg[1]
-        .push_int(2u64) // k=2
+        .push_int(20u64)
+        .push_int(0u64)
+        .push_int(30u64)
+        .push_int(1u64)
+        .push_int(2u64)
+        .dict()
         .open();
     let mut vm = vm_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
     run_to_end(&mut vm).unwrap();
-    // Parent stack: [count=0, success=1].
     assert_eq!(vm.current_call.stack.len(), 2);
-    assert_int(&vm.current_call.stack[0], Scalar::from(0u64));
+    assert_int(&vm.current_call.stack[0], Scalar::from(60u64));
     assert_int(&vm.current_call.stack[1], Scalar::from(1u64));
 }
 
@@ -597,6 +614,10 @@ fn failed_open_restores_contract_and_explicit_bearers() {
     let mut dict = Dict::new();
     dict.insert(Scalar::ZERO, Value::Token(dict_token.clone()));
     let expected_dict_root = state_root(&Value::Dict(dict.clone()));
+    let argument = Value::Dict(Dict::from_values(vec![
+        Value::ClearToken(clear),
+        Value::Dict(dict),
+    ]));
 
     let mut vm = vm_with_script(ScriptBuilder::new().open());
     vm.last_anchor = Some(Anchor([0x42; 32]));
@@ -605,14 +626,12 @@ fn failed_open_restores_contract_and_explicit_bearers() {
         Value::Point(Point::from_compressed(proof.internal_key)),
         Value::Cell(proof.root.clone().into()),
         Value::Scalar(Scalar::from(10_000u64)),
-        Value::ClearToken(clear),
-        Value::Dict(dict),
-        Value::Scalar(Scalar::from(2u64)),
+        argument,
     ];
 
     run_to_end(&mut vm).unwrap();
 
-    assert_eq!(vm.current_call.stack.len(), 5);
+    assert_eq!(vm.current_call.stack.len(), 3);
     let Value::Contract(restored_contract) = &vm.current_call.stack[0] else {
         panic!("expected restored Contract");
     };
@@ -621,20 +640,25 @@ fn failed_open_restores_contract_and_explicit_bearers() {
         restored_contract.payload(),
         Value::Token(token) if token.qty() == payload_token.qty() && token.flv() == payload_token.flv()
     ));
+    let Value::Dict(restored_argument) = &vm.current_call.stack[1] else {
+        panic!("expected restored request Dict");
+    };
     assert!(matches!(
-        &vm.current_call.stack[1],
+        restored_argument.get(&Scalar::ZERO).unwrap(),
         Value::ClearToken(token) if token.qty() == clear.qty() && token.flv() == clear.flv()
     ));
-    assert_eq!(state_root(&vm.current_call.stack[2]), expected_dict_root);
-    let Value::Dict(restored_dict) = &vm.current_call.stack[2] else {
+    assert_eq!(
+        state_root(restored_argument.get(&Scalar::ONE).unwrap()),
+        expected_dict_root
+    );
+    let Value::Dict(restored_dict) = restored_argument.get(&Scalar::ONE).unwrap() else {
         panic!("expected restored Dict");
     };
     assert!(matches!(
         restored_dict.get(&Scalar::ZERO),
         Some(Value::Token(token)) if token.qty() == dict_token.qty() && token.flv() == dict_token.flv()
     ));
-    assert_int(&vm.current_call.stack[3], Scalar::from(2u64));
-    assert_int(&vm.current_call.stack[4], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[2], Scalar::ZERO);
 }
 
 #[test]
@@ -666,9 +690,10 @@ fn predicate_tree_new_validates_inputs() {
 fn scripts_only_predicate_opens_via_program_path() {
     // End-to-end: build a scripts-only predicate, lock a contract under
     // it, and unlock via `open` with the script-path proof. Leaf
-    // `drop, push:0, return` drains the 1-item payload and exits the
+    // `drop, drop, push:0, return` drains the request and payload and exits the
     // isolated frame (ADR 0013).
     let program = ScriptBuilder::new()
+        .drop_()
         .drop_()
         .push_int(0u64)
         .return_()
@@ -684,12 +709,12 @@ fn scripts_only_predicate_opens_via_program_path() {
     p = push_taproot_proof_to_program(p, &cp);
     let script = p
         .push_int(1024u64) // gas
-        .push_int(0u64) // 0 args
+        .push_int(0u64) // unit request
         .open();
     let mut vm = vm_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
     run_to_end(&mut vm).unwrap();
-    // Parent stack: [count=0, success=1].
+    // Parent stack: [unit=0, success=1].
     assert_eq!(vm.current_call.stack.len(), 2);
     assert_int(&vm.current_call.stack[0], Scalar::from(0u64));
     assert_int(&vm.current_call.stack[1], Scalar::from(1u64));
@@ -699,7 +724,7 @@ fn scripts_only_predicate_opens_via_program_path() {
 fn multi_leaf_predicate_each_program_unlocks_via_its_path() {
     let programs = (0..3)
         .map(|n| {
-            let mut p = ScriptBuilder::new().drop_();
+            let mut p = ScriptBuilder::new().drop_().drop_();
             for _ in 0..n {
                 p = p.nop();
             }
@@ -728,6 +753,7 @@ fn multi_leaf_predicate_each_program_unlocks_via_its_path() {
 #[test]
 fn multi_leaf_predicate_tampered_dispatcher_cannot_be_opened() {
     let program = ScriptBuilder::new()
+        .drop_()
         .drop_()
         .push_int(0u64)
         .return_()
@@ -1101,6 +1127,7 @@ fn external_tx_one_input_one_output_via_signtx() {
 fn external_tx_two_inputs_two_outputs_via_open() {
     let program = ScriptBuilder::new()
         .drop_()
+        .drop_()
         .push_int(0u64)
         .return_()
         .to_bytecode();
@@ -1169,8 +1196,7 @@ fn external_tx_two_inputs_two_outputs_via_open() {
 /// `op_open` creates an isolated CallFrame with no actor identity;
 /// `op_selfid` inside the leaf errors `OpcodeRequiresActorContext`,
 /// which the step wrapper catches. The parent recovers the locked Contract
-/// followed by its explicit argument, `count=1, success=0`; the contextual
-/// Contract is not counted.
+/// followed by its explicit argument and `success=0`.
 #[test]
 fn op_open_selfid_errors_no_actor_context() {
     // `selfid` errors before reaching a return — that's fine, the
@@ -1183,27 +1209,22 @@ fn op_open_selfid_errors_no_actor_context() {
         .push_point(*pred_point.as_bytes())
         .contract();
     p = push_taproot_proof_to_program(p, &cp);
-    let script = p.push_int(1024u64).push_int(9u64).push_int(1u64).open();
+    let script = p.push_int(1024u64).push_int(9u64).open();
     let mut vm = vm_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
     run_to_end(&mut vm).unwrap();
-    assert_eq!(vm.current_call.stack.len(), 4);
+    assert_eq!(vm.current_call.stack.len(), 3);
     assert!(matches!(vm.current_call.stack[0], Value::Contract(_)));
     assert_int(&vm.current_call.stack[1], Scalar::from(9u64));
-    assert_int(&vm.current_call.stack[2], Scalar::ONE);
-    assert_int(&vm.current_call.stack[3], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[2], Scalar::ZERO);
 }
 
 /// `op_open` leaf returning the wrong arity errors `BadReturnArity`;
 /// caught by step while restoring the locked Contract to the parent.
 #[test]
 fn op_open_return_arity_mismatch_errors() {
-    // push:1, return — pops k=1 from stack, then stack.len()(0) < 1.
-    let inner = ScriptBuilder::new()
-        .drop_()
-        .push_int(1u64)
-        .return_()
-        .to_bytecode();
+    // Consuming both inputs leaves no application result for return.
+    let inner = ScriptBuilder::new().drop_().drop_().return_().to_bytecode();
     let (tree, cp) = build_predicate_with_program(&inner, 0);
     let pred_point = tree.point;
     let mut p = ScriptBuilder::new()
@@ -1238,7 +1259,6 @@ fn open_rejects_negative_token_argument() {
         .push_int(FLAME_FLAVOR)
         .borrow()
         .retire()
-        .push_int(1u64)
         .open();
     let mut vm = vm_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
@@ -1256,7 +1276,8 @@ fn open_rejects_negative_token_argument() {
 #[test]
 fn op_open_cs_blocked_when_external_context_false() {
     use crate::vm::{Anchor, CallFrame, CallKind, VM};
-    let parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    let mut parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    parent.snap_failure_values = vec![Value::Scalar(Scalar::ZERO)];
     // alloc is 0x62 — external-only CS op. push:0 + alloc + return.
     let child_kind = CallKind::ContractOpen {
         predicate: Predicate::opaque(CompressedRistretto([0u8; 32])),
@@ -1268,7 +1289,7 @@ fn op_open_cs_blocked_when_external_context_false() {
     let parent_saved = std::mem::replace(&mut vm.current_call, child);
     vm.call_stack.push(parent_saved);
     // alloc errors ExternalOnly inside the child; step catches and
-    // unwinds, leaving `[count=0, success=0]` on the parent's stack.
+    // unwinds, leaving `[unit=0, success=0]` on the parent's stack.
     vm.step_internal()
         .expect("step ok — error swallowed into marker");
     assert!(vm.call_stack.is_empty());

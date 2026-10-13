@@ -179,7 +179,9 @@ reorganization attachment:
    enqueue its sends in effect order.
 5. Fully drain this external transaction's FIFO descendant queue using its
    immutable execution Cell index before returning to step 3. Execute each message
-   under an actor-registry checkpoint. A
+   under an actor-registry checkpoint. Its one portable payload is normalized
+   to the committed cell-backed representation before metering and execution;
+   native sender maps and decoded messages must execute identically. A
    synchronous `call` remains inside its current internal transaction. On
    success, capture the actor commitment and storage pool, roll the direct VM
    mutations back, then consume the derived log through the same ordered effect

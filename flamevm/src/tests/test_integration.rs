@@ -41,6 +41,7 @@ fn log_str(p: ScriptBuilder, s: &str) -> ScriptBuilder {
 fn while_loop_emits_one_effect_per_iteration() {
     // recv: n=3; while (n) { log "x"; n-- }; drop n.
     let recv = b()
+        .drop_() // incoming unit message
         .push_literal(CellValue::from_bytes(b"x".to_vec()).unwrap())
         .push_int(3u64)
         .build_while(|p| p.dup_k(0), |p| p.dup_k(1).log().push_int(-1i64).add())
@@ -61,6 +62,7 @@ fn while_loop_emits_one_effect_per_iteration() {
 fn break_exits_loop_after_first_iteration() {
     // recv: loop { log "once"; break }.
     let recv = b()
+        .drop_()
         .build_loop(|p| log_str(p, "once").build_break())
         .to_bytecode();
     let mut reg = MemRegistry::new();
@@ -78,6 +80,7 @@ fn continue_skips_rest_of_body_each_iteration() {
     // recv: n=2; while (n) { n--; continue; log "skipped" }.
     // `continue` jumps past the log every time → zero Data effects.
     let recv = b()
+        .drop_()
         .push_int(2u64)
         .build_while(
             |p| p.dup_k(0),
@@ -125,17 +128,17 @@ fn if_else_takes_branch_by_selector_arg() {
 
 #[test]
 fn call_chain_interleaves_callee_then_caller_effects() {
-    // B.recv logs "B". A.recv calls B (drop the [count,success] markers)
+    // B.recv logs "B". A.recv calls B (drop the [unit,success] markers)
     // then logs "A". The log must contain B's effect before A's, and the
     // `call` itself emits nothing.
     let mut reg = MemRegistry::new();
-    let b_recv = log_str(b(), "B").to_bytecode();
+    let b_recv = log_str(b().drop_(), "B").to_bytecode();
     let b_id = deploy_actor(&mut reg, b_recv);
 
     let a_recv = {
         let mut p = call_to(&b_id);
-        p = p.drop_().drop_(); // discard B's [count, success]
-        log_str(p, "A").to_bytecode()
+        p = p.drop_().drop_(); // discard B's [unit, success]
+        log_str(p.drop_(), "A").to_bytecode()
     };
     let a_id = deploy_actor(&mut reg, a_recv);
 
@@ -155,7 +158,7 @@ fn call_chain_interleaves_callee_then_caller_effects() {
 #[test]
 fn failed_subcall_effects_roll_back_but_caller_continues() {
     // B.recv logs "B" then hard-fails (`verify 0`). A.recv calls B
-    // (failure → `count=0, success=0`, consume both), then logs "A". B's Data must
+    // (failure → `unit=0, success=0`, consume both), then logs "A". B's Data must
     // be rolled back; only "A" survives — the canonical effect-rollback
     // control-flow case.
     let mut reg = MemRegistry::new();
@@ -164,7 +167,7 @@ fn failed_subcall_effects_roll_back_but_caller_continues() {
 
     let a_recv = {
         let p = call_to(&b_id).drop_().drop_();
-        log_str(p, "A").to_bytecode()
+        log_str(p.drop_(), "A").to_bytecode()
     };
     let a_id = deploy_actor(&mut reg, a_recv);
 
@@ -237,9 +240,10 @@ fn setcode_upgrade_changes_dispatched_behavior() {
 
 #[test]
 fn setcode_preserves_native_graphs_through_storage_effect_encoding_and_replay() {
-    let leaf = log_str(b(), "graph").to_cell().unwrap();
+    let leaf = log_str(b().drop_(), "graph").to_cell().unwrap();
     let replacement = b().push_cell(leaf.clone()).exec().to_cell().unwrap();
     let upgrade = b()
+        .drop_()
         .push_cell(replacement.clone())
         .setcode()
         .to_cell()
@@ -283,7 +287,7 @@ fn setcode_preserves_native_graphs_through_storage_effect_encoding_and_replay() 
 
 #[test]
 fn setcode_resident_and_unloaded_graphs_have_equal_gas_and_persistent_availability() {
-    let leaf = b().nop().to_cell().unwrap();
+    let leaf = b().drop_().nop().to_cell().unwrap();
     let replacement = b().push_cell(leaf.clone()).exec().to_cell().unwrap();
     let reference: CellRef = replacement.clone().into();
     let cells = CellIndex::collect(Arc::new(replacement.clone())).unwrap();

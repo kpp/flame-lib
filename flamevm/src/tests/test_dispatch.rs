@@ -5,18 +5,18 @@
 use super::test_helpers::*;
 
 #[test]
-fn internal_empty_script_finishes() {
+fn internal_empty_script_must_consume_its_unit_message() {
     let mut reg = StubRegistry { script: vec![] };
     let block = BlockContext { height: 0 };
-    let result =
-        VM::execute_internal(dummy_header(), dummy_message(1000), &mut reg, &block).unwrap();
-    assert!(result.gas_used > 0, "per-instruction metering");
+    let error =
+        VM::execute_internal(dummy_header(), dummy_message(1000), &mut reg, &block).unwrap_err();
+    assert!(matches!(error, VMError::StackNotClean));
 }
 
 #[test]
 fn internal_nop_script_finishes() {
     let mut reg = StubRegistry {
-        script: ScriptBuilder::new().nop().nop().nop().to_bytecode(),
+        script: ScriptBuilder::new().drop_().nop().nop().nop().to_bytecode(),
     };
     let block = BlockContext { height: 0 };
     let result =

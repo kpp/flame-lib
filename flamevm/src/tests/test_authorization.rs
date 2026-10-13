@@ -28,6 +28,7 @@ fn signcall_cell_signature(program: &Cell, secret: u64) -> (CompressedRistretto,
 #[test]
 fn signcall_executes_native_program_graph_and_preserves_private_assignments() {
     let continuation = ScriptBuilder::new()
+        .drop_() // unit request
         .drop_()
         .alloc(Some(Scalar::from(7u64)))
         .expr()
@@ -83,6 +84,7 @@ fn signcall_signature_binds_factual_pruning_not_just_semantic_hash() {
         .drop_()
         .push_cell(data.clone())
         .drop_()
+        .drop_()
         .push_int(0u64)
         .return_()
         .to_cell()
@@ -132,11 +134,7 @@ fn signcall_signature_binds_factual_pruning_not_just_semantic_hash() {
 fn signcall_refunds_unused_gas_and_recovers_arguments_even_after_exhaustion() {
     for (program, succeeds, exhausts) in [
         (
-            ScriptBuilder::new()
-                .roll_k(1)
-                .drop_()
-                .push_int(1u64)
-                .return_(),
+            ScriptBuilder::new().roll_k(1).drop_().return_(),
             true,
             false,
         ),
@@ -162,14 +160,12 @@ fn signcall_refunds_unused_gas_and_recovers_arguments_even_after_exhaustion() {
                 witness_cell(CellValue::from_bytes(signature.to_vec()).unwrap()),
                 Value::Scalar(Scalar::from(grant)),
                 Value::Token(token.clone()),
-                Value::Scalar(Scalar::ONE),
             ];
             run_external_to_end(&mut vm).unwrap();
             let stack = &vm.current_call.stack;
             assert_int(&stack[stack.len() - 1], Scalar::from(succeeds as u64));
-            assert_int(&stack[stack.len() - 2], Scalar::ONE);
             assert!(
-                matches!(&stack[stack.len() - 3], Value::Token(restored) if restored.qty() == token.qty() && restored.flv() == token.flv())
+                matches!(&stack[stack.len() - 2], Value::Token(restored) if restored.qty() == token.qty() && restored.flv() == token.flv())
             );
             if !succeeds {
                 assert!(
@@ -190,6 +186,7 @@ fn signcall_refunds_unused_gas_and_recovers_arguments_even_after_exhaustion() {
 #[test]
 fn signcall_ignores_unrelated_annotations_on_authenticated_program_cell() {
     let mut source = ScriptBuilder::new()
+        .drop_()
         .drop_()
         .push_int(0u64)
         .return_()
@@ -226,6 +223,7 @@ fn internal_signcall_code(
     signature: [u8; 64],
 ) -> Cell {
     ScriptBuilder::new()
+        .drop_() // incoming message unit
         .push_int(0u64)
         .dict()
         .push_point(*verification_key.as_bytes())
@@ -306,9 +304,10 @@ fn signtx_prepays_aggregate_signature_work() {
 
 #[test]
 fn signcall_records_explicit_sig_and_runs_program() {
-    // Inner script `drop, push:0, return` drains the payload and
+    // Inner script `drop, drop, push:0, return` drains request and payload and
     // exits the isolated ContractOpen frame (ADR 0013).
     let prog = ScriptBuilder::new()
+        .drop_()
         .drop_()
         .push_int(0u64)
         .return_()
@@ -322,12 +321,12 @@ fn signcall_records_explicit_sig_and_runs_program() {
         .push_cell(crate::code_cell(&prog).unwrap()) // inner program graph
         .push_literal(CellValue::from_bytes(sig_bytes.to_vec()).unwrap()) // 64-byte sig
         .push_int(1024u64) // gas
-        .push_int(0u64) // m = 0 args
+        .push_int(0u64) // unit request
         .signcall();
     let mut vm = vm_external_with_script(script);
     vm.last_anchor = Some(Anchor([0x42; 32]));
     run_external_to_end(&mut vm).unwrap();
-    // Parent stack: [count=0, success=1] from the child's clean return.
+    // Parent stack: [unit=0, success=1] from the child's clean return.
     assert_eq!(vm.current_call.stack.len(), 2);
     assert_int(&vm.current_call.stack[0], Scalar::from(0u64));
     assert_int(&vm.current_call.stack[1], Scalar::from(1u64));
@@ -368,13 +367,12 @@ fn failed_signcall_restores_contract_and_argument_and_signature_checkpoint() {
         witness_cell(CellValue::from_bytes(signature.to_vec()).unwrap()),
         Value::Scalar(Scalar::from(10_000u64)),
         Value::Token(token.clone()),
-        Value::Scalar(Scalar::ONE),
     ];
 
     run_external_to_end(&mut vm).unwrap();
 
     assert!(vm.deferred_sigs.is_empty());
-    assert_eq!(vm.current_call.stack.len(), 4);
+    assert_eq!(vm.current_call.stack.len(), 3);
     assert!(matches!(
         &vm.current_call.stack[0],
         Value::Contract(contract) if contract.id() == contract_id
@@ -383,8 +381,7 @@ fn failed_signcall_restores_contract_and_argument_and_signature_checkpoint() {
         &vm.current_call.stack[1],
         Value::Token(restored) if restored.qty() == token.qty() && restored.flv() == token.flv()
     ));
-    assert_int(&vm.current_call.stack[2], Scalar::ONE);
-    assert_int(&vm.current_call.stack[3], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[2], Scalar::ZERO);
     assert!(
         vm.current_call.gas_used < 10_000,
         "unused signcall gas returns on failure"
@@ -398,6 +395,7 @@ fn signcall_message_binds_only_to_program_not_to_contract() {
     // intent that signcall binds only to the program.
     fn run_signcall(predicate_byte: u8) -> DeferredSig {
         let prog = ScriptBuilder::new()
+            .drop_()
             .drop_()
             .push_int(0u64)
             .return_()
@@ -431,8 +429,9 @@ fn signcall_message_binds_only_to_program_not_to_contract() {
 #[test]
 fn signcall_rejects_wrong_signature_length() {
     // payload(5), predicate, contract, prog, bad-sig, gas,
-    // m=0, signcall. signcall pops bad sig and errors before frame.
+    // unit request, signcall. Bad signature bytes fail before frame entry.
     let prog = ScriptBuilder::new()
+        .drop_()
         .drop_()
         .push_int(0u64)
         .return_()
@@ -477,6 +476,7 @@ fn internal_signtx_rejects_before_consuming_contract() {
 fn internal_signcall_verifies_valid_signature_immediately() {
     let program = ScriptBuilder::new()
         .drop_()
+        .drop_()
         .push_int(0u64)
         .return_()
         .to_bytecode();
@@ -494,6 +494,7 @@ fn internal_signcall_verifies_valid_signature_immediately() {
 #[test]
 fn internal_signcall_rejects_invalid_signature_immediately() {
     let program = ScriptBuilder::new()
+        .drop_()
         .drop_()
         .push_int(0u64)
         .return_()
@@ -525,7 +526,6 @@ fn signcall_rejects_widetoken_argument() {
         .push_int(1_024u64)
         .push_int(1u64)
         .fee()
-        .push_int(1u64)
         .signcall()
         .to_bytecode();
     let mut vm = vm_external_with_script(script);
@@ -990,7 +990,7 @@ fn phase20_signature_over_wrong_txid_rejected() {
 /// `op_signcall` creates an isolated CallFrame with no actor identity,
 /// same as `op_open` (ADR 0013). Inside the signed leaf, `op_selfid`
 /// errors `OpcodeRequiresActorContext`; the parent recovers the locked
-/// Contract followed by `count=0, success=0`; the contextual Contract is not counted.
+/// Contract followed by its original unit request and `success=0`.
 #[test]
 fn signcall_selfid_errors_no_actor_context() {
     let prog = ScriptBuilder::new().selfid().to_bytecode();

@@ -6,10 +6,7 @@ fn funded_message(target: ActorAddress) -> Message {
         target,
         None,
         Anchor([0x61; 32]),
-        vec![Value::ClearToken(ClearToken::new(
-            Scalar::from(77u64),
-            FLAME_FLAVOR,
-        ))],
+        Value::ClearToken(ClearToken::new(Scalar::from(77u64), FLAME_FLAVOR)),
         100_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -264,7 +261,7 @@ fn init_reuses_upgraded_code_but_cannot_reset_a_frozen_actor() {
         .unwrap();
     let id = ActorID::from(ctor.id());
     let mut registry = MemRegistry::new();
-    let current = ScriptBuilder::new().nop().to_cell().unwrap();
+    let current = ScriptBuilder::new().drop_().nop().to_cell().unwrap();
     registry
         .deploy(id, current.clone(), empty_state(), 10_000)
         .unwrap();
@@ -285,6 +282,7 @@ fn init_reuses_upgraded_code_but_cannot_reset_a_frozen_actor() {
         .any(|entry| matches!(entry, TxEntry::ActorDeploy { .. })));
     let caller = ActorID::from([0x83; 32]);
     let program = ScriptBuilder::new()
+        .drop_() // incoming unit message
         .push_int(0u64)
         .push_int(10_000u64)
         .push_cell(target.to_cell().unwrap())
@@ -365,7 +363,6 @@ fn synchronous_restore_failure_returns_bearer_arguments_and_discards_restore_eff
     .to_cell()
     .unwrap();
     let program = ScriptBuilder::new()
-        .push_int(1u64)
         .push_int(100_000u64)
         .push_cell(address)
         .call();
@@ -391,12 +388,11 @@ fn synchronous_restore_failure_returns_bearer_arguments_and_discards_restore_eff
     }
     assert!(entered);
     assert!(vm.call_stack.is_empty());
-    assert_eq!(vm.current_call.stack.len(), 3);
+    assert_eq!(vm.current_call.stack.len(), 2);
     assert!(
         matches!(&vm.current_call.stack[0], Value::ClearToken(value) if value.qty() == Scalar::from(7u64))
     );
-    assert_int(&vm.current_call.stack[1], Scalar::ONE);
-    assert_int(&vm.current_call.stack[2], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[1], Scalar::ZERO);
     assert!(registry.is_frozen(&callee).unwrap());
     assert_eq!(registry.actor(&callee).unwrap().root.id(), frozen);
     assert!(!vm
@@ -422,7 +418,6 @@ fn synchronous_init_without_storage_rolls_back_deployment_and_returns_arguments(
         .unwrap();
     let mut vm = fixture_vm(
         ScriptBuilder::new()
-            .push_int(1u64)
             .push_int(100_000u64)
             .push_cell(target.to_cell().unwrap())
             .call(),
@@ -443,10 +438,9 @@ fn synchronous_init_without_storage_rolls_back_deployment_and_returns_arguments(
     }
     assert!(entered);
     assert!(!registry.exists(&callee));
-    assert_eq!(vm.current_call.stack.len(), 3);
+    assert_eq!(vm.current_call.stack.len(), 2);
     assert_int(&vm.current_call.stack[0], Scalar::from(9u64));
-    assert_int(&vm.current_call.stack[1], Scalar::ONE);
-    assert_int(&vm.current_call.stack[2], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[1], Scalar::ZERO);
     assert!(!vm
         .txlog
         .iter()
@@ -472,7 +466,6 @@ fn synchronous_restore_can_buy_storage_and_commit_its_image() {
     };
     let mut vm = fixture_vm(
         ScriptBuilder::new()
-            .push_int(1u64)
             .push_int(100_000u64)
             .push_cell(target.to_cell().unwrap())
             .call(),
@@ -524,7 +517,6 @@ fn synchronous_addresses_resolve_witnesses_owned_by_the_caller() {
         };
         let caller = ActorID::from([0x86; 32]);
         let program = ScriptBuilder::new()
-            .push_int(1u64)
             .push_int(100_000u64)
             .push_cell(target.to_cell().unwrap())
             .call()
@@ -579,7 +571,6 @@ fn asynchronous_addresses_carry_witnesses_owned_by_the_sender() {
         };
         let sender = ActorID::from([0x87; 32]);
         let program = ScriptBuilder::new()
-            .push_int(1u64)
             .push_literal(CellValue::from_bytes(vec![0; 32]).unwrap())
             .push_int(100_000u64)
             .push_cell(target.to_cell().unwrap())

@@ -150,8 +150,9 @@ impl CellDecode for Value {
 
 impl Value {
     /// Logical work for a Cell-encoding attempt, without allocating encoded
-    /// bodies. Runtime-only values may still be placed in Dict caches; their
-    /// placeholder costs are included, but this does not admit them to storage.
+    /// bodies. Native Dict path construction is bounded without hashing;
+    /// backed Dicts price only resident cached paths. Runtime-only values still
+    /// fail encoding; estimating their work does not admit them to storage.
     pub(crate) fn encoding_gas(&self) -> Result<u64, crate::VMError> {
         let mut gas = 0u64;
         let mut pending = vec![(self, 0usize)];

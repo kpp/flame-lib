@@ -538,12 +538,9 @@ pub struct CallFrame {
     pub(crate) snap_total_fee: CheckedFee,
 
     /// Entry-owned values returned to the caller when the child fails.
-    /// Actor calls escrow their arguments; contract calls escrow the original
-    /// locked Contract followed by their explicit arguments.
+    /// Actor calls escrow one argument; contract calls escrow the original
+    /// locked Contract followed by the explicit argument.
     pub(crate) snap_failure_values: Vec<Value>,
-    /// Number of explicit call arguments. For contract calls this intentionally
-    /// excludes the separately restored locked Contract.
-    pub(crate) snap_failure_arg_count: usize,
 
     /// Snapshot of the delegate's MSM/signature batch state taken
     /// when this frame's child was pushed. Restored on child
@@ -605,7 +602,6 @@ impl CallFrame {
             snap_deferred_multiplications: 0,
             snap_total_fee: CheckedFee::zero(),
             snap_failure_values: Vec::new(),
-            snap_failure_arg_count: 0,
             snap_batch: None,
             snap_cs: None,
         }
@@ -970,25 +966,23 @@ impl VM {
         block: &BlockContext,
         cells: Arc<CellIndex>,
     ) -> Result<TxResult, VMError> {
-        let mut initial_gas = 0u64;
-        for value in message.payload() {
-            initial_gas = initial_gas
-                .checked_add(
-                    value
-                        .encoding_gas()?
-                        .checked_mul(4)
-                        .ok_or(VMError::OutOfGas)?,
-                )
-                .and_then(|gas| gas.checked_add(value.clone_gas().saturating_mul(2)))
-                .ok_or(VMError::OutOfGas)?;
-        }
+        // Message admission already paid for public encoding. Start every delivery
+        // from that public form, never native maps, private openings or warm caches.
+        // Trusted decoding keeps authenticated Dict branches lazy.
+        let payload_cell = message.payload().to_cell()?;
+        let payload = Value::from_trusted_cell(&payload_cell, &mut ())?;
+        let mut initial_gas = payload
+            .encoding_gas()?
+            .checked_mul(4)
+            .and_then(|gas| gas.checked_add(payload.clone_gas().saturating_mul(2)))
+            .ok_or(VMError::OutOfGas)?;
         if initial_gas > message.gas {
             return Err(VMError::OutOfGas);
         }
         let message_cell = message.to_cell()?;
         initial_gas = initial_gas
             .saturating_add(alloc_byte_gas(message_cell.record_size())?)
-            .saturating_add(alloc_item_gas(message.payload().len())?);
+            .saturating_add(alloc_item_gas(1)?);
         if initial_gas > message.gas {
             return Err(VMError::OutOfGas);
         }
@@ -1029,7 +1023,7 @@ impl VM {
                 CallFrame::from_cell(script, kind, message.gas)?.with_anchor(message.anchor);
             frame.actor_cells = actor_cells;
             frame.charge_gas(initial_gas)?;
-            frame.stack.extend(message.into_payload());
+            frame.stack.push(payload);
             let mut vm = Self::new(header, frame).with_cells(cells)?;
             vm.block_height = block.height;
             vm.txlog.push(TxEntry::Receive(message_cell.id()));
@@ -1206,7 +1200,7 @@ impl VM {
     /// Executes one instruction. Returns `Ok(true)` to continue,
     /// `Ok(false)` to stop. Errors that occur inside a nested
     /// call frame are caught — the frame is unwound via
-    /// `fail_current_call` and its entry escrow plus `count, 0` is
+    /// `fail_current_call` and its entry escrow plus status `0` is
     /// pushed onto the parent's stack. Errors at the outermost frame
     /// propagate to the caller (kill the tx).
     fn step<D: Delegate>(
@@ -1522,9 +1516,9 @@ impl VM {
     }
 
     /// Pops the current frame back to its caller on clean exit. Stack
-    /// must be empty (use `return k` to send values across the boundary).
+    /// must be empty (use `value return` to send a result across the boundary).
     /// Leftover gas is refunded to the parent. Implicit clean exits
-    /// push `{0, 1}` onto the parent's stack (success with k=0).
+    /// push `{0, 1}` onto the parent's stack (unit result and success).
     /// Shared clean-exit epilogue: refund leftover gas to the parent
     /// (already swapped in by the caller), apply the parent's post-call
     /// anchor, and discard the entry-time batch/CS snapshots
@@ -1538,7 +1532,6 @@ impl VM {
         self.current_call.snap_batch = None;
         self.current_call.snap_cs = None;
         self.current_call.snap_failure_values.clear();
-        self.current_call.snap_failure_arg_count = 0;
     }
 
     fn validate_actor_call_storage(
@@ -1570,7 +1563,7 @@ impl VM {
         if let Some(parent) = self.call_stack.pop() {
             self.current_call = parent;
             self.clean_exit_to_parent(leftover_gas);
-            // Success marker with k=0: stack += [count=0, success=1].
+            // An implicit return produces the unit Scalar and success marker.
             self.current_call
                 .stack
                 .push(Value::Scalar(Scalar::from(0u64)));
@@ -1586,7 +1579,7 @@ impl VM {
     /// parent's snapshot (txlog tail, deferred-sigs tail, total_fee,
     /// delegate batch state, R1CS constraint system), applies the
     /// parent's `post_call_anchor`, and restores entry-owned values
-    /// followed by their count and a zero status. Caller's effects up to the
+    /// followed by a zero status. Caller's effects up to the
     /// failed call are preserved; the parent script continues at
     /// the instruction after the call.
     ///
@@ -1613,8 +1606,6 @@ impl VM {
         self.current_call = parent;
         self.current_call.gas_used = self.current_call.gas_used.saturating_sub(leftover_gas);
         let failure_values = mem::take(&mut self.current_call.snap_failure_values);
-        let failure_arg_count = self.current_call.snap_failure_arg_count;
-        self.current_call.snap_failure_arg_count = 0;
         // Roll back side effects via the snapshots taken at call
         // entry.
         self.txlog.truncate(self.current_call.snap_txlog_len);
@@ -1647,7 +1638,7 @@ impl VM {
         if let Some(post) = self.current_call.post_call_anchor.take() {
             self.last_anchor = Some(post);
         }
-        self.push_failed_values(failure_values, failure_arg_count);
+        self.push_failed_values(failure_values);
     }
 
     /// Pushes a value onto the current call's stack.
@@ -1655,22 +1646,10 @@ impl VM {
         self.current_call.stack.push(v);
     }
 
-    /// Failure shape shared by synchronous calls: restored entry values,
-    /// the explicit argument count, then the zero status marker. A restored
-    /// Contract is contextual and is not included in `arg_count`.
-    fn push_failed_values(&mut self, values: Vec<Value>, arg_count: usize) {
+    /// Restore the argument (and contextual locked Contract for opening), then failure.
+    fn push_failed_values(&mut self, values: Vec<Value>) {
         self.current_call.stack.extend(values);
-        self.current_call
-            .stack
-            .push(Value::Scalar(Scalar::from(arg_count as u64)));
         self.current_call.stack.push(Value::Scalar(Scalar::ZERO));
-    }
-
-    fn charge_clone_values(&mut self, values: &[Value]) -> Result<(), VMError> {
-        let gas = values
-            .iter()
-            .fold(0u64, |gas, value| gas.saturating_add(value.clone_gas()));
-        self.current_call.charge_gas(gas)
     }
 
     /// Charge bounded serialization work before an opcode constructs Cell data.
@@ -1935,7 +1914,7 @@ impl VM {
         for _ in 0..n {
             let key = self.pop_value()?.to_scalar()?;
             let value = self.pop_value()?;
-            self.charge_value_encoding(&value, 1)?;
+            self.current_call.charge_gas(dict.native_access_gas())?;
             if dict
                 .insert_strict_resolved(key, value, &mut self.resolver())
                 .map_err(|(error, _value)| VMError::from(error))?
@@ -1955,7 +1934,11 @@ impl VM {
         let k = self.pop_value()?.to_scalar()?;
         let mut dict = self.pop_value()?.to_dict()?;
         self.charge_alloc_items(1)?;
-        self.charge_value_encoding(&v, 1)?;
+        if dict.is_native() {
+            self.current_call.charge_gas(dict.native_access_gas())?;
+        } else {
+            self.charge_value_encoding(&v, 1)?;
+        }
         if dict
             .insert_strict_resolved(k, v, &mut self.resolver())
             .map_err(|(error, _value)| VMError::from(error))?
@@ -1974,14 +1957,19 @@ impl VM {
         let v = self.pop_value()?;
         let k = self.pop_value()?.to_scalar()?;
         let mut dict = self.pop_value()?.to_dict()?;
+        let native = dict.is_native();
         self.charge_alloc_items(1)?;
-        self.charge_value_encoding(&v, 1)?;
+        if native {
+            self.current_call.charge_gas(dict.native_access_gas())?;
+        } else {
+            self.charge_value_encoding(&v, 1)?;
+        }
         let prev = dict
             .insert_resolved(k, v, &mut self.resolver())
             .map_err(|(error, _value)| VMError::from(error))?;
-        let prev = prev
-            .map(|value| self.restore_private_value(value))
-            .transpose()?;
+        let prev = if native { prev } else {
+            prev.map(|value| self.restore_private_value(value)).transpose()?
+        };
         self.push_value(Value::Dict(dict));
         match prev {
             Some(prev_v) => {
@@ -2000,10 +1988,14 @@ impl VM {
     fn op_get(&mut self) -> Result<(), VMError> {
         let k = self.pop_value()?.to_scalar()?;
         let mut dict = self.pop_value()?.to_dict()?;
+        let native = dict.is_native();
+        if native {
+            self.current_call.charge_gas(dict.native_access_gas())?;
+        }
         let v = dict
             .remove_resolved(&k, &mut self.resolver())?
             .ok_or(VMError::DictKeyNotFound)?;
-        let v = self.restore_private_value(v)?;
+        let v = if native { v } else { self.restore_private_value(v)? };
         self.push_value(Value::Dict(dict));
         self.push_value(Value::Scalar(k));
         self.push_value(v);
@@ -2015,10 +2007,14 @@ impl VM {
     fn op_getopt(&mut self) -> Result<(), VMError> {
         let k = self.pop_value()?.to_scalar()?;
         let mut dict = self.pop_value()?.to_dict()?;
+        let native = dict.is_native();
+        if native {
+            self.current_call.charge_gas(dict.native_access_gas())?;
+        }
         let v = dict.remove_resolved(&k, &mut self.resolver())?;
-        let v = v
-            .map(|value| self.restore_private_value(value))
-            .transpose()?;
+        let v = if native { v } else {
+            v.map(|value| self.restore_private_value(value)).transpose()?
+        };
         self.push_value(Value::Dict(dict));
         self.push_optional_value(v);
         Ok(())
@@ -2030,13 +2026,18 @@ impl VM {
     fn op_getdup(&mut self) -> Result<(), VMError> {
         let k = self.pop_value()?.to_scalar()?;
         let mut dict = self.pop_value()?.to_dict()?;
+        let native = dict.is_native();
+        if native {
+            self.current_call.charge_gas(dict.native_access_gas())?;
+        }
         let copied = match dict.get_resolved(&k, &mut self.resolver())? {
             Some(v) => {
                 if !v.is_copyable() {
                     return Err(VMError::TypeNotCopyable);
                 }
                 self.current_call.charge_gas(v.clone_gas())?;
-                Some(self.restore_private_value(v.try_clone()?)?)
+                let copied = v.try_clone()?;
+                Some(if native { copied } else { self.restore_private_value(copied)? })
             }
             None => None,
         };
@@ -2060,6 +2061,9 @@ impl VM {
     /// alongside a flag, or `0` if the dict is empty.
     fn op_first(&mut self) -> Result<(), VMError> {
         let dict = self.pop_value()?.to_dict()?;
+        if dict.is_native() {
+            self.current_call.charge_gas(dict.native_access_gas())?;
+        }
         let k = dict.first_key_resolved(&mut self.resolver())?;
         self.push_value(Value::Dict(dict));
         self.push_optional_value(k.map(Value::Scalar));
@@ -2069,6 +2073,9 @@ impl VM {
     /// `last` — `dict → dict {k 1 | 0}`. Mirror of `first`.
     fn op_last(&mut self) -> Result<(), VMError> {
         let dict = self.pop_value()?.to_dict()?;
+        if dict.is_native() {
+            self.current_call.charge_gas(dict.native_access_gas())?;
+        }
         let k = dict.last_key_resolved(&mut self.resolver())?;
         self.push_value(Value::Dict(dict));
         self.push_optional_value(k.map(Value::Scalar));
@@ -2080,6 +2087,9 @@ impl VM {
     fn op_next(&mut self) -> Result<(), VMError> {
         let k = self.pop_value()?.to_scalar()?;
         let dict = self.pop_value()?.to_dict()?;
+        if dict.is_native() {
+            self.current_call.charge_gas(dict.native_access_gas())?;
+        }
         let next_k = dict.next_key_after_resolved(&k, &mut self.resolver())?;
         self.push_value(Value::Dict(dict));
         self.push_optional_value(next_k.map(Value::Scalar));
@@ -2650,33 +2660,26 @@ impl VM {
         }
     }
 
-    /// _x(k-1) … x(0) k_ **return** → ø
+    /// _result_ **return** → ø
     ///
-    /// Pops the frame, refunds leftover gas, pushes the `k` items
-    /// then `k` then `1` (success marker) onto the caller's stack.
-    /// Stack on parent after the call: `… values… k 1` (top = 1).
+    /// Pops the frame, refunds leftover gas, and pushes one result
+    /// followed by `1` (success marker) onto the caller's stack.
     /// Errors `ReturnAtRoot` at the outermost frame.
     fn op_return(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
-        let k_int = self.pop_value()?.to_scalar()?;
-        let k_u64 = k_int.to_u64().ok_or(VMError::BadReturnArity)?;
-        let k = usize::try_from(k_u64).map_err(|_| VMError::BadReturnArity)?;
-
-        // Outermost frame: `return` has no parent. Fail regardless of `k`.
+        // Outermost frame has no recipient for a result.
         if self.call_stack.is_empty() {
             return Err(VMError::ReturnAtRoot);
         }
 
-        // Strict: exactly `k` items must remain. Fewer → arity mismatch,
-        // more → leftover state the script forgot about.
-        if self.current_call.stack.len() < k {
+        if self.current_call.stack.is_empty() {
             return Err(VMError::BadReturnArity);
         }
-        if self.current_call.stack.len() > k {
+        if self.current_call.stack.len() > 1 {
             return Err(VMError::StackNotClean);
         }
 
         self.validate_actor_call_storage(registry.as_deref())?;
-        let return_values: Vec<Value> = self.current_call.stack.drain(..).collect();
+        let result = self.current_call.stack.pop().expect("one result checked above");
         let leftover_gas = self
             .current_call
             .gas_limit
@@ -2685,11 +2688,7 @@ impl VM {
         let parent = self.call_stack.pop().expect("checked non-empty above");
         self.current_call = parent;
         self.clean_exit_to_parent(leftover_gas);
-        // Pour return values, then count, then success marker (1).
-        self.current_call.stack.extend(return_values);
-        self.current_call
-            .stack
-            .push(Value::Scalar(Scalar::from(k as u64)));
+        self.current_call.stack.push(result);
         self.current_call.stack.push(Value::Scalar(Scalar::ONE));
         Ok(())
     }
@@ -2964,22 +2963,11 @@ impl VM {
         Ok(())
     }
 
-    /// Pops `n` values from the stack and returns them in caller-pushed
-    /// order (deepest first). No type or portability check.
-    fn pop_n_values(&mut self, n: usize) -> Result<Vec<Value>, VMError> {
-        if self.current_call.stack.len() < n {
-            return Err(VMError::StackUnderflow);
-        }
-        self.charge_alloc_items(n)?;
-        let start = self.current_call.stack.len() - n;
-        Ok(self.current_call.stack.drain(start..).collect())
-    }
-
     /// Values may return upward in any form, but only portable values may be
     /// delegated downward into a child frame. The caller must resolve any
     /// outstanding loan before calling another actor or predicate.
-    fn require_portable_call_args(args: &[Value]) -> Result<(), VMError> {
-        if args.iter().any(|value| !value.is_portable()) {
+    fn require_portable_call_arg(arg: &Value) -> Result<(), VMError> {
+        if !arg.is_portable() {
             return Err(VMError::NonPortableInCall);
         }
         Ok(())
@@ -3067,14 +3055,13 @@ impl VM {
         Ok(())
     }
 
-    /// _contract ik program gas portable-args… k_ **open** → _results… k'_
+    /// _contract ik program gas arg_ **open** → _result 1 | contract arg 0_
     ///
     /// Authenticates the supplied program's level-zero hash. The
-    /// isolated frame receives one payload Value, followed by explicit arguments.
+    /// isolated frame receives the stored payload followed by one portable argument.
     fn op_open(&mut self) -> Result<(), VMError> {
-        let k = self.pop_byte_count(usize::MAX)?;
-        let args = self.pop_n_values(k)?;
-        Self::require_portable_call_args(&args)?;
+        let arg = self.pop_value()?;
+        Self::require_portable_call_arg(&arg)?;
         let gas = self.pop_gas_limit()?;
         let reference = self.pop_value()?.into_cell_ref()?;
         let internal_key = self.pop_value()?.to_point()?.to_compressed();
@@ -3099,7 +3086,7 @@ impl VM {
             Script::Opaque(Vec::new()),
             code_bytes,
             gas,
-            args,
+            arg,
             child_anchor,
         )?;
         self.current_call.code = None;
@@ -3135,14 +3122,13 @@ impl VM {
         Ok(())
     }
 
-    /// _contract script sig gas portable-args… m_ **signcall** → _results… k'_
+    /// _contract script sig gas arg_ **signcall** → _result 1 | contract arg 0_
     ///
 
     /// The signature commits to the factual Cell graph, including supplied/pruned branches.
     fn op_signcall(&mut self) -> Result<(), VMError> {
-        let m = self.pop_byte_count(usize::MAX)?;
-        let args = self.pop_n_values(m)?;
-        Self::require_portable_call_args(&args)?;
+        let arg = self.pop_value()?;
+        Self::require_portable_call_arg(&arg)?;
         let gas = self.pop_gas_limit()?;
         let signature_bytes = self.pop_byte_source()?;
         let program_value = match self.pop_value()? {
@@ -3199,7 +3185,7 @@ impl VM {
             Script::Cell(root.as_ref().clone()),
             code_bytes,
             gas,
-            args,
+            arg,
             child_anchor,
         )?;
         self.current_call.code = None;
@@ -3212,7 +3198,7 @@ impl VM {
 
     /// Shared tail of `op_open` / `op_signcall`: build a new
     /// `ContractOpen` frame snapshotting the caller's CS context, pour
-    /// `contract.payload` then `args` onto the new stack, swap the
+    /// `contract.payload` then `arg` onto the new stack, swap the
     /// parent out, and switch the active anchor to `child_anchor`
     /// (the `left` half of the parent's call-entry split).
     fn enter_contract_open_frame(
@@ -3221,25 +3207,19 @@ impl VM {
         code: Script,
         code_bytes: usize,
         gas: u64,
-        args: Vec<Value>,
+        arg: Value,
         child_anchor: Anchor,
     ) -> Result<(), VMError> {
         if self.call_stack.len() >= MAX_CALL_DEPTH {
             return Err(VMError::CallDepthExceeded);
         }
-        let failure_count = args.len().saturating_add(1);
-        self.charge_alloc_items(failure_count)?;
-        let clone_gas = args
-            .iter()
-            .fold(1u64.saturating_add(contract.clone_gas()), |gas, value| {
-                gas.saturating_add(value.clone_gas())
-            });
+        self.charge_alloc_items(2)?;
+        let clone_gas = 1u64.saturating_add(contract.clone_gas()).saturating_add(arg.clone_gas());
         self.current_call.charge_gas(clone_gas)?;
-        let mut failure_values = Vec::with_capacity(failure_count);
-        failure_values.push(Value::Contract(Box::new(contract.clone())));
-        failure_values.extend(args.iter().cloned());
-        self.current_call.snap_failure_values = failure_values;
-        self.current_call.snap_failure_arg_count = args.len();
+        self.current_call.snap_failure_values = vec![
+            Value::Contract(Box::new(contract.clone())),
+            arg.clone(),
+        ];
         let external_context = self.is_external();
         let caller_id = self.current_call.kind.actor().map(ActorID::to_hash);
         let mut frame = CallFrame::from_code(
@@ -3253,12 +3233,10 @@ impl VM {
         )
         .with_anchor(child_anchor);
         frame.gas_used = alloc_byte_gas(code_bytes)?
-            .saturating_add(alloc_item_gas(1usize.saturating_add(args.len()))?);
+            .saturating_add(alloc_item_gas(2)?);
         self.current_call.charge_gas(gas)?;
         frame.stack.push(contract.into_payload());
-        for v in args {
-            frame.stack.push(v);
-        }
+        frame.stack.push(arg);
         let parent = core::mem::replace(&mut self.current_call, frame);
         self.call_stack.push(parent);
         self.last_anchor = Some(child_anchor);
@@ -3273,7 +3251,7 @@ impl VM {
             .ok_or(VMError::InvalidBitrange)
     }
 
-    /// _args… k refund gas addr_ **send** → ø
+    /// _arg refund gas addr_ **send** → ø
     ///
     /// Queues a [`Message`] for the consensus layer to instantiate as a
     /// future internal tx and emits a `TxEntry::Send`. The anchor is
@@ -3290,16 +3268,13 @@ impl VM {
         let refund_predicate = Predicate::opaque(curve25519_dalek::ristretto::CompressedRistretto(
             self.pop_bytes_32()?,
         ));
-        let k = self.pop_byte_count(usize::MAX)?;
-        let args = self.pop_n_values(k)?;
+        let arg = self.pop_value()?;
 
-        if args.iter().any(|value| !value.is_portable()) {
+        if !arg.is_portable() {
             return Err(VMError::NonPortableInSend);
         }
-        for value in &args {
-            self.charge_value_encoding(value, 4)?;
-        }
-        self.charge_clone_values(&args)?;
+        self.charge_value_encoding(&arg, 4)?;
+        self.current_call.charge_gas(arg.clone_gas())?;
         if let ActorAddress::Init { ctor: witness }
         | ActorAddress::Restore { state: witness, .. } = &mut target
         {
@@ -3320,7 +3295,7 @@ impl VM {
         // `TxEntry::Output(Contract)`. The block builder scans these
         // entries to construct internal-tx deliveries; no separate
         // queue.
-        let message = Message::new(target, caller, anchor, args, gas, refund_predicate)?;
+        let message = Message::new(target, caller, anchor, arg, gas, refund_predicate)?;
         // A send reserves future execution from the active frame. The grant is
         // intentionally not refunded: asynchronous execution has no live
         // caller to receive it, and descendants must divide an existing grant
@@ -3330,10 +3305,10 @@ impl VM {
         Ok(())
     }
 
-    /// _portable-args… k gas addr_ **call** → _results… k' 1 | args… k 0_
+    /// _arg gas addr_ **call** → _result 1 | arg 0_
     ///
     /// Canonical actor routing, initialization/restoration and execution share
-    /// one checkpoint. A failed call restores its arguments and all mutations.
+    /// one checkpoint. A failed call restores its argument and all mutations.
     fn op_call(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
         let caller = *self.require_actor()?;
         let registry = registry.ok_or(VMError::RegistryUnavailable)?;
@@ -3341,9 +3316,8 @@ impl VM {
         let callee = address.to_actor_id();
         let gas = self.pop_gas_limit()?;
         self.current_call.charge_gas(gas)?;
-        let k = self.pop_byte_count(usize::MAX)?;
-        let args = self.pop_n_values(k)?;
-        Self::require_portable_call_args(&args)?;
+        let arg = self.pop_value()?;
+        Self::require_portable_call_arg(&arg)?;
 
         registry.push_checkpoint();
         let mut initial_gas = 0;
@@ -3365,7 +3339,7 @@ impl VM {
                         .actor_code_bytes(&callee)?
                         .saturating_mul(GAS_PER_ALLOC_BYTE),
                 )
-                .saturating_add(alloc_item_gas(args.len())?);
+                .saturating_add(alloc_item_gas(1)?);
             if initial_gas > gas {
                 return Err(VMError::OutOfGas);
             }
@@ -3401,16 +3375,14 @@ impl VM {
                         .gas_used
                         .saturating_sub(gas.saturating_sub(initial_gas));
                 }
-                let count = args.len();
-                self.push_failed_values(args, count);
+                self.push_failed_values(vec![arg]);
                 return Ok(());
             }
         };
         let enter = (|| {
-            self.charge_alloc_items(args.len())?;
-            self.charge_clone_values(&args)?;
-            self.current_call.snap_failure_values = args.clone();
-            self.current_call.snap_failure_arg_count = args.len();
+            self.charge_alloc_items(1)?;
+            self.current_call.charge_gas(arg.clone_gas())?;
+            self.current_call.snap_failure_values = vec![arg.clone()];
             self.split_anchor_for_call()
         })();
         let callee_anchor = match enter {
@@ -3423,7 +3395,7 @@ impl VM {
         frame.anchor = Some(callee_anchor);
         frame.gas_used = initial_gas;
         frame.actor_cells = actor_cells;
-        frame.stack.extend(args);
+        frame.stack.push(arg);
         let parent = core::mem::replace(&mut self.current_call, frame);
         self.call_stack.push(parent);
         self.last_anchor = Some(callee_anchor);
@@ -4131,7 +4103,7 @@ mod cell_execution_tests {
     use bulletproofs::PedersenGens;
 
     #[test]
-    fn wrapping_existing_dictionaries_prepays_growing_encoding_work() {
+    fn temporary_dictionary_wrapping_is_cheap_until_materialization() {
         let frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 15_000);
         let mut vm = VM::new(
             TxHeader {
@@ -4148,17 +4120,31 @@ mod cell_execution_tests {
             vm.push_value(Value::Scalar(Scalar::ZERO));
             vm.push_value(Value::Scalar(Scalar::ONE));
             let before = vm.current_call.gas_used;
-            match vm.op_dict() {
-                Ok(()) => costs.push(vm.current_call.gas_used - before),
-                Err(VMError::OutOfGas) => {
-                    assert!(costs.len() >= 2);
-                    assert!(costs.windows(2).all(|pair| pair[1] > pair[0]));
-                    return;
-                }
-                Err(error) => panic!("unexpected error: {:?}", error),
-            }
+            vm.op_dict().unwrap();
+            costs.push(vm.current_call.gas_used - before);
         }
-        panic!("nested serialization must exhaust the finite budget");
+        assert!(costs.iter().all(|cost| *cost == costs[0]));
+        let nested = vm.pop_value().unwrap();
+        let gas = nested.encoding_gas().unwrap();
+        assert!(gas > costs.iter().sum());
+        vm.current_call.gas_limit = vm.current_call.gas_used + gas - 1;
+        assert!(matches!(vm.charge_value_encoding(&nested, 1), Err(VMError::OutOfGas)));
+    }
+
+    #[test]
+    fn native_dictionary_nesting_is_bounded_before_clone_or_serialization() {
+        let frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 10_000);
+        let mut vm = VM::new(TxHeader { version: 1, locktime: 0 }, frame);
+        vm.push_value(Value::Scalar(Scalar::ONE));
+        for _ in 0..256 {
+            vm.push_value(Value::Scalar(Scalar::ZERO));
+            vm.push_value(Value::Scalar(Scalar::ONE));
+            vm.op_dict().unwrap();
+        }
+        vm.push_value(Value::Scalar(Scalar::ZERO));
+        vm.push_value(Value::Scalar(Scalar::ONE));
+        assert!(matches!(vm.op_dict(), Err(VMError::Cell(CellError::LimitExceeded))));
+        assert!(vm.current_call.gas_used < vm.current_call.gas_limit);
     }
 
     #[test]
@@ -4200,6 +4186,33 @@ mod cell_execution_tests {
         vm.push_value(Value::Scalar(Scalar::ZERO));
         vm.push_value(Value::Cell(crate::CellValue::from_bytes(vec![]).unwrap()));
         assert!(matches!(vm.op_put(), Err(VMError::OutOfGas)));
+    }
+
+    #[test]
+    fn native_record_access_is_cheap_and_serialization_does_not_change_its_gas() {
+        let native = Dict::from_values(vec![
+            Value::Scalar(Scalar::from(7u64)),
+            Value::Scalar(Scalar::from(9u64)),
+        ]);
+        let serialized = native.to_cell().unwrap();
+        let backed = Dict::from_trusted_cell(&serialized, &mut ()).unwrap();
+        let mut costs = Vec::new();
+        for dict in [native.clone(), native, backed] {
+            let frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 100_000);
+            let mut vm = VM::new(TxHeader { version: 1, locktime: 0 }, frame);
+            vm.push_value(Value::Dict(dict));
+            for _ in 0..2 {
+                vm.push_value(Value::Scalar(Scalar::ZERO));
+                let before = vm.current_call.gas_used;
+                vm.op_getdup().unwrap();
+                costs.push(vm.current_call.gas_used - before);
+                assert!(matches!(vm.pop_value().unwrap(), Value::Scalar(n) if n == Scalar::ONE));
+                assert!(matches!(vm.pop_value().unwrap(), Value::Scalar(n) if n == Scalar::from(7u64)));
+            }
+        }
+        assert_eq!(&costs[..4], &[3; 4]);
+        assert_eq!(costs[4], costs[5]);
+        assert!(costs[4] > 10 * costs[0]);
     }
 
     #[test]
@@ -4289,6 +4302,7 @@ mod cell_execution_tests {
     #[test]
     fn contract_and_branch_bodies_use_the_committed_bag_and_private_overlays() {
         let branch = ScriptBuilder::new()
+            .drop_() // unit argument
             .drop_()
             .alloc(Some(Scalar::from(9u64)))
             .drop_()

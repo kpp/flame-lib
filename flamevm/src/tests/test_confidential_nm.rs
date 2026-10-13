@@ -492,11 +492,10 @@ fn confidential_1_to_1_with_fee() {
     program = push_taproot_proof_to_program(program, &cp);
     program = program
         .push_int(1024u64) // gas
-        .push_int(0u64) // k args
+        .push_int(0u64) // unit request
         .open()
-        .verify() // assert success marker
-        .drop_(); // discard count
-                  // Fee opcode: pushes WideToken(-3, FLAME_FLAVOR).
+        .verify(); // preserve returned Token
+                   // Fee opcode: pushes WideToken(-3, FLAME_FLAVOR).
     program = program.push_int(3u64).fee();
     // Output commitment Cells (witness-bearing prover-side).
     // Clone so the post-prove assertion can still read the
@@ -700,12 +699,7 @@ fn confidential_with_fee_undersupply_rejected() {
     program = program.push_cell(CellValue::contract(contract).unwrap());
     program = program.input();
     program = push_taproot_proof_to_program(program, &cp);
-    program = program
-        .push_int(1024u64)
-        .push_int(0u64)
-        .open()
-        .verify()
-        .drop_();
+    program = program.push_int(1024u64).push_int(0u64).open().verify();
     program = program.push_int(3u64).fee();
     program = program
         .push_literal(CellValue::commitment(q_out))

@@ -83,12 +83,17 @@ pub(crate) fn witness_cell(literal: CellValue) -> Value {
 
 pub(crate) fn open_with_test_inner(inner: ScriptBuilder, recover: bool) -> ScriptBuilder {
     let mut branch = ScriptBuilder::new()
+        .drop_() // unit request
         .drop_()
         .with_cells(inner.cell_witnesses().unwrap());
     for instruction in inner.instructions() {
         branch.push_instr(instruction.clone());
     }
-    let recovery = ScriptBuilder::new().drop_().push_int(0u64).return_();
+    let recovery = ScriptBuilder::new()
+        .drop_()
+        .drop_()
+        .push_int(0u64)
+        .return_();
     let tree = PredicateTree::from_scripts(None, vec![branch.clone(), recovery], TEST_BLINDING_KEY)
         .unwrap();
     let cp = test_taproot_proof(&tree, 0).unwrap();
@@ -211,7 +216,7 @@ pub(crate) fn dummy_message(gas: u64) -> Message {
         ActorID::from([0u8; 32]),
         None,
         Anchor([0u8; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         gas,
         // Test fixture: NUMS-unspendable predicate as the refund
         // sink. No real bounce path exercised by the tests that
@@ -341,14 +346,13 @@ pub(crate) fn deliver_err(reg: &mut MemRegistry, msg: Message) -> VMError {
     VM::execute_internal(dummy_header(), msg, reg, &block).expect_err("expected delivery failure")
 }
 
-/// Builds a minimal internal `Message` targeting `actor` with no
-/// payload — the common Bucket-C delivery fixture.
+/// Builds a minimal internal `Message` carrying the scalar-zero unit.
 pub(crate) fn msg_to(actor: impl Into<ActorAddress>) -> Message {
     Message::new(
         actor,
         None,
         Anchor([0u8; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         1_000_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -362,7 +366,7 @@ pub(crate) fn msg_with_sel(actor: impl Into<ActorAddress>, sel: u64) -> Message 
         actor,
         None,
         Anchor([0u8; 32]),
-        vec![Value::Scalar(Scalar::from(sel))],
+        Value::Scalar(Scalar::from(sel)),
         1_000_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -380,16 +384,16 @@ pub(crate) fn deploy_actor(reg: &mut MemRegistry, recv: impl TestCode) -> ActorI
     id
 }
 
-/// A `call` to `target` with `k=0` args (plain single-action callee).
+/// A `call` to `target` with a unit request (plain single-action callee).
 /// Returns the builder *after* the `call` so the caller chains the
-/// result handling (`.drop_().drop_()` for the `[count, success]`).
+/// result handling (`.drop_().drop_()` for the `[unit, success]`).
 pub(crate) fn actor_address(id: &ActorID) -> CellValue {
     CellValue::from(ActorAddress::from(*id).to_cell().unwrap())
 }
 
 pub(crate) fn call_to(target: &ActorID) -> ScriptBuilder {
     ScriptBuilder::new()
-        .push_int(0u64) // k = 0
+        .push_int(0u64) // unit request
         .push_int(50_000u64) // gas
         .push_literal(actor_address(target))
         .call()
@@ -400,7 +404,6 @@ pub(crate) fn call_to(target: &ActorID) -> ScriptBuilder {
 pub(crate) fn call_with_sel(target: &ActorID, sel: u64) -> ScriptBuilder {
     ScriptBuilder::new()
         .push_int(sel) // selector arg (top)
-        .push_int(1u64) // k = 1
         .push_int(50_000u64) // gas
         .push_literal(actor_address(target))
         .call()
@@ -497,7 +500,8 @@ pub(crate) fn dispatch_cells(arms: &[(u64, Cell)]) -> Cell {
 /// exercise the inner checks (root frame would short-circuit with
 /// `ReturnAtRoot`).
 pub(crate) fn vm_with_nested_child_script(script: Vec<u8>) -> VM {
-    let parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    let mut parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    parent.snap_failure_values = vec![Value::Scalar(Scalar::ZERO)];
     let child_kind = CallKind::ContractOpen {
         predicate: Predicate::opaque(CompressedRistretto([0u8; 32])),
         external_context: true,
@@ -816,9 +820,9 @@ pub(crate) fn make_open_token(
 //   │  pushpoint <internal_key_i>                            │
 //   │  pushcell <selected_policy_tree_i>                    │
 //   │  push:<gas>                                           │
-//   │  push:0  (k = 0 args)                                  │
-//   │  open   (branch loaded from Cell index returns the Token)     │
-//   │  verify; drop  (consume success and return count)      │
+//   │  push:0  (unit request)                               │
+//   │  open   (selected policy returns the Token)           │
+//   │  verify (consume success, retain the Token)           │
 //   └────────────────────────────────────────────────────────┘
 //   ↓  stack now: [Token_0, Token_1, …, Token_{N-1}]
 //
@@ -923,16 +927,9 @@ pub(crate) fn build_confidential_nm_program(
         program = program.input();
         // taproot_proof pieces.
         program = push_taproot_proof_to_program(program, &cp);
-        // A generous gas operand, then push:0 args, open.
-        // After open, the parent stack has [Token, k=1, success=1]:
-        // verify pops the success marker (hard-fail if 0), drop
-        // discards the count, leaving just the Token for mix.
-        program = program
-            .push_int(1024u64)
-            .push_int(0u64)
-            .open()
-            .verify()
-            .drop_();
+        // A generous gas operand and unit request. Opening returns the
+        // Token followed by success; verify leaves the Token for mix.
+        program = program.push_int(1024u64).push_int(0u64).open().verify();
     }
 
     //                    commit CellValue (witness-bearing). ──
@@ -955,7 +952,7 @@ pub(crate) fn build_confidential_nm_program(
     //
     // After `mix`, the stack is [O_0, O_1, …, O_{M-1}] (bottom →
     // top, matching the `outputs[]` spec order). `op_output` pops
-    // its k=1 payload from the TOP — which would naively pair
+    // its single payload from the TOP — which would naively pair
     // `outputs[0].predicate` with `O_{M-1}`'s commitments,
     // reversing every multi-output transfer.
     //
@@ -1021,10 +1018,8 @@ pub(crate) fn push_taproot_proof_to_program(
 pub(crate) fn build_input_contract(inp: &NMInputSpec) -> (Contract, TaprootOpening) {
     let (q_open, f_open) = open_commitments(inp);
     let token = Token::new(q_open, f_open);
-    // Leaf script `push:1, return` — under ADR 0013 the opened contract
-    // runs in an isolated frame, so the leaf must explicitly return
-    // its single-Token payload to the caller.
-    let leaf = vec![0x01, 0xa4];
+    // Discard the unit request and return the single-Token payload.
+    let leaf = ScriptBuilder::new().drop_().return_().to_bytecode();
     let tree = PredicateTree::scripts_only(vec![leaf], input_blinding_for(inp))
         .expect("scripts_only tree builds");
     let cp = test_taproot_proof(&tree, 0).expect("taproot_proof for leaf 0");

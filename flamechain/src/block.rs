@@ -11,8 +11,8 @@ use cells::{
 #[cfg(test)]
 use flamevm::ActorAddress;
 use flamevm::{
-    ActorID, ActorRegistry, BlockContext, Contract, ContractID, Dict, ExternalTx, Limits, Message,
-    TxEntry, TxHeader, TxID, TxLog, VMError, Value,
+    ActorID, ActorRegistry, BlockContext, Contract, ContractID, ExternalTx, Limits, Message,
+    TxEntry, TxHeader, TxID, TxLog, VMError,
 };
 use merkle::{Hash, MerkleItem};
 use merlin::Transcript;
@@ -411,15 +411,13 @@ fn decode_proof_cell<R: CellReader + ?Sized>(
     }
     let mut bytes = slice.load_bytes(slice.remaining_bytes())?;
     slice.finish()?;
-    readerwriter::Reader::read_all(
-        &mut bytes,
-        <Proof as readerwriter::Decodable>::decode,
+    readerwriter::Reader::read_all(&mut bytes, <Proof as readerwriter::Decodable>::decode).map_err(
+        |error| match error {
+            readerwriter::ReadError::InsufficientBytes => CellError::InsufficientBytes,
+            readerwriter::ReadError::TrailingBytes => CellError::TrailingBytes,
+            _ => CellError::InvalidFormat,
+        },
     )
-    .map_err(|error| match error {
-        readerwriter::ReadError::InsufficientBytes => CellError::InsufficientBytes,
-        readerwriter::ReadError::TrailingBytes => CellError::TrailingBytes,
-        _ => CellError::InvalidFormat,
-    })
 }
 
 fn decode_sequence<T, R: CellReader + ?Sized>(
@@ -970,11 +968,7 @@ impl Blockchain {
                 locktime: 0,
             }),
             TxEntry::Receive(receive),
-            TxEntry::Output(Contract::new(
-                refund_predicate,
-                anchor,
-                Value::Dict(Dict::from_values(payload)),
-            )?),
+            TxEntry::Output(Contract::new(refund_predicate, anchor, payload)?),
         ]))
     }
 
@@ -1362,7 +1356,7 @@ pub enum ChainError {
 mod tests {
     use super::*;
     use flamevm::{
-        Anchor, ClearToken, Dict, FLAME_FLAVOR, Predicate, Scalar, ScriptBuilder, Token,
+        Anchor, ClearToken, Dict, FLAME_FLAVOR, Predicate, Scalar, ScriptBuilder, Token, Value,
         empty_state, state_root,
     };
 
@@ -1370,12 +1364,7 @@ mod tests {
         Predicate::opaque(Predicate::unspendable_key())
     }
 
-    fn message(
-        target: impl Into<ActorAddress>,
-        payload: Vec<Value>,
-        gas: u64,
-        anchor: u8,
-    ) -> Message {
+    fn message(target: impl Into<ActorAddress>, payload: Value, gas: u64, anchor: u8) -> Message {
         Message::new(
             target,
             None,
@@ -1435,7 +1424,7 @@ mod tests {
         );
         assert_eq!(
             state_root(contract.payload()),
-            state_root(&Value::Dict(Dict::from_values(original.payload().to_vec())))
+            state_root(original.payload())
         );
     }
 
@@ -1905,7 +1894,7 @@ mod tests {
             ScriptBuilder::new().nop().to_bytecode(),
         );
         let tree = flamevm::PredicateTree::scripts_only(
-            vec![ScriptBuilder::new().drop_().to_bytecode()],
+            vec![ScriptBuilder::new().drop_().drop_().to_bytecode()],
             [3; 32],
         )
         .unwrap();
@@ -1996,6 +1985,7 @@ mod tests {
         params.storage.lease_duration_blocks = 1;
         let mut chain = Blockchain::new(params).unwrap();
         let code = ScriptBuilder::new()
+            .drop_()
             .load()
             .push_int(1_024u64)
             .addstorage()
@@ -2032,7 +2022,7 @@ mod tests {
         .unwrap();
 
         let tree = flamevm::PredicateTree::scripts_only(
-            vec![ScriptBuilder::new().drop_().to_bytecode()],
+            vec![ScriptBuilder::new().drop_().drop_().to_bytecode()],
             [0x81; 32],
         )
         .unwrap();
@@ -2157,12 +2147,7 @@ mod tests {
 
     #[test]
     fn failed_delivery_matrix_returns_one_exact_bounce() {
-        let payload = || {
-            vec![Value::ClearToken(ClearToken::new(
-                Scalar::from(7u64),
-                FLAME_FLAVOR,
-            ))]
-        };
+        let payload = || Value::ClearToken(ClearToken::new(Scalar::from(7u64), FLAME_FLAVOR));
 
         let mut missing = ActorStore::new(StorageParams::default()).unwrap();
         let (error, _) = fail_and_bounce(
@@ -2259,7 +2244,7 @@ mod tests {
             .fee_sparks;
         let original = message(
             target.clone(),
-            vec![Value::ClearToken(ClearToken::new(fee, FLAME_FLAVOR))],
+            Value::ClearToken(ClearToken::new(fee, FLAME_FLAVOR)),
             10_000_000,
             8,
         );
@@ -2295,6 +2280,18 @@ mod tests {
         let expected_state = Value::Dict(state);
         let replacement_code = ScriptBuilder::new().nop().to_bytecode();
         let constructor_code = ScriptBuilder::new()
+            .push_int(1u64)
+            .get()
+            .roll_k(2)
+            .push_int(0u64)
+            .get()
+            .roll_k(2)
+            .drop_()
+            .roll_k(1)
+            .drop_()
+            .roll_k(2)
+            .drop_()
+            .roll_k(1)
             .push_int(1_024u64)
             .addstorage()
             .drop_()
@@ -2327,10 +2324,10 @@ mod tests {
             .fee_sparks;
         let delivery = message(
             target,
-            vec![
+            Value::Dict(Dict::from_values(vec![
                 expected_state.clone(),
                 Value::ClearToken(ClearToken::new(fee, FLAME_FLAVOR)),
-            ],
+            ])),
             10_000_000,
             70,
         );
@@ -2475,6 +2472,7 @@ mod tests {
     fn nested_call_effects_replay_in_order() {
         let mut baseline = ActorStore::new(StorageParams::default()).unwrap();
         let child_code = ScriptBuilder::new()
+            .drop_()
             .load()
             .drop_()
             .push_int(2u64)
@@ -2482,6 +2480,7 @@ mod tests {
             .to_bytecode();
         let child = deploy_actor(&mut baseline, 81, child_code);
         let parent_code = ScriptBuilder::new()
+            .drop_()
             .load()
             .drop_()
             .push_int(1u64)
@@ -2496,7 +2495,7 @@ mod tests {
             .drop_()
             .to_bytecode();
         let parent = deploy_actor(&mut baseline, 80, parent_code);
-        let delivery = message(parent.clone(), Vec::new(), 1_000_000, 80);
+        let delivery = message(parent.clone(), Value::Scalar(Scalar::ZERO), 1_000_000, 80);
 
         let mut executed = baseline.clone();
         let log = delivery
@@ -2552,9 +2551,9 @@ mod tests {
         let actor = deploy_actor(
             &mut baseline,
             82,
-            ScriptBuilder::new().load().drop_().to_bytecode(),
+            ScriptBuilder::new().drop_().load().drop_().to_bytecode(),
         );
-        let delivery = message(actor.clone(), Vec::new(), 1_000_000, 82);
+        let delivery = message(actor.clone(), Value::Scalar(Scalar::ZERO), 1_000_000, 82);
 
         let mut executed = baseline.clone();
         let log = delivery
@@ -2607,7 +2606,12 @@ mod tests {
         )
         .unwrap();
         let output_id = output.id();
-        let outbound = message(ActorID::from([92; 32]), Vec::new(), 1_000, 92);
+        let outbound = message(
+            ActorID::from([92; 32]),
+            Value::Scalar(Scalar::ZERO),
+            1_000,
+            92,
+        );
         let outbound_id = *outbound.id().as_bytes();
         let log = TxLog::from(vec![
             TxEntry::Header(TxHeader {
@@ -2664,14 +2668,9 @@ mod tests {
                 20 + index as u8,
                 ScriptBuilder::new().load().drop_().save().to_bytecode(),
             );
-            let result = message(
-                actor.clone(),
-                vec![value.clone()],
-                1_000_000,
-                20 + index as u8,
-            )
-            .execute_tx(&mut delivered, &BlockContext { height: 0 })
-            .expect("delivery succeeds");
+            let result = message(actor.clone(), value.clone(), 1_000_000, 20 + index as u8)
+                .execute_tx(&mut delivered, &BlockContext { height: 0 })
+                .expect("delivery succeeds");
             assert!(
                 result
                     .log()
@@ -2690,7 +2689,7 @@ mod tests {
             let mut recovered = ActorStore::new(StorageParams::default()).unwrap();
             let original = message(
                 ActorID::from([40 + index as u8; 32]),
-                vec![value],
+                value,
                 1_000_000,
                 40 + index as u8,
             );
@@ -2706,13 +2705,61 @@ mod tests {
     }
 
     #[test]
+    fn native_and_wire_decoded_message_records_execute_identically() {
+        let mut baseline = ActorStore::new(StorageParams::default()).unwrap();
+        let actor = deploy_actor(
+            &mut baseline,
+            49,
+            ScriptBuilder::new()
+                .push_int(4u64)
+                .get()
+                .roll_k(1)
+                .drop_()
+                .roll_k(1)
+                .drop_()
+                .load()
+                .drop_()
+                .save()
+                .to_bytecode(),
+        );
+        let mut record = Dict::new();
+        record.insert(Scalar::from(4u64), Value::Scalar(Scalar::from(9u64)));
+        let native = message(actor, Value::Dict(record), 1_000_000, 49);
+        let decoded = Message::from_cell(&native.to_cell().unwrap(), &mut ()).unwrap();
+        assert_eq!(native.id(), decoded.id());
+
+        let mut native_store = baseline.clone();
+        let native_result = native
+            .execute_tx(&mut native_store, &BlockContext { height: 0 })
+            .unwrap();
+        let mut decoded_store = baseline;
+        let decoded_result = decoded
+            .execute_tx(&mut decoded_store, &BlockContext { height: 0 })
+            .unwrap();
+        assert_eq!(native_result.metrics(), decoded_result.metrics());
+        assert_eq!(
+            native_result.log().effect_id(),
+            decoded_result.log().effect_id()
+        );
+        assert_eq!(
+            native_store.actor_root().unwrap(),
+            decoded_store.actor_root().unwrap()
+        );
+    }
+
+    #[test]
     fn bounce_collisions_reject_atomically() {
         let mut chain = Blockchain::new(ChainParams::default()).unwrap();
         let hasher = utreexo::utreexo_hasher::<ContractLeaf>();
         let mut work = chain.contracts.work_forest();
         let mut sends = VecDeque::new();
         let mut seen_outputs = BTreeSet::new();
-        let original = message(ActorID::from([50; 32]), Vec::new(), 1_000, 50);
+        let original = message(
+            ActorID::from([50; 32]),
+            Value::Scalar(Scalar::ZERO),
+            1_000,
+            50,
+        );
         let bounce = Blockchain::bounce_log(original).unwrap();
         let bounce_id = bounce
             .iter()

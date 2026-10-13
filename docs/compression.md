@@ -57,10 +57,14 @@ Utreexo retains its specialized forest and proof format.
 
 ## Tries and Dicts
 
-`cells::Trie` is a radix-4 Patricia trie with fixed-length byte keys. VM Dicts
-use 32-byte Scalar paths and authenticated Value leaves. Reads and mutations
-load only the required ordinary paths; unavailable data is a failure, never
-evidence that a key is absent. Nested Dicts resolve independently.
+`cells::Trie` is a radix-4 Patricia trie with fixed-length byte keys. Committed
+VM Dicts use 32-byte Scalar paths and authenticated Value leaves. Newly built
+runtime Dicts use an ordered native map, without Cells or hashes, until a
+commitment or serialization is required. Both forms have the same wire format.
+Cell-backed reads and mutations load only the required ordinary paths;
+unavailable data is a failure, never evidence that a key is absent. Nested
+cell-backed Dicts resolve independently. Native-map absence is conclusive
+because that map holds the complete dictionary, unlike a cell-backed cache.
 
 Dict capability summaries remain authenticated even when values are hidden.
 Pruning cannot make tokens droppable or Dicts copyable, and removing entries

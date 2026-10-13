@@ -279,7 +279,7 @@ fn nested_contractopen_does_not_transitively_inherit_actor_identity() {
         Script::Transparent(Vec::new()),
         0,
         100,
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         Anchor([0x55; 32]),
     )
     .unwrap();
@@ -296,7 +296,7 @@ fn nested_contractopen_does_not_transitively_inherit_actor_identity() {
         Script::Transparent(Vec::new()),
         0,
         50,
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         Anchor([0x66; 32]),
     )
     .unwrap();

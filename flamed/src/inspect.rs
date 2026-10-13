@@ -10,9 +10,9 @@ use flamed_rpc::{
 #[cfg(test)]
 use flamevm::ActorID;
 use flamevm::{
-    read_cell, resolve_cell, ActorAddress, Anchor, Cell, CellDecode, CellEncode, CellEnvelope,
-    CellError, CellIndex, CellRef, CellSlice, Contract, Instruction, Predicate, Scalar, Trie,
-    TxEntry, Value,
+    ActorAddress, Anchor, Cell, CellDecode, CellEncode, CellEnvelope, CellError, CellIndex,
+    CellRef, CellSlice, Contract, Instruction, Predicate, Scalar, Trie, TxEntry, Value, read_cell,
+    resolve_cell,
 };
 
 /// Decodes an archived contract's public payload.
@@ -103,7 +103,7 @@ fn disassemble(code: &[u8]) -> (Vec<InstructionView>, Option<String>) {
                     return (
                         instructions,
                         Some(format!("Byte {offset}: missing reference")),
-                    )
+                    );
                 }
             },
             Instruction::PushPoint(p) => format!("pushpoint 0x{}", hex::encode(p.to_bytes())),
@@ -243,42 +243,14 @@ fn message_effect(cell: &Cell, envelope: &mut CellEnvelope) -> Result<RpcTxEntry
     );
 
     let gas_limit = slice.load_u64()?.to_string();
-    let payload = read_cell(envelope, &slice.load_ref()?)?;
+    let payload = slice.load_ref()?;
     slice.finish()?;
-
-    // Message arguments use a dictionary with consecutive keys starting at zero.
-    let mut slice = CellSlice::new(&payload);
-    let len = usize::try_from(slice.load_u64()?).map_err(|_| CellError::LimitExceeded)?;
-    if slice.load_u8()? & !3 != 0 {
-        return Err(CellError::InvalidFormat);
-    }
-
-    let trie = if len == 0 {
-        Trie::new(32)?
-    } else {
-        Trie::from_cell(slice.load_ref()?, 32)?
-    };
-
-    slice.finish()?;
-
-    let payload = trie
-        .entries_exact(len, envelope)?
-        .into_iter()
-        .enumerate()
-        .map(|(i, (key, reference))| {
-            let mut expected = Scalar::from(i as u64).to_bytes();
-            expected.reverse();
-            if key != expected {
-                return Err(CellError::InvalidFormat);
-            }
-            match read_cell(envelope, &reference).and_then(|cell| Value::from_cell(&cell, envelope))
-            {
-                Ok(value) => render_value(&value, envelope),
-                Err(CellError::MissingCell(_)) => available_cells(&reference, envelope),
-                Err(error) => Err(error),
-            }
-        })
-        .collect::<Result<_, _>>()?;
+    let payload =
+        match read_cell(envelope, &payload).and_then(|cell| Value::from_cell(&cell, envelope)) {
+            Ok(value) => render_value(&value, envelope)?,
+            Err(CellError::MissingCell(_)) => available_cells(&payload, envelope)?,
+            Err(error) => return Err(error),
+        };
 
     Ok(RpcTxEntry::Send {
         message: cell.id(),
@@ -375,11 +347,7 @@ fn render_effect(entry: &TxEntry, envelope: &mut CellEnvelope) -> Result<RpcTxEn
             target: actor_target(&m.target, envelope)?,
             caller: m.caller.as_ref().map(|a| ActorId(a.to_hash())),
             anchor: m.anchor.0,
-            payload: m
-                .payload()
-                .iter()
-                .map(|value| render_value(value, envelope))
-                .collect::<Result<_, _>>()?,
+            payload: render_value(m.payload(), envelope)?,
             gas_limit: m.gas.to_string(),
             refund_predicate: PredicatePoint(m.refund_predicate.to_point().to_bytes()),
         },
@@ -533,9 +501,11 @@ mod tests {
         };
         assert_eq!(*id, CellId(root.id()));
         assert_eq!(cells.len(), 2);
-        assert!(cells
-            .iter()
-            .any(|cell| cell.id == CellId(child.id()) && cell.data == [9]));
+        assert!(
+            cells
+                .iter()
+                .any(|cell| cell.id == CellId(child.id()) && cell.data == [9])
+        );
     }
     use curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED;
     use flamevm::{CellBuilder, CellIndex, CellValue, ClearToken, Dict, Message, TxHeader, TxLog};
@@ -581,7 +551,7 @@ mod tests {
                     actor,
                     Some(ActorID::from([0x33; 32])),
                     Anchor([0x44; 32]),
-                    vec![state],
+                    state,
                     u64::MAX,
                     predicate,
                 )
@@ -601,7 +571,7 @@ mod tests {
             let value = match &decoded[0] {
                 RpcTxEntry::ActorSave { state, .. } => state,
                 RpcTxEntry::Output { payload, .. } => payload,
-                RpcTxEntry::Send { payload, .. } => &payload[0],
+                RpcTxEntry::Send { payload, .. } => payload,
                 _ => panic!("expected a value"),
             };
             let TxValue::Cells { root, cells } = value else {
@@ -622,9 +592,11 @@ mod tests {
                         .collect::<Vec<_>>()
                 );
             }
-            assert!(cells
-                .iter()
-                .any(|c| c.refs.iter().any(|r| !expected_cells.contains(&r.0))));
+            assert!(
+                cells
+                    .iter()
+                    .any(|c| c.refs.iter().any(|r| !expected_cells.contains(&r.0)))
+            );
             let json = serde_json::to_value(&decoded).unwrap();
             assert_eq!(
                 serde_json::from_value::<Vec<RpcTxEntry>>(json).unwrap(),
@@ -742,7 +714,7 @@ mod tests {
             target,
             None,
             Anchor([0x92; 32]),
-            vec![],
+            Value::Scalar(Scalar::ZERO),
             1_000,
             Predicate::opaque(Predicate::unspendable_key()),
         )
@@ -840,7 +812,7 @@ mod tests {
                     target.clone(),
                     Some(actor.clone()),
                     Anchor([0x66; 32]),
-                    vec![token],
+                    token,
                     u64::MAX,
                     predicate,
                 )
@@ -894,7 +866,7 @@ mod tests {
                 },
                 "caller": "11".repeat(32),
                 "anchor": "66".repeat(32),
-                "payload": [{ "type": "clear_token", "quantity": "7", "flavor": "8" }],
+                "payload": { "type": "clear_token", "quantity": "7", "flavor": "8" },
                 "gas_limit": u64::MAX.to_string(),
                 "refund_predicate": hex::encode(point.to_bytes()),
             })

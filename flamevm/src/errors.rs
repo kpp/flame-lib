@@ -84,8 +84,8 @@ pub enum VMError {
     #[error("jump target label not found")]
     LabelNotFound,
 
-    /// This error occurs when `return k` is invoked with a bad k.
-    #[error("Bad return arity")]
+    /// This error occurs when `return` has no result value.
+    #[error("Return requires one result value")]
     BadReturnArity,
 
     /// This error occurs when `return` is invoked at the outermost call frame.

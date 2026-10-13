@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use flamed_rpc::{
     ActorId, BlockId, BlockResult, BlocksResult, ClientError, ExecutionData, FlamedApiClient,
-    HttpClientBuilder, TxId, MAX_PAGE_SIZE,
+    HttpClientBuilder, MAX_PAGE_SIZE, TxId,
 };
 use flamevm::{ActorID, CellEncode, CellValue, ScriptBuilder};
 use jsonrpsee::{core::client::ClientT, rpc_params};
@@ -14,6 +14,7 @@ use super::*;
 
 fn counter_code() -> Vec<u8> {
     ScriptBuilder::new()
+        .drop_()
         .load()
         .push_int(0u64)
         .get()
@@ -146,7 +147,6 @@ pub(super) fn deploy(node: &mut Node, genesis: &GenesisFile) -> (ActorId, Contra
         .signtx()
         .push_int(20 * FLAME)
         .split()
-        .push_int(1u64)
         .push_literal(
             CellValue::from_bytes(input.predicate.to_point().to_bytes().to_vec()).unwrap(),
         )
@@ -323,7 +323,6 @@ fn failed_delivery_summary_matches_its_archived_refund() {
         .signtx()
         .push_int(20 * FLAME)
         .split()
-        .push_int(1u64)
         .push_literal(CellValue::from_bytes(predicate.to_vec()).unwrap())
         .push_int(1_000_000u64)
         .push_cell(
@@ -370,10 +369,7 @@ fn failed_delivery_summary_matches_its_archived_refund() {
     let id = refund.id.0;
     assert!(node.verify_proof(&id, &live(&node, &id)));
     let contract = contract_of(&node, &id);
-    let flamevm::Value::Dict(mut payload) = contract.payload().clone() else {
-        panic!("refund payload")
-    };
-    let flamevm::Value::ClearToken(value) = payload.remove(&flamevm::Scalar::ZERO).unwrap() else {
+    let flamevm::Value::ClearToken(value) = contract.payload() else {
         panic!("refund token")
     };
     assert_eq!(value.qty().to_u64().unwrap(), 20 * FLAME);

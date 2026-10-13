@@ -61,6 +61,11 @@ The count and sticky flags belong to the Dict, not the Trie: portable bit 0,
 droppable bit 1; other bits are invalid. A drained Dict is droppable regardless
 of its sticky bit. No special list encoding exists.
 
+Runtime construction uses a native ordered map and defers Trie construction
+and hashing until commitment/serialization. This does not change the encoded
+layout. Decoded Dicts remain cell-backed and preserve lazy authenticated access;
+serialization never grants authority to resolve missing or pruned branches.
+
 Other Value tags and runtime-only types are rejected. Private witnesses never
 enter encoding or hashes. ContractID is the Contract root's factual CellID;
 `input` takes that root. Authenticated Dict summaries can be read lazily;
@@ -103,7 +108,13 @@ struct Message {
     caller: Caller,
     refund: Point,
     gas: U64,
-    arguments: ^Cell,
+    payload: ^Value,
+}
+
+// Application routing address; distinct from the ActorAddress destination.
+enum Address: U8 {
+    Predicate { predicate: Point } = 0,
+    MessageTarget { dst: ActorAddress, gas: U64, payload: ^Value } = 1,
 }
 ```
 
@@ -113,8 +124,13 @@ refs: code and a portable Value root. Freeze prunes the entire ActorState;
 Restore authenticates it against the saved snapshot, preserving older cuts.
 See [Actors](flamevm.md#actors) for execution and rollback rules.
 
-Message arguments are a Dict with consecutive keys `0..count-1`. MessageID is
-the Message Cell's factual ID; each send ratchets the anchor for uniqueness.
+Message payload is one tagged portable Value, without an implicit argument-list
+Dict. Applications group fields explicitly in a Dict; Scalar zero conventionally
+represents no application data. MessageID is the Message Cell's factual ID; each
+send ratchets the anchor for uniqueness. Failed delivery seals that same Value
+directly into the refund Contract.
+The routing `Address::MessageTarget` also carries one portable Value directly;
+its encoder and decoder both reject nonportable payloads.
 
 Actor registry and lease shapes:
 

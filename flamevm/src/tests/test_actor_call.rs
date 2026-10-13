@@ -34,12 +34,12 @@ fn vm_for_actor(actor: ActorID, script: Vec<u8>) -> VM {
     )
 }
 
-/// Helper: builds bytecode that invokes `op_call` with `k=0` args
+/// Helper: builds bytecode that invokes `op_call` with a unit request
 /// (plain single-action callee — no selector). Spec stack
-/// (bottom→top): `k gas addr call`.
+/// (bottom→top): `request gas addr call`.
 fn call_script(target: &ActorID, gas: u64) -> Vec<u8> {
     ScriptBuilder::new()
-        .push_int(0u64) // k = 0 args
+        .push_int(0u64) // unit request
         .push_int(gas) // gas
         .push_literal(actor_address(&target)) // tagged ActorAddress Cell
         .call()
@@ -51,18 +51,17 @@ fn call_script(target: &ActorID, gas: u64) -> Vec<u8> {
 /// dispatch-coded callees.
 fn call_with_selector(target: &ActorID, sel: u64, gas: u64) -> Vec<u8> {
     ScriptBuilder::new()
-        .push_int(sel) // selector arg (top)
-        .push_int(1u64) // k = 1 arg
+        .push_int(sel) // selector request
         .push_int(gas)
         .push_literal(actor_address(&target))
         .call()
         .to_bytecode()
 }
 
-/// `nop`-only recv — short fixture used when the test only cares
+/// Unit-consuming recv — short fixture used when the test only cares
 /// about call-frame mechanics, not the callee body.
 fn nop_recv() -> Vec<u8> {
-    ScriptBuilder::new().nop().to_bytecode()
+    ScriptBuilder::new().drop_().nop().to_bytecode()
 }
 
 fn assert_same_bearer(actual: &Value, expected: &Value) {
@@ -119,7 +118,6 @@ fn failed_call_stack(
     let mut reg = MemRegistry::new();
     let callee = deploy_recv(&mut reg, child, 10_000);
     let caller_script = ScriptBuilder::new()
-        .push_int(1u64)
         .push_int(gas)
         .push_literal(actor_address(&callee))
         .call()
@@ -155,24 +153,25 @@ fn failed_internal_decrypt_restores_call_arguments() {
     let expected_token = Value::Token(token.clone());
 
     let mut reg = MemRegistry::new();
-    let callee = deploy_recv(
-        &mut reg,
-        ScriptBuilder::new().decrypt().to_bytecode(),
-        10_000,
-    );
+    let mut child = ScriptBuilder::new();
+    for key in 0..5u64 {
+        child = child.push_int(key).get().roll_k(1).drop_().roll_k(1);
+    }
+    let callee = deploy_recv(&mut reg, child.drop_().decrypt().to_bytecode(), 10_000);
     let caller_script = ScriptBuilder::new()
-        .push_int(f)
-        .push_int(wrong_f_blind)
-        .push_int(q)
-        .push_int(q_blind)
-        .push_int(5u64)
         .push_int(100_000u64)
         .push_literal(actor_address(&callee))
         .call()
         .to_bytecode();
     let caller = deploy_recv(&mut reg, caller_script.clone(), 10_000);
     let mut vm = vm_for_actor(caller, caller_script);
-    vm.push_value(Value::Token(token));
+    vm.push_value(Value::Dict(Dict::from_values(vec![
+        Value::Token(token),
+        Value::Scalar(f),
+        Value::Scalar(wrong_f_blind),
+        Value::Scalar(q),
+        Value::Scalar(q_blind),
+    ])));
 
     while vm.call_stack.is_empty() {
         vm.step_internal_with_registry(&mut reg)
@@ -183,16 +182,18 @@ fn failed_internal_decrypt_restores_call_arguments() {
             .expect("decrypt failure is converted to call failure");
     }
 
-    assert_eq!(vm.current_call.stack.len(), 7);
-    assert_same_bearer(&vm.current_call.stack[0], &expected_token);
-    for (actual, expected) in vm.current_call.stack[1..5]
-        .iter()
-        .zip([f, wrong_f_blind, q, q_blind])
-    {
-        assert_int(actual, expected);
+    assert_eq!(vm.current_call.stack.len(), 2);
+    let Value::Dict(request) = &vm.current_call.stack[0] else {
+        panic!("expected original Dict request");
+    };
+    assert_same_bearer(request.get(&Scalar::ZERO).unwrap(), &expected_token);
+    for (index, expected) in [f, wrong_f_blind, q, q_blind].iter().copied().enumerate() {
+        assert_int(
+            request.get(&Scalar::from(index as u64 + 1)).unwrap(),
+            expected,
+        );
     }
-    assert_int(&vm.current_call.stack[5], Scalar::from(5u64));
-    assert_int(&vm.current_call.stack[6], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[1], Scalar::ZERO);
 }
 
 #[test]
@@ -214,7 +215,6 @@ fn call_rejects_nested_nonportable_argument() {
     outer.insert(Scalar::ZERO, Value::Dict(inner));
     vm.current_call.stack = vec![
         Value::Dict(outer),
-        Value::Scalar(Scalar::ONE),
         Value::Scalar(Scalar::from(10_000u64)),
         witness_cell(actor_address(&callee)),
     ];
@@ -229,7 +229,7 @@ fn call_a_to_b_creates_new_frame_with_callee_identity() {
     // B: just `nop` so it does nothing then frame exits clean.
     let b = deploy_recv(&mut reg, nop_recv(), 1_000);
 
-    // A: call B; expect 0 results.
+    // A: call B; expect a unit result.
     let a_script = call_script(&b, 10_000);
     let a = deploy_recv(&mut reg, a_script.clone(), 10_000);
 
@@ -282,7 +282,7 @@ fn call_does_not_emit_txlog_entry_by_itself() {
 fn call_to_checked_out_actor_blocked() {
     // The re-entrancy lock (ADR 0017): calling an actor whose state is
     // checked out — a live frame holds it mid-update — fails with the
-    // `[count=0, success=0]`. The state's absence *is*
+    // `[unit=0, success=0]`. The state's absence *is*
     // the lock; `resolve_method` returns `ActorEmpty`.
     let mut reg = MemRegistry::new();
     let id = ActorID::from([0xa1; 32]);
@@ -323,7 +323,7 @@ fn reentrant_call_succeeds_when_state_not_held() {
         .push_literal(CellValue::from_bytes(b"reentered".to_vec()).unwrap())
         .log()
         .to_bytecode();
-    // A.recv (method 0): call B, drop B's [count, success].
+    // A.recv (method 0): call B, drop B's [unit, success].
     let a_recv = {
         let mut p = ScriptBuilder::parse(&call_script(&b_id, 200_000)).expect("parse");
         p.push_instr(Instruction::Drop);
@@ -335,9 +335,10 @@ fn reentrant_call_succeeds_when_state_not_held() {
     reg.deploy(a_id.clone(), a_code, empty_state(), 1_000_000)
         .expect("deploy A");
 
-    // B.recv: call A.method1, drop A's [count, success].
+    // B.recv: call A.method1, drop A's [unit, success].
     let b_recv = {
         let mut p = ScriptBuilder::parse(&call_with_selector(&a_id, 1, 100_000)).expect("parse");
+        p.push_instr(Instruction::Drop); // incoming unit request
         p.push_instr(Instruction::Drop);
         p.push_instr(Instruction::Drop);
         p.to_bytecode()
@@ -363,11 +364,11 @@ fn sibling_calls_to_same_actor_allowed_after_return() {
     // not re-entrancy because B isn't on the live call stack at
     // the time of the second call.
     let mut reg = MemRegistry::new();
-    // B: `push:0; return` — returns 0 results.
-    let b_recv = ScriptBuilder::new().push_int(0u64).return_().to_bytecode();
+    // B returns its scalar-zero unit request directly.
+    let b_recv = ScriptBuilder::new().return_().to_bytecode();
     let b = deploy_recv(&mut reg, b_recv, 1_000);
 
-    // A: call B; drop returned `[count=0, success=1]`; call B again;
+    // A: call B; drop returned `[unit=0, success=1]`; call B again;
     // drop those two markers — leaves an empty stack for the implicit
     // root finish_call.
     let a_script = {
@@ -427,8 +428,8 @@ fn call_grant_exceeding_caller_budget_is_out_of_gas() {
 #[test]
 fn call_refunds_leftover_gas_to_caller() {
     let mut reg = MemRegistry::new();
-    // Child: push:0 return — 2 instructions ≈ 2 gas of a 5_000 grant.
-    let b_recv = ScriptBuilder::new().push_int(0u64).return_().to_bytecode();
+    // Child returns its unit request, spending only a small part of its grant.
+    let b_recv = ScriptBuilder::new().return_().to_bytecode();
     let b = deploy_recv(&mut reg, b_recv, 1_000);
     let a_script = {
         let mut p = ScriptBuilder::parse(&call_script(&b, 5_000)).expect("parse");
@@ -478,7 +479,7 @@ fn reentrant_view_of_mid_update_state_is_blocked() {
         .expect("deploy A");
 
     // B.recv: call A.method1 — blocked (A checked out). The selector
-    // is restored ahead of `count=1, success=0`; consume all three.
+    // is restored ahead of `success=0`; consume both and B's own unit request.
     let b_recv = {
         let mut p = ScriptBuilder::parse(&call_with_selector(&a_id, 1, 100_000)).expect("parse");
         p.push_instr(Instruction::Drop);
@@ -644,7 +645,7 @@ fn failed_call_refunds_unused_grant() {
         .verify()
         .to_bytecode();
     let b = deploy_recv(&mut reg, b_code, 1_000);
-    // A: call B with a 5_000 grant, consume `count=0, success=0`.
+    // A: call B with a 5_000 grant, consume `unit=0, success=0`.
     let a_script = {
         let mut p = ScriptBuilder::parse(&call_script(&b, 5_000)).expect("parse");
         p.push_instr(Instruction::Drop);
@@ -715,9 +716,9 @@ fn nested_failures_refund_unused_grants_without_creating_gas() {
 fn call_depth_caps_at_exactly_max() {
     let mut reg = MemRegistry::new();
     let id = ActorID::from([0xce; 32]);
-    // recv: args…k=0, gas−200, addr → call; consume its result.
+    // recv: unit request, gas−200, addr → call; consume its result.
     let recv = ScriptBuilder::new()
-        .push_int(0u64) // k = 0 args
+        .push_int(0u64) // unit request
         .gas()
         .push_int(-200i64)
         .add() // grant = remaining − 200
@@ -783,15 +784,16 @@ fn f1_failed_subcall_load_does_not_destroy_actor() {
         .to_bytecode();
     let x_id = deploy_recv(&mut reg, evil_recv, 10_000);
 
-    // A.recv: call X (k=0, gas=5_000), consume its failure result so
+    // A.recv: call X (unit request, gas=5_000), consume its failure result so
     // A's frame exits clean (stack empty → no StackNotClean).
     let a_recv = ScriptBuilder::new()
-        .push_int(0u64) // k = 0 args
+        .drop_() // incoming message unit
+        .push_int(0u64) // unit request
         .push_int(5_000u64) // gas
         .push_literal(actor_address(&x_id)) // addr
         .call()
         .drop_() // drop status = 0
-        .drop_() // drop restored-value count = 0
+        .drop_() // drop restored unit request
         .to_bytecode();
     let a_id = deploy_recv(&mut reg, a_recv, 10_000);
 
@@ -801,7 +803,7 @@ fn f1_failed_subcall_load_does_not_destroy_actor() {
         a_id,
         None,
         Anchor([0x42; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         100_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -859,6 +861,7 @@ fn f1_failed_subcall_save_rolls_back_state_mutation() {
     );
 
     let a_recv = ScriptBuilder::new()
+        .drop_() // incoming message unit
         .push_int(0u64)
         .push_int(5_000u64)
         .push_literal(actor_address(&x_id))
@@ -873,7 +876,7 @@ fn f1_failed_subcall_save_rolls_back_state_mutation() {
         a_id,
         None,
         Anchor([0x42; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         100_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -943,6 +946,7 @@ fn f3_save_failure_rolls_back_and_preserves_actor() {
     );
 
     let a_recv = ScriptBuilder::new()
+        .drop_() // incoming message unit
         .push_int(0u64)
         .push_int(5_000u64)
         .push_literal(actor_address(&x_id))
@@ -957,7 +961,7 @@ fn f3_save_failure_rolls_back_and_preserves_actor() {
         a_id,
         None,
         Anchor([0x42; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         100_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -1018,10 +1022,9 @@ fn call_to_unknown_actor_rejected_with_marker() {
     let mut reg = MemRegistry::new();
     // Caller exists; target does not — pre-frame registry lookup
     // fails. The original Token argument must be restored before
-    // `count=1, success=0`; no side effects are emitted.
+    // `success=0`; no side effects are emitted.
     let ghost = ActorID::from([0xab; 32]);
     let a_script = ScriptBuilder::new()
-        .push_int(1u64)
         .push_int(10_000u64)
         .push_literal(actor_address(&ghost))
         .call()
@@ -1030,16 +1033,15 @@ fn call_to_unknown_actor_rejected_with_marker() {
     let mut vm = vm_for_actor(a, a_script);
     let token = Token::cleartext(Scalar::from(7u64), Scalar::from(9u64)).unwrap();
     vm.push_value(Value::Token(token.clone()));
-    for _ in 0..4 {
+    for _ in 0..3 {
         vm.step_internal_with_registry(&mut reg).expect("step ok");
     }
-    assert_eq!(vm.current_call.stack.len(), 3);
+    assert_eq!(vm.current_call.stack.len(), 2);
     assert!(matches!(
         &vm.current_call.stack[0],
         Value::Token(t) if t.qty() == token.qty() && t.flv() == token.flv()
     ));
-    assert_int(&vm.current_call.stack[1], Scalar::ONE);
-    assert_int(&vm.current_call.stack[2], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[1], Scalar::ZERO);
     assert_eq!(vm.txlog.len(), 1);
 }
 
@@ -1082,10 +1084,9 @@ fn entered_call_failure_matrix_restores_portable_bearers() {
 
     for (child, bearer, gas, exhaust_after_entry) in cases {
         let stack = failed_call_stack(child, bearer.clone(), gas, exhaust_after_entry);
-        assert_eq!(stack.len(), 3);
+        assert_eq!(stack.len(), 2);
         assert_same_bearer(&stack[0], &bearer);
-        assert_int(&stack[1], Scalar::ONE);
-        assert_int(&stack[2], Scalar::ZERO);
+        assert_int(&stack[1], Scalar::ZERO);
     }
 }
 
@@ -1098,14 +1099,12 @@ fn nested_call_failure_restores_one_original_bearer() {
         10_000,
     );
     let b_script = ScriptBuilder::new()
-        .push_int(1u64)
         .push_int(5_000u64)
         .push_literal(actor_address(&c))
         .call()
         .to_bytecode();
     let b = deploy_recv(&mut reg, b_script, 10_000);
     let a_script = ScriptBuilder::new()
-        .push_int(1u64)
         .push_int(100_000u64)
         .push_literal(actor_address(&b))
         .call()
@@ -1129,10 +1128,9 @@ fn nested_call_failure_restores_one_original_bearer() {
     }
     assert!(entered && vm.call_stack.is_empty());
 
-    assert_eq!(vm.current_call.stack.len(), 3);
+    assert_eq!(vm.current_call.stack.len(), 2);
     assert_same_bearer(&vm.current_call.stack[0], &bearer);
-    assert_int(&vm.current_call.stack[1], Scalar::ONE);
-    assert_int(&vm.current_call.stack[2], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[1], Scalar::ZERO);
 }
 
 #[test]
@@ -1140,11 +1138,10 @@ fn successful_call_discards_escrow_copy() {
     let mut reg = MemRegistry::new();
     let callee = deploy_recv(
         &mut reg,
-        ScriptBuilder::new().push_int(1u64).return_().to_bytecode(),
+        ScriptBuilder::new().return_().to_bytecode(),
         10_000,
     );
     let caller_script = ScriptBuilder::new()
-        .push_int(1u64)
         .push_int(5_000u64)
         .push_literal(actor_address(&callee))
         .call()
@@ -1158,8 +1155,104 @@ fn successful_call_discards_escrow_copy() {
         vm.step_internal_with_registry(&mut reg).expect("step ok");
     }
 
-    assert_eq!(vm.current_call.stack.len(), 3);
+    assert_eq!(vm.current_call.stack.len(), 2);
     assert_same_bearer(&vm.current_call.stack[0], &token);
     assert_int(&vm.current_call.stack[1], Scalar::ONE);
-    assert_int(&vm.current_call.stack[2], Scalar::ONE);
+}
+
+#[test]
+fn call_echoes_one_portable_value_without_an_arity_operand_or_result() {
+    let requests = vec![
+        Value::Scalar(Scalar::ZERO),
+        Value::Scalar(Scalar::from(23u64)),
+        Value::Token(Token::cleartext(Scalar::from(7u64), FLAME_FLAVOR).unwrap()),
+        Value::ClearToken(ClearToken::new(Scalar::from(9u64), FLAME_FLAVOR)),
+        Value::Point(Point::from_compressed(Predicate::unspendable_key())),
+        Value::Cell(CellValue::from_bytes(vec![1, 2, 3]).unwrap()),
+        Value::Dict(Dict::from_values(vec![
+            Value::Scalar(Scalar::from(11u64)),
+            Value::Token(Token::cleartext(Scalar::from(13u64), FLAME_FLAVOR).unwrap()),
+        ])),
+    ];
+    for request in requests {
+        let expected = state_root(&request);
+        let mut registry = MemRegistry::new();
+        let callee = deploy_recv(
+            &mut registry,
+            ScriptBuilder::new().return_().to_bytecode(),
+            10_000,
+        );
+        let code = ScriptBuilder::new()
+            .push_int(10_000u64)
+            .push_literal(actor_address(&callee))
+            .call()
+            .to_bytecode();
+        let caller = deploy_recv(&mut registry, code.clone(), 10_000);
+        let mut vm = vm_for_actor(caller, code);
+        vm.push_value(Value::Scalar(Scalar::from(99u64)));
+        vm.push_value(request);
+        while !vm.current_call.is_finished() || !vm.call_stack.is_empty() {
+            vm.step_internal_with_registry(&mut registry).unwrap();
+        }
+        assert_eq!(vm.current_call.stack.len(), 3);
+        assert_int(&vm.current_call.stack[0], Scalar::from(99u64));
+        assert_eq!(state_root(&vm.current_call.stack[1]), expected);
+        assert_int(&vm.current_call.stack[2], Scalar::ONE);
+        assert!(vm.current_call.snap_failure_values.is_empty());
+    }
+}
+
+#[test]
+fn implicit_child_exit_returns_one_scalar_zero_unit() {
+    let mut registry = MemRegistry::new();
+    let callee = deploy_recv(
+        &mut registry,
+        ScriptBuilder::new().drop_().to_bytecode(),
+        10_000,
+    );
+    let code = call_script(&callee, 10_000);
+    let caller = deploy_recv(&mut registry, code.clone(), 10_000);
+    let mut vm = vm_for_actor(caller, code);
+    while !vm.current_call.is_finished() || !vm.call_stack.is_empty() {
+        vm.step_internal_with_registry(&mut registry).unwrap();
+    }
+    assert_eq!(vm.current_call.stack.len(), 2);
+    assert_int(&vm.current_call.stack[0], Scalar::ZERO);
+    assert_int(&vm.current_call.stack[1], Scalar::ONE);
+}
+
+#[test]
+fn call_forwards_lazy_dict_without_resolving_unavailable_branches() {
+    let mut original = Dict::new();
+    original.insert(Scalar::from(53u64), Value::Scalar(Scalar::from(71u64)));
+    let encoded = original.to_cell().unwrap();
+    let request = Value::Dict(Dict::from_trusted_cell(&encoded.detached(), &mut ()).unwrap());
+    let expected = state_root(&request);
+    let mut registry = MemRegistry::new();
+    let callee = deploy_recv(
+        &mut registry,
+        ScriptBuilder::new().return_().to_bytecode(),
+        10_000,
+    );
+    let code = ScriptBuilder::new()
+        .push_int(10_000u64)
+        .push_literal(actor_address(&callee))
+        .call()
+        .to_bytecode();
+    let caller = deploy_recv(&mut registry, code.clone(), 10_000);
+    let mut vm = vm_for_actor(caller, code);
+    vm.push_value(request);
+    while !vm.current_call.is_finished() || !vm.call_stack.is_empty() {
+        vm.step_internal_with_registry(&mut registry).unwrap();
+    }
+    assert_eq!(vm.current_call.stack.len(), 2);
+    assert_eq!(state_root(&vm.current_call.stack[0]), expected);
+    assert_int(&vm.current_call.stack[1], Scalar::ONE);
+    let Value::Dict(returned) = &mut vm.current_call.stack[0] else {
+        panic!("expected the lazy Dict result");
+    };
+    assert!(matches!(
+        returned.get_resolved(&Scalar::from(53u64), &mut ()),
+        Err(CellError::MissingCell(_))
+    ));
 }

@@ -70,7 +70,7 @@ async fn actor_tracks_updates_expiry_and_replay() {
             .iter()
             .map(|op| op.text.as_str())
             .collect::<Vec<_>>(),
-        ["load", "push 0", "get", "push 1", "add", "put", "save"]
+        ["drop", "load", "push 0", "get", "push 1", "add", "put", "save"]
     );
     assert_eq!(deployed.instructions[0].offset, 0);
     assert!(deployed
