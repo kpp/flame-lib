@@ -104,7 +104,7 @@ fn put_marks_dict_non_portable() {
         .push_int(0u64)
         .dict() // {}
         .push_int(0u64) // key
-        .push_str(String::from(Vec::<u8>::new()))
+        .push_literal(CellValue::from_bytes(Vec::<u8>::new()).unwrap())
         .transcript() // → Merlin
         .put()
         .to_bytecode();

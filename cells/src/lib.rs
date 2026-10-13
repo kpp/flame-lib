@@ -1,21 +1,23 @@
 //! Content-addressed Cells and the minimal structures built from them.
 
-mod boc;
 mod builder;
 mod cell;
 mod codec;
+pub mod ctl;
 mod error;
+mod index;
 mod slice;
-#[cfg(test)]
-mod snake;
+mod transport;
 mod trie;
 
-pub use boc::{BagOfCells, BoCID, CellEnvelope, GasMeter};
 pub use builder::CellBuilder;
 pub use cell::{
-    Cell, CellID, CellRef, CellResolver, MAX_CELL_PAYLOAD, MAX_CELL_REFS, resolve_cell,
+    Cell, CellCommitment, CellID, CellReader, CellRef, CellResolver, CellView, MAX_CELL_LEVEL,
+    MAX_CELL_PAYLOAD, MAX_CELL_REFS, read_cell, resolve_cell,
 };
 pub use codec::{CellDecode, CellEncode};
 pub use error::CellError;
+pub use index::{CellEnvelope, CellIndex, project_cell};
 pub use slice::CellSlice;
+pub use transport::GasMeter;
 pub use trie::{MAX_TRIE_KEY_BYTES, Trie};

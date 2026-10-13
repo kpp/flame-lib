@@ -4,7 +4,7 @@
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
 use flamekd::{util, Network, HARDENED};
 
-use crate::keys::{Account, KeyError};
+use crate::keys::{KeyError, ReceiveAccount, SpendAccount, ViewAccount};
 
 const SEED: [u8; 64] = [0x33; 64];
 
@@ -17,8 +17,8 @@ const PAIRS: [(u32, u32); 5] = [
     (util::CHANGE, 21),
 ];
 
-fn account() -> Account {
-    Account::from_seed(&SEED, Network::Testnet).expect("account from seed")
+fn account() -> SpendAccount {
+    SpendAccount::from_seed(&SEED, Network::Testnet, 0).expect("account from seed")
 }
 
 #[test]
@@ -77,6 +77,112 @@ fn the_branch_receiving_key_derives_the_same_addresses() {
             "address at receiving/{n}"
         );
     }
+}
+
+#[test]
+fn the_view_key_derives_the_same_viewing_keys() {
+    let account = account();
+    let view = account.view_key();
+    assert_eq!(
+        view.to_recv(),
+        account.recv_key(),
+        "the view key narrows to the account recv key"
+    );
+
+    for (branch, n) in PAIRS {
+        assert_eq!(
+            view.derive_child(branch)
+                .and_then(|key| key.derive_child(n))
+                .expect("child")
+                .viewing_key(),
+            &account.viewing_key_at(branch, n).expect("viewing key"),
+            "v at {branch}/{n}"
+        );
+    }
+}
+
+#[test]
+fn a_view_account_sees_everything_the_spending_one_does() {
+    let mut account = account();
+    account.next_address().expect("next address");
+    let view = ViewAccount::from_view_key(account.view_key(), Network::Testnet, 1)
+        .expect("account from view key");
+
+    let narrowed = account.to_view_account();
+    assert_eq!(narrowed.view_key(), view.view_key());
+    assert_eq!(narrowed.next_index(), view.next_index());
+    assert_eq!(narrowed.network(), view.network());
+    assert_eq!(view.view_key(), account.view_key());
+    assert_eq!(view.recv_key(), account.recv_key());
+    for (branch, n) in PAIRS {
+        assert_eq!(
+            view.address_at(branch, n).expect("address"),
+            account.address_at(branch, n).expect("address"),
+            "address at {branch}/{n}"
+        );
+        assert_eq!(
+            view.viewing_key_at(branch, n).expect("viewing key"),
+            account.viewing_key_at(branch, n).expect("viewing key"),
+            "v at {branch}/{n}"
+        );
+    }
+
+    let point = account
+        .address_at(util::CHANGE, 21)
+        .expect("address")
+        .spending_key()
+        .compress();
+    assert_eq!(view.owns(&point, 21), Some((util::CHANGE, 21)));
+    assert_eq!(
+        ViewAccount::from_view_key(account.view_key(), Network::Testnet, HARDENED).err(),
+        Some(KeyError::HardenedIndex(HARDENED))
+    );
+}
+
+#[test]
+fn a_receive_account_finds_everything_the_spending_one_does() {
+    let mut account = account();
+    account.next_address().expect("next address");
+    let receive = ReceiveAccount::from_recv_key(account.recv_key(), Network::Testnet, 1)
+        .expect("account from recv key");
+
+    for narrowed in [
+        account.to_receive_account(),
+        account.to_view_account().to_receive_account(),
+    ] {
+        assert_eq!(narrowed.recv_key(), receive.recv_key());
+        assert_eq!(narrowed.next_index(), receive.next_index());
+        assert_eq!(narrowed.network(), receive.network());
+    }
+    for (branch, n) in PAIRS {
+        assert_eq!(
+            receive.address_at(branch, n).expect("address"),
+            account.address_at(branch, n).expect("address"),
+            "address at {branch}/{n}"
+        );
+        assert_eq!(
+            receive
+                .predicate_at(branch, n)
+                .expect("predicate")
+                .to_point(),
+            account
+                .predicate_at(branch, n)
+                .expect("predicate")
+                .to_point(),
+            "predicate at {branch}/{n}"
+        );
+    }
+
+    let point = account
+        .address_at(util::CHANGE, 21)
+        .expect("address")
+        .spending_key()
+        .compress();
+    assert_eq!(receive.owns(&point, 21), Some((util::CHANGE, 21)));
+    assert_eq!(
+        ReceiveAccount::from_recv_key(account.recv_key(), Network::Testnet, HARDENED).err(),
+        Some(KeyError::HardenedIndex(HARDENED))
+    );
 }
 
 #[test]
@@ -155,7 +261,8 @@ fn a_hardened_branch_or_index_is_refused() {
 /// branch order or flamekd's derivation changes, this is what notices.
 #[test]
 fn pinned_testnet_address() {
-    let account = Account::from_seed(&[0x11; 64], Network::Testnet).expect("account from seed");
+    let account =
+        SpendAccount::from_seed(&[0x11; 64], Network::Testnet, 0).expect("account from seed");
     let address = account
         .address_at(util::RECEIVING, 0)
         .expect("first receiving address");

@@ -1,13 +1,12 @@
 //! Outbound messages and MessageID identity.
 
-use cells::{CellBuilder, CellDecode, CellEncode, CellError, CellRef, CellResolver, CellSlice};
+use cells::{CellBuilder, CellDecode, CellEncode, CellError, CellReader, CellRef, CellSlice};
 
-use crate::actor::ActorID;
+use crate::actor::{ActorAddress, ActorID};
 use crate::contract::Predicate;
 use crate::errors::VMError;
 use crate::value::Value;
 use crate::vm::Anchor;
-use crate::{Dict, Scalar};
 
 /// Unique identity of a scheduled internal transaction (a queued `Send`).
 /// Uniqueness is inherited from the embedded `anchor`: each send consumes a
@@ -28,16 +27,14 @@ impl MessageID {
 /// predicate for the Contract emitted directly by consensus when delivery fails.
 #[derive(Clone, Debug)]
 pub struct Message {
-    /// Destination actor (either `Hash` for an already-deployed actor,
-    /// or `Constructor` for transparent on-the-fly deployment). Encoding
-    /// preserves the variant because constructor code must reach first
-    /// delivery, so Hash and Constructor forms have different MessageIDs.
-    pub target: ActorID,
+    /// Destination and initialization/restoration witnesses. Address styles
+    /// remain distinct in the MessageID, while routing uses their ActorID.
+    pub target: ActorAddress,
 
     /// Originating actor's id when the sending frame has actor authority.
     /// `None` means no authenticated actor principal: this includes
-    /// ExternalRoot and ContractOpen sends. Canonicalized during encoding so
-    /// equivalent constructor-form caller ids commit identically.
+    /// ExternalRoot and ContractOpen sends. Caller identity is always raw32,
+    /// without a constructor or restoration witness.
     pub caller: Option<ActorID>,
 
     /// Anchor ratcheted from the current tx's chain right before the
@@ -46,9 +43,8 @@ pub struct Message {
     /// `last_anchor`.
     pub anchor: Anchor,
 
-    /// Args to deliver to the method's stack. Walked at delivery time
-    /// and pushed in payload order before the dispatched method runs.
-    payload: Vec<Value>,
+    /// One portable application value delivered to the method's stack.
+    payload: Value,
 
     /// Gas allotment committed by the originator. Fully consumed
     /// regardless of internal-tx outcome; asynchronous sends have no
@@ -65,18 +61,18 @@ impl Message {
     /// Constructs a message, rejecting values that cannot cross into the
     /// asynchronous execution domain.
     pub fn new(
-        target: ActorID,
+        target: impl Into<ActorAddress>,
         caller: Option<ActorID>,
         anchor: Anchor,
-        payload: Vec<Value>,
+        payload: Value,
         gas: u64,
         refund_predicate: Predicate,
     ) -> Result<Self, VMError> {
-        if payload.iter().any(|v| !v.is_portable()) {
+        if !payload.is_portable() {
             return Err(VMError::NonPortableInSend);
         }
         let message = Self {
-            target,
+            target: target.into(),
             caller,
             anchor,
             payload,
@@ -90,12 +86,12 @@ impl Message {
     }
 
     /// Borrows the immutable payload.
-    pub fn payload(&self) -> &[Value] {
+    pub fn payload(&self) -> &Value {
         &self.payload
     }
 
     /// Consumes the message and returns its payload.
-    pub fn into_payload(self) -> Vec<Value> {
+    pub fn into_payload(self) -> Value {
         self.payload
     }
 
@@ -118,60 +114,49 @@ impl Message {
 /// Canonical wire form. Field order:
 ///
 /// 1. `anchor` — 32 raw bytes.
-/// 2. `target` — `ActorID::encode`, preserving Hash or Constructor form.
+/// 2. `target` — canonical `ActorAddress`, including referenced witnesses.
 /// 3. `caller` — `0x00` for None, `0x01 ‖ canonical actor hash`
 ///    for Some.
 /// 4. `refund_predicate` — 32-byte compressed Ristretto.
 /// 5. `gas` — little-endian u64.
-/// 6. `payload` — reference to a Dict with consecutive keys `0..k`.
+/// 6. `payload` — reference to one tagged portable Value.
 ///
 /// Portability is enforced by
 /// [`Message::new`] before a payload enters the asynchronous domain.
 impl CellEncode for Message {
     fn encode(&self, w: &mut CellBuilder) -> Result<(), CellError> {
         w.store(&self.anchor)?;
-        // Preserve Constructor bytes: they are the code needed for
-        // deploy-on-first-delivery. Registry lookup still canonicalizes the id.
         w.store(&self.target)?;
         match &self.caller {
             None => {
                 w.store_u8(0)?;
             }
             Some(c) => {
-                w.store_u8(1)?.store_bytes(&c.to_hash())?;
+                w.store_u8(1)?.store(c)?;
             }
         }
         w.store(&self.refund_predicate)?.store_u64(self.gas)?;
-        w.store_ref(CellRef::resident(
-            Dict::from_values(self.payload.clone()).to_cell()?,
-        ))?;
+        w.store_ref(CellRef::resident(self.payload.to_cell()?))?;
         Ok(())
     }
 }
 
 impl CellDecode for Message {
-    fn decode<R: CellResolver + ?Sized>(
+    fn decode<R: CellReader + ?Sized>(
         s: &mut CellSlice<'_>,
         cells: &mut R,
     ) -> Result<Self, CellError> {
         let anchor = Anchor::decode(s, cells)?;
-        let target = ActorID::decode(s, cells)?;
+        let target = ActorAddress::decode(s, cells)?;
         let caller = match s.load_u8()? {
             0 => None,
-            1 => Some(ActorID::Hash(<[u8; 32]>::decode(s, cells)?)),
+            1 => Some(ActorID::decode(s, cells)?),
             _ => return Err(CellError::InvalidFormat),
         };
         let refund = Predicate::decode(s, cells)?;
         let gas = s.load_u64()?;
-        let root = cells::resolve_cell(cells, &s.load_ref()?)?;
-        let mut dict = Dict::from_cell(&root, cells)?;
-        let mut payload = Vec::new();
-        for i in 0..dict.len() {
-            payload.push(
-                dict.remove_resolved(&Scalar::from(i as u64), cells)?
-                    .ok_or(CellError::InvalidFormat)?,
-            );
-        }
+        let root = cells::read_cell(cells, &s.load_ref()?)?;
+        let payload = Value::from_cell(&root, cells)?;
         Self::new(target, caller, anchor, payload, gas, refund)
             .map_err(|_| CellError::InvalidFormat)
     }
@@ -183,7 +168,7 @@ mod tests {
 
     use curve25519_dalek::ristretto::CompressedRistretto;
 
-    use crate::{ClearToken, Dict, Scalar, FLAME_FLAVOR};
+    use crate::{ClearToken, Dict, FLAME_FLAVOR, Scalar};
 
     fn dummy_predicate() -> Predicate {
         Predicate::opaque(CompressedRistretto([0u8; 32]))
@@ -191,22 +176,65 @@ mod tests {
 
     fn fixture_message(anchor: Anchor) -> Message {
         Message::new(
-            ActorID::Hash([0x11; 32]),
+            ActorID::from([0x11; 32]),
             None,
             anchor,
-            Vec::new(),
+            Value::Scalar(Scalar::ZERO),
             1_000,
             dummy_predicate(),
         )
-        .expect("empty payload is portable")
+        .expect("unit payload is portable")
+    }
+
+    #[test]
+    fn payload_is_one_direct_value_and_roundtrips_without_a_list_wrapper() {
+        let mut dict = Dict::new();
+        dict.insert(Scalar::from(42u64), Value::Scalar(Scalar::from(7u64)));
+        let payloads = [
+            Value::Scalar(Scalar::from(9u64)),
+            Value::ClearToken(ClearToken::new(Scalar::from(5u64), FLAME_FLAVOR)),
+            Value::Dict(dict),
+        ];
+        for payload in payloads {
+            let expected = payload.to_cell().unwrap().id();
+            let message = Message::new(
+                ActorID::from([0x11; 32]),
+                None,
+                Anchor([0x22; 32]),
+                payload,
+                1_000,
+                dummy_predicate(),
+            )
+            .unwrap();
+            let cell = message.to_cell().unwrap();
+            assert_eq!(cell.refs().len(), 1);
+            assert_eq!(cell.refs()[0].id(), expected);
+            let decoded = Message::from_cell(&cell, &mut ()).unwrap();
+            assert_eq!(decoded.payload().to_cell().unwrap().id(), expected);
+            assert_eq!(decoded.id(), message.id());
+        }
+    }
+
+    #[test]
+    fn decoding_rejects_a_nonportable_single_value() {
+        let mut message = fixture_message(Anchor([0x22; 32]));
+        message.payload = Value::ClearToken(ClearToken::new(Scalar::from(-1i64), FLAME_FLAVOR));
+        assert!(matches!(
+            Message::from_cell(&message.to_cell().unwrap(), &mut ()),
+            Err(CellError::InvalidFormat)
+        ));
     }
 
     #[test]
     fn sendid_preserves_constructor_code() {
         // Constructor bytes must survive the queued message so first delivery
         // can deploy code. Registry identity still canonicalizes separately.
-        let ctor = ActorID::Constructor(vec![0x42, 0x42, 0x42]);
-        let hash_form = ActorID::Hash(ctor.to_hash());
+        let ctor = ActorAddress::Init {
+            ctor: cells::Cell::new(vec![0x42, 0x42, 0x42], vec![])
+                .unwrap()
+                .into(),
+        };
+        let hash_form = ActorAddress::from(ctor.to_actor_id());
         let mut m1 = fixture_message(Anchor([0x99; 32]));
         let mut m2 = fixture_message(Anchor([0x99; 32]));
         m1.target = ctor;
@@ -216,14 +244,47 @@ mod tests {
 
     #[test]
     fn sendid_canonical_caller_form() {
-        // Same canonicalization for caller.
-        let ctor = ActorID::Constructor(vec![0x11, 0x22, 0x33]);
-        let hash_form = ActorID::Hash(ctor.to_hash());
+        let ctor = ActorAddress::Init {
+            ctor: cells::Cell::new(vec![0x11, 0x22, 0x33], vec![])
+                .unwrap()
+                .into(),
+        };
+        let caller = ctor.to_actor_id();
         let mut m1 = fixture_message(Anchor([0x99; 32]));
         let mut m2 = fixture_message(Anchor([0x99; 32]));
-        m1.caller = Some(ctor);
-        m2.caller = Some(hash_form);
+        m1.caller = Some(caller);
+        m2.caller = Some(ActorID::from(caller.to_hash()));
         assert_eq!(m1.id(), m2.id(), "canonical caller form must dominate");
+    }
+
+    #[test]
+    fn restore_message_commits_supplied_factual_state_and_roundtrips() {
+        let state = cells::Cell::new(vec![42], vec![]).unwrap();
+        let pruned = state.prune(1).unwrap();
+        assert_eq!(pruned.hash(0).unwrap(), state.hash(0).unwrap());
+        let actor = ActorID::from([0x11; 32]);
+        let mut full = fixture_message(Anchor([0x22; 32]));
+        full.target = ActorAddress::Restore {
+            addr: actor,
+            state: state.clone().into(),
+        };
+        let mut partial = full.clone();
+        partial.target = ActorAddress::Restore {
+            addr: actor,
+            state: pruned.clone().into(),
+        };
+        assert_ne!(full.id(), partial.id());
+        assert_ne!(full.target, partial.target);
+        let decoded = Message::from_cell(&partial.to_cell().unwrap(), &mut ()).unwrap();
+        assert_eq!(decoded.id(), partial.id());
+        assert_eq!(decoded.target, partial.target);
+        match decoded.target {
+            ActorAddress::Restore { addr, state } => {
+                assert_eq!(addr, actor);
+                assert!(state.as_resident().unwrap().is_pruned());
+            }
+            _ => panic!("wrong address style"),
+        }
     }
 
     #[test]
@@ -238,10 +299,10 @@ mod tests {
 
         assert!(matches!(
             Message::new(
-                ActorID::Hash([0x11; 32]),
+                ActorID::from([0x11; 32]),
                 None,
                 Anchor([0x22; 32]),
-                vec![Value::Dict(outer)],
+                Value::Dict(outer),
                 1_000,
                 dummy_predicate(),
             ),
@@ -258,10 +319,10 @@ mod tests {
         assert!(value.is_portable());
         assert!(matches!(
             Message::new(
-                ActorID::Hash([0x11; 32]),
+                ActorID::from([0x11; 32]),
                 None,
                 Anchor([0x22; 32]),
-                vec![value],
+                value,
                 1_000,
                 dummy_predicate(),
             ),

@@ -5,7 +5,7 @@ use merlin::Transcript;
 
 use crate::actor::ActorID;
 use crate::constraints::Commitment;
-use crate::{Predicate, Scalar, String};
+use crate::{Predicate, Scalar};
 
 /// Canonical flavor of the native Flame token.
 pub const FLAME_FLAVOR: Scalar = Scalar::ONE;
@@ -64,7 +64,7 @@ impl Token {
     /// received. The published Contract holds only the two commitment
     /// points; the recipient, who kept the openings, rebuilds the same
     /// Contract with open commitments and pushes it as a private witness
-    /// through `String::contract`. The alternative — opening the token
+    /// through `CellValue::contract`. The alternative — opening the token
     /// on the stack with `decrypt` — puts the quantity and both blinding
     /// factors into the bytecode, where every verifier reads them.
     ///
@@ -222,14 +222,14 @@ impl ClearToken {
 /// lets one actor mint multiple distinct flavors. The result is a canonical
 /// scalar from wide modular reduction. The Merlin domain is consensus-fixed —
 /// a rename is a hard fork.
-pub fn flavor_from_actor(actor: &ActorID, tag: &String) -> Scalar {
+pub fn flavor_from_actor(actor: &ActorID, tag: &[u8]) -> Scalar {
     let mut t = Transcript::new(b"flamevm.issuepub.flavor");
     // `to_hash()` collapses both enum variants to the canonical
     // 32-byte form; for the Hash variant it's the stored id, for
     // the Constructor variant it's the deterministic seed (per
     // `ActorID::to_hash` docstring).
     t.append_message(b"actor", &actor.to_hash());
-    t.append_message(b"tag", &tag.to_bytes_vec());
+    t.append_message(b"tag", tag);
     let mut buf = [0u8; 64];
     t.challenge_bytes(b"flavor", &mut buf);
     Scalar::from(DalekScalar::from_bytes_mod_order_wide(&buf))
@@ -240,11 +240,11 @@ pub fn flavor_from_actor(actor: &ActorID, tag: &String) -> Scalar {
 /// label as `flavor_from_actor` but a distinct first message (`b"predicate"`
 /// vs `b"actor"`), so actor- and predicate-issued flavors can never collide
 /// even when their 32-byte identities are numerically equal.
-pub fn flavor_from_predicate(predicate: &Predicate, tag: &String) -> Scalar {
+pub fn flavor_from_predicate(predicate: &Predicate, tag: &[u8]) -> Scalar {
     let mut t = Transcript::new(b"flamevm.issuepriv.flavor");
     let point_bytes = predicate.to_point().to_bytes();
     t.append_message(b"predicate", &point_bytes);
-    t.append_message(b"tag", &tag.to_bytes_vec());
+    t.append_message(b"tag", tag);
     let mut buf = [0u8; 64];
     t.challenge_bytes(b"flavor", &mut buf);
     Scalar::from(DalekScalar::from_bytes_mod_order_wide(&buf))

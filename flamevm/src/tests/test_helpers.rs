@@ -13,16 +13,16 @@
 // "defined multiple times".
 pub use super::super::*;
 
-pub(crate) use super::mem_registry::MemRegistry;
+pub(crate) use super::mem_registry::{MemRegistry, TestCode};
 
 pub use crate::{
-    CheckedFee, CommitmentWitness, Constraint, Expression, Instruction, PredicateTree, Prover,
-    Script, ScriptBuilder, SecretConstraint, Token, Value, Variable, Verifier, WideToken,
-    FLAME_FLAVOR, MAX_FEE,
+    ActorAddress, CellValue, CellWitness, CheckedFee, CommitmentWitness, Constraint, Expression,
+    Instruction, PredicateTree, Prover, Script, ScriptBuilder, SecretConstraint, TaprootOpening,
+    Token, Value, Variable, Verifier, WideToken, FLAME_FLAVOR, MAX_FEE,
 };
 pub use bulletproofs::PedersenGens;
 pub use cells::{
-    BagOfCells, Cell, CellBuilder, CellDecode, CellEncode, CellEnvelope, CellError, CellRef,
+    Cell, CellBuilder, CellDecode, CellEncode, CellEnvelope, CellError, CellIndex, CellRef,
     CellSlice,
 };
 pub use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
@@ -55,31 +55,18 @@ pub(crate) fn fixture_vm(program: impl TestProgram, kind: CallKind) -> VM {
         dummy_header(),
         CallFrame::new(program.into_instructions(), kind, 1_000_000),
     )
-    .with_cells(cells);
+    .with_cells(cells)
+    .unwrap();
     vm.contract_witnesses = contracts;
     vm.script_witnesses = scripts;
     vm
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct TestTaprootProof {
-    pub proof: TaprootProof,
-    pub cells: BagOfCells,
-}
-
-impl std::ops::Deref for TestTaprootProof {
-    type Target = TaprootProof;
-    fn deref(&self) -> &Self::Target {
-        &self.proof
-    }
-}
-
 pub(crate) fn test_taproot_proof(
     tree: &PredicateTree,
     index: usize,
-) -> Result<TestTaprootProof, VMError> {
-    let (proof, cells) = tree.witness_for(index)?;
-    Ok(TestTaprootProof { proof, cells })
+) -> Result<TaprootOpening, VMError> {
+    tree.opening_for(index)
 }
 
 pub(crate) fn test_payload(values: Vec<Value>) -> Value {
@@ -90,19 +77,25 @@ pub(crate) fn test_payload(values: Vec<Value>) -> Value {
     }
 }
 
+pub(crate) fn witness_cell(literal: CellValue) -> Value {
+    Value::Cell(literal)
+}
+
 pub(crate) fn open_with_test_inner(inner: ScriptBuilder, recover: bool) -> ScriptBuilder {
     let mut branch = ScriptBuilder::new()
+        .drop_() // unit request
         .drop_()
         .with_cells(inner.cell_witnesses().unwrap());
     for instruction in inner.instructions() {
         branch.push_instr(instruction.clone());
     }
-    let recovery = ScriptBuilder::new().drop_().push_int(0u64).return_();
-    let tree = PredicateTree::scripts_only(
-        vec![branch.to_bytecode(), recovery.to_bytecode()],
-        TEST_BLINDING_KEY,
-    )
-    .unwrap();
+    let recovery = ScriptBuilder::new()
+        .drop_()
+        .drop_()
+        .push_int(0u64)
+        .return_();
+    let tree = PredicateTree::from_scripts(None, vec![branch.clone(), recovery], TEST_BLINDING_KEY)
+        .unwrap();
     let cp = test_taproot_proof(&tree, 0).unwrap();
     let recovery_cp = test_taproot_proof(&tree, 1).unwrap();
     let contract = Contract::new(
@@ -112,7 +105,7 @@ pub(crate) fn open_with_test_inner(inner: ScriptBuilder, recover: bool) -> Scrip
     )
     .unwrap();
     let program = ScriptBuilder::new()
-        .push_str(String::contract(contract))
+        .push_cell(CellValue::contract(contract).unwrap())
         .input()
         .with_script_witness(branch)
         .unwrap();
@@ -137,19 +130,19 @@ pub(crate) struct StubRegistry {
 }
 
 impl ActorRegistry for StubRegistry {
-    fn load_code(&self, _actor: &ActorID) -> Result<Vec<u8>, VMError> {
-        Ok(self.script.clone())
+    fn load_code(&self, _actor: &ActorID) -> Result<Cell, VMError> {
+        Ok(crate::code_cell(&self.script)?)
     }
 
     fn actor_code_bytes(&self, _actor: &ActorID) -> Result<u64, VMError> {
-        Ok(self.script.len() as u64)
+        Ok(crate::code_cell(&self.script)?.payload().len() as u64)
     }
 
     fn actor_state_bytes(&self, _actor: &ActorID) -> Result<u64, VMError> {
         Ok(0)
     }
 
-    fn set_code(&mut self, _actor: &ActorID, _code: Vec<u8>) -> Result<(), VMError> {
+    fn set_code(&mut self, _actor: &ActorID, _code: Cell) -> Result<(), VMError> {
         unimplemented!("StubRegistry::set_code — use MemRegistry")
     }
 
@@ -206,7 +199,7 @@ impl ActorRegistry for StubRegistry {
     fn commit_tx_destructions(&mut self) -> Vec<ActorID> {
         Vec::new()
     }
-    fn deploy(&mut self, _id: ActorID, _code: Vec<u8>, _state: Value) -> Result<(), VMError> {
+    fn deploy(&mut self, _id: ActorID, _code: Cell, _state: Value) -> Result<(), VMError> {
         unimplemented!("StubRegistry::deploy — use MemRegistry")
     }
 }
@@ -220,10 +213,10 @@ pub(crate) fn dummy_header() -> TxHeader {
 
 pub(crate) fn dummy_message(gas: u64) -> Message {
     Message::new(
-        ActorID::Hash([0u8; 32]),
+        ActorID::from([0u8; 32]),
         None,
         Anchor([0u8; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         gas,
         // Test fixture: NUMS-unspendable predicate as the refund
         // sink. No real bounce path exercised by the tests that
@@ -236,7 +229,7 @@ pub(crate) fn dummy_message(gas: u64) -> Message {
 /// Builds a VM running `script` as the entry Run of an InternalRoot.
 pub(crate) fn vm_with_script(script: impl TestProgram) -> VM {
     let kind = CallKind::InternalRoot {
-        actor: ActorID::Hash([0u8; 32]),
+        actor: ActorID::from([0u8; 32]),
         caller: None,
     };
     let mut vm = fixture_vm(script, kind);
@@ -263,7 +256,6 @@ pub(crate) fn assert_int(v: &Value, expected: Scalar) {
 pub(crate) fn value_kind(v: &Value) -> &'static str {
     match v {
         Value::Scalar(_) => "Scalar",
-        Value::String(_) => "String",
         Value::Dict(_) => "Dict",
         Value::Point(_) => "Point",
         Value::Token(_) => "Token",
@@ -275,6 +267,9 @@ pub(crate) fn value_kind(v: &Value) -> &'static str {
         Value::Expression(_) => "Expression",
         Value::Constraint(_) => "Constraint",
         Value::MultiscalarMul(_) => "MultiscalarMul",
+        Value::Cell(_) => "Cell",
+        Value::Slice(_) => "Slice",
+        Value::Builder(_) => "Builder",
     }
 }
 
@@ -351,14 +346,13 @@ pub(crate) fn deliver_err(reg: &mut MemRegistry, msg: Message) -> VMError {
     VM::execute_internal(dummy_header(), msg, reg, &block).expect_err("expected delivery failure")
 }
 
-/// Builds a minimal internal `Message` targeting `actor` with no
-/// payload — the common Bucket-C delivery fixture.
-pub(crate) fn msg_to(actor: ActorID) -> Message {
+/// Builds a minimal internal `Message` carrying the scalar-zero unit.
+pub(crate) fn msg_to(actor: impl Into<ActorAddress>) -> Message {
     Message::new(
         actor,
         None,
         Anchor([0u8; 32]),
-        Vec::new(),
+        Value::Scalar(Scalar::ZERO),
         1_000_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -367,12 +361,12 @@ pub(crate) fn msg_to(actor: ActorID) -> Message {
 
 /// Like [`msg_to`] but carries a single top-of-stack selector arg
 /// (ADR 0020 dispatch convention).
-pub(crate) fn msg_with_sel(actor: ActorID, sel: u64) -> Message {
+pub(crate) fn msg_with_sel(actor: impl Into<ActorAddress>, sel: u64) -> Message {
     Message::new(
         actor,
         None,
         Anchor([0u8; 32]),
-        vec![Value::Scalar(Scalar::from(sel))],
+        Value::Scalar(Scalar::from(sel)),
         1_000_000,
         Predicate::opaque(Predicate::unspendable_key()),
     )
@@ -382,21 +376,26 @@ pub(crate) fn msg_with_sel(actor: ActorID, sel: u64) -> Message {
 /// Deploys an actor whose code is `recv` (id derived from the code, a
 /// stand-in for the real constructor) and returns its id. The common
 /// Bucket-C fixture: deploy, then `deliver` and read the effect log.
-pub(crate) fn deploy_actor(reg: &mut MemRegistry, recv: Vec<u8>) -> ActorID {
-    let id = ActorID::Hash(ActorID::Constructor(recv.clone()).to_hash());
+pub(crate) fn deploy_actor(reg: &mut MemRegistry, recv: impl TestCode) -> ActorID {
+    let recv = recv.into_code().expect("actor code compiles");
+    let id = ActorID::from(recv.id());
     reg.deploy(id.clone(), recv, empty_state(), 1_000_000)
         .expect("deploy");
     id
 }
 
-/// A `call` to `target` with `k=0` args (plain single-action callee).
+/// A `call` to `target` with a unit request (plain single-action callee).
 /// Returns the builder *after* the `call` so the caller chains the
-/// result handling (`.drop_().drop_()` for the `[count, success]`).
+/// result handling (`.drop_().drop_()` for the `[unit, success]`).
+pub(crate) fn actor_address(id: &ActorID) -> CellValue {
+    CellValue::from(ActorAddress::from(*id).to_cell().unwrap())
+}
+
 pub(crate) fn call_to(target: &ActorID) -> ScriptBuilder {
     ScriptBuilder::new()
-        .push_int(0u64) // k = 0
+        .push_int(0u64) // unit request
         .push_int(50_000u64) // gas
-        .push_str(String::from(target.to_hash().to_vec()))
+        .push_literal(actor_address(target))
         .call()
 }
 
@@ -405,9 +404,8 @@ pub(crate) fn call_to(target: &ActorID) -> ScriptBuilder {
 pub(crate) fn call_with_sel(target: &ActorID, sel: u64) -> ScriptBuilder {
     ScriptBuilder::new()
         .push_int(sel) // selector arg (top)
-        .push_int(1u64) // k = 1
         .push_int(50_000u64) // gas
-        .push_str(String::from(target.to_hash().to_vec()))
+        .push_literal(actor_address(target))
         .call()
 }
 
@@ -439,15 +437,61 @@ pub(crate) fn dispatch_code(arms: &[(u64, Vec<u8>)]) -> Vec<u8> {
     }
     p = p.drop_().push_int(0u64).verify(); // no match: drop S, revert
     for (i, (_, handler)) in arms.iter().enumerate() {
-        p = p
-            .label(i as u32)
-            .drop_()
-            .drop_() // drop arm value + selector
-            .raw_bytes(handler)
+        p = p.label(i as u32).drop_().drop_(); // drop arm value + selector
+        for instruction in ScriptBuilder::parse(handler)
             .expect("handler parses")
-            .jump(n);
+            .into_instructions()
+        {
+            if let Instruction::CellLiteral(bytes) = instruction {
+                // A skipped/repeated handler cannot consume a positional program ref.
+                p = p.builder();
+                for chunk in bytes.payload().unwrap().chunks(31) {
+                    let mut scalar = [0; 32];
+                    scalar[..chunk.len()].copy_from_slice(chunk);
+                    p = p
+                        .push_int(Scalar::from_bytes(scalar).unwrap())
+                        .push_int(chunk.len() as u64)
+                        .write_uint();
+                }
+                p = p.endcell();
+            } else {
+                p.push_instr(instruction);
+            }
+        }
+        p = p.jump(n);
     }
     p.label(n).to_bytecode()
+}
+
+/// Native dispatch keeps handler graphs as refs and chooses them without consuming
+/// refs belonging to a skipped branch.
+pub(crate) fn dispatch_cells(arms: &[(u64, Cell)]) -> Cell {
+    let mut program = ScriptBuilder::new();
+    for (index, (selector, _)) in arms.iter().enumerate() {
+        program = program
+            .push_int(*selector)
+            .eq()
+            .jumpif(index as u32)
+            .drop_();
+    }
+    program = program.drop_().push_int(0u64).verify();
+    for (index, _) in arms.iter().enumerate() {
+        program = program
+            .label(index as u32)
+            .drop_()
+            .drop_()
+            .run_slice()
+            .push_int(index as u64)
+            .load_ref()
+            .roll_k(1)
+            .drop_()
+            .exec();
+    }
+    Cell::new(
+        program.to_bytecode(),
+        arms.iter().map(|(_, cell)| cell.clone().into()).collect(),
+    )
+    .unwrap()
 }
 
 /// Helper: builds a VM with a child ContractOpen frame as `current_call`
@@ -456,7 +500,8 @@ pub(crate) fn dispatch_code(arms: &[(u64, Vec<u8>)]) -> Vec<u8> {
 /// exercise the inner checks (root frame would short-circuit with
 /// `ReturnAtRoot`).
 pub(crate) fn vm_with_nested_child_script(script: Vec<u8>) -> VM {
-    let parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    let mut parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    parent.snap_failure_values = vec![Value::Scalar(Scalar::ZERO)];
     let child_kind = CallKind::ContractOpen {
         predicate: Predicate::opaque(CompressedRistretto([0u8; 32])),
         external_context: true,
@@ -475,10 +520,18 @@ pub(crate) fn vm_with_nested_child_script(script: Vec<u8>) -> VM {
     vm
 }
 
-pub(crate) fn assert_str(v: &Value, expected: &[u8]) {
+pub(crate) fn assert_bytes(v: &Value, expected: &[u8]) {
     match v {
-        Value::String(s) => assert_eq!(s.as_opaque().unwrap(), expected),
-        other => panic!("expected String, got {}", value_kind(other)),
+        Value::Cell(reference) => assert_eq!(
+            reference
+                .as_resident()
+                .expect("resident byte Cell")
+                .payload(),
+            expected
+        ),
+        Value::Slice(slice) => assert_eq!(slice.bytes(), expected),
+        Value::Builder(builder) => assert_eq!(builder.payload(), expected),
+        other => panic!("expected byte source, got {}", value_kind(other)),
     }
 }
 
@@ -519,11 +572,11 @@ pub(crate) fn hex_to_bytes(h: &str) -> Vec<u8> {
 pub(crate) const TEST_BLINDING_KEY: [u8; 32] = [0u8; 32];
 
 /// Helper: builds a single-leaf `PredicateTree` from a program and a
-/// known internal-key scalar, plus the `TaprootProof` that opens it.
+/// known internal-key scalar, plus the Cell-based opening.
 pub(crate) fn build_predicate_with_program(
     program: &[u8],
     internal_secret: u64,
-) -> (PredicateTree, TestTaprootProof) {
+) -> (PredicateTree, TaprootOpening) {
     let secret = DalekScalar::from(internal_secret);
     let x_point = RISTRETTO_BASEPOINT_TABLE * &secret;
     let internal_key = x_point.compress();
@@ -538,12 +591,12 @@ pub(crate) fn build_predicate_with_program(
 }
 
 /// Helper: builds a `PredicateTree` with multiple programs and the
-/// `TaprootProof` that opens the `program_index`-th one.
+/// opening that supplies the `program_index`-th one.
 pub(crate) fn build_multi_leaf_predicate(
     programs: Vec<Vec<u8>>,
     program_index: usize,
     internal_secret: u64,
-) -> (PredicateTree, TestTaprootProof) {
+) -> (PredicateTree, TaprootOpening) {
     let secret = DalekScalar::from(internal_secret);
     let x_point = RISTRETTO_BASEPOINT_TABLE * &secret;
     let internal_key = x_point.compress();
@@ -561,22 +614,15 @@ pub(crate) fn make_cleartext_token(qty: u64, flv: u64) -> Token {
 
 /// Builds a VM running `script` under InternalRoot with a specific
 /// actor identity (so `op_issue` has actor context).
-pub(crate) fn vm_internal_with_actor(script: Vec<u8>, actor: ActorID) -> VM {
+pub(crate) fn vm_internal_with_actor(script: impl TestProgram, actor: ActorID) -> VM {
     let kind = CallKind::InternalRoot {
         actor,
         caller: None,
     };
-    VM::new(
-        dummy_header(),
-        CallFrame::new(
-            ScriptBuilder::parse(&script)
-                .expect("script parses")
-                .into_instructions(),
-            kind,
-            1_000_000,
-        )
-        .with_anchor(Anchor([0u8; 32])),
-    )
+    let mut vm = fixture_vm(script, kind);
+    vm.last_anchor = Some(Anchor([0; 32]));
+    vm.current_call.anchor = vm.last_anchor;
+    vm
 }
 
 /// Quick helper: builds a stub delegate for external-context tests
@@ -600,8 +646,7 @@ pub(crate) fn vm_external_with_script(script: impl TestProgram) -> VM {
     fixture_vm(script, CallKind::ExternalRoot)
 }
 
-/// Builds a wire-encoded contract as a `Vec<u8>` so tests can feed it
-/// to the `input` opcode (which pops a `String` and decodes it).
+/// Transport bytes for codec tests; `input` itself takes the Contract root Cell.
 pub(crate) fn encode_contract_to_bytes(contract: &Contract) -> Vec<u8> {
     contract.to_envelope().unwrap().encode()
 }
@@ -621,7 +666,7 @@ pub(crate) fn fixture_contract() -> Contract {
     let anchor = Anchor([0x42; 32]);
     let payload = vec![
         Value::Scalar(Scalar::from(7u64)),
-        Value::String(String::from(b"hello".to_vec())),
+        Value::Cell(CellValue::from_bytes(b"hello".to_vec()).unwrap()),
     ];
     Contract::new(predicate, anchor, Value::Dict(Dict::from_values(payload)))
         .expect("fixture payload is portable")
@@ -738,7 +783,7 @@ pub(crate) fn make_signtx_script_with_contract(
     .expect("payload is portable");
     let contract_id = contract.id();
     let script = ScriptBuilder::new()
-        .push_str(String::contract(contract))
+        .push_cell(CellValue::contract(contract).unwrap())
         .input()
         .signtx()
         .drop_(); // drop the single payload
@@ -747,7 +792,7 @@ pub(crate) fn make_signtx_script_with_contract(
 
 /// Helper: build a Token with `Commitment::Open` quantity and
 /// flavor (witness-bearing). The token can be embedded in a Contract
-/// and pushed via `String::contract(c)` so witnesses survive the trip
+/// and pushed via `CellValue::contract(c)` so witnesses survive the trip
 /// through `op_input` and into the downstream `mix` gadget.
 pub(crate) fn make_open_token(
     qty_value: u64,
@@ -770,20 +815,19 @@ pub(crate) fn make_open_token(
 // The script shape:
 //
 //   ┌── per input contract i ───────────────────────────────────┐
-//   │  pushstr <contract_id_i>                               │
-//   │  input  (Contract body from the transaction BoC)       │
+//   │  pushcell <contract_root_i>                           │
+//   │  input  (instantiate the supplied Contract root)      │
 //   │  pushpoint <internal_key_i>                            │
-//   │  pushstr <program_trie_root_i>                         │
-//   │  push:<program_index_i>                                │
+//   │  pushcell <selected_policy_tree_i>                    │
 //   │  push:<gas>                                           │
-//   │  push:0  (k = 0 args)                                  │
-//   │  open   (branch loaded from BoC returns the Token)     │
-//   │  verify; drop  (consume success and return count)      │
+//   │  push:0  (unit request)                               │
+//   │  open   (selected policy returns the Token)           │
+//   │  verify (consume success, retain the Token)           │
 //   └────────────────────────────────────────────────────────┘
 //   ↓  stack now: [Token_0, Token_1, …, Token_{N-1}]
 //
 //   For each output j:
-//   ┌── push the (qty, flv) commitment Strings ─────────────┐
+//   ┌── push the (qty, flv) commitment Cells ───────────────┐
 //   │  pushstr <qty_open_j>                                  │
 //   │  pushstr <flv_open_j>                                  │
 //   └────────────────────────────────────────────────────────┘
@@ -865,7 +909,7 @@ pub(crate) fn output_predicate_point(tag: u8) -> CompressedRistretto {
 /// separately by the negative tests).
 ///
 /// Returns the prover ScriptBuilder (witnesses inline) — the canonical
-/// bytecode is recovered via `program.to_bytecode()` on the
+/// native program is recovered via `program.to_cell()` on the
 /// verifier side.
 pub(crate) fn build_confidential_nm_program(
     inputs: &[NMInputSpec],
@@ -876,31 +920,24 @@ pub(crate) fn build_confidential_nm_program(
     //                    taproot_proof pieces + push:0 + open. ──
     for inp in inputs {
         let (contract, cp) = build_input_contract(inp);
-        // pushstr String::contract(c) — prover-side witness carrier
+        // The Contract root carries prover-side private openings.
         // (Token's open commitments ride along into op_input).
-        // The verifier-side equivalent is `String::from(contract.to_bytes())`.
-        program = program.push_str(String::contract(contract));
+        // The verifier-side equivalent is its unannotated public root Cell.
+        program = program.push_cell(CellValue::contract(contract).unwrap());
         program = program.input();
         // taproot_proof pieces.
         program = push_taproot_proof_to_program(program, &cp);
-        // A generous gas operand, then push:0 args, open.
-        // After open, the parent stack has [Token, k=1, success=1]:
-        // verify pops the success marker (hard-fail if 0), drop
-        // discards the count, leaving just the Token for mix.
-        program = program
-            .push_int(1024u64)
-            .push_int(0u64)
-            .open()
-            .verify()
-            .drop_();
+        // A generous gas operand and unit request. Opening returns the
+        // Token followed by success; verify leaves the Token for mix.
+        program = program.push_int(1024u64).push_int(0u64).open().verify();
     }
 
-    //                    commit String (witness-bearing). ──
+    //                    commit CellValue (witness-bearing). ──
     for out in outputs {
         let (q_open, f_open) = open_commitments_for_output(out);
         program = program
-            .push_str(String::commitment(q_open))
-            .push_str(String::commitment(f_open));
+            .push_literal(CellValue::commitment(q_open))
+            .push_literal(CellValue::commitment(f_open));
     }
 
     //
@@ -915,7 +952,7 @@ pub(crate) fn build_confidential_nm_program(
     //
     // After `mix`, the stack is [O_0, O_1, …, O_{M-1}] (bottom →
     // top, matching the `outputs[]` spec order). `op_output` pops
-    // its k=1 payload from the TOP — which would naively pair
+    // its single payload from the TOP — which would naively pair
     // `outputs[0].predicate` with `O_{M-1}`'s commitments,
     // reversing every multi-output transfer.
     //
@@ -954,20 +991,17 @@ pub(crate) fn open_commitments_for_output(out: &NMOutputSpec) -> (Commitment, Co
     (q, f)
 }
 
-/// Like `push_taproot_proof_pieces` but emits Instructions into a
-/// ScriptBuilder (so the prover keeps witness-bearing variants).
+/// Push the inner Point and partial program graph into the ScriptBuilder.
 pub(crate) fn push_taproot_proof_to_program(
     program: ScriptBuilder,
-    cp: &TestTaprootProof,
+    cp: &TaprootOpening,
 ) -> ScriptBuilder {
     program
-        .with_cells(cp.cells.clone())
         .push_point(*cp.internal_key.as_bytes())
-        .push_str(String::from(cp.root.to_vec()))
-        .push_int(cp.index)
+        .push_cell(cp.root.clone())
 }
 
-/// Build the input contract + the matching `TaprootProof` for an input
+/// Build the input contract + the matching Cell-based opening for an input
 /// spec. Used by both `build_confidential_nm_program` (to
 /// produce the contract bytes pushed onto the stack) and
 /// `assert_nm_txlog` (to compute the expected `contract_id` for the
@@ -981,13 +1015,11 @@ pub(crate) fn push_taproot_proof_to_program(
 /// harness would only exercise the "all inputs locked under
 /// the same predicate" shape, which doesn't match real
 /// transactions where each input comes from its own keypair.
-pub(crate) fn build_input_contract(inp: &NMInputSpec) -> (Contract, TestTaprootProof) {
+pub(crate) fn build_input_contract(inp: &NMInputSpec) -> (Contract, TaprootOpening) {
     let (q_open, f_open) = open_commitments(inp);
     let token = Token::new(q_open, f_open);
-    // Leaf script `push:1, return` — under ADR 0013 the opened contract
-    // runs in an isolated frame, so the leaf must explicitly return
-    // its single-Token payload to the caller.
-    let leaf = vec![0x01, 0xa4];
+    // Discard the unit request and return the single-Token payload.
+    let leaf = ScriptBuilder::new().drop_().return_().to_bytecode();
     let tree = PredicateTree::scripts_only(vec![leaf], input_blinding_for(inp))
         .expect("scripts_only tree builds");
     let cp = test_taproot_proof(&tree, 0).expect("taproot_proof for leaf 0");
@@ -1026,30 +1058,29 @@ pub(crate) fn assert_nm_txlog(result: &TxResult, inputs: &[NMInputSpec], outputs
     // bugs (wrong count) before walking entry-by-entry.
     assert_eq!(
         result.txlog.len(),
-        2 + inputs.len() + outputs.len(),
-        "txlog length must be Header + CellWitness + N inputs + M outputs"
+        1 + inputs.len() + outputs.len(),
+        "txlog length must be Header + N inputs + M outputs"
     );
     // Header at index 0.
     assert!(matches!(result.txlog[0], TxEntry::Header(_)));
-    assert!(matches!(result.txlog[1], TxEntry::CellWitness(_)));
-    // Inputs at [2..2+N], in spec order. The contract_id check is
+    // Inputs at [1..1+N], in spec order. The contract_id check is
     // load-bearing — it pins down predicate + anchor + payload
     // bytes all at once.
     for (i, inp) in inputs.iter().enumerate() {
         let expected_id = build_input_contract(inp).0.id();
-        match &result.txlog[2 + i] {
+        match &result.txlog[1 + i] {
             TxEntry::Input(id) => {
                 assert_eq!(
                     *id,
                     expected_id,
                     "txlog[{}] input contract_id mismatch",
-                    2 + i
+                    1 + i
                 )
             }
-            _ => panic!("txlog[{}] must be Input", 2 + i),
+            _ => panic!("txlog[{}] must be Input", 1 + i),
         }
     }
-    // Outputs at [2+N .. 2+N+M], in spec order. We verify:
+    // Outputs at [1+N .. 1+N+M], in spec order. We verify:
     //
     //   - predicate point             (catches pairing inversion)
     //   - Token qty/flv commitment points
@@ -1078,7 +1109,7 @@ pub(crate) fn assert_nm_txlog(result: &TxResult, inputs: &[NMInputSpec], outputs
     for (j, out) in outputs.iter().enumerate() {
         let expected_pred = output_predicate_point(out.predicate_tag);
         let (q_open, f_open) = open_commitments_for_output(out);
-        let idx = 2 + inputs.len() + j;
+        let idx = 1 + inputs.len() + j;
         match &result.txlog[idx] {
             TxEntry::Output(c) => {
                 assert_eq!(
@@ -1152,16 +1183,16 @@ pub(crate) fn run_confidential_nm(inputs: &[NMInputSpec], outputs: &[NMOutputSpe
     // verifier views is independently visible.
     assert_nm_txlog(&prover_result, inputs, outputs);
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = prover_result;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    let result = Verifier::verify_with_cells(
+    let result = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,

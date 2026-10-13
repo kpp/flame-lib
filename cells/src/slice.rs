@@ -1,4 +1,4 @@
-use crate::{Cell, CellError, CellRef, CellResolver, MAX_CELL_PAYLOAD, resolve_cell};
+use crate::{Cell, CellError, CellRef};
 
 /// A consuming payload/reference cursor over one [`Cell`].
 #[derive(Clone, Debug)]
@@ -47,7 +47,32 @@ impl<'a> CellSlice<'a> {
         ))
     }
 
+    /// Reads a canonical unsigned LEB128 integer, leaving the cursor unchanged
+    /// on truncation, overflow, or a non-shortest representation.
+    pub fn load_leb128(&mut self) -> Result<u64, CellError> {
+        self.try_load(|slice| {
+            let mut value = 0;
+            for index in 0..10 {
+                let byte = slice.load_u8()?;
+                if index == 9 && byte > 1 {
+                    return Err(CellError::InvalidFormat);
+                }
+                value |= u64::from(byte & 0x7f) << (index * 7);
+                if byte & 0x80 == 0 {
+                    if index > 0 && byte == 0 {
+                        return Err(CellError::InvalidFormat);
+                    }
+                    return Ok(value);
+                }
+            }
+            Err(CellError::InvalidFormat)
+        })
+    }
+
     pub fn load_bytes(&mut self, len: usize) -> Result<&'a [u8], CellError> {
+        if self.cell.is_pruned() {
+            return Err(CellError::PrunedCell);
+        }
         let end = self
             .byte_offset
             .checked_add(len)
@@ -61,55 +86,10 @@ impl<'a> CellSlice<'a> {
         Ok(bytes)
     }
 
-    /// Reads a byte string encoded by [`crate::CellBuilder::store_snake`].
-    ///
-    /// Checks the declared byte length against `limit` before allocating or
-    /// resolving anything. Overflow consumes only the next unread parent ref;
-    /// dedicated continuation Cells must have canonical lengths and ref counts.
-    /// The cursor stays on the parent, preserving subsequent fields and refs.
-    /// On error the cursor is unchanged, but resolver charges are not refunded.
-    pub fn load_snake<R: CellResolver + ?Sized>(
-        &mut self,
-        cells: &mut R,
-        limit: usize,
-    ) -> Result<Vec<u8>, CellError> {
-        self.try_load(|slice| {
-            let length =
-                usize::try_from(slice.load_u32()?).map_err(|_| CellError::LimitExceeded)?;
-            if length > limit {
-                return Err(CellError::LimitExceeded);
-            }
-
-            let inline = length.min(slice.remaining_bytes());
-            if inline < length && slice.cell.payload().len() != MAX_CELL_PAYLOAD {
-                return Err(CellError::InvalidFormat);
-            }
-            // Grow only from validated data, not the untrusted declared length.
-            let mut bytes = slice.load_bytes(inline)?.to_vec();
-            if bytes.len() == length {
-                return Ok(bytes);
-            }
-
-            let mut reference = slice.load_ref()?;
-            loop {
-                let cell = resolve_cell(cells, &reference)?;
-                let remaining = length - bytes.len();
-                let continues = remaining > MAX_CELL_PAYLOAD;
-                if cell.payload().len() != remaining.min(MAX_CELL_PAYLOAD)
-                    || cell.refs().len() != usize::from(continues)
-                {
-                    return Err(CellError::InvalidFormat);
-                }
-                bytes.extend_from_slice(cell.payload());
-                if !continues {
-                    return Ok(bytes);
-                }
-                reference = cell.refs()[0].clone();
-            }
-        })
-    }
-
     pub fn load_ref(&mut self) -> Result<CellRef, CellError> {
+        if self.cell.is_pruned() {
+            return Err(CellError::PrunedCell);
+        }
         let reference = self
             .cell
             .refs()
@@ -138,6 +118,9 @@ impl<'a> CellSlice<'a> {
     }
 
     pub fn finish(self) -> Result<(), CellError> {
+        if self.cell.is_pruned() {
+            return Err(CellError::PrunedCell);
+        }
         if self.remaining_bytes() != 0 {
             return Err(CellError::TrailingBytes);
         }
@@ -145,5 +128,47 @@ impl<'a> CellSlice<'a> {
             return Err(CellError::TrailingReferences);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leb128_rejects_invalid_encodings_without_consuming_input() {
+        for (bytes, expected) in [
+            (vec![], CellError::InsufficientBytes),
+            (vec![0x80], CellError::InsufficientBytes),
+            (vec![0x80, 0], CellError::InvalidFormat),
+            (vec![0x81, 0], CellError::InvalidFormat),
+            (vec![0xff; 10], CellError::InvalidFormat),
+            (vec![0x80; 11], CellError::InvalidFormat),
+            (
+                vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2],
+                CellError::InvalidFormat,
+            ),
+        ] {
+            let child = CellRef::resident(Cell::new(vec![1], vec![]).unwrap());
+            let mut payload = vec![7];
+            payload.extend_from_slice(&bytes);
+            let cell = Cell::new(payload, vec![child]).unwrap();
+            let mut slice = CellSlice::new(&cell);
+            assert_eq!(slice.load_u8(), Ok(7));
+            assert_eq!(slice.load_leb128(), Err(expected));
+            assert_eq!(slice.remaining_bytes(), bytes.len());
+            assert_eq!(slice.remaining_refs(), 1);
+        }
+    }
+
+    #[test]
+    fn pruning_records_cannot_be_read_as_ordinary_payload() {
+        let cell = Cell::from_pruned(1, vec![[7; 32]], vec![0]).unwrap();
+        let mut slice = CellSlice::new(&cell);
+        assert_eq!(slice.load_bytes(0), Err(CellError::PrunedCell));
+        assert_eq!(slice.load_u8(), Err(CellError::PrunedCell));
+        assert!(matches!(slice.load_ref(), Err(CellError::PrunedCell)));
+        assert_eq!(slice.remaining_bytes(), cell.payload().len());
+        assert_eq!(slice.finish(), Err(CellError::PrunedCell));
     }
 }

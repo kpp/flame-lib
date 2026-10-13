@@ -11,10 +11,9 @@ for wallets and nodes that interoperate. None of them is a consensus rule; see
 
 ## Status
 
-Proposed; not implemented. Today `flamepayments::build_transfer` takes
-caller-chosen blinding factors and emits no note, and `flamed`'s `scan`
-returns a contract's bytes without the entry that follows it. This document
-is the target for both.
+Implemented. `flamepayments` sends and receives: `build_transfer` seals a
+note for every output it creates, and `open_note` opens one. `flamed` keeps
+the note that follows each output and returns it from `scan`.
 
 The protocol follows the requirements `flamekd.md` sets for token encryption;
 [Compliance with flamekd](#compliance-with-flamekd) maps each of them to the
@@ -45,7 +44,7 @@ writer knew `V`, and anyone given the address knows `V`.
 ## Notation
 
 This document uses the notation and the transcript conventions of
-[`flamekd.md`](../flamekd/flamekd.md#transcript-conventions): `G` is the
+[`flamekd.md`](flamekd.md#transcript-conventions): `G` is the
 ristretto255 generator, `x*P` is scalar multiplication, `enc(x)` and `enc(P)`
 are the canonical 32-byte encodings of a scalar and a compressed point, `++`
 is concatenation, and `Transcript(domain)`, `P.append(label, bytes)` and
@@ -69,7 +68,7 @@ to the quantity and one to the flavor.
 ## Overview
 
 A Receiving Address is two public keys, `(S, V)`
-([`flamekd.md`](../flamekd/flamekd.md#key-types-and-capabilities)). `S` locks
+([`flamekd.md`](flamekd.md#key-types-and-capabilities)). `S` locks
 the payment: it becomes the output's predicate, and only its secret `s` can
 authorize a spend. `V` encrypts the payment: the sender runs a
 Diffie-Hellman exchange against it, and only its secret `v` recovers the
@@ -83,7 +82,7 @@ quantity, the flavor, and a memo, encrypted under that key, and is logged
 directly after the output:
 
 ```text
-Header · CellWitness · Input(id)… · Fee(fee)
+Header · Input(id)… · Fee(fee)
 Output(Contract { enc(S_a), anchor, Token { C_qty, C_flv } })   Data(0x01 ++ enc(R_0) ++ tag_0 ++ ct_0)
 Output(Contract { enc(S_b), anchor, Token { C_qty, C_flv } })   Data(0x01 ++ enc(R_1) ++ tag_1 ++ ct_1)
 ```
@@ -225,29 +224,28 @@ The note is:
 | 89 | N | memo | encrypted |
 
 A note is `89 + N` bytes, and the memo's length is public: `N` is the note's
-length minus 89. The memo MUST be at most 8102 bytes. The note travels as a
-single VM `String`, whose limit is one Cell payload, 8191 bytes
-(`String::MAX_LEN` in `flamevm/src/string.rs`, which flamevm marks as
-temporary).
+length minus 89. The memo MUST be at most 4006 bytes (4095 minus 89). The note
+travels as a single zero-ref VM Cell, bounded by `cells::MAX_CELL_PAYLOAD`
+(4095 bytes), with no additional length prefix.
 
 ## Building the transaction
 
 The script extends the transfer in
 [`flamepayments.md`](../flamepayments/flamepayments.md#a-transfer) by one
-`push_str` and one `log` after each `output`:
+`pushcell` and one `log` after each `output`:
 
 ```text
-per input:    push_str(String::contract(c))  input  signtx
+per input:    push_literal(CellValue::contract(c))  input  signtx
 fee > 0:      push_int(fee)  fee
-per output:   push_str(commitment(qty, qty_blinding))
-              push_str(commitment(flv, flv_blinding))
+per output:   push_literal(CellValue::commitment(commitment(qty, qty_blinding)))
+              push_literal(CellValue::commitment(commitment(flv, flv_blinding)))
               push_int(m)  push_int(n)  mix
 per output i: roll_k(n-1-i) if > 0
               push_point(enc(S_i))  output
-              push_str(note_i)  log
+              pushcell(note_i)  log
 ```
 
-`push_str(note) log` leaves the stack as it found it, so the roll depths
+`pushcell(note) log` leaves the stack as it found it, so the roll depths
 before each `output` are unchanged.
 
 ### Pairing
@@ -276,7 +274,7 @@ relies on an output's position.
 
 An `ExternalTx` carries a pruned `TxLog`
 ([`encoding.md`](encoding.md#transactions-and-execution-witnesses)). The note
-travels once, as the `push_str` literal in the script, and its `Data` entry
+travels once, as the `pushcell` literal in the script, and its `Data` entry
 is derived again when a verifier executes the script. The TxID covers the
 `Data` entry, so the `signtx` signature covers the note: nobody but the
 signer can alter it. `log` charges gas for every byte it writes: a note is
@@ -359,7 +357,7 @@ path described in
    `Token::from_opening(qty, flv, qty_blinding, flv_blinding)` inside
    `Contract::new(opaque(S_n), anchor, …)`. Its id MUST equal the published
    id.
-2. Push it with `push_str(String::contract(c))`, then `input` and `signtx`.
+2. Push it with `push_literal(CellValue::contract(c))`, then `input` and `signtx`.
    The bytecode holds only the 32-byte contract id; the contract's public
    body goes into the transaction's witness bag, where its token is two
    points again; the openings stay with the prover.
@@ -441,7 +439,7 @@ it does not know keeps the output as **unknown version**.
 
 `flamekd.md` leaves token encryption to another specification and sets its
 requirements in
-[Compromise boundaries](../flamekd/flamekd.md#compromise-boundaries):
+[Compromise boundaries](flamekd.md#compromise-boundaries):
 
 > An encryption protocol SHOULD use fresh sender randomness per output,
 > validated group inputs, and a domain-separated KDF bound to the output and

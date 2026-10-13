@@ -4,8 +4,9 @@
 use crate::crypto::Point;
 use crate::errors::VMError;
 use crate::scalar::Scalar;
-use crate::string::String;
+use crate::CellValue;
 use core::convert::TryFrom;
+use std::sync::Arc;
 
 // ── Opcode bytes ─────────────────────────────────────────────────────
 
@@ -27,7 +28,8 @@ const OP_PUSHINT64_NEG: u8 = 0x15;
 const OP_PUSHINT128_POS: u8 = 0x16;
 const OP_PUSHINT128_NEG: u8 = 0x17;
 const OP_PUSHINT_FULL: u8 = 0x18;
-const OP_PUSHSTR: u8 = 0x19;
+// Legacy host-source marker only; not a VM opcode.
+const SOURCE_BYTES: u8 = 0x19;
 const OP_PUSHPOINT: u8 = 0x1a;
 const OP_PUSHTOKEN: u8 = 0x1b;
 const OP_DROP: u8 = 0x1c;
@@ -43,14 +45,23 @@ const OP_DUPK_MAX: u8 = 0x2f;
 const OP_ROLLK_BASE: u8 = 0x30;
 const OP_ROLLK_MAX: u8 = 0x3f;
 
-// 0x4X — String
-const OP_READBITS: u8 = 0x40;
-const OP_READINT: u8 = 0x41;
-const OP_READSTR: u8 = 0x42;
+// 0x4X — Cell bytes/refs
+const OP_READUINT: u8 = 0x40;
+const OP_READSCALAR: u8 = 0x41;
+const OP_READBYTES: u8 = 0x42;
 const OP_READPOINT: u8 = 0x43;
-const OP_WRITEBITS: u8 = 0x44;
-const OP_WRITEINT: u8 = 0x45;
-const OP_APPEND: u8 = 0x46;
+const OP_WRITEUINT: u8 = 0x44;
+const OP_WRITESCALAR: u8 = 0x45;
+const OP_APPENDBYTES: u8 = 0x46;
+const OP_APPENDREFS: u8 = 0x4e;
+const OP_BUILDER: u8 = 0x4f;
+const OP_SLICE: u8 = 0xa8;
+const OP_ENDCELL: u8 = 0xa9;
+const OP_LOADREF: u8 = 0xaa;
+const OP_CELLINFO: u8 = 0xab;
+const OP_RUNSLICE: u8 = 0xac;
+const OP_WRITEREF: u8 = 0xad;
+const OP_WRITEPOINT: u8 = 0xae;
 const OP_WRITEZEROS: u8 = 0x47;
 const OP_BITNOT: u8 = 0x48;
 const OP_BITOR: u8 = 0x49;
@@ -73,7 +84,6 @@ const OP_OR: u8 = 0x59;
 const OP_SIZE: u8 = 0x5a;
 
 // 0x6X — Constraints
-const OP_SCALAR: u8 = 0x60;
 const OP_COMMIT: u8 = 0x61;
 const OP_ALLOC: u8 = 0x62;
 const OP_EXPR: u8 = 0x63;
@@ -99,6 +109,8 @@ const OP_SHA512: u8 = 0x84;
 const OP_SHA3: u8 = 0x85;
 const OP_KECCAK256: u8 = 0x86;
 const OP_LOG: u8 = 0x87;
+const OP_CELLHASH: u8 = 0x88;
+const OP_EVALPOINT: u8 = 0x89;
 
 // 0x9X — Tokens. Mint opcodes and their consumer-side flavor helpers
 // are paired (priv ↔ privflv, pub ↔ pubflv) for adjacency.
@@ -123,6 +135,8 @@ const OP_JUMP: u8 = 0xa2;
 const OP_JUMPIF: u8 = 0xa3;
 const OP_RETURN: u8 = 0xa4;
 const OP_TYPE: u8 = 0xa5;
+const OP_PUSHCELL: u8 = 0xa6;
+const OP_EXEC: u8 = 0xa7;
 
 // 0xcX — Contracts & predicates
 const OP_INPUT: u8 = 0xc0;
@@ -163,65 +177,79 @@ const OP_HEIGHT: u8 = 0xf2;
 /// variant's inline comment shows its stack diagram.
 #[derive(Clone, Debug)]
 pub enum Instruction {
-    PushInt(Scalar),       // ø push → int
-    PushStr(String),       // ø pushstr → str
-    PushPoint(Point),      // ø pushpoint → point (witness-bearing on prover)
-    PushToken,             // flv pushtoken → token
-    Drop,                  // x drop → ø
-    Nop,                   // ø nop → ø
-    Dup,                   // x(k) … x(0) k dup → x(k) … x(0) x(k)
-    Roll,                  // x(k) … x(0) k roll → x(k-1) … x(0) x(k)
-    DupK(u8),              // x(k) … x(0) dup:k → x(k) … x(0) x(k)
-    RollK(u8),             // x(k) … x(0) roll:k → x(k-1) … x(0) x(k)
-    ReadBits,              // s n readbits → s' x 1 | s 0
-    ReadInt,               // s readint → s' x 1 | s 0
-    ReadStr,               // s n readstr → s' s'' 1 | s 0
-    ReadPoint,             // s readpoint → s' p 1 | s 0
-    WriteBits,             // s x n writebits → s'
-    WriteInt,              // s x writeint → s'
-    Append,                // s s' append → s''
-    WriteZeros,            // s n writezeros → s'
-    BitNot,                // s bitnot → s'
-    BitOr,                 // a b bitor → c
-    BitAnd,                // a b bitand → c
-    BitXor,                // a b bitxor → c
-    ShiftLeft,             // a n shiftleft → b c
-    ShiftRight,            // a n shiftright → b c
-    Keccak256,             // s keccak256 → x
-    Abs,                   // x abs → |x| s
-    Eq,                    // a b eq → a b {0|1} or constraint
-    Neg,                   // x neg → -x
-    Add,                   // x y add → z
-    Mul,                   // x y mul → z
-    DivMod,                // x z divmod → d r
-    Mod252,                // s mod252 → int
-    Not,                   // x not → y
-    And,                   // a b and → c
-    Or,                    // a b or → c
-    Size,                  // x size → x n
-    Scalar,                // s scalar → expr
-    Commit,                // s commit → var
-    Alloc(Option<Scalar>), // ø alloc → expr
-    Expr,                  // var expr → expr
-    Range,                 // x n range → x (scalar anywhere; expression external-only)
-    Dict,                  // val key … val key n dict → dict
-    Put,                   // dict k v put → dict'
-    Replace,               // dict k v replace → dict' {prev 1 | 0}
-    Get,                   // dict k get → dict' k v
-    GetOpt,                // dict k getopt → dict' {v 1 | 0}
-    GetDup,                // dict k getdup → dict {v 1 | 0}
-    First,                 // dict first → dict {k 1 | 0}
-    Last,                  // dict last → dict {k 1 | 0}
-    Next,                  // dict k next → dict {k' 1 | 0}
-    Transcript,            // label transcript → merlin (opens a Merlin transcript)
-    TWrite,                // m label s twrite → m
-    TRead,                 // m label n tread → m s
-    Sha256,                // s sha256 → x
-    Sha512,                // s sha512 → x
-    Sha3,                  // s sha3 → x
-    Log,                   // s log → ø
-    Amount,                // t amount → t qty flv
-    IssuePriv,             // qty:Variable tag issuepriv    → T  (predicate context)
+    PushInt(Scalar), // ø push → int
+    /// Host-only byte literal, compiled to pushcell and a child Cell.
+    CellLiteral(Arc<CellValue>),
+    PushPoint(Point), // ø pushpoint → point (witness-bearing on prover)
+    PushToken,        // flv pushtoken → token
+    /// The optional reference is compiler input, not an inline bytecode operand.
+    PushCell(Option<CellValue>), // ø pushcell → cell
+    Exec,             // cell exec → ø (tail execution in this frame)
+    Drop,             // x drop → ø
+    Nop,              // ø nop → ø
+    Dup,              // x(k) … x(0) k dup → x(k) … x(0) x(k)
+    Roll,             // x(k) … x(0) k roll → x(k-1) … x(0) x(k)
+    DupK(u8),         // x(k) … x(0) dup:k → x(k) … x(0) x(k)
+    RollK(u8),        // x(k) … x(0) roll:k → x(k-1) … x(0) x(k)
+    ReadUint,         // s n readuint → s' x 1 | s 0
+    ReadScalar,       // s readscalar → s' x 1 | s 0
+    ReadBytes,        // s b n readbytes → s' b' 1 | s b 0
+    ReadPoint,        // s readpoint → s' p 1 | s 0
+    WriteUint,        // b x n writeuint → b'
+    WriteScalar,      // b x writescalar → b'
+    WritePoint,       // b p writepoint → b'
+    WriteRef,         // b c writeref → b'
+    AppendBytes,      // s b appendbytes → s' b'
+    AppendRefs,       // s b appendrefs → s' b'
+    Builder,          // ø builder → b
+    Slice,            // c slice → s
+    EndCell,          // b endcell → c
+    LoadRef,          // s index loadref → s' c
+    CellInfo,         // c/s/b cellinfo → c/s/b bytes refs depth level pruned
+    RunSlice,         // ø runslice → slice (unread current program bytes/refs)
+    WriteZeros,       // b n writezeros → b'
+    BitNot,           // b bitnot → b'
+    BitOr,            // b s bitor → b'
+    BitAnd,           // b s bitand → b'
+    BitXor,           // b s bitxor → b'
+    ShiftLeft,        // b n shiftleft → b'
+    ShiftRight,       // b n shiftright → b'
+    Keccak256,        // s b keccak256 → b'
+    Abs,              // x abs → |x| s
+    Eq,               // a b eq → a b {0|1} or constraint
+    Neg,              // x neg → -x
+    Add,              // x y add → z
+    Mul,              // x y mul → z
+    DivMod,           // x z divmod → d r
+    Mod252,           // bytes mod252 → int
+    Not,              // x not → y
+    And,              // a b and → c
+    Or,               // a b or → c
+    Size,             // x size → x n
+    Commit,           // s commit → var
+    Alloc(Option<Scalar>), // ø alloc → var
+    Expr,             // var expr → expr
+    Range,            // x n range → x (scalar anywhere; expression external-only)
+    Dict,             // val key … val key n dict → dict
+    Put,              // dict k v put → dict'
+    Replace,          // dict k v replace → dict' {prev 1 | 0}
+    Get,              // dict k get → dict' k v
+    GetOpt,           // dict k getopt → dict' {v 1 | 0}
+    GetDup,           // dict k getdup → dict {v 1 | 0}
+    First,            // dict first → dict {k 1 | 0}
+    Last,             // dict last → dict {k 1 | 0}
+    Next,             // dict k next → dict {k' 1 | 0}
+    Transcript,       // label transcript → merlin (opens a Merlin transcript)
+    TWrite,           // m label s twrite → m
+    TRead,            // m label b n tread → m b'
+    Sha256,           // s b sha256 → b'
+    Sha512,           // s b sha512 → b'
+    Sha3,             // s b sha3 → b'
+    CellHash,         // c level b cellhash → b'
+    EvalPoint,        // msm evalpoint → point (immediate public computation)
+    Log,              // s log → ø
+    Amount,           // t amount → t qty flv
+    IssuePriv,        // qty:Variable tag issuepriv    → T  (predicate context)
     IssuePrivFlv, // pred tag    issueprivflv      → int (consumer-side flv helper for issuepriv)
     IssuePub,     // qty:Scalar tag issuepub → CT (InternalRoot / ActorCall)
     IssuePubFlv,  // cid tag     issuepubflv       → int (consumer-side flv helper for issuepub)
@@ -236,21 +264,21 @@ pub enum Instruction {
     Label(u32),   // ø label:n → ø  (operand: label number)
     Jump(u32),    // ø jump:n → ø   (unconditional)
     JumpIf(u32),  // x jumpif:n → ø (jump iff x ≠ 0)
-    Return,       // a(k-1) … a(0) k return → ø
+    Return,       // result return → ø (caller receives result 1)
     Type,         // x type → x code
     Input,        // s input → contract
     Contract,     // payload pred contract → contract
     Output,       // payload pred output → ø
-    Open,         // contract ik nbrs pos script gas portable-args… k open → results… k'
-    Send,         // portable-args… k refund gas addr send → ø (anonymous outside actor frames)
-    Call,         // portable-args… k gas addr call → results… k' 1 | args… k 0 (actor-only)
+    Open,         // contract ik program gas arg open → result 1 | contract arg 0
+    Send,         // arg refund gas addr send → ø (portable arg; anonymous outside actor frames)
+    Call,         // arg gas addr call → result 1 | arg 0 (portable arg; actor-only)
     Load,         // ø load → value (actor-only)
     Save,         // value save → ø (actor-only)
     Setcode,      // code setcode → ø (actor-only)
     AddStorage,   // q addstorage → {debt 1 | 0} (actor-only)
     QuoteStorage, // q quotestorage → {fee 1 | 0} (actor-only)
     Signtx,       // contract signtx → payload (external-only)
-    Signcall,     // contract script sig gas portable-args… m signcall → results… k'
+    Signcall,     // contract script sig gas arg signcall → result 1 | contract arg 0
     Timelock,     // ø timelock → n {0|1}
     Version,      // ø version → n
     Selfid,       // ø selfid → s (actor-only)
@@ -270,17 +298,7 @@ impl Instruction {
         let op = |w: &mut Vec<u8>, b: u8| w.push(b);
         match self {
             Instruction::PushInt(i) => encode_push_int(i, w),
-            Instruction::PushStr(s) => {
-                op(w, OP_PUSHSTR);
-                write_subvarint(w, s.len() as u64);
-                // Use `bytes_view` so witness-bearing variants
-                // (Commitment / Scalar / Predicate) serialize to
-                // their canonical opaque bytes. `as_bytes` would
-                // panic for those — the verifier's wire form must
-                // match regardless of which variant the prover
-                // used.
-                w.extend_from_slice(&s.to_bytes_vec())
-            }
+            Instruction::CellLiteral(_) => op(w, OP_PUSHCELL),
             Instruction::PushPoint(p) => {
                 op(w, OP_PUSHPOINT);
                 // Always serializes the canonical 32-byte form;
@@ -288,6 +306,8 @@ impl Instruction {
                 w.extend_from_slice(&p.to_bytes())
             }
             Instruction::PushToken => op(w, OP_PUSHTOKEN),
+            Instruction::PushCell(_) => op(w, OP_PUSHCELL),
+            Instruction::Exec => op(w, OP_EXEC),
             Instruction::Drop => op(w, OP_DROP),
             Instruction::Nop => op(w, OP_NOP),
             Instruction::Dup => op(w, OP_DUP),
@@ -300,13 +320,22 @@ impl Instruction {
                 debug_assert!(*k <= 0x0f, "RollK arg must fit in 4 bits");
                 op(w, OP_ROLLK_BASE + (*k & 0x0f))
             }
-            Instruction::ReadBits => op(w, OP_READBITS),
-            Instruction::ReadInt => op(w, OP_READINT),
-            Instruction::ReadStr => op(w, OP_READSTR),
+            Instruction::ReadUint => op(w, OP_READUINT),
+            Instruction::ReadScalar => op(w, OP_READSCALAR),
+            Instruction::ReadBytes => op(w, OP_READBYTES),
             Instruction::ReadPoint => op(w, OP_READPOINT),
-            Instruction::WriteBits => op(w, OP_WRITEBITS),
-            Instruction::WriteInt => op(w, OP_WRITEINT),
-            Instruction::Append => op(w, OP_APPEND),
+            Instruction::WriteUint => op(w, OP_WRITEUINT),
+            Instruction::WriteScalar => op(w, OP_WRITESCALAR),
+            Instruction::WritePoint => op(w, OP_WRITEPOINT),
+            Instruction::WriteRef => op(w, OP_WRITEREF),
+            Instruction::AppendBytes => op(w, OP_APPENDBYTES),
+            Instruction::AppendRefs => op(w, OP_APPENDREFS),
+            Instruction::Builder => op(w, OP_BUILDER),
+            Instruction::Slice => op(w, OP_SLICE),
+            Instruction::EndCell => op(w, OP_ENDCELL),
+            Instruction::LoadRef => op(w, OP_LOADREF),
+            Instruction::CellInfo => op(w, OP_CELLINFO),
+            Instruction::RunSlice => op(w, OP_RUNSLICE),
             Instruction::WriteZeros => op(w, OP_WRITEZEROS),
             Instruction::BitNot => op(w, OP_BITNOT),
             Instruction::BitOr => op(w, OP_BITOR),
@@ -326,7 +355,6 @@ impl Instruction {
             Instruction::And => op(w, OP_AND),
             Instruction::Or => op(w, OP_OR),
             Instruction::Size => op(w, OP_SIZE),
-            Instruction::Scalar => op(w, OP_SCALAR),
             Instruction::Commit => op(w, OP_COMMIT),
             Instruction::Alloc(_) => op(w, OP_ALLOC),
             Instruction::Expr => op(w, OP_EXPR),
@@ -346,6 +374,8 @@ impl Instruction {
             Instruction::Sha256 => op(w, OP_SHA256),
             Instruction::Sha512 => op(w, OP_SHA512),
             Instruction::Sha3 => op(w, OP_SHA3),
+            Instruction::CellHash => op(w, OP_CELLHASH),
+            Instruction::EvalPoint => op(w, OP_EVALPOINT),
             Instruction::Log => op(w, OP_LOG),
             Instruction::Amount => op(w, OP_AMOUNT),
             Instruction::IssuePriv => op(w, OP_ISSUEPRIV),
@@ -416,29 +446,45 @@ impl Instruction {
     pub fn encoded_size(&self) -> usize {
         match self {
             Self::PushInt(value) => 1 + push_int_parts(value).1,
-            Self::PushStr(value) => 1 + subvarint_size(value.len() as u64) + value.len(),
             Self::PushPoint(_) => 33,
             Self::Label(n) | Self::Jump(n) | Self::JumpIf(n) => 1 + subvarint_size(u64::from(*n)),
             _ => 1,
         }
     }
 
-    /// Heap bytes needed to materialize the next decoded instruction.
-    /// Only `pushstr` is variable-sized; inspect its length prefix before
-    /// `parse` allocates the owned buffer.
-    pub(crate) fn decoded_allocation_bytes(bytes: &[u8]) -> Result<usize, VMError> {
-        let mut reader = bytes;
-        let opcode = take_bytes(&mut reader, 1)?[0];
-        if opcode != OP_PUSHSTR {
-            return Ok(0);
+    /// Compatibility source for byte-only host APIs, never native execution.
+    pub(crate) fn encode_source(&self, bytes: &mut Vec<u8>) {
+        if let Self::CellLiteral(value) = self {
+            if let Ok(payload) = value.payload() {
+                bytes.push(SOURCE_BYTES);
+                write_subvarint(bytes, payload.len() as u64);
+                bytes.extend_from_slice(payload);
+                return;
+            }
         }
-        let len = read_subvarint(&mut reader).map_err(|_| VMError::UnexpectedEndOfScript)?;
-        let len = usize::try_from(len).map_err(|_| VMError::OutOfGas)?;
-        if len > reader.len() {
+        self.encode(bytes);
+    }
+
+    /// Parses legacy host source; native VM execution uses `parse` instead.
+    pub fn parse_source(reader: &mut &[u8]) -> Result<Self, VMError> {
+        if reader.first() != Some(&SOURCE_BYTES) {
+            return Self::parse(reader);
+        }
+        take_bytes(reader, 1)?;
+        let length = usize::try_from(read_subvarint(reader)?).map_err(|_| VMError::OutOfGas)?;
+        if length > reader.len() {
             return Err(VMError::UnexpectedEndOfScript);
         }
-        String::check_length(len)?;
-        Ok(len)
+        if length > cells::MAX_CELL_PAYLOAD {
+            return Err(cells::CellError::PayloadTooLarge {
+                actual: length,
+                max: cells::MAX_CELL_PAYLOAD,
+            }
+            .into());
+        }
+        Ok(Self::CellLiteral(Arc::new(CellValue::from_bytes(
+            take_bytes(reader, length)?.to_vec(),
+        )?)))
     }
 
     /// Reads exactly one Instruction (opcode + inline parameter bytes)
@@ -466,38 +512,36 @@ impl Instruction {
             OP_PUSHINT128_POS => parse_pushint_n(reader, 16, false),
             OP_PUSHINT128_NEG => parse_pushint_n(reader, 16, true),
             OP_PUSHINT_FULL => parse_pushint_full(reader),
-            OP_PUSHSTR => {
-                let len =
-                    usize::try_from(read_subvarint(reader)?).map_err(|_| VMError::OutOfGas)?;
-                // Bound the claimed length against remaining input BEFORE
-                // allocating — a tiny length prefix must not force a giant
-                // allocation on adversarial bytecode.
-                if len > reader.len() {
-                    return Err(VMError::UnexpectedEndOfScript);
-                }
-                String::check_length(len)?;
-                let buf = take_bytes(reader, len)?.to_vec();
-                Ok(Instruction::PushStr(String::from(buf)))
-            }
             OP_PUSHPOINT => {
                 let mut buf = [0u8; 32];
                 buf.copy_from_slice(take_bytes(reader, 32)?);
                 Ok(Instruction::PushPoint(Point::from_bytes(buf)))
             }
             OP_PUSHTOKEN => Ok(Instruction::PushToken),
+            OP_PUSHCELL => Ok(Instruction::PushCell(None)),
+            OP_EXEC => Ok(Instruction::Exec),
             OP_DROP => Ok(Instruction::Drop),
             OP_NOP => Ok(Instruction::Nop),
             OP_DUP => Ok(Instruction::Dup),
             OP_ROLL => Ok(Instruction::Roll),
             OP_DUPK_BASE..=OP_DUPK_MAX => Ok(Instruction::DupK(byte - OP_DUPK_BASE)),
             OP_ROLLK_BASE..=OP_ROLLK_MAX => Ok(Instruction::RollK(byte - OP_ROLLK_BASE)),
-            OP_READBITS => Ok(Instruction::ReadBits),
-            OP_READINT => Ok(Instruction::ReadInt),
-            OP_READSTR => Ok(Instruction::ReadStr),
+            OP_READUINT => Ok(Instruction::ReadUint),
+            OP_READSCALAR => Ok(Instruction::ReadScalar),
+            OP_READBYTES => Ok(Instruction::ReadBytes),
             OP_READPOINT => Ok(Instruction::ReadPoint),
-            OP_WRITEBITS => Ok(Instruction::WriteBits),
-            OP_WRITEINT => Ok(Instruction::WriteInt),
-            OP_APPEND => Ok(Instruction::Append),
+            OP_WRITEUINT => Ok(Instruction::WriteUint),
+            OP_WRITESCALAR => Ok(Instruction::WriteScalar),
+            OP_WRITEPOINT => Ok(Instruction::WritePoint),
+            OP_WRITEREF => Ok(Instruction::WriteRef),
+            OP_APPENDBYTES => Ok(Instruction::AppendBytes),
+            OP_APPENDREFS => Ok(Instruction::AppendRefs),
+            OP_BUILDER => Ok(Instruction::Builder),
+            OP_SLICE => Ok(Instruction::Slice),
+            OP_ENDCELL => Ok(Instruction::EndCell),
+            OP_LOADREF => Ok(Instruction::LoadRef),
+            OP_CELLINFO => Ok(Instruction::CellInfo),
+            OP_RUNSLICE => Ok(Instruction::RunSlice),
             OP_WRITEZEROS => Ok(Instruction::WriteZeros),
             OP_BITNOT => Ok(Instruction::BitNot),
             OP_BITOR => Ok(Instruction::BitOr),
@@ -517,7 +561,6 @@ impl Instruction {
             OP_AND => Ok(Instruction::And),
             OP_OR => Ok(Instruction::Or),
             OP_SIZE => Ok(Instruction::Size),
-            OP_SCALAR => Ok(Instruction::Scalar),
             OP_COMMIT => Ok(Instruction::Commit),
             OP_ALLOC => Ok(Instruction::Alloc(None)),
             OP_EXPR => Ok(Instruction::Expr),
@@ -537,6 +580,8 @@ impl Instruction {
             OP_SHA256 => Ok(Instruction::Sha256),
             OP_SHA512 => Ok(Instruction::Sha512),
             OP_SHA3 => Ok(Instruction::Sha3),
+            OP_CELLHASH => Ok(Instruction::CellHash),
+            OP_EVALPOINT => Ok(Instruction::EvalPoint),
             OP_LOG => Ok(Instruction::Log),
             OP_AMOUNT => Ok(Instruction::Amount),
             OP_ISSUEPRIV => Ok(Instruction::IssuePriv),
@@ -730,6 +775,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loadref_has_one_byte_encoding_without_inline_operands() {
+        assert_eq!(Instruction::LoadRef.encode_to_vec(), vec![0xaa]);
+        assert_eq!(Instruction::LoadRef.encoded_size(), 1);
+        let mut input = &[0xaa, OP_NOP][..];
+        assert!(matches!(
+            Instruction::parse(&mut input).unwrap(),
+            Instruction::LoadRef
+        ));
+        assert_eq!(input, &[OP_NOP]);
+    }
+
+    #[test]
+    fn cellinfo_has_one_byte_encoding_without_inline_operands() {
+        assert_eq!(Instruction::CellInfo.encode_to_vec(), vec![0xab]);
+        assert_eq!(Instruction::CellInfo.encoded_size(), 1);
+        let mut input = &[0xab, OP_NOP][..];
+        assert!(matches!(
+            Instruction::parse(&mut input).unwrap(),
+            Instruction::CellInfo
+        ));
+        assert_eq!(input, &[OP_NOP]);
+    }
+
+    #[test]
     fn bytecode_subvarints_are_canonical_and_bounded() {
         for (value, expected) in [
             (0, "0000"),
@@ -753,7 +822,7 @@ mod tests {
         assert!(read_subvarint(&mut &[4][..]).is_err());
         assert!(read_subvarint(&mut &[3, 0][..]).is_err());
         for instruction in [
-            Instruction::PushStr(String::from(vec![7; 256])),
+            Instruction::CellLiteral(Arc::new(CellValue::from_bytes(vec![7; 256]).unwrap())),
             Instruction::Label(u32::MAX),
             Instruction::PushInt(Scalar::from(-256i64)),
             Instruction::Alloc(Some(Scalar::ONE)),
@@ -869,12 +938,12 @@ mod tests {
 
     #[test]
     fn ext_opcode_for_unknown_bytes() {
-        // 0x4f remains unassigned (0x4e is keccak256, 0x50 is abs).
+        // 0x19 was pushstr; literals now use pushcell.
         // 0xf3..=0xf7 remain reserved for the chain-info family after
         // 0xf2 was assigned to height.
         // 0xff is a sentinel "definitely unassigned" byte for fuzzing
         // future extensions.
-        let unused = [0x4f, 0xf3, 0xff];
+        let unused = [0x19, 0xf3, 0xff];
         for b in unused {
             let mut r: &[u8] = &[b];
             let parsed = Instruction::parse(&mut r).expect("parses");

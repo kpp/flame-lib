@@ -1,4 +1,4 @@
-//! The seven methods `flamed` serves.
+//! The methods `flamed` serves.
 //!
 //! The macro generates `FlamedApiServer`, which `flamed` implements, and
 //! `FlamedApiClient`, blanket-implemented for every jsonrpsee client, so the
@@ -13,14 +13,47 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 
 use crate::types::{
-    BlockTxEnvelope, ContractId, ContractResult, PredicatePoint, ProofResult, ScanResult,
-    TipResult, TxId, TxStatusResult,
+    ActorId, ActorResult, BlockResult, BlockTxEnvelope, BlocksResult, ContractId, ContractResult,
+    PendingTransactionsResult, PredicatePoint, ProofResult, ScanResult, TipResult,
+    TransactionResult, TransactionsResult, TxId, TxStatusResult,
 };
 
 /// The `flamed` JSON-RPC 2.0 API. Parameters are positional, in the order
 /// written; method names carry no prefix.
 #[rpc(server, client)]
 pub trait FlamedApi {
+    /// Blocks newest first, strictly below `before` when provided. Limit 1..100.
+    /// Includes genesis at height zero.
+    #[method(name = "blocks")]
+    async fn blocks(&self, before: Option<u64>, limit: u32) -> RpcResult<BlocksResult>;
+
+    /// One block by height, including its internal executions.
+    /// Genesis is height zero; `NOT_FOUND` if the height is absent.
+    #[method(name = "block")]
+    async fn block(&self, height: u64) -> RpcResult<BlockResult>;
+
+    /// Confirmed executions, newest first.
+    /// `before` excludes the named execution and all newer executions. Limit 1..100.
+    /// Returns `NOT_FOUND` if the cursor does not name a confirmed execution.
+    #[method(name = "transactions")]
+    async fn transactions(&self, before: Option<TxId>, limit: u32)
+        -> RpcResult<TransactionsResult>;
+
+    /// The first pending transactions in mempool admission order. Limit 1..100.
+    #[method(name = "pending_transactions")]
+    async fn pending_transactions(&self, limit: u32) -> RpcResult<PendingTransactionsResult>;
+
+    /// One confirmed external or internal execution.
+    /// Set `decode_effects` to true to decode public effects. The default is false.
+    /// Returns `NOT_FOUND` for unknown or pending transactions.
+    #[method(name = "tx")]
+    async fn tx(&self, id: TxId, decode_effects: Option<bool>) -> RpcResult<TransactionResult>;
+
+    /// Current actor state and code, with decoded state and instructions.
+    /// Returns `NOT_FOUND` if the actor does not exist.
+    #[method(name = "actor")]
+    async fn actor(&self, id: ActorId) -> RpcResult<ActorResult>;
+
     /// The current tip: its hash, its height, and the contract accumulator root.
     #[method(name = "tip")]
     async fn tip(&self) -> RpcResult<TipResult>;
@@ -33,7 +66,8 @@ pub trait FlamedApi {
     #[method(name = "proofs")]
     async fn proofs(&self, ids: Vec<ContractId>) -> RpcResult<Vec<(ContractId, ProofResult)>>;
 
-    /// One contract as the node archived it. `NOT_FOUND` if it has none.
+    /// An archived contract, its spend status, and its decoded public payload.
+    /// Returns `NOT_FOUND` if the contract does not exist.
     #[method(name = "contract")]
     async fn contract(&self, id: ContractId) -> RpcResult<ContractResult>;
 
@@ -47,7 +81,8 @@ pub trait FlamedApi {
     async fn tx_status(&self, txid: TxId) -> RpcResult<TxStatusResult>;
 
     /// Every contract created at `since_height` or later under one of these
-    /// predicates. `LIMIT_EXCEEDED` past `MAX_SCAN_PREDICATES`.
+    /// predicates, each with the note that followed it in its log.
+    /// `LIMIT_EXCEEDED` past `MAX_SCAN_PREDICATES`.
     #[method(name = "scan")]
     async fn scan(
         &self,

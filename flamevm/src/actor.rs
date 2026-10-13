@@ -1,113 +1,288 @@
 //! Actor data model: identity, state, lifecycle counters, registry.
 
 use cells::{
-    BagOfCells, CellBuilder, CellDecode, CellEncode, CellError, CellRef, CellResolver, CellSlice,
+    Cell, CellBuilder, CellDecode, CellEncode, CellError, CellIndex, CellReader, CellRef, CellSlice,
 };
 use std::sync::Arc;
 
 use crate::dict::Dict;
-use crate::encoding::{blob_cell, read_blob};
 use crate::errors::VMError;
 use crate::value::Value;
 
-// ── ActorID ──────────────────────────────────────────────────────
+// ── Actor identity and routing ──────────────────────────────────
 
-/// Actor identifier. **Every actor has exactly one identity**;
-/// this enum is just two views of the *same* 32-byte hash:
-///
-/// - [`ActorID::Hash`] — the bare canonical hash. The form scripts
-///   use to address already-deployed actors (32 bytes, low overhead).
-///
-/// - [`ActorID::Constructor`] — the constructor script bytes
-///   inlined. Carries the actor's full code on the wire, useful
-///   for the first send to a not-yet-deployed actor: consensus
-///   sees the script, runs it to instantiate state, and registers
-///   the actor under the same canonical id.
-///
-/// **Equivalence invariant**: `Constructor(bytes).to_hash()` ==
-/// `Hash(h).to_hash()` whenever `h == code_root(bytes)`.
-/// Both addresses route to the same actor; the registry
-/// canonicalizes on the hash so callers can use whichever form
-/// they have on hand.
-///
-/// Wire form: a tag byte (`0x00` Hash, `0x01` Constructor) followed
-/// by the payload. The Hash variant's payload is a bare 32 bytes;
-/// the Constructor variant has one reference to snake-encoded code.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ActorID {
-    /// Canonical 32-byte hash of the constructor script.
-    Hash([u8; 32]),
+mod wire {
+    use std::convert::TryInto;
+    include!(concat!(env!("OUT_DIR"), "/actor_wire.rs"));
+}
 
-    /// Constructor script bytes. Hashes to the same canonical
-    /// id as `Hash(code_root(bytes))`.
-    Constructor(Vec<u8>),
+/// Immutable actor identity: the factual CellID of its original constructor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ActorID(pub [u8; 32]);
+
+impl From<[u8; 32]> for ActorID {
+    fn from(id: [u8; 32]) -> Self {
+        Self(id)
+    }
 }
 
 impl ActorID {
-    /// Tag value for [`ActorID::Hash`] on the wire.
-    pub const TAG_HASH: u8 = 0x00;
-    /// Tag value for [`ActorID::Constructor`] on the wire.
-    pub const TAG_CONSTRUCTOR: u8 = 0x01;
-
-    /// Returns this id's canonical 32-byte hash. Both variants resolve
-    /// to the **same** value (the equivalence invariant from the type docs).
+    /// Returns the raw identity bytes, without an address-style tag.
     pub fn to_hash(&self) -> [u8; 32] {
-        match self {
-            ActorID::Hash(h) => *h,
-            ActorID::Constructor(bytes) => code_root(bytes),
-        }
+        self.0
     }
 
-    /// Returns this id in its compact `Hash` form. Use this to compare
-    /// ids by canonical value without keeping the constructor bytes around.
-    pub fn to_canonical(&self) -> ActorID {
-        match self {
-            ActorID::Hash(_) => self.clone(),
-            ActorID::Constructor(_) => ActorID::Hash(self.to_hash()),
-        }
+    /// Actor identities have only one representation.
+    pub fn to_canonical(&self) -> Self {
+        *self
     }
 }
 
-/// Canonical wire form (tag byte + payload). `Hash` writes a 32-byte
-/// payload; `Constructor` stores one reference to snake-encoded code.
 impl CellEncode for ActorID {
-    fn encode(&self, w: &mut CellBuilder) -> Result<(), CellError> {
-        match self {
-            ActorID::Hash(h) => {
-                w.store_u8(Self::TAG_HASH)?.store_bytes(h)?;
-            }
-            ActorID::Constructor(bytes) => {
-                w.store_u8(Self::TAG_CONSTRUCTOR)?;
-                w.store_ref(CellRef::resident(blob_cell(bytes)?))?;
-            }
-        }
-        Ok(())
+    fn encode(&self, builder: &mut CellBuilder) -> Result<(), CellError> {
+        wire::ActorID(self.0).encode(builder)
     }
 }
 
 impl CellDecode for ActorID {
-    fn decode<R: CellResolver + ?Sized>(
-        r: &mut CellSlice<'_>,
+    fn decode<R: CellReader + ?Sized>(
+        slice: &mut CellSlice<'_>,
         cells: &mut R,
     ) -> Result<Self, CellError> {
-        let tag = r.load_u8()?;
-        match tag {
-            Self::TAG_HASH => {
-                let h = <[u8; 32]>::decode(r, cells)?;
-                Ok(ActorID::Hash(h))
-            }
-            Self::TAG_CONSTRUCTOR => {
-                let bytes = read_blob(&r.load_ref()?, cells, u32::MAX as usize)?;
-                Ok(ActorID::Constructor(bytes))
-            }
-            _ => Err(CellError::InvalidFormat),
+        Ok(Self(wire::ActorID::decode(slice, cells)?.0))
+    }
+}
+
+/// Canonical actor routing operand, defined by `flamevm/actor.ctl`.
+#[derive(Clone, Debug)]
+pub enum ActorAddress {
+    /// Initialize an absent actor using this native constructor graph.
+    Init { ctor: CellRef },
+    /// Invoke an existing initialized actor.
+    Address { addr: ActorID },
+    /// Restore authenticated state under an existing actor identity.
+    Restore { addr: ActorID, state: CellRef },
+}
+
+impl ActorAddress {
+    /// Resolves identity without reading the constructor or supplied state.
+    pub fn to_actor_id(&self) -> ActorID {
+        match self {
+            Self::Init { ctor } => ActorID(ctor.id()),
+            Self::Address { addr } | Self::Restore { addr, .. } => *addr,
         }
+    }
+
+    /// Returns the routing identity bytes, independent of the address style.
+    pub fn to_hash(&self) -> [u8; 32] {
+        self.to_actor_id().to_hash()
+    }
+}
+
+impl PartialEq for ActorAddress {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Init { ctor: left }, Self::Init { ctor: right }) => {
+                left.commitment() == right.commitment()
+            }
+            (Self::Address { addr: left }, Self::Address { addr: right }) => left == right,
+            (
+                Self::Restore {
+                    addr: left,
+                    state: left_state,
+                },
+                Self::Restore {
+                    addr: right,
+                    state: right_state,
+                },
+            ) => left == right && left_state.commitment() == right_state.commitment(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ActorAddress {}
+
+impl From<ActorID> for ActorAddress {
+    fn from(addr: ActorID) -> Self {
+        Self::Address { addr }
+    }
+}
+
+impl CellEncode for ActorAddress {
+    fn encode(&self, builder: &mut CellBuilder) -> Result<(), CellError> {
+        let address = match self {
+            Self::Init { ctor } => wire::ActorAddress::Init { ctor: ctor.clone() },
+            Self::Address { addr } => wire::ActorAddress::Address {
+                addr: wire::ActorID(addr.0),
+            },
+            Self::Restore { addr, state } => wire::ActorAddress::Restore {
+                addr: wire::ActorID(addr.0),
+                state: state.clone(),
+            },
+        };
+        address.encode(builder)
+    }
+}
+
+impl CellDecode for ActorAddress {
+    fn decode<R: CellReader + ?Sized>(
+        slice: &mut CellSlice<'_>,
+        cells: &mut R,
+    ) -> Result<Self, CellError> {
+        Ok(match wire::ActorAddress::decode(slice, cells)? {
+            wire::ActorAddress::Init { ctor } => Self::Init { ctor },
+            wire::ActorAddress::Address { addr } => Self::Address {
+                addr: ActorID(addr.0),
+            },
+            wire::ActorAddress::Restore { addr, state } => Self::Restore {
+                addr: ActorID(addr.0),
+                state,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    struct NoReads;
+
+    impl CellReader for NoReads {
+        fn read(
+            &mut self,
+            _: cells::CellID,
+            _: Option<&Arc<Cell>>,
+        ) -> Result<Arc<Cell>, CellError> {
+            panic!("decoding an actor address must not load witness bodies")
+        }
+    }
+
+    #[test]
+    fn actor_id_is_raw32_and_address_tags_follow_ctl() {
+        let id = ActorID::from([0x42; 32]);
+        let cell = id.to_cell().unwrap();
+        assert_eq!(cell.payload(), &[0x42; 32]);
+        assert!(cell.refs().is_empty());
+        assert_eq!(ActorID::from_cell(&cell, &mut NoReads).unwrap(), id);
+
+        let ctor = Cell::new(
+            vec![0xa6, 0xa7],
+            vec![Cell::new(vec![0], vec![]).unwrap().into()],
+        )
+        .unwrap();
+        let init = ActorAddress::Init {
+            ctor: ctor.clone().into(),
+        };
+        let encoded = init.to_cell().unwrap();
+        assert_eq!(encoded.payload(), &[0]);
+        assert_eq!(encoded.refs().len(), 1);
+        assert_eq!(encoded.refs()[0].id(), ctor.id());
+        assert_eq!(init.to_actor_id(), ActorID::from(ctor.id()));
+        let decoded = ActorAddress::from_cell(&encoded, &mut NoReads).unwrap();
+        assert_eq!(decoded, init);
+        assert_ne!(init, ActorAddress::from(init.to_actor_id()));
+        match decoded {
+            ActorAddress::Init { ctor: reference } => {
+                assert_eq!(
+                    reference.as_resident().unwrap().refs()[0].id(),
+                    ctor.refs()[0].id()
+                );
+            }
+            _ => panic!("wrong address style"),
+        }
+
+        let address = ActorAddress::from(id).to_cell().unwrap();
+        assert_eq!(address.payload(), [&[1][..], &id.0[..]].concat());
+        assert!(address.refs().is_empty());
+        assert_eq!(
+            ActorAddress::from_cell(&address, &mut NoReads)
+                .unwrap()
+                .to_actor_id(),
+            id
+        );
+
+        let state = Cell::new(vec![], vec![ctor.into(), cell.into()]).unwrap();
+        let restore = ActorAddress::Restore {
+            addr: id,
+            state: state.clone().into(),
+        };
+        let encoded = restore.to_cell().unwrap();
+        assert_eq!(encoded.payload(), [&[2][..], &id.0[..]].concat());
+        assert_eq!(encoded.refs().len(), 1);
+        match ActorAddress::from_cell(&encoded, &mut NoReads).unwrap() {
+            ActorAddress::Restore {
+                addr,
+                state: reference,
+            } => {
+                assert_eq!(addr, id);
+                assert_eq!(reference.id(), state.id());
+                assert_eq!(reference.as_resident().unwrap().refs().len(), 2);
+            }
+            _ => panic!("wrong address style"),
+        }
+    }
+
+    #[test]
+    fn actor_addresses_keep_pruned_and_unloaded_references_lazy() {
+        let cell = Cell::new(vec![0], vec![]).unwrap();
+        let pruned = cell.prune(1).unwrap();
+        let init = ActorAddress::Init {
+            ctor: pruned.clone().into(),
+        };
+        assert_eq!(init.to_actor_id(), ActorID::from(pruned.id()));
+        assert_ne!(init.to_actor_id().to_hash(), cell.id());
+        let decoded = ActorAddress::from_cell(&init.to_cell().unwrap(), &mut NoReads).unwrap();
+        match decoded {
+            ActorAddress::Init { ctor } => assert!(ctor.as_resident().unwrap().is_pruned()),
+            _ => panic!("wrong address style"),
+        }
+
+        let restore = ActorAddress::Restore {
+            addr: ActorID::from([7; 32]),
+            state: CellRef::from(cell).to_unloaded(),
+        };
+        let decoded = ActorAddress::from_cell(&restore.to_cell().unwrap(), &mut NoReads).unwrap();
+        match decoded {
+            ActorAddress::Restore { state, .. } => assert!(state.is_unloaded()),
+            _ => panic!("wrong address style"),
+        }
+    }
+
+    #[test]
+    fn actor_addresses_reject_unknown_tags_and_wrong_field_shapes() {
+        for tag in 3..=u8::MAX {
+            let cell = Cell::new(vec![tag], vec![]).unwrap();
+            assert!(matches!(
+                ActorAddress::from_cell(&cell, &mut NoReads),
+                Err(CellError::InvalidFormat)
+            ));
+        }
+        for payload in [
+            vec![0],
+            vec![1],
+            vec![2; 33],
+            [&[1][..], &[0; 33][..]].concat(),
+        ] {
+            let cell = Cell::new(payload, vec![]).unwrap();
+            assert!(ActorAddress::from_cell(&cell, &mut NoReads).is_err());
+        }
+        let cell = Cell::new(
+            [&[1][..], &[0; 32][..]].concat(),
+            vec![Cell::new(vec![], vec![]).unwrap().into()],
+        )
+        .unwrap();
+        assert!(matches!(
+            ActorAddress::from_cell(&cell, &mut NoReads),
+            Err(CellError::TrailingReferences)
+        ));
     }
 }
 
 // ── Actor state + code helpers ───────────────────────────────────
 //
-// An actor is `(code, state)`: a single bytecode blob (set by `setcode`,
+// An actor is `(code, state)`: an executable Cell graph (set by `setcode`,
 // dispatched on the `method` opcode) plus an opaque state `Value` the
 // author structures however they like. `op_load` / `op_save` move the
 // state; `state_root` / `code_root` are the canonical commitments for
@@ -130,10 +305,76 @@ pub fn state_root(state: &Value) -> [u8; 32] {
         .id()
 }
 
-/// Canonical snake Cell ID of an actor's code, referenced by `TxEntry::SetCode`.
+/// Compiles legacy flat code to native program Cells with explicit continuations.
+pub fn code_cell(code: &[u8]) -> Result<Cell, CellError> {
+    crate::script::script_cell(code)
+}
+
+/// Compatibility decoding for bytecode-only actor APIs, not execution. Only
+/// canonical compiler-produced continuation chains can be flattened safely.
+pub fn code_from_cell<R: CellReader + ?Sized>(
+    root: &Cell,
+    reader: &mut R,
+    limit: usize,
+) -> Result<Vec<u8>, CellError> {
+    let mut cell = root.clone();
+    let mut bytes = Vec::new();
+    loop {
+        if cell.is_pruned() {
+            return Err(CellError::PrunedCell);
+        }
+        let mut payload = cell.payload();
+        let mut refs = cell.refs().iter();
+        let mut next = None;
+        while !payload.is_empty() {
+            let instruction =
+                crate::Instruction::parse(&mut payload).map_err(|_| CellError::InvalidFormat)?;
+            let mut encoded = Vec::new();
+            if matches!(instruction, crate::Instruction::PushCell(_)) {
+                let reference = refs.next().ok_or(CellError::InsufficientReferences)?;
+                if payload == [0xa7] && refs.len() == 0 {
+                    next = Some(cells::read_cell(reader, reference)?.as_ref().clone());
+                    break;
+                }
+                let literal = cells::read_cell(reader, reference)?;
+                if literal.is_pruned() || !literal.refs().is_empty() {
+                    return Err(CellError::InvalidFormat);
+                }
+                crate::Instruction::CellLiteral(std::sync::Arc::new(crate::CellValue::from(
+                    literal,
+                )))
+                .encode_source(&mut encoded);
+            } else {
+                instruction.encode_source(&mut encoded);
+            }
+            if encoded.len() > limit.saturating_sub(bytes.len()) {
+                return Err(CellError::LimitExceeded);
+            }
+            bytes.extend_from_slice(&encoded);
+        }
+        if refs.len() != 0 {
+            return Err(CellError::TrailingReferences);
+        }
+        match next {
+            Some(child) => {
+                if cell.payload().len() <= 2 {
+                    return Err(CellError::InvalidFormat);
+                }
+                cell = child;
+            }
+            None => break,
+        }
+    }
+    if code_cell(&bytes)?.id() != root.id() {
+        return Err(CellError::InvalidFormat);
+    }
+    Ok(bytes)
+}
+
+/// Legacy source-byte constructor address; native program identities use `Cell::id`.
 pub fn code_root(code: &[u8]) -> [u8; 32] {
-    blob_cell(code)
-        .expect("actor code fits the byte-string format")
+    code_cell(code)
+        .expect("actor code is representable as native program Cells")
         .id()
 }
 
@@ -146,11 +387,11 @@ pub fn code_root(code: &[u8]) -> [u8; 32] {
 /// encodability ≠ portability — op_save's `is_portable` check is the
 /// authoritative storage gate; this reports the rare case of a portable
 /// value that lacks an encoder.
-pub fn code_state_bytes(code: &[u8], state: &Value) -> Result<u64, VMError> {
-    let mut graph = BagOfCells::collect(Arc::new(blob_cell(code)?))?;
-    graph.extend(&BagOfCells::collect(Arc::new(state.to_cell()?))?)?;
+pub fn code_state_bytes(code: &Cell, state: &Value) -> Result<u64, VMError> {
+    let mut graph = CellIndex::collect(Arc::new(code.clone()))?;
+    graph.extend(&CellIndex::collect(Arc::new(state.to_cell()?))?)?;
     let size = graph.iter().try_fold(0u64, |size, (_, cell)| {
-        size.checked_add(cell.encoded_size() as u64)
+        size.checked_add(cell.record_size() as u64)
             .ok_or(VMError::StorageArithmeticOverflow)
     });
     size
@@ -173,25 +414,50 @@ pub struct StoragePurchase {
 /// transaction.
 ///
 pub trait ActorRegistry {
-    /// Bodies committed as resident for this actor, never a node-global cache.
-    fn actor_cells(&self, _id: &ActorID) -> Result<Arc<BagOfCells>, VMError> {
-        Ok(Arc::new(BagOfCells::new()))
+    /// True when the actor's combined code/data root is explicitly pruned.
+    fn is_frozen(&self, _id: &ActorID) -> Result<bool, VMError> {
+        Ok(false)
     }
 
-    /// Execution-only recovery from the initiating transaction's immutable BoC.
+    /// Authenticates and merges supplied bodies into the actor's current image.
+    /// The caller must checkpoint before this mutation: execution failure rolls
+    /// hydration and all associated storage changes back together.
+    fn restore_with_cells(
+        &mut self,
+        _id: &ActorID,
+        _state: &CellRef,
+        _cells: &mut dyn CellReader,
+    ) -> Result<(), VMError> {
+        Err(VMError::ActorRestoreUnsupported)
+    }
+
+    /// Native execution entry; references remain part of the executable graph.
+    fn load_program_with_cells(
+        &self,
+        id: &ActorID,
+        cells: &mut dyn CellReader,
+    ) -> Result<Cell, VMError> {
+        self.load_code_with_cells(id, cells)
+    }
+    /// Bodies committed as resident for this actor, never a node-global cache.
+    fn actor_cells(&self, _id: &ActorID) -> Result<Arc<CellIndex>, VMError> {
+        Ok(Arc::new(CellIndex::new()))
+    }
+
+    /// Execution-only recovery from the initiating transaction's immutable Cell hierarchy.
     /// Implementations must not implicitly persist externally supplied bodies.
     fn load_code_with_cells(
         &self,
         id: &ActorID,
-        _cells: &mut dyn CellResolver,
-    ) -> Result<Vec<u8>, VMError> {
+        _cells: &mut dyn CellReader,
+    ) -> Result<Cell, VMError> {
         self.load_code(id)
     }
 
     fn load_state_with_cells(
         &mut self,
         id: &ActorID,
-        _cells: &mut dyn CellResolver,
+        _cells: &mut dyn CellReader,
     ) -> Result<Value, VMError> {
         self.load_state(id)
     }
@@ -211,10 +477,10 @@ pub trait ActorRegistry {
     /// ensures `state` is portable (op_save checks first).
     fn save_state(&mut self, id: &ActorID, state: Value) -> Result<(), VMError>;
 
-    /// Returns the actor's code blob, method-agnostic — the code itself
+    /// Returns the actor's native program Cell, method-agnostic — the code itself
     /// dispatches on the `method` opcode. Errors `ActorNotFound` or
     /// `ActorEmpty` (checked out → re-entrancy block).
-    fn load_code(&self, actor: &ActorID) -> Result<Vec<u8>, VMError>;
+    fn load_code(&self, actor: &ActorID) -> Result<Cell, VMError>;
 
     /// Code bytes that [`Self::load_code`] would activate. Used to debit gas
     /// before the host clones or decodes the code.
@@ -224,8 +490,8 @@ pub trait ActorRegistry {
     /// debit gas before checkout or deserialization.
     fn actor_state_bytes(&self, actor: &ActorID) -> Result<u64, VMError>;
 
-    /// Replaces the actor's code blob (`setcode`). Errors `ActorNotFound`.
-    fn set_code(&mut self, actor: &ActorID, code: Vec<u8>) -> Result<(), VMError>;
+    /// Replaces the actor's program graph (`setcode`). Errors `ActorNotFound`.
+    fn set_code(&mut self, actor: &ActorID, code: Cell) -> Result<(), VMError>;
 
     /// Charged bytes currently occupied by code, committed state, and lease
     /// records. While state is checked out this remains the committed usage.
@@ -299,5 +565,5 @@ pub trait ActorRegistry {
     /// Installs a provisional actor with no lease. Its constructor may buy
     /// storage; the containing transaction commits only after
     /// [`Self::validate_actor_storage`] succeeds.
-    fn deploy(&mut self, id: ActorID, code: Vec<u8>, state: Value) -> Result<(), VMError>;
+    fn deploy(&mut self, id: ActorID, code: Cell, state: Value) -> Result<(), VMError>;
 }

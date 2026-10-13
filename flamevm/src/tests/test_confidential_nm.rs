@@ -485,25 +485,24 @@ fn confidential_1_to_1_with_fee() {
     let (q_out, f_out) = open_commitments_for_output(&out);
 
     let mut program = ScriptBuilder::new();
-    // Consume the input contract — push the witness-bearing StringWitness::Contract
+    // Consume the input contract — push the witness-bearing CellWitness::Contract
     // so the Token's open commitments survive into the CS.
-    program = program.push_str(String::contract(contract));
+    program = program.push_cell(CellValue::contract(contract).unwrap());
     program = program.input();
     program = push_taproot_proof_to_program(program, &cp);
     program = program
         .push_int(1024u64) // gas
-        .push_int(0u64) // k args
+        .push_int(0u64) // unit request
         .open()
-        .verify() // assert success marker
-        .drop_(); // discard count
-                  // Fee opcode: pushes WideToken(-3, FLAME_FLAVOR).
+        .verify(); // preserve returned Token
+                   // Fee opcode: pushes WideToken(-3, FLAME_FLAVOR).
     program = program.push_int(3u64).fee();
-    // Output commitment Strings (witness-bearing prover-side).
+    // Output commitment Cells (witness-bearing prover-side).
     // Clone so the post-prove assertion can still read the
     // expected points off the local Open commitments.
     program = program
-        .push_str(String::commitment(q_out.clone()))
-        .push_str(String::commitment(f_out.clone()));
+        .push_literal(CellValue::commitment(q_out.clone()))
+        .push_literal(CellValue::commitment(f_out.clone()));
     // mix: m=2 (real Token + fee WideToken), n=1 (output).
     program = program.push_int(2u64).push_int(1u64).mix();
     // Emit the output contract.
@@ -517,18 +516,17 @@ fn confidential_1_to_1_with_fee() {
     assert_eq!(prover_result.total_fee, 3);
 
     // Txlog layout: Header, Input, Fee(3), Output.
-    assert_eq!(prover_result.txlog.len(), 5);
+    assert_eq!(prover_result.txlog.len(), 4);
     assert!(matches!(prover_result.txlog[0], TxEntry::Header(_)));
-    assert!(matches!(prover_result.txlog[1], TxEntry::CellWitness(_)));
-    match &prover_result.txlog[2] {
+    match &prover_result.txlog[1] {
         TxEntry::Input(id) => assert_eq!(*id, expected_input_id),
-        _ => panic!("txlog[2] must be Input"),
+        _ => panic!("txlog[1] must be Input"),
+    }
+    match &prover_result.txlog[2] {
+        TxEntry::Fee(q) => assert_eq!(*q, 3),
+        _ => panic!("txlog[2] must be Fee(3)"),
     }
     match &prover_result.txlog[3] {
-        TxEntry::Fee(q) => assert_eq!(*q, 3),
-        _ => panic!("txlog[3] must be Fee(3)"),
-    }
-    match &prover_result.txlog[4] {
         TxEntry::Output(c) => {
             assert_eq!(c.predicate.to_point(), out_pred);
             let token = match c.payload() {
@@ -538,22 +536,22 @@ fn confidential_1_to_1_with_fee() {
             assert_eq!(token.qty.to_point(), q_out.to_point());
             assert_eq!(token.flv.to_point(), f_out.to_point());
         }
-        _ => panic!("txlog[4] must be Output"),
+        _ => panic!("txlog[3] must be Output"),
     }
 
     // Verifier round-trip.
     let txid_p = prover_result.txid;
     let TxResult {
-        bytecode,
+        program,
         proof,
         cells,
         ..
     } = prover_result;
     let proof = proof.expect("proof set");
     let pc_gens_v = PedersenGens::default();
-    let v = Verifier::verify_with_cells(
+    let v = Verifier::verify_cell_with_cells(
         &pc_gens_v,
-        bytecode,
+        program,
         &proof,
         dummy_header(),
         1_000_000,
@@ -593,16 +591,16 @@ fn confidential_unbalanced_inputs_rejected() {
         Err(_) => { /* prover refused — good */ }
         Ok(result) => {
             let TxResult {
-                bytecode,
+                program,
                 proof,
                 cells,
                 ..
             } = result;
             let proof = proof.expect("proof set");
             let pc_gens_v = PedersenGens::default();
-            let err = Verifier::verify_with_cells(
+            let err = Verifier::verify_cell_with_cells(
                 &pc_gens_v,
-                bytecode,
+                program,
                 &proof,
                 dummy_header(),
                 1_000_000,
@@ -641,16 +639,16 @@ fn confidential_flavor_mismatch_rejected() {
         Err(_) => { /* prover refused — good */ }
         Ok(result) => {
             let TxResult {
-                bytecode,
+                program,
                 proof,
                 cells,
                 ..
             } = result;
             let proof = proof.expect("proof set");
             let pc_gens_v = PedersenGens::default();
-            let err = Verifier::verify_with_cells(
+            let err = Verifier::verify_cell_with_cells(
                 &pc_gens_v,
-                bytecode,
+                program,
                 &proof,
                 dummy_header(),
                 1_000_000,
@@ -698,19 +696,14 @@ fn confidential_with_fee_undersupply_rejected() {
     // the unbalanced output qty.
     let out_pred = output_predicate_point(out.predicate_tag);
     let mut program = ScriptBuilder::new();
-    program = program.push_str(String::contract(contract));
+    program = program.push_cell(CellValue::contract(contract).unwrap());
     program = program.input();
     program = push_taproot_proof_to_program(program, &cp);
-    program = program
-        .push_int(1024u64)
-        .push_int(0u64)
-        .open()
-        .verify()
-        .drop_();
+    program = program.push_int(1024u64).push_int(0u64).open().verify();
     program = program.push_int(3u64).fee();
     program = program
-        .push_str(String::commitment(q_out))
-        .push_str(String::commitment(f_out));
+        .push_literal(CellValue::commitment(q_out))
+        .push_literal(CellValue::commitment(f_out));
     program = program.push_int(2u64).push_int(1u64).mix();
     program = program.push_point(*out_pred.as_bytes()).output();
 
@@ -719,16 +712,16 @@ fn confidential_with_fee_undersupply_rejected() {
         Err(_) => { /* prover refused the bad witness — good */ }
         Ok(result) => {
             let TxResult {
-                bytecode,
+                program,
                 proof,
                 cells,
                 ..
             } = result;
             let proof = proof.expect("proof set");
             let pc_gens_v = PedersenGens::default();
-            let err = Verifier::verify_with_cells(
+            let err = Verifier::verify_cell_with_cells(
                 &pc_gens_v,
-                bytecode,
+                program,
                 &proof,
                 dummy_header(),
                 1_000_000,

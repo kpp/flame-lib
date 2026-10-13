@@ -31,7 +31,8 @@ fn data_trace(log: &[TxEntry]) -> Vec<Vec<u8>> {
 
 /// `log "<s>"` as a builder step — emits one `TxEntry::Data`.
 fn log_str(p: ScriptBuilder, s: &str) -> ScriptBuilder {
-    p.push_str(String::from(s.as_bytes().to_vec())).log()
+    p.push_literal(CellValue::from_bytes(s.as_bytes().to_vec()).unwrap())
+        .log()
 }
 
 // ── Loops ────────────────────────────────────────────────────────────
@@ -40,8 +41,11 @@ fn log_str(p: ScriptBuilder, s: &str) -> ScriptBuilder {
 fn while_loop_emits_one_effect_per_iteration() {
     // recv: n=3; while (n) { log "x"; n-- }; drop n.
     let recv = b()
+        .drop_() // incoming unit message
+        .push_literal(CellValue::from_bytes(b"x".to_vec()).unwrap())
         .push_int(3u64)
-        .build_while(|p| p.dup_k(0), |p| log_str(p, "x").push_int(-1i64).add())
+        .build_while(|p| p.dup_k(0), |p| p.dup_k(1).log().push_int(-1i64).add())
+        .drop_()
         .drop_()
         .to_bytecode();
     let mut reg = MemRegistry::new();
@@ -58,6 +62,7 @@ fn while_loop_emits_one_effect_per_iteration() {
 fn break_exits_loop_after_first_iteration() {
     // recv: loop { log "once"; break }.
     let recv = b()
+        .drop_()
         .build_loop(|p| log_str(p, "once").build_break())
         .to_bytecode();
     let mut reg = MemRegistry::new();
@@ -75,6 +80,7 @@ fn continue_skips_rest_of_body_each_iteration() {
     // recv: n=2; while (n) { n--; continue; log "skipped" }.
     // `continue` jumps past the log every time → zero Data effects.
     let recv = b()
+        .drop_()
         .push_int(2u64)
         .build_while(
             |p| p.dup_k(0),
@@ -97,7 +103,10 @@ fn continue_skips_rest_of_body_each_iteration() {
 fn if_else_takes_branch_by_selector_arg() {
     // recv reads its top-of-stack arg: if truthy log "then" else "else".
     let recv = b()
-        .build_if_else(|p| log_str(p, "then"), |p| log_str(p, "else"))
+        .push_literal(CellValue::from_bytes(b"then".to_vec()).unwrap())
+        .push_literal(CellValue::from_bytes(b"else".to_vec()).unwrap())
+        .roll_k(2)
+        .build_if_else(|p| p.drop_().log(), |p| p.roll_k(1).drop_().log())
         .to_bytecode();
     let mut reg = MemRegistry::new();
     let id = deploy_actor(&mut reg, recv);
@@ -119,17 +128,17 @@ fn if_else_takes_branch_by_selector_arg() {
 
 #[test]
 fn call_chain_interleaves_callee_then_caller_effects() {
-    // B.recv logs "B". A.recv calls B (drop the [count,success] markers)
+    // B.recv logs "B". A.recv calls B (drop the [unit,success] markers)
     // then logs "A". The log must contain B's effect before A's, and the
     // `call` itself emits nothing.
     let mut reg = MemRegistry::new();
-    let b_recv = log_str(b(), "B").to_bytecode();
+    let b_recv = log_str(b().drop_(), "B").to_bytecode();
     let b_id = deploy_actor(&mut reg, b_recv);
 
     let a_recv = {
         let mut p = call_to(&b_id);
-        p = p.drop_().drop_(); // discard B's [count, success]
-        log_str(p, "A").to_bytecode()
+        p = p.drop_().drop_(); // discard B's [unit, success]
+        log_str(p.drop_(), "A").to_bytecode()
     };
     let a_id = deploy_actor(&mut reg, a_recv);
 
@@ -149,7 +158,7 @@ fn call_chain_interleaves_callee_then_caller_effects() {
 #[test]
 fn failed_subcall_effects_roll_back_but_caller_continues() {
     // B.recv logs "B" then hard-fails (`verify 0`). A.recv calls B
-    // (failure → `count=0, success=0`, consume both), then logs "A". B's Data must
+    // (failure → `unit=0, success=0`, consume both), then logs "A". B's Data must
     // be rolled back; only "A" survives — the canonical effect-rollback
     // control-flow case.
     let mut reg = MemRegistry::new();
@@ -158,7 +167,7 @@ fn failed_subcall_effects_roll_back_but_caller_continues() {
 
     let a_recv = {
         let p = call_to(&b_id).drop_().drop_();
-        log_str(p, "A").to_bytecode()
+        log_str(p.drop_(), "A").to_bytecode()
     };
     let a_id = deploy_actor(&mut reg, a_recv);
 
@@ -177,7 +186,7 @@ fn reentrant_call_runs_and_its_effect_is_observable() {
     // A.recv (method 0) calls A.method1; A never holds its state, so the
     // re-entry is permitted (ADR 0017) and A.method1's "R" log appears.
     let mut reg = MemRegistry::new();
-    let a_id = ActorID::Hash([0xaa; 32]);
+    let a_id = ActorID::from([0xaa; 32]);
     let a_method1 = log_str(b(), "R").to_bytecode();
     let a_recv = call_with_sel(&a_id, 1).drop_().drop_().to_bytecode();
     let a_code = dispatch_code(&[(0, a_recv.clone()), (1, a_method1)]);
@@ -202,15 +211,12 @@ fn setcode_upgrade_changes_dispatched_behavior() {
     // C2 is the full replacement code (a 1-method dispatch blob, so it
     // consumes the selector just like the original). recv_v1 is the
     // method-0 handler inside the original blob.
-    let c2 = dispatch_code(&[(0, log_str(b(), "v2").to_bytecode())]);
+    let c2 = crate::code_cell(&dispatch_code(&[(0, log_str(b(), "v2").to_bytecode())])).unwrap();
     let recv_v1 = log_str(b(), "v1").to_bytecode();
-    // Method 1: push the new code string, setcode.
-    let upgrade = b()
-        .push_str(String::from(c2.clone()))
-        .setcode()
-        .to_bytecode();
-    let id = ActorID::Hash([0xcc; 32]);
-    let code = dispatch_code(&[(0, recv_v1), (1, upgrade)]);
+    // Method 1: push the native replacement code graph, setcode.
+    let upgrade = b().push_cell(c2.clone()).setcode().to_cell().unwrap();
+    let id = ActorID::from([0xcc; 32]);
+    let code = dispatch_cells(&[(0, crate::code_cell(&recv_v1).unwrap()), (1, upgrade)]);
     reg.deploy(id.clone(), code, empty_state(), 1_000_000)
         .expect("deploy");
 
@@ -230,4 +236,84 @@ fn setcode_upgrade_changes_dispatched_behavior() {
         data_trace(&deliver(&mut reg, msg_with_sel(id, 0))),
         vec![b"v2".to_vec()]
     );
+}
+
+#[test]
+fn setcode_preserves_native_graphs_through_storage_effect_encoding_and_replay() {
+    let leaf = log_str(b().drop_(), "graph").to_cell().unwrap();
+    let replacement = b().push_cell(leaf.clone()).exec().to_cell().unwrap();
+    let upgrade = b()
+        .drop_()
+        .push_cell(replacement.clone())
+        .setcode()
+        .to_cell()
+        .unwrap();
+    let id = ActorID::from([0xab; 32]);
+    let mut registry = MemRegistry::new();
+    registry
+        .deploy(id.clone(), upgrade.clone(), empty_state(), 1_000_000)
+        .unwrap();
+    let effects = deliver(&mut registry, msg_to(id.clone()));
+    let stored = registry.load_code(&id).unwrap();
+    assert_eq!(stored.id(), replacement.id());
+    assert_eq!(stored.refs()[0].id(), leaf.id());
+    assert_eq!(
+        data_trace(&deliver(&mut registry, msg_to(id.clone()))),
+        vec![b"graph".to_vec()]
+    );
+
+    let log = crate::TxLog::from(effects);
+    let decoded: crate::TxLog = decode_envelope(&log.to_envelope().unwrap().encode()).unwrap();
+    assert_eq!(decoded.effect_id(), log.effect_id());
+    let mut replay = MemRegistry::new();
+    replay
+        .deploy(id.clone(), upgrade, empty_state(), 1_000_000)
+        .unwrap();
+    let mut saw_upgrade = false;
+    for entry in decoded.entries() {
+        if let TxEntry::SetCode { actor, code } = entry {
+            assert_eq!(code.id(), replacement.id());
+            assert_eq!(code.refs()[0].id(), leaf.id());
+            replay.set_code(actor, code.clone()).unwrap();
+            saw_upgrade = true;
+        }
+    }
+    assert!(saw_upgrade);
+    assert_eq!(
+        data_trace(&deliver(&mut replay, msg_to(id))),
+        vec![b"graph".to_vec()]
+    );
+}
+
+#[test]
+fn setcode_resident_and_unloaded_graphs_have_equal_gas_and_persistent_availability() {
+    let leaf = b().drop_().nop().to_cell().unwrap();
+    let replacement = b().push_cell(leaf.clone()).exec().to_cell().unwrap();
+    let reference: CellRef = replacement.clone().into();
+    let cells = CellIndex::collect(Arc::new(replacement.clone())).unwrap();
+    let id = ActorID::from([0xac; 32]);
+    let mut spent = Vec::new();
+    let mut usage = Vec::new();
+    for reference in [reference.clone(), reference.to_unloaded()] {
+        let mut registry = MemRegistry::new();
+        registry
+            .deploy(id.clone(), b().to_cell().unwrap(), empty_state(), 1_000_000)
+            .unwrap();
+        let mut vm = fixture_vm(
+            b().push_cell(reference).setcode().with_cells(cells.clone()),
+            CallKind::InternalRoot {
+                actor: id.clone(),
+                caller: None,
+            },
+        );
+        while vm.step_internal_with_registry(&mut registry).unwrap() {}
+        let code = registry.load_code(&id).unwrap();
+        assert_eq!(code.id(), replacement.id());
+        assert_eq!(code.refs()[0].as_resident().unwrap().id(), leaf.id());
+        spent.push(vm.current_call.gas_used);
+        usage.push(registry.actor_usage(&id).unwrap());
+        deliver(&mut registry, msg_to(id.clone()));
+    }
+    assert_eq!(spent[0], spent[1]);
+    assert_eq!(usage[0], usage[1]);
 }

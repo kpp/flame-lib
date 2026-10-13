@@ -7,7 +7,7 @@
 //! `OutputIndex` for the history. All three are rebuilt by replaying
 //! `blocks.bin`, which is the only durable state there is.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::sync::{Arc, Mutex};
 
@@ -16,14 +16,21 @@ use flamechain::{
     utreexo_hasher, Block, BlockHash, BlockTx, Blockchain, ChainError, ChainParams, ContractLeaf,
     ExecutionKind, Mempool, MempoolError, MempoolPolicy, RebaseReport,
 };
-use flamed_rpc::{ContractEnvelope, ContractId, PredicatePoint, ScanEntry, SpentAt, TxId};
-use flamevm::{CellError, ContractID, TxEntry, TxID, TxLog, VMError};
+use flamed_rpc::{
+    ActorCode, ActorId, ActorResult, ActorStateEnvelope, BlockHeader, BlockId, BlockResult,
+    BlockSummary, BlockTxEnvelope, BlocksResult, ContractEnvelope, ContractId, ExecutionData,
+    NoteEnvelope, PendingTransaction, PendingTransactionsResult, PredicatePoint, ScanEntry,
+    SpentAt, StateCommitment, TransactionResult, TransactionSummary, TransactionsResult, TxId,
+    MAX_PAGE_SIZE,
+};
+use flamevm::{ActorID, CellError, ContractID, TxEntry, TxID, VMError};
 use sha2::{Digest, Sha256};
 
 use crate::cells::{contract_bytes, log_bytes};
 use crate::config::{GenesisFile, NodeConfig};
 use crate::genesis::{self, GenesisError};
 use crate::index::{OutputIndex, OutputRecord, SpendRecord, TxIndex, TxRecord};
+use crate::inspect;
 use crate::store::{BlockStore, StoreError};
 use crate::utxos::UtxoSet;
 
@@ -132,6 +139,9 @@ impl Node {
         let mut utxos = UtxoSet::new();
         let mut outputs = OutputIndex::new();
         let mut txindex = TxIndex::new();
+
+        txindex.insert_block(block_summary(chain.header(), 0, 0, 0, 0));
+
         for ((id, contract), record) in allocations.iter().zip(&genesis.contracts) {
             utxos.insert_transient(*id);
             outputs.insert(
@@ -141,6 +151,7 @@ impl Node {
                     txid: GENESIS_TXID,
                     predicate: contract.predicate.to_point().to_bytes(),
                     contract: record.bytes.0.clone(),
+                    note: None,
                 },
             );
         }
@@ -222,6 +233,125 @@ impl Node {
         self.outputs.get(id)
     }
 
+    /// A page of blocks, newest first.
+    pub fn blocks(&self, before: Option<u64>, limit: u32) -> Result<BlocksResult, NodeError> {
+        Ok(self.txindex.blocks(before, page_limit(limit)?))
+    }
+
+    /// A block header and its execution counts.
+    pub fn block_summary(&self, height: u64) -> Result<&BlockSummary, NodeError> {
+        self.txindex
+            .block(height)
+            .ok_or_else(|| NodeError::NotFound(format!("block {height}")))
+    }
+
+    /// A header and its executions, including internal deliveries.
+    pub fn block(&self, height: u64) -> Result<BlockResult, NodeError> {
+        let summary = self.block_summary(height)?.clone();
+        let executions = self
+            .txindex
+            .at_height(height)
+            .iter()
+            .filter_map(|id| self.txindex.get(id))
+            .map(|r| r.summary.clone())
+            .collect();
+        Ok(BlockResult {
+            summary,
+            executions,
+        })
+    }
+
+    /// Current actor code, state, and storage availability.
+    pub fn actor(&self, id: ActorId) -> Result<ActorResult, NodeError> {
+        let info = self
+            .chain
+            .actor_info(&ActorID::from(id.0))
+            .map_err(|error| match error {
+                ChainError::Vm(VMError::ActorNotFound) => {
+                    NodeError::NotFound(format!("actor {id}"))
+                }
+                other => NodeError::Chain(other),
+            })?;
+
+        let tip = self.tip();
+
+        Ok(ActorResult {
+            id,
+            height: tip.height,
+            block: BlockId(tip.hash.into_bytes()),
+            root_hash: flamed_rpc::CellId(info.root),
+            frozen: info.frozen,
+            code_hash: info.code_root.map(flamed_rpc::CellId),
+            state_hash: info.state_root.map(flamed_rpc::CellId),
+            code_size: info.code_size,
+            state_size: info.state_size,
+            storage_used: info.storage_used,
+            storage_capacity: info.storage_capacity,
+            code: info.code.map(|code| ActorCode(code.encode())),
+            state: info.state.map(|state| ActorStateEnvelope(state.encode())),
+            decoded_state: None,
+            state_error: None,
+            instructions: Vec::new(),
+            code_error: None,
+        })
+    }
+
+    /// Confirmed external or internal execution details.
+    pub fn transaction(
+        &self,
+        id: TxId,
+        decode_effects: bool,
+    ) -> Result<TransactionResult, NodeError> {
+        let record = self
+            .txindex
+            .get(&TxID(id.0))
+            .ok_or_else(|| NodeError::NotFound(format!("transaction {id}")))?;
+
+        Ok(TransactionResult {
+            summary: record.summary.clone(),
+            height: record.height,
+            block: BlockId(record.block.into_bytes()),
+            log: record.log.clone(),
+            effects: if decode_effects {
+                Some(inspect::effects(&record.log)?)
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Confirmed executions, newest first.
+    pub fn transactions(
+        &self,
+        before: Option<TxId>,
+        limit: u32,
+    ) -> Result<TransactionsResult, NodeError> {
+        self.txindex
+            .transactions(before.map(|id| TxID(id.0)), page_limit(limit)?)
+            .ok_or_else(|| NodeError::NotFound("transaction cursor".into()))
+    }
+
+    /// The first pending transactions in mempool admission order.
+    pub fn pending_transactions(&self, limit: u32) -> Result<PendingTransactionsResult, NodeError> {
+        let limit = page_limit(limit)?;
+        Ok(PendingTransactionsResult {
+            transactions: self
+                .mempool
+                .entries()
+                .take(limit)
+                .map(|entry| {
+                    Ok(PendingTransaction {
+                        id: TxId(entry.txid().0),
+                        block_tx: BlockTxEnvelope(entry.transaction().to_bytes()?),
+                        fee_sparks: entry.fee().to_string(),
+                        witness_bytes: entry.witness_bytes() as u64,
+                    })
+                })
+                .collect::<Result<_, CellError>>()?,
+            total: self.mempool.len() as u64,
+        })
+    }
+
     /// Where a transaction is.
     pub fn tx_status(&self, txid: &TxID) -> TxStatus {
         if self.mempool.entries().any(|entry| entry.txid() == *txid) {
@@ -237,7 +367,7 @@ impl Node {
     }
 
     /// Every contract created at `since_height` or later under one of these
-    /// predicates, in height order.
+    /// predicates, in height order, each with the note that followed it.
     pub fn scan(&self, predicates: &[[u8; 32]], since_height: u64) -> Vec<ScanEntry> {
         let unique: BTreeSet<[u8; 32]> = predicates.iter().copied().collect();
         let mut hits = Vec::new();
@@ -255,6 +385,7 @@ impl Node {
                     txid: TxId(record.txid.0),
                     predicate: PredicatePoint(record.predicate),
                     bytes: ContractEnvelope(record.contract.clone()),
+                    note: record.note.clone().map(NoteEnvelope),
                     spent: self.outputs.spend_of(id).map(|spend| SpentAt {
                         height: spend.height,
                         txid: TxId(spend.txid.0),
@@ -441,6 +572,16 @@ impl Node {
     }
 }
 
+fn page_limit(limit: u32) -> Result<usize, NodeError> {
+    if limit == 0 || limit > MAX_PAGE_SIZE {
+        return Err(NodeError::Limit {
+            got: limit as usize,
+            max: MAX_PAGE_SIZE as usize,
+        });
+    }
+    Ok(limit as usize)
+}
+
 /// Whether a build failure means the block was too large rather than that
 /// something in it was wrong.
 #[cfg(any(test, feature = "devnet"))]
@@ -511,78 +652,147 @@ fn connect_block(
     block: &Block,
 ) -> Result<(BlockHash, RebaseReport), NodeError> {
     // 1. `connect` reports only `ExecutionRecord { kind, txid }`, so the
-    //    effects have to be re-derived. On the mint path this is a third
-    //    execution of every transaction, and it is deliberate: a log decoded
-    //    from this node's own archive would be the archive checking itself.
-    let logs: Vec<TxLog> = block
-        .transactions
-        .iter()
-        .map(|block_tx| block_tx.tx.verify(block_tx.limits))
-        .collect::<Result<_, VMError>>()?;
+    //    effects are read through an observer during block validation.
+    //    A log decoded from this node's own archive would be the archive
+    //    checking itself.
+    let height = block.header.height;
+    let block_id = block.header.id();
+    let size_bytes = block.to_bytes()?.len() as u64;
+    let mut messages = BTreeMap::new();
+    let mut staged: Vec<(TxID, TxRecord, Vec<UtxoEffect>)> = Vec::new();
 
     // 2. Nothing is recorded before the chain has accepted the block.
-    let applied = chain.connect(block)?;
-    let height = block.header.height;
+    let applied = chain.connect_with_observer(block, |record, log, error| {
+        let txid = record.txid;
 
-    for log in &logs {
-        let txid = log.txid();
+        let mut changes = Vec::new();
+        let mut received = None;
+        let mut inputs = 0;
+        let mut output_count = 0;
+        let mut sends = 0;
+        let mut fees = 0u128;
+
         // 3. In log order, not inputs then outputs: a contract created and
         //    spent inside one block has to end up spent, and two passes
-        //    would leave it unspent and spent at once.
-        for entry in log.entries() {
+        //    would leave it unspent and spent at once. An output keeps the
+        //    entry after it when that entry is `Data`: the output's note,
+        //    kept byte for byte and never parsed here.
+        let entries = log.entries();
+        for (index, entry) in entries.iter().enumerate() {
             match entry {
                 TxEntry::Input(id) => {
-                    utxos.remove(id);
-                    outputs.spend(*id, SpendRecord { height, txid });
+                    inputs += 1;
+                    changes.push(UtxoEffect::Input(*id));
                 }
                 TxEntry::Output(contract) => {
+                    output_count += 1;
                     let id = contract.id();
-                    utxos.insert_transient(id);
-                    outputs.insert(
+                    changes.push(UtxoEffect::Output(
                         id,
                         OutputRecord {
                             height,
                             txid,
                             predicate: contract.predicate.to_point().to_bytes(),
                             contract: contract_bytes(contract)?,
+                            note: match entries.get(index + 1) {
+                                Some(TxEntry::Data(note)) => Some(note.clone()),
+                                _ => None,
+                            },
                         },
-                    );
+                    ));
+                }
+                TxEntry::Fee(q) => fees += u128::from(*q),
+                TxEntry::Send(m) => {
+                    sends += 1;
+                    let target = ActorId(m.target.to_hash());
+                    messages.insert(m.id().0, (TxId(txid.0), target));
+                }
+                TxEntry::Receive(id) => {
+                    received = Some(messages.remove(id).ok_or(ChainError::InvalidEffectLog)?);
                 }
                 _ => {}
             }
         }
+
+        let execution = match (record.kind, received, error) {
+            (ExecutionKind::External, None, None) => ExecutionData::External,
+            (ExecutionKind::Internal, Some((parent, actor)), None) => {
+                ExecutionData::Internal { parent, actor }
+            }
+            (ExecutionKind::InternalFailed, Some((parent, actor)), Some(error)) => {
+                ExecutionData::InternalFailed {
+                    parent,
+                    actor,
+                    error: error.to_owned(),
+                }
+            }
+            _ => return Err(ChainError::InvalidEffectLog),
+        };
+        let summary = TransactionSummary {
+            id: TxId(txid.0),
+            execution,
+            fee_sparks: fees.to_string(),
+            inputs,
+            outputs: output_count,
+            messages: sends,
+        };
+
         // 4. The log itself, for anyone who asks what this transaction did.
-        txindex.insert(
+        staged.push((
             txid,
             TxRecord {
                 height,
-                block: applied.id,
+                block: block_id,
                 log: log_bytes(log)?,
+                summary,
             },
-        );
-    }
+            changes,
+        ));
+        Ok(())
+    })?;
 
     // 5. Every execution the chain ran that was not one of these external
-    //    transactions produced effects this node cannot see: `connect`
-    //    reports a kind and a txid and nothing else. It is reachable
+    //    transactions produced effects this node can now see through
+    //    `connect_with_observer`. It is reachable
     //    today, without a single actor existing — a `send` in an external
     //    transaction finds no actor, bounces, and the bounce mints a
     //    refund contract under the sender's refund predicate. That
     //    contract is real and in the accumulator, and this node can serve
-    //    neither a proof nor a record for it. Internal logs cannot carry
-    //    an `Input`, so nothing the node *does* hold is ever wrong; it is
-    //    incomplete, and it says so rather than pretending otherwise.
+    //    both a proof and a record for it.
+    for (txid, record, changes) in staged {
+        for change in changes {
+            match change {
+                UtxoEffect::Input(id) => {
+                    utxos.remove(&id);
+                    outputs.spend(id, SpendRecord { height, txid });
+                }
+                UtxoEffect::Output(id, output) => {
+                    utxos.insert_transient(id);
+                    outputs.insert(id, output);
+                }
+            }
+        }
+        txindex.insert(txid, record);
+    }
+
     let internal = applied
         .records
         .iter()
-        .filter(|record| record.kind != ExecutionKind::External)
-        .count();
-    if internal != 0 {
-        eprintln!(
-            "block {height} ran {internal} internal execution(s) whose effects this node \
-             cannot index; any contract they created is unservable here"
-        );
-    }
+        .filter(|r| r.kind != ExecutionKind::External)
+        .count() as u32;
+    let failed = applied
+        .records
+        .iter()
+        .filter(|r| r.kind == ExecutionKind::InternalFailed)
+        .count() as u32;
+
+    txindex.insert_block(block_summary(
+        &block.header,
+        block.transactions.len() as u32,
+        internal,
+        failed,
+        size_bytes,
+    ));
 
     // 6. Every surviving proof moves to the new tip, and the ids this block
     //    inserted turn from `Transient` into `Committed`. After the removals,
@@ -611,12 +821,49 @@ fn connect_block(
     Ok((applied.id, rebase))
 }
 
+enum UtxoEffect {
+    Input(ContractID),
+    Output(ContractID, OutputRecord),
+}
+
+fn block_summary(
+    header: &flamechain::BlockHeader,
+    transactions: u32,
+    internal: u32,
+    failed: u32,
+    size_bytes: u64,
+) -> BlockSummary {
+    BlockSummary {
+        id: BlockId(header.id().into_bytes()),
+        header: BlockHeader {
+            version: header.version,
+            height: header.height,
+            core_block_hash: header.core_block_hash,
+            parent: BlockId(header.parent.into_bytes()),
+            witness_root: header.witness_root,
+            effects_root: header.effects_root,
+            state: StateCommitment {
+                contracts: header.state.contracts.0,
+                actors: header.state.actors,
+                available_storage_units: header.state.available_storage_units,
+            },
+        },
+        transactions,
+        internal,
+        failed,
+        size_bytes,
+    }
+}
+
 /// Something the node could not do.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     /// The node has no such contract.
     #[error("no contract {0}")]
     UnknownContract(String),
+    /// A requested actor, block, or confirmed execution is absent.
+    #[error("not found: {0}")]
+    NotFound(String),
     /// A request named more items than the method allows.
     #[error("{got} items, at most {max}")]
     Limit {

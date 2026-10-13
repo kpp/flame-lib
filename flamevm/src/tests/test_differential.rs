@@ -10,7 +10,7 @@ use crate::tx::TxID;
 
 fn internal_kind() -> CallKind {
     CallKind::InternalRoot {
-        actor: ActorID::Hash([0u8; 32]),
+        actor: ActorID::from([0u8; 32]),
         caller: None,
     }
 }
@@ -83,11 +83,14 @@ fn backends_agree_across_sample_programs() {
             .push_int(7u64)
             .push_int(8u64)
             .label(0),
-        // String growth (charges allocation gas identically) + type probe.
+        // CellValue growth (charges allocation gas identically) + type probe.
         ScriptBuilder::new()
-            .push_str(String::from(b"ab".to_vec()))
-            .push_str(String::from(b"cd".to_vec()))
-            .append()
+            .push_literal(CellValue::from_bytes(b"ab".to_vec()).unwrap())
+            .slice()
+            .builder()
+            .append_bytes()
+            .endcell()
+            .drop_()
             .drop_(),
         ScriptBuilder::new().push_int(5u64).type_().drop_().drop_(),
         // Failing programs must fail identically.

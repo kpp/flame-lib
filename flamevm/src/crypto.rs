@@ -63,12 +63,12 @@ impl Point {
     }
 
     /// Downcasts to `Commitment`. `Opaque` → `Commitment::Closed`;
-    /// `Commitment` returns its witness directly; `Predicate` errors.
+    /// `Commitment` returns its witness directly; other annotations are ignored.
     pub fn to_commitment(self) -> Result<Commitment, VMError> {
         match self {
             Point::Commitment(c) => Ok(*c),
             Point::Opaque(c) => Ok(Commitment::Closed(c)),
-            Point::Predicate(_) => Err(VMError::TypeNotPoint),
+            Point::Predicate(predicate) => Ok(Commitment::Closed(predicate.to_point())),
         }
     }
 
@@ -129,7 +129,11 @@ impl Merlin {
     /// `label`. Used by the `merlinread` opcode.
     pub fn read_bytes(&mut self, label: &[u8], n: usize) -> Vec<u8> {
         let mut out = vec![0u8; n];
-        self.transcript.challenge_bytes(label, &mut out);
+        self.read_into(label, &mut out);
         out
+    }
+
+    pub fn read_into(&mut self, label: &[u8], out: &mut [u8]) {
+        self.transcript.challenge_bytes(label, out);
     }
 }

@@ -5,14 +5,13 @@
 use super::test_helpers::*;
 
 #[test]
-fn op_scalar_pushes_constant_expression() {
-    // Pre-load a 32-byte String on the stack, dispatch `scalar`,
+fn op_expr_pushes_constant_expression() {
+    // Pre-load a Scalar on the stack, dispatch `expr`,
     // confirm the result is Expression::Constant.
-    let mut vm = vm_external_with_script(ScriptBuilder::new().scalar().to_bytecode());
-    let s = String::scalar(Scalar::from(99u64));
-    vm.push_value(Value::String(s));
+    let mut vm = vm_external_with_script(ScriptBuilder::new().expr().to_bytecode());
+    vm.push_value(Value::Scalar(Scalar::from(99u64)));
     let mut delegate = StubDelegate::new();
-    vm.step_external(&mut delegate).expect("scalar ok");
+    vm.step_external(&mut delegate).expect("expr ok");
     assert_eq!(vm.current_call.stack.len(), 1);
     match &vm.current_call.stack[0] {
         Value::Expression(Expression::Constant(i)) => {
@@ -24,46 +23,101 @@ fn op_scalar_pushes_constant_expression() {
 
 #[test]
 fn op_commit_pushes_variable() {
-    // Pre-load a witness-bearing String::Commitment, dispatch
+    // Pre-load a Point carrying an open Commitment witness, dispatch
     // `commit`, confirm the result is a Variable with the open
     // commitment preserved.
     let mut vm = vm_external_with_script(ScriptBuilder::new().commit().to_bytecode());
     let c = Commitment::unblinded(Scalar::from(42u64));
-    vm.push_value(Value::String(String::commitment(c.clone())));
+    vm.push_value(Value::Point(Point::commitment(c.clone())));
     let mut delegate = StubDelegate::new();
     vm.step_external(&mut delegate).expect("commit ok");
     assert_eq!(vm.current_call.stack.len(), 1);
     match &vm.current_call.stack[0] {
-        Value::Variable(v) => {
-            assert_eq!(v.commitment.assignment(), Some(Scalar::from(42u64)));
+        Value::Variable(Variable::Committed(commitment)) => {
+            assert_eq!(commitment.assignment(), Some(Scalar::from(42u64)));
         }
         _ => panic!("expected Variable"),
     }
 }
 
 #[test]
+fn raw_cell_bytes_can_be_read_as_a_point_then_committed() {
+    let commitment = Commitment::unblinded(Scalar::from(42u64));
+    let mut vm = vm_external_with_script(
+        ScriptBuilder::new()
+            .push_cell(Cell::new(commitment.to_point().as_bytes().to_vec(), vec![]).unwrap())
+            .slice()
+            .read_point()
+            .verify()
+            .roll_k(1)
+            .drop_()
+            .commit(),
+    );
+    run_to_end(&mut vm).unwrap();
+    let [Value::Variable(Variable::Committed(Commitment::Closed(point)))] =
+        vm.current_call.stack.as_slice()
+    else {
+        panic!("raw serialization must produce a closed commitment")
+    };
+    assert_eq!(*point, commitment.to_point());
+}
+
+#[test]
+fn removed_scalar_opcode_is_rejected() {
+    let mut vm = vm_external_with_script(vec![0x60]);
+    assert!(matches!(
+        run_to_end(&mut vm),
+        Err(VMError::UnknownOpcode(0x60))
+    ));
+}
+
+#[test]
+fn commit_ignores_unrelated_private_point_annotations() {
+    let limits = crate::Limits { gas: 1_000_000 };
+    let point = CompressedRistretto([0; 32]);
+    let mut results = Vec::new();
+    for point in [
+        Point::from_compressed(point),
+        Point::predicate(Predicate::opaque(point)),
+    ] {
+        let unsigned = ScriptBuilder::new()
+            .push_point_typed(point)
+            .commit()
+            .drop_()
+            .build_tx(dummy_header(), limits)
+            .unwrap();
+        results.push((unsigned.txid(), unsigned.metrics()));
+        unsigned
+            .without_signature()
+            .unwrap()
+            .verify(limits)
+            .unwrap();
+    }
+    assert_eq!(results[0], results[1]);
+}
+
+#[test]
 fn prove_then_verify_with_commit_expr_eq() {
-    // pushstr <open commitment witness> ; commit ; expr ;
-    // alloc(42) ; eq ; verify.
+    // pushpoint <open commitment witness> ; commit ; expr ;
+    // alloc(42) ; expr ; eq ; verify.
     // Both the commit-side and alloc-side Expressions point to
     // value 42 → eq holds → verify succeeds.
     let pc_gens = PedersenGens::default();
     let witness_int = Scalar::from(42u64);
     // Use a blinding factor that we'll need to encode into the
-    // ScriptBuilder as a witness-bearing String.
+    // ScriptBuilder as a witness-bearing Point.
     let blinding = curve25519_dalek::scalar::Scalar::from(7u64);
     let c = Commitment::blinded_with_factor(witness_int, blinding);
     let program = ScriptBuilder::new()
-        // Push the witness-bearing Commitment String. The bytecode
-        // will encode it as 32 bytes (the point); the prover's
-        // Run::Queue preserves the witness; the verifier walks
-        // bytecode and sees String::Opaque, which downcasts to
+        // Only the public point is encoded; the prover retains its opening.
+        // The verifier sees a public Point, which becomes
         // Commitment::Closed(point) — sufficient for the CS to
         // bind to the same point the prover used.
-        .push_str(String::commitment(c))
+        .push_point_typed(Point::commitment(c))
         .commit()
         .expr()
         .alloc(Some(witness_int))
+        .expr()
         .eq()
         .verify();
     let _pp = Prover::prove(&pc_gens, program, dummy_header(), 1_000_000).expect("prove succeeds");
@@ -172,8 +226,8 @@ fn op_decrypt_rejects_wrong_witness() {
 }
 
 #[test]
-fn scalar_in_internal_context_errors_external_only() {
-    let mut vm = vm_with_script(ScriptBuilder::new().scalar().to_bytecode());
+fn expr_scalar_in_internal_context_errors_external_only() {
+    let mut vm = vm_with_script(ScriptBuilder::new().push_int(1u64).expr().to_bytecode());
     let err = run_to_end(&mut vm).unwrap_err();
     assert!(matches!(err, VMError::ExternalOnly));
 }

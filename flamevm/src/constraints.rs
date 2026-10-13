@@ -11,15 +11,33 @@ use subtle::{ConditionallySelectable, ConstantTimeEq};
 use crate::errors::VMError;
 use crate::scalar::Scalar;
 
-/// Variable represents a high-level R1CS variable specified by its
-/// Pedersen commitment.
+/// A copyable handle to a Pedersen commitment or an allocated R1CS variable.
 #[derive(Clone, Debug)]
-pub struct Variable {
-    pub(crate) commitment: Commitment,
+pub enum Variable {
+    Committed(Commitment),
+    Allocated {
+        variable: r1cs::Variable,
+        assignment: Option<Scalar>,
+    },
 }
 
-/// Expression is a linear combination of high-level variables (`var`),
-/// low-level variables (`alloc`) and constants.
+impl Variable {
+    pub fn assignment(&self) -> Option<Scalar> {
+        match self {
+            Self::Committed(commitment) => commitment.assignment(),
+            Self::Allocated { assignment, .. } => *assignment,
+        }
+    }
+
+    pub(crate) fn into_commitment(self) -> Result<Commitment, VMError> {
+        match self {
+            Self::Committed(commitment) => Ok(commitment),
+            Self::Allocated { .. } => Err(VMError::TypeNotCommittedVariable),
+        }
+    }
+}
+
+/// A non-copyable linear combination built from Variable handles and constants.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expression {
     /// Represents a constant. Operations on constants produce constants.

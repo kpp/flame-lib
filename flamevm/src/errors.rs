@@ -5,6 +5,20 @@ use thiserror::Error;
 /// Represents an error in proof creation, verification, or parsing.
 #[derive(Error, Debug)]
 pub enum VMError {
+    #[error("Item is not a MultiscalarMul")]
+    TypeNotMultiscalarMul,
+    #[error("Item is not a committed Variable")]
+    TypeNotCommittedVariable,
+    #[error("Item is not a Cell")]
+    TypeNotCell,
+    #[error("Item is not a Slice")]
+    TypeNotSlice,
+    #[error("Item is not a Builder")]
+    TypeNotBuilder,
+    #[error("Item is not a Cell, Slice, or Builder")]
+    TypeNotByteSource,
+    #[error("Item is not a Cell or Slice")]
+    TypeNotCellOrSlice,
     /// A Cell was missing, malformed, or exceeded the execution budget.
     #[error(transparent)]
     Cell(#[from] cells::CellError),
@@ -57,14 +71,6 @@ pub enum VMError {
     #[error("call depth exceeded")]
     CallDepthExceeded,
 
-    /// This error occurs when an instruction requires a String.
-    #[error("Item is not a String")]
-    TypeNotString,
-
-    /// A VM String must fit in one Cell payload, without snake continuations.
-    #[error("String exceeds the single-Cell payload limit")]
-    StringTooLong,
-
     /// This error occurs when `verify` sees a zero value on top of the stack.
     #[error("verify failed: zero value")]
     VerifyFailed,
@@ -78,8 +84,8 @@ pub enum VMError {
     #[error("jump target label not found")]
     LabelNotFound,
 
-    /// This error occurs when `return k` is invoked with a bad k.
-    #[error("Bad return arity")]
+    /// This error occurs when `return` has no result value.
+    #[error("Return requires one result value")]
     BadReturnArity,
 
     /// This error occurs when `return` is invoked at the outermost call frame.
@@ -90,9 +96,9 @@ pub enum VMError {
     #[error("Division by zero")]
     DivByZero,
 
-    /// This error occurs when `mod252` sees a String longer than 64 bytes.
-    #[error("String too long for mod252 (max 64 bytes)")]
-    StringTooLongForModReduction,
+    /// `mod252` accepts at most 64 raw bytes.
+    #[error("Byte payload too long for mod252 (max 64 bytes)")]
+    BytesTooLongForModReduction,
 
     /// This error occurs when `size` is applied to a type that has no length.
     #[error("Type has no length")]
@@ -130,8 +136,8 @@ pub enum VMError {
     #[error("Item is not a Contract")]
     TypeNotContract,
 
-    /// This error occurs when a TaprootProof does not verify against the contract's predicate.
-    #[error("TaprootProof does not match the contract's predicate")]
+    /// The supplied program's level-zero hash and inner key do not match the predicate.
+    #[error("Taproot commitment does not match the contract's predicate")]
     TaprootProofMismatch,
 
     /// This error occurs when `contract` or `output` is invoked without a seeded anchor.
@@ -158,10 +164,6 @@ pub enum VMError {
     /// This error occurs when an instruction requires a Point.
     #[error("Item is not a Point")]
     TypeNotPoint,
-
-    /// This error occurs when a TaprootProof's wire pieces are malformed.
-    #[error("Malformed TaprootProof")]
-    MalformedTaprootProof,
 
     /// This error occurs when `PredicateTree::new` is called with zero programs.
     #[error("PredicateTree must have at least one program")]
@@ -197,6 +199,14 @@ pub enum VMError {
     /// This error occurs when the registry has no actor at the requested ID.
     #[error("Actor not found in registry")]
     ActorNotFound,
+
+    /// The actor's combined state root is pruned and requires explicit Restore.
+    #[error("Actor is frozen")]
+    ActorFrozen,
+
+    /// This host does not implement authenticated actor-state restoration.
+    #[error("Actor restoration is unsupported by this registry")]
+    ActorRestoreUnsupported,
 
     /// A negative clear token is a liability and cannot be destroyed to
     /// satisfy balance. It must be matched by an equal positive token.

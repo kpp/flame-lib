@@ -176,15 +176,20 @@ fn divmod_full_width_magnitude_succeeds() {
 }
 
 #[test]
-fn mod252_empty_string_is_zero() {
-    assert_stack_ints(b().push_str(String::from(Vec::<u8>::new())).mod252(), &[0]);
+fn mod252_empty_cell_is_zero() {
+    assert_stack_ints(
+        b().push_literal(CellValue::from_bytes(Vec::<u8>::new()).unwrap())
+            .mod252(),
+        &[0],
+    );
 }
 
 #[test]
-fn mod252_short_string_is_le_value() {
+fn mod252_short_cell_is_le_value() {
     // [0x07, 0x00, 0x01] LE = 7 + 0*256 + 1*65536 = 65543.
     assert_stack_ints(
-        b().push_str(String::from(vec![0x07, 0x00, 0x01])).mod252(),
+        b().push_literal(CellValue::from_bytes(vec![0x07, 0x00, 0x01]).unwrap())
+            .mod252(),
         &[65543],
     );
 }
@@ -194,15 +199,18 @@ fn mod252_64_bytes_reduces() {
     // 64 bytes of 0xff — should equal 2^512 - 1 reduced mod ℓ.
     let expected = Scalar::from(DalekScalar::from_bytes_mod_order_wide(&[0xff; 64]));
     assert_stack(
-        b().push_str(String::from(vec![0xffu8; 64])).mod252(),
+        b().push_literal(CellValue::from_bytes(vec![0xffu8; 64]).unwrap())
+            .mod252(),
         &[expected],
     );
 }
 
 #[test]
 fn mod252_too_long_errors() {
-    let s = b().push_str(String::from(vec![0u8; 65])).mod252();
-    assert!(matches!(run_err(s), VMError::StringTooLongForModReduction));
+    let s = b()
+        .push_literal(CellValue::from_bytes(vec![0u8; 65]).unwrap())
+        .mod252();
+    assert!(matches!(run_err(s), VMError::BytesTooLongForModReduction));
 }
 
 #[test]
@@ -232,9 +240,13 @@ fn or_truth_table() {
 }
 
 #[test]
-fn size_of_string() {
-    // [String("abc"), 3] — String residue below, so check the top.
-    assert_top(b().push_str(String::from(b"abc".to_vec())).size(), 3u64);
+fn size_of_cell_payload() {
+    // [CellValue("abc"), 3] — CellValue residue below, so check the top.
+    assert_top(
+        b().push_literal(CellValue::from_bytes(b"abc".to_vec()).unwrap())
+            .size(),
+        3u64,
+    );
 }
 
 #[test]

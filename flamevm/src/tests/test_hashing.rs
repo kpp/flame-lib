@@ -4,9 +4,9 @@
 
 use super::test_helpers::*;
 
-/// Helper: makes a String from a byte slice (for `push_str` in tests).
-fn s(bytes: &[u8]) -> String {
-    String::from(bytes.to_vec())
+/// Helper: makes a CellValue from a byte slice (for `push_literal` in tests).
+fn s(bytes: &[u8]) -> CellValue {
+    CellValue::from_bytes(bytes.to_vec()).unwrap()
 }
 
 #[test]
@@ -15,7 +15,7 @@ fn transcript_is_noncopyable_but_droppable() {
     // wrt stack duplication — has internal CS-style state).
     let mut vm = vm_with_script(
         ScriptBuilder::new()
-            .push_str(s(b""))
+            .push_literal(s(b""))
             .transcript()
             .dup_k(0)
             .to_bytecode(),
@@ -30,7 +30,7 @@ fn transcript_is_noncopyable_but_droppable() {
     // `Value::is_droppable`.
     let mut vm = vm_with_script(
         ScriptBuilder::new()
-            .push_str(s(b""))
+            .push_literal(s(b""))
             .transcript()
             .drop_()
             .to_bytecode(),
@@ -44,8 +44,8 @@ fn twrite_requires_merlin_on_bottom() {
     // push:5 (wrong type), pushstr "lbl", pushstr "data", merlinwrite
     let script = ScriptBuilder::new()
         .push_int(5u64)
-        .push_str(s(b"lbl"))
-        .push_str(s(b"data"))
+        .push_literal(s(b"lbl"))
+        .push_literal(s(b"data"))
         .twrite()
         .to_bytecode();
     let mut vm = vm_with_script(script);
@@ -61,21 +61,23 @@ fn keccak256_differs_from_sha3() {
     // (FIPS-202 added a domain separator).
     let mut a = vm_with_script(
         ScriptBuilder::new()
-            .push_str(s(b"abc"))
+            .push_literal(s(b"abc"))
+            .builder()
             .sha3()
             .to_bytecode(),
     );
     run_to_end(&mut a).unwrap();
     let mut b = vm_with_script(
         ScriptBuilder::new()
-            .push_str(s(b"abc"))
+            .push_literal(s(b"abc"))
+            .builder()
             .keccak256()
             .to_bytecode(),
     );
     run_to_end(&mut b).unwrap();
     match (&a.current_call.stack[0], &b.current_call.stack[0]) {
-        (Value::String(sa), Value::String(sb)) => {
-            assert_ne!(sa.as_opaque().unwrap(), sb.as_opaque().unwrap());
+        (Value::Builder(sa), Value::Builder(sb)) => {
+            assert_ne!(sa.payload(), sb.payload());
         }
         _ => panic!(),
     }
@@ -95,13 +97,19 @@ fn calibrated_hash_cost_tracks_compression_blocks() {
 #[test]
 fn sha256_debits_the_calibrated_work_before_hashing() {
     let mut vm = vm_with_script(ScriptBuilder::new().sha256().to_bytecode());
-    vm.current_call.stack = vec![Value::String(String::from(vec![0x5a; 64]))];
-    vm.current_call.gas_limit = GAS_PER_INSTRUCTION + hash_gas(64, 64).unwrap();
+    let mut source = CellBuilder::new();
+    source.store_bytes(&[0x5a; 64]).unwrap();
+    vm.current_call.stack = vec![
+        Value::Builder(source.clone()),
+        Value::Builder(CellBuilder::new()),
+    ];
+    vm.current_call.gas_limit =
+        GAS_PER_INSTRUCTION + hash_gas(64, 64).unwrap() + alloc_byte_gas(32).unwrap();
     assert!(vm.step_internal().expect("exact budget succeeds"));
     assert_eq!(vm.current_call.gas_used, vm.current_call.gas_limit);
 
     let mut short = vm_with_script(ScriptBuilder::new().sha256().to_bytecode());
-    short.current_call.stack = vec![Value::String(String::from(vec![0x5a; 64]))];
-    short.current_call.gas_limit = GAS_PER_INSTRUCTION + hash_gas(64, 64).unwrap() - 1;
+    short.current_call.stack = vec![Value::Builder(source), Value::Builder(CellBuilder::new())];
+    short.current_call.gas_limit = vm.current_call.gas_limit - 1;
     assert!(matches!(short.step_internal(), Err(VMError::OutOfGas)));
 }

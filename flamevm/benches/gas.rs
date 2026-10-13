@@ -3,7 +3,7 @@ extern crate criterion;
 
 use bulletproofs::r1cs::{ConstraintSystem, Prover as R1csProver, Verifier as R1csVerifier};
 use bulletproofs::{BulletproofGens, PedersenGens};
-use criterion::{black_box, Criterion};
+use criterion::{black_box, BatchSize, Criterion};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
@@ -11,6 +11,7 @@ use curve25519_dalek::traits::VartimeMultiscalarMul;
 use flamevm::{MultiscalarMul, Point};
 use merlin::Transcript;
 use musig::{BatchVerifier, Signature, VerificationKey};
+use rand::{rngs::StdRng, SeedableRng};
 use sha2::Digest;
 use std::time::Duration;
 
@@ -119,8 +120,23 @@ fn msm(c: &mut Criterion) {
             })
         });
 
-        let scalars = vec![Scalar::ONE; n];
-        let points = vec![RISTRETTO_BASEPOINT_POINT; n];
+        let mut rng = StdRng::seed_from_u64(7);
+        let scalars: Vec<_> = (0..n).map(|_| Scalar::random(&mut rng)).collect();
+        let points: Vec<_> = (0..n)
+            .map(|_| RISTRETTO_BASEPOINT_POINT * Scalar::random(&mut rng))
+            .collect();
+        let mut expression = MultiscalarMul::default();
+        for (scalar, point) in scalars.iter().zip(&points) {
+            expression = expression.push_term(*scalar, point.compress());
+        }
+        c.bench_function(&format!("gas/msm/evaluate/{}", n), move |b| {
+            // Input cloning is setup, not part of the VM's consuming computation.
+            b.iter_batched(
+                || expression.clone(),
+                |msm| black_box(msm.evaluate().unwrap()),
+                BatchSize::SmallInput,
+            )
+        });
         c.bench_function(&format!("gas/msm/finalize/{}", n), move |b| {
             b.iter(|| {
                 black_box(RistrettoPoint::vartime_multiscalar_mul(

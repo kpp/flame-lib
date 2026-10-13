@@ -2,15 +2,13 @@
 
 use bulletproofs::PedersenGens;
 use cells::{
-    BagOfCells, CellBuilder, CellDecode, CellEncode, CellError, CellID, CellRef, CellResolver,
-    CellSlice, Trie,
+    CellBuilder, CellDecode, CellEncode, CellError, CellID, CellReader, CellRef, CellSlice,
 };
 use core::{any::Any, fmt};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
 use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::scalar::Scalar;
 use merlin::Transcript;
-use std::{convert::TryFrom, sync::Arc};
 
 use crate::{errors::VMError, vm::Anchor, ScriptBuilder, Value};
 
@@ -24,7 +22,7 @@ pub trait PredicateWitness: Any + Send + Sync + fmt::Debug {
     fn as_any(&self) -> &dyn Any;
 }
 
-/// Unlock condition P = X + H(X, root Cell ID) · B.
+/// Unlock condition P = X + H(X, program Cell hash(0)) · B.
 pub struct Predicate {
     pub(crate) point: CompressedRistretto,
     pub(crate) witness: Option<Box<dyn PredicateWitness>>,
@@ -45,40 +43,14 @@ impl fmt::Debug for Predicate {
     }
 }
 
-/// The sum tag distinguishes executable programs from random blinding data.
-#[derive(Clone, Debug)]
-pub enum PredicateLeaf {
-    Program(Vec<u8>),
-    Blinding([u8; 32]),
-}
-
-impl CellEncode for PredicateLeaf {
-    fn encode(&self, builder: &mut CellBuilder) -> Result<(), CellError> {
-        match self {
-            Self::Program(program) => {
-                builder.store_u8(0)?.store_snake(program)?;
-            }
-            Self::Blinding(bytes) => {
-                builder.store_u8(1)?.store_bytes(bytes)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Prover witness containing the resident program Trie and its blinding leaves.
-///
-/// Each program occupies one randomly selected slot in a pair of leaves. The
-/// other slot contains a deterministic, secret-seeded blinding value. The root
-/// Cell is the raw root of an eight-byte-key Trie, with no count envelope.
-/// Its Cell ID commits directly to the paths and leaves in the Taproot tweak.
+/// Optional host-side builder for blinded executable policy trees.
+/// Branch selection is ordinary bytecode, not part of the `open` opcode.
 #[derive(Clone, Debug)]
 pub struct PredicateTree {
     pub(crate) internal_key: CompressedRistretto,
-    pub(crate) leaves: Vec<PredicateLeaf>,
+    programs: Vec<cells::Cell>,
     root: CellRef,
     pub(crate) point: CompressedRistretto,
-    /// Optional prover programs in logical input order; never public encoding.
     scripts: Vec<ScriptBuilder>,
 }
 
@@ -132,36 +104,32 @@ impl Predicate {
         PedersenGens::default().B_blinding.compress()
     }
 
-    /// Authenticates a branch selector and loads its code through this execution's
-    /// resolver. There are no separate sibling hashes or caller-supplied code.
-    /// Missing path/continuation Cells are hard errors, never alternate branches.
-    pub fn open_branch<R: CellResolver + ?Sized>(
+    /// Creates a predicate directly from any policy Cell's level-zero commitment.
+    pub fn taproot(
+        internal_key: CompressedRistretto,
+        program: &cells::Cell,
+    ) -> Result<Self, VMError> {
+        let internal = internal_key.decompress().ok_or(VMError::InvalidPoint)?;
+        let tweak = taproot_tweak(&internal_key, &program.hash(0)?);
+        Ok(Self::opaque(
+            (internal + RISTRETTO_BASEPOINT_TABLE * &tweak).compress(),
+        ))
+    }
+
+    /// Authentication does not execute code or turn pruning records into bodies.
+    pub fn verify_taproot(
         &self,
-        proof: &TaprootProof,
-        cells: &mut R,
-        max_program_bytes: usize,
-    ) -> Result<Vec<u8>, VMError> {
-        let internal = proof
-            .internal_key
-            .decompress()
-            .ok_or(VMError::TaprootProofMismatch)?;
-        let tweak = taproot_tweak(&proof.internal_key, &proof.root);
-        if (internal + RISTRETTO_BASEPOINT_TABLE * &tweak).compress() != self.point {
+        internal_key: &CompressedRistretto,
+        program: &cells::Cell,
+    ) -> Result<(), VMError> {
+        let predicate = Self::taproot(*internal_key, program).map_err(|error| match error {
+            VMError::InvalidPoint => VMError::TaprootProofMismatch,
+            other => other,
+        })?;
+        if predicate.point != self.point {
             return Err(VMError::TaprootProofMismatch);
         }
-        let leaf = Trie::lookup(
-            &CellRef::pruned(proof.root),
-            &proof.index.to_be_bytes(),
-            cells,
-        )?
-        .ok_or(VMError::TaprootProofMismatch)?;
-        let mut slice = CellSlice::new(&leaf);
-        if slice.load_u8()? != 0 {
-            return Err(VMError::TaprootProofMismatch);
-        }
-        let program = slice.load_snake(cells, max_program_bytes)?;
-        slice.finish()?;
-        Ok(program)
+        Ok(())
     }
 }
 
@@ -173,7 +141,7 @@ impl CellEncode for Predicate {
 }
 
 impl CellDecode for Predicate {
-    fn decode<R: CellResolver + ?Sized>(
+    fn decode<R: CellReader + ?Sized>(
         slice: &mut CellSlice<'_>,
         cells: &mut R,
     ) -> Result<Self, CellError> {
@@ -184,48 +152,66 @@ impl CellDecode for Predicate {
 }
 
 impl PredicateTree {
-    /// Builds a deterministic, blinded program Trie. None disables key spends.
     pub fn new(
         internal_key: Option<CompressedRistretto>,
         programs: Vec<Vec<u8>>,
+        blinding_key: [u8; 32],
+    ) -> Result<Self, VMError> {
+        let programs = programs
+            .iter()
+            .map(|program| crate::script::script_cell(program))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::from_cells(internal_key, programs, blinding_key)
+    }
+
+    pub fn from_cells(
+        internal_key: Option<CompressedRistretto>,
+        programs: Vec<cells::Cell>,
         blinding_key: [u8; 32],
     ) -> Result<Self, VMError> {
         if programs.is_empty() {
             return Err(VMError::EmptyPredicateTree);
         }
         let internal_key = internal_key.unwrap_or_else(Predicate::unspendable_key);
-        let internal = internal_key.decompress().ok_or(VMError::InvalidPoint)?;
-        let leaves = create_blinded_leaves(&programs, &blinding_key);
-        let mut trie = Trie::new(8)?;
-        for (index, leaf) in leaves.iter().enumerate() {
-            let index = u64::try_from(index).map_err(|_| VMError::ProgramIndexOutOfRange)?;
-            trie.insert(&index.to_be_bytes(), leaf.to_cell()?, &mut ())?;
+        let mut transcript = Transcript::new(b"flamevm.taproot.blinding");
+        transcript.append_message(b"key", &blinding_key);
+        for program in &programs {
+            transcript.append_message(b"prog", &program.hash(0)?);
         }
-        let root = trie.into_root().expect("programs are nonempty");
-        let tweak = taproot_tweak(&internal_key, &root.id());
-        let point = (internal + RISTRETTO_BASEPOINT_TABLE * &tweak).compress();
+        let mut leaves = Vec::with_capacity(programs.len());
+        for program in &programs {
+            let mut salt = [0; 32];
+            transcript.challenge_bytes(b"salt", &mut salt);
+            leaves.push(
+                ScriptBuilder::new()
+                    .push_cell(cells::Cell::new(salt.to_vec(), vec![])?)
+                    .drop_()
+                    .push_cell(program.clone())
+                    .exec()
+                    .to_cell()?,
+            );
+        }
+        let root = dispatch_tree(&leaves)?;
+        let point = Predicate::taproot(internal_key, &root)?.point;
         Ok(Self {
             internal_key,
-            leaves,
-            root,
+            programs,
+            root: root.into(),
             point,
             scripts: Vec::new(),
         })
     }
 
-    /// Builds the same public tree as [`Self::new`], retaining each program's
-    /// private assignments and embedded public witnesses for the prover.
-    /// [`ScriptBuilder::push_taproot_proof`] attaches only the selected program.
     pub fn from_scripts(
         internal_key: Option<CompressedRistretto>,
         programs: Vec<ScriptBuilder>,
         blinding_key: [u8; 32],
     ) -> Result<Self, VMError> {
-        let mut tree = Self::new(
-            internal_key,
-            programs.iter().map(ScriptBuilder::to_bytecode).collect(),
-            blinding_key,
-        )?;
+        let public_programs = programs
+            .iter()
+            .map(ScriptBuilder::to_cell)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut tree = Self::from_cells(internal_key, public_programs, blinding_key)?;
         tree.scripts = programs;
         Ok(tree)
     }
@@ -233,22 +219,14 @@ impl PredicateTree {
     pub(crate) fn script_witness(&self, program_index: usize) -> Option<&ScriptBuilder> {
         self.scripts.get(program_index)
     }
-
     pub fn scripts_only(programs: Vec<Vec<u8>>, blinding_key: [u8; 32]) -> Result<Self, VMError> {
         Self::new(None, programs, blinding_key)
     }
     pub fn internal_key(&self) -> &CompressedRistretto {
         &self.internal_key
     }
-    pub fn leaves(&self) -> &[PredicateLeaf] {
-        &self.leaves
-    }
-
-    pub fn programs(&self) -> impl Iterator<Item = &[u8]> {
-        self.leaves.iter().filter_map(|leaf| match leaf {
-            PredicateLeaf::Program(program) => Some(program.as_slice()),
-            PredicateLeaf::Blinding(_) => None,
-        })
+    pub fn programs(&self) -> impl Iterator<Item = &cells::Cell> {
+        self.programs.iter()
     }
     pub fn root(&self) -> &CellRef {
         &self.root
@@ -257,115 +235,91 @@ impl PredicateTree {
         self.root.id()
     }
 
-    /// Selects a program in original input order. The proof index is its actual
-    /// blinded Trie position, not its logical program index.
-    pub fn taproot_proof_for(&self, program_index: usize) -> Result<TaprootProof, VMError> {
-        let pair = program_index
-            .checked_mul(2)
-            .ok_or(VMError::ProgramIndexOutOfRange)?;
-        let first = self
-            .leaves
-            .get(pair)
-            .ok_or(VMError::ProgramIndexOutOfRange)?;
-        let index = pair + usize::from(matches!(first, PredicateLeaf::Blinding(_)));
-        Ok(TaprootProof {
+    /// Supply one branch; the policy's dispatcher chooses the first unpruned child.
+    pub fn opening_for(&self, program_index: usize) -> Result<TaprootOpening, VMError> {
+        if program_index >= self.programs.len() {
+            return Err(VMError::ProgramIndexOutOfRange);
+        }
+        let root = self.root.as_resident().expect("builder owns its policy");
+        let root = select_branch(
+            root,
+            self.programs.len(),
+            program_index,
+            root.level().max(1),
+        )?;
+        debug_assert_eq!(root.hash(0)?, self.root.commitment().hash(0)?);
+        Ok(TaprootOpening {
             internal_key: self.internal_key,
-            root: self.root.id(),
-            index: u64::try_from(index).map_err(|_| VMError::ProgramIndexOutOfRange)?,
+            root,
         })
     }
-
-    /// Records only Cells read to open this program, including snake overflow.
-    /// Unused program/blinding bodies remain pruned in the returned witness bag.
-    pub fn witness_for(&self, program_index: usize) -> Result<(TaprootProof, BagOfCells), VMError> {
-        let proof = self.taproot_proof_for(program_index)?;
-        let mut recorder = BranchRecorder {
-            root: &self.root,
-            recorded: BagOfCells::new(),
-        };
-        Predicate::opaque(self.point).open_branch(&proof, &mut recorder, u32::MAX as usize)?;
-        Ok((proof, recorder.recorded))
-    }
 }
 
-struct BranchRecorder<'a> {
-    root: &'a CellRef,
-    recorded: BagOfCells,
-}
-
-impl CellResolver for BranchRecorder<'_> {
-    fn resolve(&mut self, reference: &CellRef) -> Result<Arc<cells::Cell>, CellError> {
-        let source = if reference.id() == self.root.id() {
-            self.root
-        } else {
-            reference
-        };
-        let cell = source
-            .as_resident_arc()
-            .cloned()
-            .ok_or(CellError::MissingCell(source.id()))?;
-        self.recorded.insert(Arc::clone(&cell))?;
-        Ok(cell)
-    }
-}
-
-fn create_blinded_leaves(programs: &[Vec<u8>], blinding_key: &[u8; 32]) -> Vec<PredicateLeaf> {
-    let mut transcript = Transcript::new(b"flamevm.taproot.blinding");
-    transcript.append_message(b"n", &(programs.len() as u64).to_le_bytes());
-    transcript.append_message(b"key", blinding_key);
-    for program in programs {
-        transcript.append_message(b"prog", program);
-    }
-    let mut leaves = Vec::with_capacity(programs.len() * 2);
-    for program in programs {
-        let mut blinding = [0; 32];
-        transcript.challenge_bytes(b"blinding", &mut blinding);
-        let pair = if blinding[0] & 1 == 0 {
-            [
-                PredicateLeaf::Blinding(blinding),
-                PredicateLeaf::Program(program.clone()),
-            ]
-        } else {
-            [
-                PredicateLeaf::Program(program.clone()),
-                PredicateLeaf::Blinding(blinding),
-            ]
-        };
-        leaves.extend(pair);
-    }
-    leaves
-}
-
-/// An authenticated root and leaf selector. Path Cells live in the transaction
-/// BoC; this contains neither a parallel proof encoding nor a copy of the code.
+/// Host-side opening data; the VM receives the Point and Cell separately.
 #[derive(Clone, Debug)]
-pub struct TaprootProof {
+pub struct TaprootOpening {
     pub internal_key: CompressedRistretto,
-    pub root: CellID,
-    pub index: u64,
+    pub root: cells::Cell,
 }
 
-impl CellEncode for TaprootProof {
-    fn encode(&self, builder: &mut CellBuilder) -> Result<(), CellError> {
-        builder
-            .store_bytes(self.internal_key.as_bytes())?
-            .store_bytes(&self.root)?
-            .store_u64(self.index)?;
-        Ok(())
+fn dispatch_tree(leaves: &[cells::Cell]) -> Result<cells::Cell, CellError> {
+    if leaves.len() == 1 {
+        return Ok(leaves[0].clone());
     }
+    let width = leaves.len().div_ceil(cells::MAX_CELL_REFS);
+    let children = leaves
+        .chunks(width)
+        .map(dispatch_tree)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut code = ScriptBuilder::new().run_slice();
+    for _ in &children {
+        code = code.push_int(0u64).load_ref().cell_info();
+        for _ in 0..4 {
+            code = code.roll_k(1).drop_();
+        }
+        code = code.not().jumpif(0).drop_();
+    }
+    code = code
+        .drop_()
+        .push_int(0u64)
+        .verify()
+        .label(0)
+        .roll_k(1)
+        .drop_()
+        .exec();
+    cells::Cell::new(
+        code.to_cell()?.payload().to_vec(),
+        children.into_iter().map(CellRef::from).collect(),
+    )
 }
 
-impl CellDecode for TaprootProof {
-    fn decode<R: CellResolver + ?Sized>(
-        slice: &mut CellSlice<'_>,
-        cells: &mut R,
-    ) -> Result<Self, CellError> {
-        Ok(Self {
-            internal_key: CompressedRistretto(<[u8; 32]>::decode(slice, cells)?),
-            root: <[u8; 32]>::decode(slice, cells)?,
-            index: slice.load_u64()?,
-        })
+fn select_branch(
+    root: &cells::Cell,
+    count: usize,
+    index: usize,
+    level: u8,
+) -> Result<cells::Cell, CellError> {
+    if count == 1 {
+        return Ok(root.clone());
     }
+    let width = count.div_ceil(cells::MAX_CELL_REFS);
+    let selected = index / width;
+    let mut refs = Vec::with_capacity(root.refs().len());
+    for (slot, reference) in root.refs().iter().enumerate() {
+        let child = reference.as_resident().expect("builder owns its branches");
+        let child = if slot == selected {
+            select_branch(
+                child,
+                (count - slot * width).min(width),
+                index % width,
+                level,
+            )?
+        } else {
+            child.prune(level)?
+        };
+        refs.push(child.into());
+    }
+    cells::Cell::new(root.payload().to_vec(), refs)
 }
 
 /// A linear Contract protecting a single portable payload Value.
@@ -403,9 +357,9 @@ impl Contract {
     /// "Trusted" refers to the Dict counts/capability summaries checked when the
     /// output was created, not to its sender or a hash alone. The caller must
     /// bind this body to an accepted input commitment (including chain membership
-    /// validation). Unlike ordinary `CellDecode`, hidden branches remain pruned;
+    /// validation). Unlike ordinary `CellDecode`, hidden branches remain unloaded;
     /// accessed nodes and values still undergo their normal decoding checks.
-    pub fn from_trusted_cell<R: CellResolver + ?Sized>(
+    pub fn from_trusted_cell<R: CellReader + ?Sized>(
         cell: &cells::Cell,
         resolver: &mut R,
     ) -> Result<Self, CellError> {
@@ -440,7 +394,7 @@ impl CellEncode for Contract {
 }
 
 impl CellDecode for Contract {
-    fn decode<R: CellResolver + ?Sized>(
+    fn decode<R: CellReader + ?Sized>(
         slice: &mut CellSlice<'_>,
         cells: &mut R,
     ) -> Result<Self, CellError> {
@@ -464,6 +418,8 @@ fn taproot_tweak(internal_key: &CompressedRistretto, root: &CellID) -> Scalar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cells::CellIndex;
+    use std::sync::Arc;
 
     #[test]
     fn constructor_rejects_unencodable_depth_before_identity_is_used() {
@@ -513,54 +469,36 @@ mod tests {
     }
 
     #[test]
-    fn branch_witness_opens_only_the_selected_program_and_checks_commitments() {
+    fn branch_opening_preserves_semantic_hash_without_revealing_other_programs() {
         let programs = vec![vec![1], vec![2; 20_000], vec![3]];
-        let tree = PredicateTree::scripts_only(programs.clone(), [7; 32]).unwrap();
-        let mut trie = Trie::new(8).unwrap();
-        for (index, leaf) in tree.leaves().iter().enumerate() {
-            trie.insert(
-                &(index as u64).to_be_bytes(),
-                leaf.to_cell().unwrap(),
-                &mut (),
-            )
-            .unwrap();
-        }
-        assert_eq!(
-            tree.root_id(),
-            trie.root_id().unwrap(),
-            "no predicate count-wrapper Cell"
-        );
+        let tree = PredicateTree::scripts_only(programs, [7; 32]).unwrap();
         let predicate = Predicate::opaque(tree.point);
-        let (proof, mut bag) = tree.witness_for(1).unwrap();
-        assert_eq!(
-            predicate.open_branch(&proof, &mut bag, 20_000).unwrap(),
-            programs[1]
-        );
-        assert!(predicate.open_branch(&proof, &mut bag, 19_999).is_err());
-        assert!(predicate
-            .open_branch(&proof, &mut BagOfCells::new(), 20_000)
-            .is_err());
-        let other = tree.taproot_proof_for(0).unwrap();
-        assert!(predicate.open_branch(&other, &mut bag, 20_000).is_err());
-        let mut missing = proof.clone();
-        missing.index = u64::MAX;
+        let opening = tree.opening_for(1).unwrap();
+        let full = tree.root().as_resident().unwrap();
+        assert_eq!(opening.root.hash(0).unwrap(), full.hash(0).unwrap());
+        assert_ne!(opening.root.id(), full.id());
+        predicate
+            .verify_taproot(&opening.internal_key, &opening.root)
+            .unwrap();
+        for (index, reference) in opening.root.refs().iter().enumerate() {
+            assert_eq!(reference.as_resident().unwrap().is_pruned(), index != 1);
+        }
+        let supplied = CellIndex::collect(Arc::new(opening.root.clone())).unwrap();
+        for (index, program) in tree.programs().enumerate() {
+            assert_eq!(supplied.contains(&program.id()), index == 1);
+        }
+        let forged = cells::Cell::new(vec![0], opening.root.refs().to_vec()).unwrap();
         assert!(matches!(
-            predicate.open_branch(&missing, &mut bag, 20_000),
+            predicate.verify_taproot(&opening.internal_key, &forged),
             Err(VMError::TaprootProofMismatch)
         ));
-        let mut forged = proof.clone();
-        forged.root[0] ^= 1;
-        assert!(matches!(
-            predicate.open_branch(&forged, &mut bag, 20_000),
-            Err(VMError::TaprootProofMismatch)
-        ));
-        forged = proof;
-        forged.index ^= 1;
-        let mut all = BagOfCells::collect(tree.root.as_resident_arc().unwrap().clone()).unwrap();
-        assert!(matches!(
-            predicate.open_branch(&forged, &mut all, 20_000),
-            Err(VMError::TaprootProofMismatch)
-        ));
+        let other_key = (RISTRETTO_BASEPOINT_TABLE * &Scalar::from(7u64)).compress();
+        for key in [other_key, CompressedRistretto([0xff; 32])] {
+            assert!(matches!(
+                predicate.verify_taproot(&key, &opening.root),
+                Err(VMError::TaprootProofMismatch)
+            ));
+        }
     }
 
     #[test]
@@ -575,15 +513,8 @@ mod tests {
         assert_ne!(a.point, c.point);
         assert_eq!(a.internal_key, Predicate::unspendable_key());
         assert!(matches!(
-            a.taproot_proof_for(3),
+            a.opening_for(3),
             Err(VMError::ProgramIndexOutOfRange)
         ));
-        let proof = a.taproot_proof_for(0).unwrap();
-        let cell = proof.to_cell().unwrap();
-        assert_eq!(cell.payload().len(), 72);
-        assert!(cell.refs().is_empty());
-        let decoded = TaprootProof::from_cell(&cell, &mut ()).unwrap();
-        assert_eq!(decoded.root, proof.root);
-        assert_eq!(decoded.index, proof.index);
     }
 }

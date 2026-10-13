@@ -30,6 +30,18 @@ pub enum CellError {
     #[error("invalid Cell encoding")]
     InvalidFormat,
 
+    #[error("invalid Cell hash level")]
+    InvalidLevel,
+
+    #[error("Cell depth exceeds 65535")]
+    DepthOverflow,
+
+    #[error("pruned Cell has no accessible application data")]
+    PrunedCell,
+
+    #[error("resolved Cell commitment mismatch for {0:?}")]
+    CellCommitmentMismatch(CellID),
+
     #[error("missing Cell {0:?}")]
     MissingCell(CellID),
 
@@ -42,7 +54,7 @@ pub enum CellError {
     #[error("resource budget exhausted")]
     ResourceExhausted,
 
-    #[error("Bag of Cells count does not fit u32")]
+    #[error("Cell index count does not fit u32")]
     CellCountOverflow,
 
     #[error("cycle through Cell {0:?}")]

@@ -17,6 +17,17 @@ The project is a work-in-progress, many parts are changing and breaking all the 
 ### Documentation
 
 - [FlameVM Specification](docs/flamevm.md)
-- [Key Derivation](flamekd/flamekd.md)
+- [Key Derivation](docs/flamekd.md)
+- [Address Formats](docs/address.md)
+- [Bech32f](docs/bech32f.md)
+- [Cell-based Encoding](docs/encoding.md)
+- [Merkle Compression](docs/compression.md)
+- [Payment Keys and Transfers](flamepayments/flamepayments.md)
+- [Confidential Payments](docs/payments.md)
+- [Native Wallet Bindings](flamewallet-ffi/flamewallet-ffi.md)
+- [WebAssembly Wallet Bindings](flamewallet-wasm/flamewallet-wasm.md)
+- [The Node and its JSON-RPC](flamed/flamed.md)
+- [Benchmarks](docs/benchmarks.md)
+- [Actor Storage Specification](docs/storage.md)
 - [Blockchain State Machine](docs/blockchain.md)
 - [Consensus](docs/consensus.md)

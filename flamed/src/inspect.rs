@@ -1,0 +1,879 @@
+//! Public VM data for RPC responses.
+
+use std::collections::HashSet;
+
+use flamed_rpc::{
+    ActorCode, ActorId, ActorResult, ActorStateEnvelope, ActorTarget, CellId, ContractId,
+    ContractResult, DictEntry, InstructionView, PredicatePoint, TxEntry as RpcTxEntry, TxValue,
+    ValueCell,
+};
+#[cfg(test)]
+use flamevm::ActorID;
+use flamevm::{
+    ActorAddress, Anchor, Cell, CellDecode, CellEncode, CellEnvelope, CellError, CellIndex,
+    CellRef, CellSlice, Contract, Instruction, Predicate, Scalar, Trie, TxEntry, Value, read_cell,
+    resolve_cell,
+};
+
+/// Decodes an archived contract's public payload.
+pub fn contract(id: ContractId, mut result: ContractResult) -> Result<ContractResult, CellError> {
+    let bytes = &result.bytes.0;
+    let mut gas = (bytes.len() as u64).saturating_mul(1024);
+    let mut envelope = CellEnvelope::decode(bytes, bytes.len(), &mut gas)?;
+    if envelope.root() != id.0 {
+        return Err(CellError::InvalidFormat);
+    }
+    let root = resolve_cell(&mut envelope, id.0)?;
+    let (contract, decoded) = match Contract::from_cell(&root, &mut envelope) {
+        Ok(contract) => {
+            let decoded = render_value(contract.payload(), &mut envelope);
+            (contract, decoded)
+        }
+        Err(CellError::MissingCell(_)) => {
+            let contract = Contract::from_trusted_cell(&root, &mut envelope)?;
+            let payload = CellRef::resident(contract.payload().to_cell()?);
+            let decoded = available_cells(&payload, &mut envelope);
+            (contract, decoded)
+        }
+        Err(error) => return Err(error),
+    };
+    result.anchor = contract.anchor.0;
+    (result.decoded_payload, result.payload_error) = match decoded {
+        Ok(value) => (Some(value), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    Ok(result)
+}
+
+/// Decodes the available state and code from a current actor snapshot.
+pub fn actor(mut result: ActorResult) -> ActorResult {
+    let decoded = result.state.as_ref().map(|bytes| {
+        let mut gas = (bytes.0.len() as u64).saturating_mul(1024);
+        let mut envelope = CellEnvelope::decode(&bytes.0, bytes.0.len(), &mut gas)?;
+        let id = envelope.root();
+        let root = resolve_cell(&mut envelope, id)?;
+        let reference = CellRef::resident(root.clone());
+        match Value::from_cell(&root, &mut envelope) {
+            Ok(value) => render_value(&value, &mut envelope),
+            Err(CellError::MissingCell(_)) => available_cells(&reference, &mut envelope),
+            Err(error) => Err(error),
+        }
+    });
+
+    (result.decoded_state, result.state_error) = match decoded {
+        Some(Ok(value)) => (Some(value), None),
+        Some(Err(error)) => (None, Some(error.to_string())),
+        None => (None, Some("State body is unavailable".into())),
+    };
+
+    (result.instructions, result.code_error) = match &result.code {
+        Some(code) => disassemble(&code.0),
+        None => (Vec::new(), Some("Code body is unavailable".into())),
+    };
+
+    result
+}
+
+fn disassemble(code: &[u8]) -> (Vec<InstructionView>, Option<String>) {
+    let mut gas = u64::MAX;
+    let envelope = match CellEnvelope::decode(code, code.len(), &mut gas) {
+        Ok(envelope) => envelope,
+        Err(error) => return (Vec::new(), Some(error.to_string())),
+    };
+    let root = match envelope.cells().get(&envelope.root()) {
+        Some(root) => root,
+        None => return (Vec::new(), Some("Code root is unavailable".into())),
+    };
+    let mut instructions = Vec::new();
+    let mut remaining = root.payload();
+    let mut refs = root.refs().iter();
+    while !remaining.is_empty() {
+        let offset = (root.payload().len() - remaining.len()) as u64;
+        let op = match Instruction::parse(&mut remaining) {
+            Ok(op) => op,
+            Err(error) => {
+                return (instructions, Some(format!("Byte {offset}: {error}")));
+            }
+        };
+        let text = match op {
+            Instruction::PushInt(n) => format!("push {}", scalar(n)),
+            Instruction::PushCell(_) => match refs.next() {
+                Some(reference) => format!("pushcell 0x{}", hex::encode(reference.id())),
+                None => {
+                    return (
+                        instructions,
+                        Some(format!("Byte {offset}: missing reference")),
+                    );
+                }
+            },
+            Instruction::PushPoint(p) => format!("pushpoint 0x{}", hex::encode(p.to_bytes())),
+            Instruction::DupK(k) => format!("dup:{k}"),
+            Instruction::RollK(k) => format!("roll:{k}"),
+            Instruction::Label(n) => format!("label:{n}"),
+            Instruction::Jump(n) => format!("jump:{n}"),
+            Instruction::JumpIf(n) => format!("jumpif:{n}"),
+            Instruction::Ext(n) => format!("ext 0x{n:02x}"),
+            Instruction::Alloc(_) => "alloc".into(),
+            plain => format!("{plain:?}").to_ascii_lowercase(),
+        };
+        instructions.push(InstructionView { offset, text });
+    }
+    (instructions, None)
+}
+
+/// Reads public effects from an archived log.
+pub fn effects(bytes: &[u8]) -> Result<Vec<RpcTxEntry>, CellError> {
+    let mut gas = (bytes.len() as u64).saturating_mul(1024);
+    let mut envelope = CellEnvelope::decode(bytes, bytes.len(), &mut gas)?;
+    let root = envelope
+        .cells()
+        .get(&envelope.root())
+        .ok_or(CellError::MissingCell(envelope.root()))?;
+
+    let mut slice = CellSlice::new(&root);
+    let len = usize::try_from(slice.load_u64()?).map_err(|_| CellError::LimitExceeded)?;
+
+    let trie = if len == 0 {
+        Trie::new(8)?
+    } else {
+        Trie::from_cell(slice.load_ref()?, 8)?
+    };
+
+    slice.finish()?;
+
+    trie.entries_exact(len, &mut envelope)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, (key, reference))| {
+            if key != (i as u64).to_be_bytes() {
+                return Err(CellError::InvalidFormat);
+            }
+            let cell = read_cell(&mut envelope, &reference)?;
+            effect_from_cell(&cell, &mut envelope)
+        })
+        .collect()
+}
+
+fn effect_from_cell(cell: &Cell, envelope: &mut CellEnvelope) -> Result<RpcTxEntry, CellError> {
+    match TxEntry::from_cell(cell, envelope) {
+        Ok(entry) => return render_effect(&entry, envelope),
+        Err(CellError::MissingCell(_)) => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut slice = CellSlice::new(cell);
+    // Archived logs can omit old state cells. Keep their hashes and all available bodies.
+    let effect = match slice.load_u8()? {
+        tag @ (TxEntry::TAG_ACTOR_DEPLOY | TxEntry::TAG_SET_CODE) => {
+            let actor = ActorId(<[u8; 32]>::decode(&mut slice, envelope)?);
+            let reference = slice.load_ref()?;
+            let code =
+                CellEnvelope::new(reference.id(), available_index(&reference, envelope)?)?.encode();
+            if tag == TxEntry::TAG_ACTOR_DEPLOY {
+                RpcTxEntry::ActorDeploy {
+                    actor,
+                    code,
+                    code_hash: reference.id(),
+                }
+            } else {
+                RpcTxEntry::SetCode {
+                    actor,
+                    code,
+                    code_hash: reference.id(),
+                }
+            }
+        }
+        TxEntry::TAG_ACTOR_SAVE => {
+            let actor = ActorId(<[u8; 32]>::decode(&mut slice, envelope)?);
+            let state = slice.load_ref()?;
+            RpcTxEntry::ActorSave {
+                actor,
+                state_hash: state.id(),
+                state: available_cells(&state, envelope)?,
+            }
+        }
+        TxEntry::TAG_ACTOR_RESTORE => {
+            let actor = ActorId(<[u8; 32]>::decode(&mut slice, envelope)?);
+            let reference = slice.load_ref()?;
+            RpcTxEntry::ActorRestore {
+                actor,
+                state_hash: CellId(reference.id()),
+                state: ActorStateEnvelope(
+                    available_envelope(&reference, envelope)?
+                        .ok_or(CellError::MissingCell(reference.id()))?,
+                ),
+            }
+        }
+        TxEntry::TAG_OUTPUT => {
+            let contract = read_cell(envelope, &slice.load_ref()?)?;
+            let contract = Contract::from_trusted_cell(&contract, envelope)?;
+            let payload = CellRef::resident(contract.payload().to_cell()?);
+            RpcTxEntry::Output {
+                contract: ContractId(contract.id()),
+                predicate: PredicatePoint(contract.predicate.to_point().to_bytes()),
+                anchor: contract.anchor.0,
+                payload: available_cells(&payload, envelope)?,
+            }
+        }
+        TxEntry::TAG_SEND => {
+            let message = read_cell(envelope, &slice.load_ref()?)?;
+            message_effect(&message, envelope)?
+        }
+        _ => return Err(CellError::InvalidFormat),
+    };
+
+    slice.finish()?;
+    Ok(effect)
+}
+
+fn message_effect(cell: &Cell, envelope: &mut CellEnvelope) -> Result<RpcTxEntry, CellError> {
+    let mut slice = CellSlice::new(cell);
+    let anchor = Anchor::decode(&mut slice, envelope)?.0;
+    let target = actor_target(&ActorAddress::decode(&mut slice, envelope)?, envelope)?;
+    let caller = match slice.load_u8()? {
+        0 => None,
+        1 => Some(ActorId(<[u8; 32]>::decode(&mut slice, envelope)?)),
+        _ => return Err(CellError::InvalidFormat),
+    };
+
+    let refund_predicate = PredicatePoint(
+        Predicate::decode(&mut slice, envelope)?
+            .to_point()
+            .to_bytes(),
+    );
+
+    let gas_limit = slice.load_u64()?.to_string();
+    let payload = slice.load_ref()?;
+    slice.finish()?;
+    let payload =
+        match read_cell(envelope, &payload).and_then(|cell| Value::from_cell(&cell, envelope)) {
+            Ok(value) => render_value(&value, envelope)?,
+            Err(CellError::MissingCell(_)) => available_cells(&payload, envelope)?,
+            Err(error) => return Err(error),
+        };
+
+    Ok(RpcTxEntry::Send {
+        message: cell.id(),
+        target,
+        caller,
+        anchor,
+        payload,
+        gas_limit,
+        refund_predicate,
+    })
+}
+
+fn scalar(n: Scalar) -> String {
+    n.centered_abs()
+        .to_u128()
+        .map(|v| {
+            if n.is_centered_negative() {
+                format!("-{v}")
+            } else {
+                v.to_string()
+            }
+        })
+        .unwrap_or_else(|| format!("0x{}", hex::encode(n.to_bytes())))
+}
+
+fn actor_target(
+    actor: &ActorAddress,
+    envelope: &mut CellEnvelope,
+) -> Result<ActorTarget, CellError> {
+    let id = ActorId(actor.to_hash());
+    Ok(match actor {
+        ActorAddress::Address { .. } => ActorTarget::Address { actor: id },
+        ActorAddress::Init { ctor } => ActorTarget::Init {
+            actor: id,
+            ctor: available_envelope(ctor, envelope)?.map(ActorCode),
+        },
+        ActorAddress::Restore { state, .. } => ActorTarget::Restore {
+            actor: id,
+            state_hash: CellId(state.id()),
+            state: available_envelope(state, envelope)?.map(ActorStateEnvelope),
+        },
+    })
+}
+
+fn render_effect(entry: &TxEntry, envelope: &mut CellEnvelope) -> Result<RpcTxEntry, CellError> {
+    Ok(match entry {
+        TxEntry::Header(h) => RpcTxEntry::Header {
+            version: h.version,
+            locktime: h.locktime,
+        },
+        TxEntry::Data(bytes) => RpcTxEntry::Data {
+            bytes: bytes.clone(),
+        },
+        TxEntry::Input(id) => RpcTxEntry::Input {
+            contract: ContractId(*id),
+        },
+        TxEntry::Receive(id) => RpcTxEntry::Receive { message: *id },
+        TxEntry::Output(c) => RpcTxEntry::Output {
+            contract: ContractId(c.id()),
+            predicate: PredicatePoint(c.predicate.to_point().to_bytes()),
+            anchor: c.anchor.0,
+            payload: render_value(c.payload(), envelope)?,
+        },
+        TxEntry::ActorDeploy { actor, code } => RpcTxEntry::ActorDeploy {
+            actor: ActorId(actor.to_hash()),
+            code: CellEnvelope::new(code.id(), available_index(&code.clone().into(), envelope)?)?
+                .encode(),
+            code_hash: code.id(),
+        },
+        TxEntry::ActorSave { actor, state } => RpcTxEntry::ActorSave {
+            actor: ActorId(actor.to_hash()),
+            state_hash: flamevm::state_root(state),
+            state: render_value(state, envelope)?,
+        },
+        TxEntry::ActorRestore { actor, state } => RpcTxEntry::ActorRestore {
+            actor: ActorId(actor.to_hash()),
+            state_hash: CellId(state.id()),
+            state: ActorStateEnvelope(
+                available_envelope(&state.clone().into(), envelope)?
+                    .ok_or(CellError::MissingCell(state.id()))?,
+            ),
+        },
+        TxEntry::SetCode { actor, code } => RpcTxEntry::SetCode {
+            actor: ActorId(actor.to_hash()),
+            code: CellEnvelope::new(code.id(), available_index(&code.clone().into(), envelope)?)?
+                .encode(),
+            code_hash: code.id(),
+        },
+        TxEntry::ActorDestroy { actor } => RpcTxEntry::ActorDestroy {
+            actor: ActorId(actor.to_hash()),
+        },
+        TxEntry::Send(m) => RpcTxEntry::Send {
+            message: m.id().0,
+            target: actor_target(&m.target, envelope)?,
+            caller: m.caller.as_ref().map(|a| ActorId(a.to_hash())),
+            anchor: m.anchor.0,
+            payload: render_value(m.payload(), envelope)?,
+            gas_limit: m.gas.to_string(),
+            refund_predicate: PredicatePoint(m.refund_predicate.to_point().to_bytes()),
+        },
+        TxEntry::StoragePurchase {
+            actor,
+            bytes,
+            expiry_height,
+            fee_sparks,
+        } => RpcTxEntry::StoragePurchase {
+            actor: ActorId(actor.to_hash()),
+            bytes: *bytes,
+            expiry_height: *expiry_height,
+            fee_sparks: scalar(*fee_sparks),
+        },
+        TxEntry::Fee(q) => RpcTxEntry::Fee {
+            sparks: q.to_string(),
+        },
+        TxEntry::IssuePub(q, f) => RpcTxEntry::IssuePublic {
+            quantity: scalar(*q),
+            flavor: scalar(*f),
+        },
+        TxEntry::IssuePriv(q, f) => RpcTxEntry::IssuePrivate {
+            quantity_commitment: q.to_bytes(),
+            flavor_commitment: f.to_bytes(),
+        },
+        TxEntry::Retire(q, f) => RpcTxEntry::Retire {
+            quantity_commitment: q.to_bytes(),
+            flavor_commitment: f.to_bytes(),
+        },
+    })
+}
+
+fn render_value(value: &Value, envelope: &mut CellEnvelope) -> Result<TxValue, CellError> {
+    Ok(match value {
+        Value::Scalar(n) => TxValue::Scalar { value: scalar(*n) },
+        Value::Cell(cell) => available_cells(cell, envelope)?,
+        Value::Point(p) => TxValue::Point { hex: p.to_bytes() },
+        Value::ClearToken(t) => TxValue::ClearToken {
+            quantity: scalar(t.qty()),
+            flavor: scalar(t.flv()),
+        },
+        Value::Token(t) => TxValue::Token {
+            quantity_commitment: t.qty().to_point().to_bytes(),
+            flavor_commitment: t.flv().to_point().to_bytes(),
+        },
+        Value::Dict(d) => TxValue::Dict {
+            entries: d
+                .entries()
+                .map(|(key, value)| {
+                    Ok(DictEntry {
+                        key: scalar(*key),
+                        value: render_value(value, envelope)?,
+                    })
+                })
+                .collect::<Result<_, CellError>>()?,
+        },
+        _ => return Err(CellError::InvalidFormat),
+    })
+}
+
+fn available_index(
+    reference: &CellRef,
+    envelope: &mut CellEnvelope,
+) -> Result<CellIndex, CellError> {
+    let mut pending = vec![reference.clone()];
+    let mut seen = HashSet::new();
+    let mut cells = CellIndex::new();
+    while let Some(reference) = pending.pop() {
+        if !seen.insert(reference.id()) {
+            continue;
+        }
+        match read_cell(envelope, &reference) {
+            Ok(cell) => {
+                pending.extend(cell.refs().iter().cloned());
+                cells.insert(cell)?;
+            }
+            Err(CellError::MissingCell(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(cells)
+}
+
+fn available_envelope(
+    reference: &CellRef,
+    envelope: &mut CellEnvelope,
+) -> Result<Option<Vec<u8>>, CellError> {
+    let cells = available_index(reference, envelope)?;
+    if cells.get(&reference.id()).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(CellEnvelope::new(reference.id(), cells)?.encode()))
+}
+
+fn available_cells(reference: &CellRef, envelope: &mut CellEnvelope) -> Result<TxValue, CellError> {
+    let cells = available_index(reference, envelope)?
+        .iter()
+        .map(|(_, cell)| ValueCell {
+            id: CellId(cell.id()),
+            data: cell.payload().to_vec(),
+            refs: cell
+                .refs()
+                .iter()
+                .map(|reference| CellId(reference.id()))
+                .collect(),
+        })
+        .collect();
+
+    Ok(TxValue::Cells {
+        root: CellId(reference.id()),
+        cells,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_code_projection_keeps_refs_even_when_child_bodies_are_unavailable() {
+        let child = Cell::new(vec![0x1d], vec![]).unwrap();
+        let root = Cell::new(vec![0xa6, 0xa7], vec![child.clone().into()]).unwrap();
+        let mut cells = CellIndex::new();
+        cells.insert(root.clone().into()).unwrap();
+        let snapshot = CellEnvelope::new(root.id(), cells).unwrap();
+        let (instructions, error) = disassemble(&snapshot.encode());
+        assert!(error.is_none());
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(
+            instructions[0].text,
+            format!("pushcell 0x{}", hex::encode(child.id()))
+        );
+        assert_eq!(instructions[1].text, "exec");
+    }
+
+    #[test]
+    fn raw_cell_effect_values_render_their_available_graph() {
+        let child = Cell::new(vec![9], vec![]).unwrap();
+        let root = Cell::new(vec![7], vec![child.clone().into()]).unwrap();
+        let log = flamevm::TxLog::from(vec![flamevm::TxEntry::ActorSave {
+            actor: flamevm::ActorID::from([1; 32]),
+            state: Value::Cell(root.clone().into()),
+        }]);
+        let entries = effects(&log.to_envelope().unwrap().encode()).unwrap();
+        let RpcTxEntry::ActorSave {
+            state: TxValue::Cells { root: id, cells },
+            ..
+        } = &entries[0]
+        else {
+            panic!("expected raw Cell graph");
+        };
+        assert_eq!(*id, CellId(root.id()));
+        assert_eq!(cells.len(), 2);
+        assert!(
+            cells
+                .iter()
+                .any(|cell| cell.id == CellId(child.id()) && cell.data == [9])
+        );
+    }
+    use curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED;
+    use flamevm::{CellBuilder, CellIndex, CellValue, ClearToken, Dict, Message, TxHeader, TxLog};
+    use serde_json::json;
+
+    #[test]
+    fn archived_effects_preserve_available_cells_and_unloaded_references() {
+        let source = Dict::from_values(vec![
+            Value::Scalar(Scalar::from(42u64)),
+            Value::Scalar(Scalar::from(43u64)),
+        ])
+        .to_cell()
+        .unwrap();
+        let CellRef::Resident(trie) = &source.refs()[0] else {
+            panic!("expected a resident trie")
+        };
+        assert_eq!(trie.refs().len(), 2);
+        let mut builder = CellBuilder::new();
+        builder.store_bytes(trie.payload()).unwrap();
+        builder.store_ref(trie.refs()[0].to_unloaded()).unwrap();
+        builder.store_ref(trie.refs()[1].clone()).unwrap();
+        let partial_trie = builder.build();
+        let mut builder = CellBuilder::new();
+        builder.store_bytes(source.payload()).unwrap();
+        builder.store_ref(CellRef::resident(partial_trie)).unwrap();
+        let cell = builder.build();
+        let dict = Dict::decode_trusted(&mut CellSlice::new(&cell), &mut ()).unwrap();
+        let state = Value::Dict(dict);
+        let state_cell = state.to_cell().unwrap();
+        let expected_cells = CellIndex::collect(state_cell.clone().into()).unwrap();
+        let actor = ActorID::from([0x11; 32]);
+        let predicate = Predicate::opaque(RISTRETTO_BASEPOINT_COMPRESSED);
+        let entries = vec![
+            TxEntry::ActorSave {
+                actor: actor.clone(),
+                state: state.clone(),
+            },
+            TxEntry::Output(
+                Contract::new(predicate.clone(), Anchor([0x22; 32]), state.clone()).unwrap(),
+            ),
+            TxEntry::Send(
+                Message::new(
+                    actor,
+                    Some(ActorID::from([0x33; 32])),
+                    Anchor([0x44; 32]),
+                    state,
+                    u64::MAX,
+                    predicate,
+                )
+                .unwrap(),
+            ),
+        ];
+        for entry in entries {
+            let bytes = crate::cells::log_bytes(&TxLog::from(vec![entry])).unwrap();
+            let mut gas = (bytes.len() as u64) * 1024;
+            let mut envelope = CellEnvelope::decode(&bytes, bytes.len(), &mut gas).unwrap();
+            let root = envelope.cells().get(&envelope.root()).unwrap();
+            assert!(matches!(
+                TxLog::from_cell(&root, &mut envelope),
+                Err(CellError::MissingCell(_))
+            ));
+            let decoded = effects(&bytes).unwrap();
+            let value = match &decoded[0] {
+                RpcTxEntry::ActorSave { state, .. } => state,
+                RpcTxEntry::Output { payload, .. } => payload,
+                RpcTxEntry::Send { payload, .. } => payload,
+                _ => panic!("expected a value"),
+            };
+            let TxValue::Cells { root, cells } = value else {
+                panic!("expected available cells")
+            };
+            assert_eq!(root.0, state_cell.id());
+            assert_eq!(cells.len(), expected_cells.len());
+            assert!(cells.windows(2).all(|pair| pair[0].id < pair[1].id));
+            for cell in cells {
+                let expected = expected_cells.get(&cell.id.0).unwrap();
+                assert_eq!(cell.data, expected.payload());
+                assert_eq!(
+                    cell.refs,
+                    expected
+                        .refs()
+                        .iter()
+                        .map(|r| CellId(r.id()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            assert!(
+                cells
+                    .iter()
+                    .any(|c| c.refs.iter().any(|r| !expected_cells.contains(&r.0)))
+            );
+            let json = serde_json::to_value(&decoded).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Vec<RpcTxEntry>>(json).unwrap(),
+                decoded
+            );
+        }
+    }
+
+    #[test]
+    fn absent_state_root_stays_a_hash_reference() {
+        let state_ref =
+            CellRef::resident(Value::Scalar(Scalar::ONE).to_cell().unwrap()).to_unloaded();
+        let state = state_ref.id();
+        let mut builder = CellBuilder::new();
+        builder
+            .store_u8(TxEntry::TAG_ACTOR_SAVE)
+            .unwrap()
+            .store_bytes(&[0x11; 32])
+            .unwrap()
+            .store_ref(state_ref)
+            .unwrap();
+        let mut trie = Trie::new(8).unwrap();
+        trie.insert_ref(
+            &0u64.to_be_bytes(),
+            CellRef::resident(builder.build()),
+            &mut (),
+        )
+        .unwrap();
+        let mut builder = CellBuilder::new();
+        builder
+            .store_u64(1)
+            .unwrap()
+            .store_ref(trie.into_root().unwrap())
+            .unwrap();
+        let root = builder.build();
+        let envelope =
+            CellEnvelope::new(root.id(), CellIndex::collect(root.into()).unwrap()).unwrap();
+        assert_eq!(
+            effects(&envelope.encode()).unwrap(),
+            vec![RpcTxEntry::ActorSave {
+                actor: ActorId([0x11; 32]),
+                state_hash: state,
+                state: TxValue::Cells {
+                    root: CellId(state),
+                    cells: vec![]
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn archived_effects_keep_order_precision_and_full_data() {
+        let code = Cell::new(vec![0xcd; 257], vec![]).unwrap();
+        let code_bytes =
+            CellEnvelope::new(code.id(), CellIndex::collect(code.clone().into()).unwrap())
+                .unwrap()
+                .encode();
+        let log = TxLog::from(vec![
+            TxEntry::Data(vec![0xab; 257]),
+            TxEntry::Fee(u64::MAX),
+            TxEntry::SetCode {
+                actor: ActorID::from([0x11; 32]),
+                code: code.clone(),
+            },
+        ]);
+        let bytes = crate::cells::log_bytes(&log).unwrap();
+        let decoded = effects(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            json!([
+                {
+                    "kind": "data",
+                    "data": { "bytes": "q6ur".repeat(85) + "q6s=" },
+                },
+                {
+                    "kind": "fee",
+                    "data": { "sparks": "18446744073709551615" },
+                },
+                {
+                    "kind": "set_code",
+                    "data": {
+                        "actor": "11".repeat(32),
+                        "code": serde_json::to_value(flamed_rpc::ActorCode(code_bytes)).unwrap(),
+                        "code_hash": hex::encode(code.id()),
+                    },
+                },
+            ])
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<RpcTxEntry>>(&serde_json::to_string(&decoded).unwrap())
+                .unwrap(),
+            decoded
+        );
+        assert!(effects(&bytes[..bytes.len() - 1]).is_err());
+        assert!(effects(&[]).is_err());
+        let empty = crate::cells::log_bytes(&TxLog::from(vec![])).unwrap();
+        assert!(effects(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restoration_effects_and_addresses_preserve_native_partial_state_graphs() {
+        let actor = ActorID::from([0x91; 32]);
+        let code = Cell::new(vec![0x1d], vec![]).unwrap();
+        let data = Value::Scalar(Scalar::from(42u64))
+            .to_cell()
+            .unwrap()
+            .prune(1)
+            .unwrap();
+        let state = Cell::new(vec![], vec![code.into(), data.into()]).unwrap();
+        let target = ActorAddress::Restore {
+            addr: actor,
+            state: state.clone().into(),
+        };
+        let message = flamevm::Message::new(
+            target,
+            None,
+            Anchor([0x92; 32]),
+            Value::Scalar(Scalar::ZERO),
+            1_000,
+            Predicate::opaque(Predicate::unspendable_key()),
+        )
+        .unwrap();
+        let log = flamevm::TxLog::from(vec![
+            TxEntry::ActorRestore {
+                actor,
+                state: state.clone(),
+            },
+            TxEntry::Send(message),
+        ]);
+        let decoded = effects(&log.to_envelope().unwrap().encode()).unwrap();
+        let RpcTxEntry::ActorRestore {
+            actor: restored,
+            state_hash,
+            state: bytes,
+        } = &decoded[0]
+        else {
+            panic!("expected restoration effect");
+        };
+        assert_eq!(*restored, ActorId(actor.to_hash()));
+        assert_eq!(*state_hash, CellId(state.id()));
+        let mut gas = u64::MAX;
+        let mut graph = CellEnvelope::decode(&bytes.0, bytes.0.len(), &mut gas).unwrap();
+        assert_eq!(graph.root(), state.id());
+        let root = graph.cells().get(&graph.root()).unwrap();
+        assert_eq!(root.refs().len(), 2);
+        assert!(read_cell(&mut graph, &root.refs()[1]).unwrap().is_pruned());
+        let RpcTxEntry::Send {
+            target:
+                ActorTarget::Restore {
+                    actor: target,
+                    state_hash: hash,
+                    state: Some(supplied),
+                },
+            ..
+        } = &decoded[1]
+        else {
+            panic!("expected restoration address");
+        };
+        assert_eq!(*target, ActorId(actor.to_hash()));
+        assert_eq!(*hash, CellId(state.id()));
+        assert_eq!(supplied, bytes);
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(encoded[0]["kind"], "actor_restore");
+        assert_eq!(encoded[1]["data"]["target"]["kind"], "restore");
+        assert_eq!(
+            serde_json::from_value::<Vec<RpcTxEntry>>(encoded).unwrap(),
+            decoded
+        );
+    }
+
+    #[test]
+    fn full_effects_include_payloads_state_and_message_fields() {
+        let actor = ActorID::from([0x11; 32]);
+        let point = RISTRETTO_BASEPOINT_COMPRESSED;
+        let predicate = Predicate::opaque(point);
+        let token = Value::ClearToken(ClearToken::new(Scalar::from(7u64), Scalar::from(8u64)));
+        let dict = Value::Dict(Dict::from_values(vec![
+            Value::Cell(CellValue::from_bytes(vec![0xab; 257]).unwrap()),
+            token.clone(),
+        ]));
+        let target = ActorAddress::Init {
+            ctor: Cell::new(vec![0xcd; 257], vec![]).unwrap().into(),
+        };
+        let ctor = match &target {
+            ActorAddress::Init { ctor } => ctor.as_resident().unwrap(),
+            _ => unreachable!(),
+        };
+        let ctor = ActorCode(
+            CellEnvelope::new(ctor.id(), CellIndex::collect(ctor.clone().into()).unwrap())
+                .unwrap()
+                .encode(),
+        );
+        let entries = vec![
+            TxEntry::Header(TxHeader {
+                version: 1,
+                locktime: u32::MAX,
+            }),
+            TxEntry::Input([0x33; 32]),
+            TxEntry::Receive([0x44; 32]),
+            TxEntry::Output(
+                Contract::new(predicate.clone(), Anchor([0x55; 32]), dict.clone()).unwrap(),
+            ),
+            TxEntry::ActorDeploy {
+                actor: actor.clone(),
+                code: Cell::new(vec![0xef; 257], vec![]).unwrap(),
+            },
+            TxEntry::ActorSave {
+                actor: actor.clone(),
+                state: dict,
+            },
+            TxEntry::Send(
+                Message::new(
+                    target.clone(),
+                    Some(actor.clone()),
+                    Anchor([0x66; 32]),
+                    token,
+                    u64::MAX,
+                    predicate,
+                )
+                .unwrap(),
+            ),
+            TxEntry::StoragePurchase {
+                actor: actor.clone(),
+                bytes: u64::MAX,
+                expiry_height: u64::MAX,
+                fee_sparks: Scalar::from(u64::MAX),
+            },
+            TxEntry::IssuePub(Scalar::from(9u64), Scalar::from(10u64)),
+            TxEntry::IssuePriv(point, point),
+            TxEntry::Retire(point, point),
+            TxEntry::ActorDestroy { actor },
+        ];
+        let mut envelope = Value::Scalar(Scalar::ZERO).to_envelope().unwrap();
+        let expected = entries
+            .iter()
+            .map(|entry| render_effect(entry, &mut envelope))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let bytes = crate::cells::log_bytes(&TxLog::from(entries)).unwrap();
+        let decoded = effects(&bytes).unwrap();
+        assert_eq!(decoded, expected);
+        let json = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(json[3]["data"]["anchor"], "55".repeat(32));
+        assert_eq!(
+            json[3]["data"]["payload"]["entries"][0]["value"]["cells"][0]["data"],
+            "q6ur".repeat(85) + "q6s="
+        );
+        let RpcTxEntry::ActorDeploy {
+            code, code_hash, ..
+        } = &decoded[4]
+        else {
+            panic!("expected native code effect");
+        };
+        let mut gas = u64::MAX;
+        let code = CellEnvelope::decode(code, code.len(), &mut gas).unwrap();
+        assert_eq!(code.root(), *code_hash);
+        assert_eq!(code.cells().get(code_hash).unwrap().payload(), &[0xef; 257]);
+        assert_eq!(json[5]["data"]["state"], json[3]["data"]["payload"]);
+        assert_eq!(
+            json[6]["data"],
+            json!({
+                "message": json[6]["data"]["message"],
+                "target": {
+                    "kind": "init",
+                    "actor": hex::encode(target.to_hash()),
+                    "ctor": ctor,
+                },
+                "caller": "11".repeat(32),
+                "anchor": "66".repeat(32),
+                "payload": { "type": "clear_token", "quantity": "7", "flavor": "8" },
+                "gas_limit": u64::MAX.to_string(),
+                "refund_predicate": hex::encode(point.to_bytes()),
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<Vec<RpcTxEntry>>(json).unwrap(),
+            decoded
+        );
+    }
+}

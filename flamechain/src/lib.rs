@@ -1,6 +1,7 @@
 use std::fmt;
 
 pub mod block;
+pub mod codec;
 pub mod mempool;
 pub mod storage;
 pub mod utreexo;
@@ -11,7 +12,7 @@ pub use block::{
     CoreBlockHeader, ContractLeaf, ExecutionKind, ExecutionRecord, ReorgOutcome, StateCommitment,
 };
 pub use mempool::{Mempool, MempoolEntry, MempoolError, MempoolPolicy, RebaseReport};
-pub use storage::{Lease, SPARKS_PER_FLAME, StorageError, StorageParams, StoredActor};
+pub use storage::{ActorInfo, Lease, SPARKS_PER_FLAME, StorageError, StorageParams, StoredActor};
 pub use utreexo::utreexo_hasher;
 pub use validation::FlameBlockValidator;
 

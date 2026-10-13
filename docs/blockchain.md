@@ -74,11 +74,12 @@ equal the block's committed contract root.
 Utreexo is not part of the Cell migration. `Forest`, `Proof`, and Merkle `Path`
 retain their existing `readerwriter` encodings and validation, including the
 occupied-level bitmap, ordered roots, proof kind, position, depth, and neighbor
-hashes. The block transport wraps each legacy Proof byte string in a snake Cell;
-it does not add Cell codecs to the Utreexo types or change the forest format.
-Proof strings are bounded to the existing depth-63 representation and decoded
-with exact byte consumption. The Serde forms of `Forest`, `WorkForest`,
-`Catchup`, and `Proof` remain local working-state formats.
+hashes. The block transport stores each legacy Proof byte string as the raw
+payload of a dedicated zero-ref Cell, without another length prefix. It does
+not add Cell codecs to the Utreexo types or change the forest format. Proofs
+are bounded to the existing depth-63 representation, fit the 4095-byte Cell
+limit, and are decoded with exact byte consumption. The Serde forms of
+`Forest`, `WorkForest`, `Catchup`, and `Proof` remain local working-state formats.
 
 Utreexo retains its specialized Merkle hashing and proof-update algorithm, and
 is the remaining consumer of `merkle` / `readerwriter`. Other chain collections
@@ -110,7 +111,7 @@ order. Their code/state roots, size metadata, identity, and leases remain;
 linear values stay owned by those authenticated roots and are not retired.
 Freezing changes the actor-state commitment but emits no system destruction
 transaction. Later transactions can supply missing bodies through their own
-execution BoC. Explicit actor destruction still leaves unexpired leases locked
+execution Cell index. Explicit actor destruction still leaves unexpired leases locked
 until their original expiry.
 
 Serial pricing is deterministic and maintains a hard storage bound, but ordering
@@ -126,8 +127,8 @@ A block has a header and an ordered body of external transactions. Internal
 transactions are execution records derived by the state machine; they are not
 independently submitted or selected by a proposer.
 
-The header is a canonical Cell, identified by plain SHA256 of its unambiguous
-encoding. It commits to:
+The header is a canonical Cell, identified by its factual CellID using the
+[Cell hashing rules](cells.md#identity). It commits to:
 
 - protocol/network version, parent, and height;
 - the authenticated core-block context;
@@ -137,19 +138,24 @@ encoding. It commits to:
 - the ordered execution-record Trie.
 
 The exact layouts live in [encoding.md](encoding.md). `Block`, `BlockTx`, and
-`BlockHeader` use `CellEncode` / `CellDecode`, with bounded network transport as
-`CellEnvelope = root CellID || canonical BoC`. Block Cells refer to the header
+`BlockHeader` use `CellEncode` / `CellDecode`, with bounded root-last DAG
+transport. Their `CellEnvelope` is a normal Cell carrying a level cap and a
+reference to the physical proof root, not a root-ID packet prefix.
+Block Cells refer to the header
 and ordered transaction Trie; each transaction refers to its ExternalTx and
-ordered proof Trie whose leaves contain snake-wrapped legacy Utreexo Proof
-bytes. Scalar fields use little-endian encoding; ordered Trie indices use
-fixed-width big-endian keys.
+ordered proof Trie whose leaves contain raw legacy Utreexo Proof bytes
+in dedicated zero-ref Cells. Scalar fields use little-endian encoding;
+ordered Trie indices use fixed-width big-endian keys.
 
-Each ExternalTx contains a separate, explicitly committed execution BoC. The
+Each ExternalTx body references its program, whose subcells carry the supplied
+execution witness hierarchy. Body TxID commits the program and canonical pruned
+log; Tx WitnessID additionally commits the inline signature and R1CS proof.
+Its restored execution Cell index is immutable. The
 outer block transport graph is not an execution witness pool. Bounded decoders
-check script length before loading its snake, enforce counts/depths and exact
+check root code payload length before execution, enforce counts/depths and exact
 typed payload/reference consumption, and reject malformed signatures/proofs.
 Re-encoding must reproduce the exact outer envelope, rejecting unused transport
-bodies. Unused bodies inside an execution BoC are permitted because their
+bodies. Unused bodies inside an execution Cell index are permitted because their
 availability is explicitly committed. Network code never accepts a supplied
 TxLog in place of execution.
 
@@ -172,8 +178,10 @@ reorganization attachment:
 4. Consume each derived external log through the ordered effect applier and
    enqueue its sends in effect order.
 5. Fully drain this external transaction's FIFO descendant queue using its
-   immutable execution BoC before returning to step 3. Execute each message
-   under an actor-registry checkpoint. A
+   immutable execution Cell index before returning to step 3. Execute each message
+   under an actor-registry checkpoint. Its one portable payload is normalized
+   to the committed cell-backed representation before metering and execution;
+   native sender maps and decoded messages must execute identically. A
    synchronous `call` remains inside its current internal transaction. On
    success, capture the actor commitment and storage pool, roll the direct VM
    mutations back, then consume the derived log through the same ordered effect
@@ -192,7 +200,7 @@ reorganization attachment:
 The message discipline is FIFO within each external transaction's complete
 execution closure. Sends made by an internal transaction append in effect order;
 the next external transaction starts only after this queue is empty. Every
-descendant uses the same initiating execution BoC, never the next transaction's
+descendant uses the same initiating execution Cell index, never the next transaction's
 bag or an uncommitted global cache. This is deterministic, but it makes a
 long send chain serial and lets early transactions influence all later actor and
 storage outcomes. Gas, message-count, call-depth, and block limits must bound
@@ -276,7 +284,7 @@ logical byte/item allocation work against external or internal gas, so these
 gas ceilings also bound hostile active-memory growth. Persistent actor capacity
 continues to bound stored state only.
 
-Cell admission also bounds logical expansion, not just serialized BoC size.
+Cell admission also bounds logical expansion, not just serialized Cell index size.
 Typed block decoding has a shared work budget of four times the configured
 witness-byte limit, charging each resolved Cell's canonical size, reference
 count, and one lookup unit before decoding its contents. Repeated references

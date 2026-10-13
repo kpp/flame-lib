@@ -1,8 +1,10 @@
 //! Transactions by id.
 
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use flamechain::BlockHash;
+use flamed_rpc::{BlockSummary, BlocksResult, TransactionSummary, TransactionsResult};
 use flamevm::TxID;
 
 /// Where a transaction landed, and what it did.
@@ -14,6 +16,8 @@ pub struct TxRecord {
     pub block: BlockHash,
     /// Its effect log, as a `CellEnvelope`.
     pub log: Vec<u8>,
+    /// Public execution summary.
+    pub summary: TransactionSummary,
 }
 
 /// Confirmed transactions, by id.
@@ -23,6 +27,7 @@ pub struct TxIndex {
     // upstream's own mempool keeps a `BTreeSet<[u8; 32]>`.
     txs: BTreeMap<[u8; 32], TxRecord>,
     by_height: BTreeMap<u64, Vec<TxID>>,
+    blocks: BTreeMap<u64, BlockSummary>,
 }
 
 impl TxIndex {
@@ -58,5 +63,64 @@ impl TxIndex {
     /// Whether any have.
     pub fn is_empty(&self) -> bool {
         self.txs.is_empty()
+    }
+
+    /// Adds a header after the block has been accepted.
+    pub fn insert_block(&mut self, block: BlockSummary) {
+        self.blocks.insert(block.header.height, block);
+    }
+
+    /// Header at an exact height.
+    pub fn block(&self, height: u64) -> Option<&BlockSummary> {
+        self.blocks.get(&height)
+    }
+
+    /// A page of blocks, newest first and strictly below `before`.
+    pub fn blocks(&self, before: Option<u64>, limit: usize) -> BlocksResult {
+        let mut blocks = self
+            .blocks
+            .range((Unbounded, before.map_or(Unbounded, Excluded)))
+            .rev();
+        let page = blocks
+            .by_ref()
+            .take(limit)
+            .map(|(_, block)| block.clone())
+            .collect();
+
+        BlocksResult {
+            blocks: page,
+            has_more: blocks.next().is_some(),
+        }
+    }
+
+    /// A page of executions, newest first.
+    /// Returns `None` if the cursor does not name a confirmed execution.
+    pub fn transactions(&self, before: Option<TxID>, limit: usize) -> Option<TransactionsResult> {
+        let height = match before {
+            Some(id) => self.get(&id)?.height,
+            None => u64::MAX,
+        };
+
+        let mut ids = self
+            .by_height
+            .range(..=height)
+            .rev()
+            .flat_map(|(_, ids)| ids.iter().rev())
+            .skip_while(|id| before.is_some_and(|cursor| **id != cursor));
+
+        if before.is_some() {
+            ids.next();
+        }
+
+        let transactions = ids
+            .by_ref()
+            .take(limit)
+            .map(|id| self.txs[&id.0].summary.clone())
+            .collect();
+
+        Some(TransactionsResult {
+            transactions,
+            has_more: ids.next().is_some(),
+        })
     }
 }

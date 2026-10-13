@@ -11,19 +11,19 @@ fn hex(bytes: &[u8]) -> std::string::String {
 #[test]
 fn golden_consensus_hashes() {
     let header = || TxEntry::Header(dummy_header());
-    let actor = ActorID::Hash([7; 32]);
+    let actor = ActorID::from([7; 32]);
     let samples = [
         (
             vec![header()],
-            "881bb76904e627c9c79c0a525987f072024033dc78d45743df418b4e601dd62c",
+            "bbdc11ab33c50d53c003b29031345bea4082ad79150e32c854c1f7224f3333c9",
         ),
         (
             vec![header(), TxEntry::Data(vec![1, 2, 3])],
-            "d78b7ff69a8c3f308d1c347460c802f1ad39aad093e54e3f9d7a96bbdb09de84",
+            "b91a77db5912986f514a84597f0fae06a1e9fb7d458ddb2d89b486876fee91fd",
         ),
         (
             vec![header(), TxEntry::Fee(1000)],
-            "191ca034b9a0acd11e92f87accdff54fef6b0d631e81e1d4fc123cfdc3c810f5",
+            "73b3bf8b22b057d6dacd6644300fa86d52f5a7da4f635f88f9b1a7300ef744e9",
         ),
         (
             vec![
@@ -33,46 +33,46 @@ fn golden_consensus_hashes() {
                     state: Value::Scalar(Scalar::from(42u64)),
                 },
             ],
-            "f1ee34ac75a5c37e528ca38cd498860a5aac7c4352dd2d94ecce849121963ebc",
+            "aecd677b8e5e59c3e5dc5bbe3ab0133c9d4ccc000291eb3730c3f15374fb55f8",
         ),
         (
             vec![
                 header(),
                 TxEntry::SetCode {
                     actor: actor.clone(),
-                    code: vec![0x1d],
+                    code: crate::code_cell(&[0x1d]).unwrap(),
                 },
             ],
-            "864ce848ec493fe3df21e8b765be7613a65b0f07828bd1dc89c36c24eb25e8f0",
+            "411a403392920265ced1a4b4ece87e380286d4a4ac6e63e7b13e53b739e070e0",
         ),
         (
             vec![
                 header(),
                 TxEntry::ActorDeploy {
                     actor,
-                    code: vec![0x1d],
+                    code: crate::code_cell(&[0x1d]).unwrap(),
                 },
             ],
-            "cda8173e68708ad6c830610128d6b329e920b111ea35127df580ed443053791d",
+            "bc7376d7341da1dc9ea6bad893b54e2372d5f7f7e38ac726707256670c416dbc",
         ),
     ];
     for (entries, expected) in samples {
         assert_eq!(hex(TxID::from_log(&entries).as_bytes()), expected);
         let log = crate::TxLog::from(entries);
         let decoded: crate::TxLog = decode_envelope(&log.to_envelope().unwrap().encode()).unwrap();
-        assert_eq!(decoded.txid(), log.txid());
+        assert_eq!(decoded.effect_id(), log.effect_id());
     }
     assert_eq!(
         hex(&state_root(&Value::Scalar(Scalar::from(42u64)))),
-        "4377380d51c730f99228f59486cdd68bfcc79ab9281fc80c249bb8478984ea35"
+        "228e117e651446f12d17e89a542ac6b5af34a88c3cc1fd1e496dfdd94b0cabcf"
     );
     assert_eq!(
         hex(&code_root(&[0x1d])),
-        "9bce55aad1742ba6593542c4e6f8162568c1f7c211e7c46d6ad29542f9150a5c"
+        "7e72188b8144c3677a63d3f2c2d70e33934c7a6767a55b81bf639bd1467c48ed"
     );
     assert_eq!(
-        hex(&ActorID::Constructor(vec![1, 2, 3]).to_hash()),
-        "2ce7935d93d22e90e74c4e780d5fcf361607b431fbb1f8b217dc6fea5da9baff"
+        hex(&crate::code_cell(&[1, 2, 3]).unwrap().id()),
+        "98cf202457011106ee0345b2b2b5cd239ce36b57997d4398614c03211139dfde"
     );
     let contract = Contract::new(
         Predicate::opaque(CompressedRistretto([0x77; 32])),
@@ -82,7 +82,7 @@ fn golden_consensus_hashes() {
     .unwrap();
     assert_eq!(
         hex(&contract.id()),
-        "5b4cd468f4a5c19949c7791ecde65394b785b909345195928374114044d078f0"
+        "64627d3704e75e34c296d2718ccb37724cbaf979c766fa06128cb9d717f09ba9"
     );
     assert_eq!(
         hex(TxID::from_log(&[
@@ -91,7 +91,7 @@ fn golden_consensus_hashes() {
             TxEntry::Output(contract)
         ])
         .as_bytes()),
-        "9773ed29353f6b97cce5f516a03aa471c798a9c88f6b58664721e9b205301c2f"
+        "5412d3b07ac33d69caddde19f517fe5cb32772b26348fa6328e81c9af3e50827"
     );
     assert_ne!(
         TxID::from_log(&[header(), TxEntry::Data(vec![1]), TxEntry::Fee(7)]),
@@ -100,32 +100,60 @@ fn golden_consensus_hashes() {
 }
 
 /// A raw record writer independent of CellBuilder and all type codecs.
-fn record(payload: &[u8], refs: &[[u8; 32]]) -> Vec<u8> {
-    let descriptor = payload.len() as u16 | ((refs.len() as u16) << 13);
+fn record(payload: &[u8], refs: &[([u8; 32], u16)]) -> Vec<u8> {
+    let descriptor = payload.len() as u16 | ((refs.len() as u16) << 12);
     let mut bytes = descriptor.to_le_bytes().to_vec();
     bytes.extend_from_slice(payload);
-    for reference in refs {
-        bytes.extend_from_slice(reference);
+    for (hash, depth) in refs {
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // ordinary level mask
+        bytes.extend_from_slice(hash);
+        bytes.extend_from_slice(&depth.to_le_bytes());
     }
     bytes
 }
 
+/// Independent physical-depth calculation for these fully resident, level-zero fixtures.
+fn depth(cell: &Cell) -> u16 {
+    cell.refs()
+        .iter()
+        .map(|child| depth(child.as_resident().unwrap()) + 1)
+        .max()
+        .unwrap_or(0)
+}
+
 #[test]
-fn golden_string_is_raw_bytes_in_one_cell() {
-    let string = String::from(b"abc".to_vec());
-    let cell = string.to_cell().unwrap();
-    assert_eq!(cell.encode(), record(b"abc", &[]));
-    assert_eq!(hex(&cell.encode()), "0300616263");
+fn golden_cell_value_is_a_reference_to_raw_bytes() {
+    let bytes = CellValue::from_bytes(b"abc".to_vec()).unwrap();
+    let cell = bytes.as_resident().unwrap();
+    assert_eq!(cell.encode_record(), record(b"abc", &[]));
+    assert_eq!(hex(&cell.encode_record()), "0300616263");
     assert_eq!(
         hex(&cell.id()),
-        "c602df104f2bfde94e05197faa97f07dda1d43d559f0c423f93e9bb9669d24ff"
+        "3da9865b43fa2ec490f78da9db16acd5638704dbce5cc7b3df2e3c7a23addf19"
     );
-    let value = Value::String(string).to_cell().unwrap();
-    assert_eq!(value.encode(), record(&[1], &[cell.id()]));
+    let value = Value::Cell(bytes.clone()).to_cell().unwrap();
+    assert_eq!(value.encode_record(), record(&[13], &[(cell.id(), 0)]));
+    // Hashing places the root mask before its payload, then depths before hashes.
+    let mut preimage = vec![1, 0x10, 0, 0, 13, 0, 0];
+    preimage.extend_from_slice(&cell.id());
+    assert_eq!(value.hash_preimage(0).unwrap(), preimage);
     assert_eq!(
         hex(&value.id()),
-        "d2b64a4e5655f7a299aa1898303e2e9024569783fe55527f38cc5624a63d8f0b"
+        "fcf99950da2237a4b452b62159bde6b96d3f2f0c7f13809f44a9dcd66796da7a"
     );
+}
+
+#[test]
+fn retired_string_value_tag_is_not_reinterpreted_as_cell() {
+    let cell = Cell::new(
+        vec![1],
+        vec![Cell::new(b"abc".to_vec(), vec![]).unwrap().into()],
+    )
+    .unwrap();
+    assert!(matches!(
+        Value::from_cell(&cell, &mut ()),
+        Err(CellError::InvalidFormat)
+    ));
 }
 
 #[test]
@@ -140,23 +168,22 @@ fn golden_txlog_wire_encoding() {
         })
         .to_cell()
         .unwrap()
-        .encode(),
+        .encode_record(),
         record(&header, &[])
     );
     for (entry, tag, data) in [
         (TxEntry::Input([0x11; 32]), 2, [0x11; 32]),
         (TxEntry::Receive([0x22; 32]), 3, [0x22; 32]),
-        (TxEntry::CellWitness([0x33; 32]), 15, [0x33; 32]),
         (
             TxEntry::ActorDestroy {
-                actor: ActorID::Hash([7; 32]),
+                actor: ActorID::from([7; 32]),
             },
             13,
             [7; 32],
         ),
     ] {
         assert_eq!(
-            entry.to_cell().unwrap().encode(),
+            entry.to_cell().unwrap().encode_record(),
             record(&[&[tag][..], &data].concat(), &[])
         );
     }
@@ -181,7 +208,7 @@ fn golden_txlog_wire_encoding() {
         ),
     ] {
         assert_eq!(
-            entry.to_cell().unwrap().encode(),
+            entry.to_cell().unwrap().encode_record(),
             record(&[&[tag][..], &first, &second].concat(), &[])
         );
     }
@@ -196,13 +223,17 @@ fn golden_txlog_wire_encoding() {
         .concat()
     );
     assert_eq!(
-        TxEntry::Fee(1000).to_cell().unwrap().encode(),
+        TxEntry::Fee(1000).to_cell().unwrap().encode_record(),
         record(&[&[8][..], &1000u64.to_le_bytes()].concat(), &[])
     );
 
-    let actor = ActorID::Hash([7; 32]);
+    let actor = ActorID::from([7; 32]);
     for (entry, tag, child) in [
-        (TxEntry::Data(vec![1, 2, 3]), 1, code_root(&[1, 2, 3])),
+        (
+            TxEntry::Data(vec![1, 2, 3]),
+            1,
+            Cell::new(vec![1, 2, 3], vec![]).unwrap().id(),
+        ),
         (
             TxEntry::ActorSave {
                 actor: actor.clone(),
@@ -214,7 +245,7 @@ fn golden_txlog_wire_encoding() {
         (
             TxEntry::SetCode {
                 actor: actor.clone(),
-                code: vec![0x1d],
+                code: crate::code_cell(&[0x1d]).unwrap(),
             },
             10,
             code_root(&[0x1d]),
@@ -222,7 +253,7 @@ fn golden_txlog_wire_encoding() {
         (
             TxEntry::ActorDeploy {
                 actor: actor.clone(),
-                code: vec![0x1d],
+                code: crate::code_cell(&[0x1d]).unwrap(),
             },
             14,
             code_root(&[0x1d]),
@@ -234,8 +265,8 @@ fn golden_txlog_wire_encoding() {
             [&[tag][..], &[7; 32]].concat()
         };
         assert_eq!(
-            entry.to_cell().unwrap().encode(),
-            record(&payload, &[child])
+            entry.to_cell().unwrap().encode_record(),
+            record(&payload, &[(child, 0)])
         );
     }
     let contract = fixture_contract();
@@ -243,20 +274,26 @@ fn golden_txlog_wire_encoding() {
         TxEntry::Output(contract.clone())
             .to_cell()
             .unwrap()
-            .encode(),
-        record(&[4], &[contract.id()])
+            .encode_record(),
+        record(
+            &[4],
+            &[(contract.id(), depth(&contract.to_cell().unwrap()))]
+        )
     );
     let message = dummy_message(50);
     assert_eq!(
-        TxEntry::Send(message.clone()).to_cell().unwrap().encode(),
-        record(&[11], &[message.to_cell().unwrap().id()])
+        TxEntry::Send(message.clone())
+            .to_cell()
+            .unwrap()
+            .encode_record(),
+        record(&[11], &[(message.to_cell().unwrap().id(), 1)])
     );
 }
 
 #[test]
 fn golden_storage_effect_wire_encoding() {
     let purchase = TxEntry::StoragePurchase {
-        actor: ActorID::Hash([7; 32]),
+        actor: ActorID::from([7; 32]),
         bytes: 1024,
         expiry_height: 52_500,
         fee_sparks: Scalar::from(1_000_007_630u64),
@@ -269,5 +306,8 @@ fn golden_storage_effect_wire_encoding() {
         Scalar::from(1_000_007_630u64).as_bytes(),
     ]
     .concat();
-    assert_eq!(purchase.to_cell().unwrap().encode(), record(&payload, &[]));
+    assert_eq!(
+        purchase.to_cell().unwrap().encode_record(),
+        record(&payload, &[])
+    );
 }

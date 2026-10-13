@@ -62,7 +62,7 @@ fn gas_reports_remaining_budget_after_its_own_cost() {
 #[test]
 fn usage_and_capacity_read_actor_storage() {
     let mut reg = MemRegistry::new();
-    let id = ActorID::Hash([0xab; 32]);
+    let id = ActorID::from([0xab; 32]);
     reg.deploy(
         id.clone(),
         ScriptBuilder::new().nop().to_bytecode(),
@@ -98,7 +98,7 @@ fn usage_and_capacity_read_actor_storage() {
 #[test]
 fn storage_introspection_requires_registry() {
     let kind = CallKind::InternalRoot {
-        actor: ActorID::Hash([0xab; 32]),
+        actor: ActorID::from([0xab; 32]),
         caller: None,
     };
     let mut vm = VM::new(
@@ -121,7 +121,7 @@ fn height_is_zero_for_external_transaction() {
 #[test]
 fn storage_quote_and_purchase_use_host_result() {
     let mut reg = MemRegistry::new();
-    let id = ActorID::Hash([0xcd; 32]);
+    let id = ActorID::from([0xcd; 32]);
     reg.deploy(
         id.clone(),
         ScriptBuilder::new().nop().to_bytecode(),

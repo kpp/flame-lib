@@ -1,11 +1,16 @@
 //! Fixtures shared by the two round trips.
 //!
-//! Every transaction here is built by `flamepayments` and nothing else. No
+//! Every transaction here is built by `flamepayments` and nothing else, and
+//! every opening a test spends with comes from a note the node returned. No
 //! test assembles a script, so both round trips exercise the same client
 //! the wallet will be.
 
+mod actor;
+mod block;
+mod contract;
 mod node;
 mod rpc;
+mod transactions;
 
 use std::path::Path;
 
@@ -13,9 +18,13 @@ use curve25519_dalek::scalar::Scalar as DalekScalar;
 use flamechain::utreexo::Proof;
 use flamechain::{BlockTx, SPARKS_PER_FLAME};
 use flamekd::{util, Network};
-use flamepayments::{block_tx, build_transfer, sign, Account, InputSpec, Opening, OutputSpec};
+use flamepayments::{
+    block_tx, build_transfer, open_note, sign, Account, AccountKey, InputSpec, Opening, OutputSpec,
+    SpendAccount, ViewingKey,
+};
 use flamevm::{Contract, ContractID, Limits, TxEntry, TxHeader, TxLog, FLAME_FLAVOR};
-use merlin::Transcript;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 
 use crate::cells::contract_from_bytes;
 use crate::config::{ChainParamsFile, GenesisFile, GenesisSpec, NetworkName, NodeConfig};
@@ -33,8 +42,8 @@ pub(crate) const FLAME: u64 = SPARKS_PER_FLAME;
 /// The fee every test transfer pays.
 pub(crate) const FEE: u64 = 1_000;
 
-pub(crate) fn account(seed: &[u8; 64]) -> Account {
-    Account::from_seed(seed, Network::Testnet).expect("a 64-byte seed derives an account")
+pub(crate) fn account(seed: &[u8; 64]) -> SpendAccount {
+    SpendAccount::from_seed(seed, Network::Testnet, 0).expect("a 64-byte seed derives an account")
 }
 
 pub(crate) fn header() -> TxHeader {
@@ -48,44 +57,32 @@ pub(crate) fn limits() -> Limits {
     Limits { gas: 10_000_000 }
 }
 
-/// Test-only blinding factors, derived so a failing run replays exactly. A
-/// real wallet draws these from a CSPRNG and keeps them with the output.
-pub(crate) fn blinding(index: usize) -> (DalekScalar, DalekScalar) {
-    let mut transcript = Transcript::new(b"flamed.test.blinding");
-    transcript.append_u64(b"output", index as u64);
-    let mut qty = [0u8; 64];
-    let mut flv = [0u8; 64];
-    transcript.challenge_bytes(b"qty", &mut qty);
-    transcript.challenge_bytes(b"flv", &mut flv);
-    (
-        DalekScalar::from_bytes_mod_order_wide(&qty),
-        DalekScalar::from_bytes_mod_order_wide(&flv),
-    )
+/// The generator a test draws every `r` from: seeded, so a failing run
+/// replays exactly. One per test, threaded through every transfer it
+/// builds, because a transfer rebuilt from a re-seeded generator would draw
+/// the same `r` again.
+pub(crate) fn rng(seed: u64) -> StdRng {
+    StdRng::seed_from_u64(seed)
 }
 
-/// One native-flavor output, and the opening its recipient will need.
-pub(crate) fn output(
-    account: &Account,
+/// One native-flavor output to `m/…/branch/n`, with no memo.
+pub(crate) fn output<K: AccountKey>(
+    account: &Account<K>,
     branch: u32,
     n: u32,
     qty: u64,
-    index: usize,
-) -> (OutputSpec, Opening) {
-    let (qty_blinding, flv_blinding) = blinding(index);
-    let spec = OutputSpec {
-        predicate: account.predicate_at(branch, n).expect("predicate"),
+) -> OutputSpec {
+    OutputSpec {
+        address: account.address_at(branch, n).expect("address"),
         qty,
         flv: FLAME_FLAVOR,
-        qty_blinding,
-        flv_blinding,
-    };
-    let opening = spec.opening();
-    (spec, opening)
+        memo: Vec::new(),
+    }
 }
 
 /// The network definition under test: the whole supply under A's first
 /// receiving address, written the way an operator writes one.
-pub(crate) fn chainparams(a: &Account) -> ChainParamsFile {
+pub(crate) fn chainparams<K: AccountKey>(a: &Account<K>) -> ChainParamsFile {
     let address = a
         .address_at(util::RECEIVING, 0)
         .expect("first receiving address")
@@ -107,7 +104,7 @@ pub(crate) fn chainparams(a: &Account) -> ChainParamsFile {
 /// Writes `genesis.json` into `dir` through the very function
 /// `flamed genesis` runs, then reads it back. Hand-assembled JSON would
 /// leave that path untested.
-pub(crate) fn devnet(dir: &Path, a: &Account) -> (GenesisFile, NodeConfig) {
+pub(crate) fn devnet<K: AccountKey>(dir: &Path, a: &Account<K>) -> (GenesisFile, NodeConfig) {
     let path = dir.join("genesis.json");
     crate::genesis::write(&chainparams(a), &path).expect("derive genesis.json");
     let genesis = GenesisFile::load(&path).expect("read genesis.json back");
@@ -132,14 +129,36 @@ pub(crate) fn created(log: &TxLog) -> Vec<Contract> {
         .collect()
 }
 
+/// The one contract of `contracts` that pays `m/…/branch/n`. A transfer
+/// sorts its outputs, so a contract is found by its predicate, never by its
+/// position.
+pub(crate) fn paying<K: AccountKey>(
+    contracts: &[Contract],
+    account: &Account<K>,
+    branch: u32,
+    n: u32,
+) -> Contract {
+    let point = account
+        .predicate_at(branch, n)
+        .expect("predicate")
+        .to_point();
+    let mut found = contracts
+        .iter()
+        .filter(|contract| contract.predicate.to_point() == point);
+    let contract = found.next().expect("a contract pays the address");
+    assert!(found.next().is_none(), "one contract pays the address");
+    contract.clone()
+}
+
 /// Builds, signs and packages one transfer, and hands back the contracts
 /// its effect log says it creates — read before signing consumes it.
 pub(crate) fn signed_transfer(
     inputs: Vec<InputSpec>,
     outputs: &[OutputSpec],
     fee: u64,
+    rng: &mut StdRng,
 ) -> (BlockTx, Vec<Contract>) {
-    let unsigned = build_transfer(&inputs, outputs, fee, header(), limits()).expect("builds");
+    let unsigned = build_transfer(&inputs, outputs, fee, header(), limits(), rng).expect("builds");
     let contracts = created(unsigned.log());
     let keys: Vec<DalekScalar> = inputs.iter().map(InputSpec::signing_key).collect();
     let proofs: Vec<Proof> = inputs.iter().map(|input| input.proof().clone()).collect();
@@ -158,6 +177,29 @@ pub(crate) fn live(node: &Node, id: &ContractID) -> Proof {
         ProofStatus::Unspent(proof) => proof,
         other => panic!("expected {} to be unspent, got {other:?}", hex::encode(id)),
     }
+}
+
+/// What a recipient learns from the node about the one contract paid to
+/// `m/…/branch/n`: the contract as `scan` returned it, and the opening read
+/// from the note `scan` returned beside it.
+pub(crate) fn received<K: ViewingKey>(
+    node: &Node,
+    account: &Account<K>,
+    branch: u32,
+    n: u32,
+) -> (Contract, Opening) {
+    let predicate = account.predicate_at(branch, n).expect("predicate");
+    let hits = node.scan(&[predicate.to_point().to_bytes()], 0);
+    assert_eq!(hits.len(), 1, "one contract pays m/…/{branch}/{n}");
+    let contract = contract_from_bytes(&hits[0].bytes.0).expect("canonical contract bytes decode");
+    let note = open_note(
+        &contract,
+        hits[0].note.as_ref().map(|note| note.0.as_slice()),
+        &account.address_at(branch, n).expect("address"),
+        &account.viewing_key_at(branch, n).expect("viewing key"),
+    )
+    .expect("the note scan returned opens");
+    (contract, note.opening)
 }
 
 /// The contract bytes the node published, decoded as a recipient would.

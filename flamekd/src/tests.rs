@@ -291,6 +291,14 @@ fn reference_vectors() {
         }
         assert_eq!(hex::encode(key.to_bytes()), spend_hex);
         assert_eq!(hex::encode(key.to_recv().to_bytes()), recv_hex);
+        let view_hex = format!("{}{}", &recv_hex[..64], &spend_hex[64..]);
+        assert_eq!(hex::encode(key.to_view().to_bytes()), view_hex);
+        let address_bytes = key.to_recv().to_address();
+        assert_eq!(hex::encode(address_bytes.to_bytes()), &recv_hex[..128]);
+        assert_eq!(
+            hex::encode(address_bytes.to_tracking_address().to_bytes()),
+            &recv_hex[..64]
+        );
         assert_eq!(key.to_recv().to_address().to_string(), address);
     }
     assert_eq!(root.to_string(),

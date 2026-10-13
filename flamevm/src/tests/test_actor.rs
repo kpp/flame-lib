@@ -4,7 +4,7 @@ use cells::{Cell, CellDecode, CellError};
 
 use super::mem_registry::MemRegistry;
 use crate::{
-    code_state_bytes, empty_state, state_root, ActorID, ActorRegistry, Dict, Scalar, String,
+    code_state_bytes, empty_state, state_root, ActorID, ActorRegistry, CellValue, Dict, Scalar,
     VMError, Value,
 };
 
@@ -13,7 +13,7 @@ fn fixture_code() -> Vec<u8> {
 }
 
 fn fixture_id(seed: u8) -> ActorID {
-    ActorID::Hash([seed; 32])
+    ActorID::from([seed; 32])
 }
 
 fn state_with(entries: &[(u64, u64)]) -> Value {
@@ -57,13 +57,20 @@ fn checkpoint_rollback_removes_deployed_actor() {
 
 #[test]
 fn actorid_forms_share_one_registry_key() {
-    let constructor = ActorID::Constructor(vec![1, 2, 3]);
-    let hash = constructor.to_canonical();
+    let constructor = crate::ActorAddress::Init {
+        ctor: crate::code_cell(&[1, 2, 3]).unwrap().into(),
+    };
+    let hash = constructor.to_actor_id();
     assert_eq!(constructor.to_hash(), hash.to_hash());
 
     let mut reg = MemRegistry::new();
-    reg.deploy(constructor.clone(), fixture_code(), empty_state(), 1_000)
-        .unwrap();
+    reg.deploy(
+        constructor.to_actor_id(),
+        fixture_code(),
+        empty_state(),
+        1_000,
+    )
+    .unwrap();
     assert!(reg.exists(&hash));
     assert!(matches!(
         reg.deploy(hash, fixture_code(), empty_state(), 1_000),
@@ -75,9 +82,40 @@ fn actorid_forms_share_one_registry_key() {
 fn actorid_decode_rejects_unknown_tag() {
     let cell = Cell::new(vec![0x42u8], vec![]).unwrap();
     assert!(matches!(
-        ActorID::from_cell(&cell, &mut ()),
+        crate::ActorAddress::from_cell(&cell, &mut ()),
         Err(CellError::InvalidFormat)
     ));
+}
+
+#[test]
+fn registry_reserves_freeze_level_before_deploy_save_or_setcode_mutates() {
+    let id = fixture_id(0x79);
+    let cut = Cell::new(vec![], vec![]).unwrap().prune(15).unwrap();
+    let code = Cell::new(vec![0x1d], vec![cut.clone().into()]).unwrap();
+    let mut registry = MemRegistry::new();
+    assert!(matches!(
+        registry.deploy(id, code.clone(), empty_state(), 10_000),
+        Err(VMError::Cell(CellError::InvalidLevel))
+    ));
+    assert!(!registry.exists(&id));
+    registry
+        .deploy(id, fixture_code(), empty_state(), 10_000)
+        .unwrap();
+    let original = registry.actor(&id).unwrap().root.id();
+    let state = registry.load_state(&id).unwrap();
+    assert!(matches!(
+        registry.save_state(&id, Value::Cell(cut.into())),
+        Err(VMError::Cell(CellError::InvalidLevel))
+    ));
+    assert_eq!(registry.actor(&id).unwrap().root.id(), original);
+    assert!(registry.actor(&id).unwrap().is_checked_out());
+    registry.save_state(&id, state).unwrap();
+    assert!(matches!(
+        registry.set_code(&id, code),
+        Err(VMError::Cell(CellError::InvalidLevel))
+    ));
+    assert_eq!(registry.actor(&id).unwrap().root.id(), original);
+    assert!(!registry.actor(&id).unwrap().is_checked_out());
 }
 
 #[test]
@@ -86,24 +124,36 @@ fn registry_code_roundtrip_and_reentry_lock() {
     let id = fixture_id(0x2a);
     reg.deploy(id.clone(), vec![0xde, 0xad], empty_state(), 100)
         .unwrap();
-    assert_eq!(reg.load_code(&id).unwrap(), vec![0xde, 0xad]);
+    assert_eq!(
+        reg.load_code(&id).unwrap().id(),
+        crate::code_cell(&[0xde, 0xad]).unwrap().id()
+    );
     reg.set_code(&id, vec![0x02, 0x03]).unwrap();
-    assert_eq!(reg.load_code(&id).unwrap(), vec![0x02, 0x03]);
+    assert_eq!(
+        reg.load_code(&id).unwrap().id(),
+        crate::code_cell(&[0x02, 0x03]).unwrap().id()
+    );
     drop(reg.load_state(&id).unwrap());
     assert!(matches!(reg.load_code(&id), Err(VMError::ActorEmpty)));
 }
 
 #[test]
 fn charged_usage_counts_state_and_code() {
-    let code = fixture_code();
+    let code = crate::code_cell(&fixture_code()).unwrap();
     let small = empty_state();
     let mut large = Dict::new();
-    large.insert(Scalar::ZERO, Value::String(String::from(vec![0u8; 100])));
+    large.insert(
+        Scalar::ZERO,
+        Value::Cell(CellValue::from_bytes(vec![0u8; 100]).unwrap()),
+    );
     let large = Value::Dict(large);
     let small_usage = code_state_bytes(&code, &small).unwrap();
     let large_usage = code_state_bytes(&code, &large).unwrap();
     assert!(large_usage - small_usage >= 100);
-    assert!(code_state_bytes(&[0x1d; 100], &small).unwrap() - small_usage >= 99);
+    assert!(
+        code_state_bytes(&crate::code_cell(&[0x1d; 100]).unwrap(), &small).unwrap() - small_usage
+            >= 99
+    );
 }
 
 #[test]

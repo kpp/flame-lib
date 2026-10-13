@@ -1,5 +1,6 @@
 mod actor;
 mod address;
+mod cell_value;
 mod constraints;
 mod contract;
 mod crypto;
@@ -13,7 +14,7 @@ mod ops;
 mod prover;
 mod scalar;
 mod script;
-mod string;
+mod slice;
 mod token;
 mod tx;
 mod value;
@@ -21,13 +22,15 @@ mod verifier;
 mod vm;
 
 pub use actor::{
-    code_root, code_state_bytes, empty_state, state_root, ActorID, ActorRegistry, StoragePurchase,
+    code_cell, code_from_cell, code_root, code_state_bytes, empty_state, state_root, ActorAddress,
+    ActorID, ActorRegistry, StoragePurchase,
 };
 pub use address::Address;
+pub use cell_value::{CellValue, CellWitness};
 pub use constraints::{
     Commitment, CommitmentWitness, Constraint, Expression, SecretConstraint, Variable,
 };
-pub use contract::{Contract, ContractID, Predicate, PredicateTree, TaprootProof};
+pub use contract::{Contract, ContractID, Predicate, PredicateTree, TaprootOpening};
 pub use crypto::{Merlin, Point};
 pub use dict::Dict;
 pub use errors::VMError;
@@ -38,18 +41,20 @@ pub use ops::Instruction;
 pub use prover::Prover;
 pub use scalar::Scalar;
 pub use script::{Script, ScriptBuilder};
-pub use string::{String, StringWitness};
+pub use slice::Slice;
 pub use token::{flavor_from_actor, ClearToken, Token, WideToken, FLAME_FLAVOR};
 pub use value::Value;
 pub use verifier::Verifier;
 
 pub use tx::{
-    ExternalTx, InternalTx, Limits, SigningInstructions, TxEntry, TxHeader, TxID, TxLog, TxMetrics,
-    UnsignedTx,
+    EffectID, ExternalTx, InternalTx, Limits, SigningInstructions, TxEntry, TxHeader, TxID, TxLog,
+    TxMetrics, UnsignedTx,
 };
+#[cfg(feature = "debugger")]
+pub use vm::debugger;
 pub use vm::{Anchor, BlockContext};
 
 pub use cells::{
-    BagOfCells, Cell, CellBuilder, CellDecode, CellEncode, CellEnvelope, CellError, CellID,
-    CellRef, CellResolver, CellSlice, Trie,
+    read_cell, resolve_cell, Cell, CellBuilder, CellDecode, CellEncode, CellEnvelope, CellError,
+    CellID, CellIndex, CellReader, CellRef, CellResolver, CellSlice, Trie,
 };

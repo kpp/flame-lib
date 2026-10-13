@@ -67,8 +67,9 @@ impl<'g> Prover<'g> {
     /// proof fails.
     ///
     /// Returns the full [`TxResult`]: `proof = Some(...)`,
-    /// `bytecode = program.to_bytecode()` (the verifier walks the
-    /// same bytes), `txid` / `txlog` / `total_fee` etc. populated.
+    /// `program` retains the complete native graph. `bytecode` is a legacy
+    /// compatibility view, not a standalone graph; use Cell-based verification.
+    /// `txid` / `txlog` / `total_fee` etc. are populated.
     pub fn prove(
         pc_gens: &'g PedersenGens,
         program: ScriptBuilder,
@@ -85,8 +86,8 @@ impl<'g> Prover<'g> {
             .multiplications
             .saturating_add(prover.cs.metrics().multipliers);
         // Bind the canonical TxID into the R1CS transcript so the
-        // proof commits to the full transaction effects (header +
-        // log), not just the constraint system shape. Verifier
+        // proof commits to the body (header, supplied program, pruned log),
+        // not just the constraint system shape. Verifier
         // mirrors this exact step before `cs.verify`.
         prover
             .cs
