@@ -898,8 +898,16 @@ impl ScriptBuilder {
         self.instructions.push(Instruction::Send);
         self
     }
+    /// Actor call inheriting the caller's write permission: `arg gas addr call → result 1 | arg 0`.
     pub fn call(mut self) -> Self {
         self.instructions.push(Instruction::Call);
+        self
+    }
+
+    /// Actor call with `readwrite = false`: `arg gas addr query → result 1 | arg 0`.
+    /// Arguments and results must be portable data, including data-only Dicts.
+    pub fn query(mut self) -> Self {
+        self.instructions.push(Instruction::Query);
         self
     }
     pub fn load(mut self) -> Self {

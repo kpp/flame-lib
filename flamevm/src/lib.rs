@@ -52,7 +52,7 @@ pub use tx::{
 };
 #[cfg(feature = "debugger")]
 pub use vm::debugger;
-pub use vm::{Anchor, BlockContext};
+pub use vm::{query_actor, Anchor, BlockContext, QueryResult};
 
 pub use cells::{
     read_cell, resolve_cell, Cell, CellBuilder, CellDecode, CellEncode, CellEnvelope, CellError,

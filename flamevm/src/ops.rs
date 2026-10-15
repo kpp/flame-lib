@@ -154,6 +154,7 @@ const OP_SAVE: u8 = 0xd3;
 const OP_SETCODE: u8 = 0xd4;
 const OP_ADDSTORAGE: u8 = 0xd5;
 const OP_QUOTESTORAGE: u8 = 0xd6;
+const OP_QUERY: u8 = 0xd7;
 
 // 0xeX — Frame introspection
 const OP_SELFID: u8 = 0xe0;
@@ -272,6 +273,7 @@ pub enum Instruction {
     Open,         // contract ik program gas arg open → result 1 | contract arg 0
     Send,         // arg refund gas addr send → ø (portable arg; anonymous outside actor frames)
     Call,         // arg gas addr call → result 1 | arg 0 (portable arg; actor-only)
+    Query,        // arg gas addr query → result 1 | arg 0 (data-only; actor-only)
     Load,         // ø load → value (actor-only)
     Save,         // value save → ø (actor-only)
     Setcode,      // code setcode → ø (actor-only)
@@ -412,6 +414,7 @@ impl Instruction {
             Instruction::Open => op(w, OP_OPEN),
             Instruction::Send => op(w, OP_SEND),
             Instruction::Call => op(w, OP_CALL),
+            Instruction::Query => op(w, OP_QUERY),
             Instruction::Load => op(w, OP_LOAD),
             Instruction::Save => op(w, OP_SAVE),
             Instruction::Setcode => op(w, OP_SETCODE),
@@ -607,6 +610,7 @@ impl Instruction {
             OP_OPEN => Ok(Instruction::Open),
             OP_SEND => Ok(Instruction::Send),
             OP_CALL => Ok(Instruction::Call),
+            OP_QUERY => Ok(Instruction::Query),
             OP_LOAD => Ok(Instruction::Load),
             OP_SAVE => Ok(Instruction::Save),
             OP_SETCODE => Ok(Instruction::Setcode),
@@ -773,6 +777,18 @@ fn parse_pushint_full(reader: &mut &[u8]) -> Result<Instruction, VMError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_has_one_byte_encoding_without_inline_operands() {
+        assert_eq!(Instruction::Query.encode_to_vec(), vec![0xd7]);
+        assert_eq!(Instruction::Query.encoded_size(), 1);
+        let mut input = &[0xd7, OP_NOP][..];
+        assert!(matches!(
+            Instruction::parse(&mut input).unwrap(),
+            Instruction::Query
+        ));
+        assert_eq!(input, &[OP_NOP]);
+    }
 
     #[test]
     fn loadref_has_one_byte_encoding_without_inline_operands() {

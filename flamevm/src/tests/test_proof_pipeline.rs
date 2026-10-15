@@ -226,7 +226,7 @@ fn alloc_pushes_copyable_variable_with_witness() {
     let kind = CallKind::ExternalRoot;
     let mut vm = VM::new(
         dummy_header(),
-        CallFrame::new(program.into_instructions(), kind, 1_000_000),
+        CallFrame::new(program.into_instructions(), kind, 1_000_000).with_readwrite(true),
     );
     // One step → executes the alloc.
     vm.step_external(&mut prover).expect("alloc step ok");
@@ -615,7 +615,8 @@ fn phase21_total_fee_flows_through_to_txresult() {
             program.into_instructions(),
             CallKind::ExternalRoot,
             1_000_000,
-        ),
+        )
+        .with_readwrite(true),
     );
     let mut prover = Prover::new(&pc_gens);
     for _ in 0..2 {

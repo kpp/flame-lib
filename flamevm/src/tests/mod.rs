@@ -13,6 +13,7 @@ pub(crate) mod test_helpers;
 mod test_actor;
 mod test_actor_call;
 mod test_actor_introspection;
+mod test_actor_query;
 mod test_actor_restore;
 mod test_actor_send;
 mod test_actor_state;

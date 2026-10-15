@@ -11,10 +11,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use flamed_rpc::{
-    async_trait, codes, ActorId, ActorResult, BlockId, BlockResult, BlockTxEnvelope, BlocksResult,
-    ContractEnvelope, ContractId, ContractResult, ErrorCode, ErrorObjectOwned, FlamedApiServer,
-    PendingTransactionsResult, PredicatePoint, ProofBytes, ProofResult, RpcResult, ScanResult,
-    TipResult, TransactionResult, TransactionsResult, TxId, TxStatusResult, MAX_PROOF_IDS,
+    async_trait, codes, ActorId, ActorQueryResult, ActorResult, BlockId, BlockResult,
+    BlockTxEnvelope, BlocksResult, ContractEnvelope, ContractId, ContractResult, ErrorCode,
+    ErrorObjectOwned, FlamedApiServer, PendingTransactionsResult, PredicatePoint, ProofBytes,
+    ProofResult, RpcResult, ScanResult, TipResult, TransactionResult, TransactionsResult, TxId,
+    TxStatusResult, ValueEnvelope, MAX_PROOF_IDS, MAX_QUERY_BYTES, MAX_QUERY_GAS,
     MAX_SCAN_PREDICATES,
 };
 use jsonrpsee::server::{BatchRequestConfig, Server, ServerConfig, ServerHandle};
@@ -110,6 +111,21 @@ impl FlamedApiServer for FlamedRpc {
         tokio::task::spawn_blocking(move || inspect::actor(snapshot))
             .await
             .map_err(|error| internal(error.to_string()))
+    }
+
+    async fn query_actor(
+        &self,
+        id: ActorId,
+        argument: ValueEnvelope,
+        gas_limit: u64,
+        expected_block: Option<BlockId>,
+    ) -> RpcResult<ActorQueryResult> {
+        check_limit(MAX_QUERY_BYTES, argument.0.len())?;
+        if gas_limit == 0 || gas_limit > MAX_QUERY_GAS {
+            return Err(NodeError::QueryGasLimit(gas_limit).into());
+        }
+        self.with_node(move |node| node.query_actor(id, argument, gas_limit, expected_block))
+            .await
     }
 
     async fn tip(&self) -> RpcResult<TipResult> {
@@ -245,8 +261,10 @@ impl From<NodeError> for ErrorObjectOwned {
         let code = match &error {
             NodeError::UnknownContract(_) | NodeError::NotFound(_) => codes::NOT_FOUND,
             NodeError::Mempool(_) => codes::MEMPOOL_REJECTED,
-            NodeError::Limit { .. } => codes::LIMIT_EXCEEDED,
-            NodeError::Decode(_) => codes::INVALID_BYTES,
+            NodeError::Limit { .. } | NodeError::QueryGasLimit(_) => codes::LIMIT_EXCEEDED,
+            NodeError::Decode(_) | NodeError::QueryDecode(_) => codes::INVALID_BYTES,
+            NodeError::StaleBlock => codes::STALE_BLOCK,
+            NodeError::Query(_) => codes::QUERY_FAILED,
             _ => ErrorCode::InternalError.code(),
         };
         ErrorObjectOwned::owned(code, error.to_string(), None::<()>)

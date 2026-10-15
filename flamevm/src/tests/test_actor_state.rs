@@ -34,6 +34,7 @@ fn vm_for(actor: ActorID, script: Vec<u8>) -> VM {
             kind,
             1_000_000,
         )
+        .with_readwrite(true)
         .with_anchor(Anchor([0u8; 32])),
     )
 }
@@ -163,7 +164,8 @@ fn load_in_external_root_errors_actor_context() {
     let kind = CallKind::ExternalRoot;
     let mut vm = VM::new(
         dummy_header(),
-        CallFrame::new(ScriptBuilder::new().load().into_instructions(), kind, 1000),
+        CallFrame::new(ScriptBuilder::new().load().into_instructions(), kind, 1000)
+            .with_readwrite(true),
     );
     let err = vm
         .step_internal_with_registry(&mut reg)

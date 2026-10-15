@@ -538,6 +538,7 @@ fn synchronous_addresses_resolve_witnesses_owned_by_the_caller() {
                 1_000_000,
             )
             .unwrap()
+            .with_readwrite(true)
             .with_anchor(Anchor([0x55; 32])),
         );
         vm.push_value(Value::ClearToken(ClearToken::new(
@@ -591,6 +592,7 @@ fn asynchronous_addresses_carry_witnesses_owned_by_the_sender() {
                 1_000_000,
             )
             .unwrap()
+            .with_readwrite(true)
             .with_anchor(Anchor([0x56; 32])),
         );
         vm.push_value(Value::ClearToken(ClearToken::new(

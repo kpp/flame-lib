@@ -22,6 +22,7 @@ fn vm_internal_with(
             kind,
             1_000_000,
         )
+        .with_readwrite(true)
         .with_anchor(anchor),
     )
 }
@@ -36,7 +37,8 @@ fn vm_external(script: Vec<u8>) -> VM {
                 .into_instructions(),
             CallKind::ExternalRoot,
             1_000_000,
-        ),
+        )
+        .with_readwrite(true),
     )
 }
 

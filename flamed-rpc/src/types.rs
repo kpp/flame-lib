@@ -39,6 +39,21 @@ base64_newtype! {
     ActorCode;
     /// An actor's public state as a `CellEnvelope`.
     ActorStateEnvelope;
+    /// One query argument or result, as a VM Value `CellEnvelope`.
+    ValueEnvelope;
+}
+
+/// A read-only actor result at one committed chain tip.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorQueryResult {
+    /// Block against whose state the getter ran.
+    pub block: BlockId,
+    /// Height of that block.
+    pub height: u64,
+    /// One data Value (Scalar, Point, Cell, or recursively data-only portable Dict).
+    pub value: ValueEnvelope,
+    /// VM execution gas consumed, excluding transport decoding.
+    pub gas_used: u64,
 }
 
 /// The chain's current tip.
@@ -625,6 +640,12 @@ pub const MAX_SCAN_PREDICATES: usize = 1024;
 /// The most ids one `proofs` may name.
 pub const MAX_PROOF_IDS: usize = 1024;
 
+/// Maximum execution gas for an offchain actor query.
+pub const MAX_QUERY_GAS: u64 = 1_000_000;
+
+/// Maximum decoded envelope bytes for either a query argument or result.
+pub const MAX_QUERY_BYTES: usize = 64 * 1024;
+
 /// Server-defined JSON-RPC error codes, in the -32000..-32099 range.
 pub mod codes {
     /// The node has no such actor, contract, block, or confirmed execution.
@@ -635,4 +656,8 @@ pub mod codes {
     pub const LIMIT_EXCEEDED: i32 = -32003;
     /// A blob did not decode into what it claims to be.
     pub const INVALID_BYTES: i32 = -32004;
+    /// The expected query block is no longer the current tip.
+    pub const STALE_BLOCK: i32 = -32005;
+    /// Actor query execution failed, including gas exhaustion or a write attempt.
+    pub const QUERY_FAILED: i32 = -32006;
 }

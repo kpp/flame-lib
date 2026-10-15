@@ -333,7 +333,8 @@ fn issuepub_at_external_root_errors_actor_context() {
                 .into_instructions(),
             CallKind::ExternalRoot,
             1_000_000,
-        ),
+        )
+        .with_readwrite(true),
     );
     let mut delegate = make_stub_delegate();
     let err = drive_external(&mut vm, &mut delegate).unwrap_err();
@@ -373,13 +374,14 @@ fn issuepriv_emits_token_with_predicate_bound_flavor() {
         .push_literal(tag_str.clone())
         .issuepriv()
         .return_();
-    let parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 20_000);
+    let parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 20_000).with_readwrite(true);
     let child_kind = CallKind::ContractOpen {
         predicate: Predicate::opaque(CompressedRistretto([0u8; 32])),
         external_context: true,
         caller_id: None,
     };
-    let child = CallFrame::new(program.into_instructions(), child_kind, 20_000);
+    let child =
+        CallFrame::new(program.into_instructions(), child_kind, 20_000).with_readwrite(true);
     let mut vm = VM::new(dummy_header(), parent);
     let p = core::mem::replace(&mut vm.current_call, child);
     vm.call_stack.push(p);
@@ -438,7 +440,8 @@ fn issuepriv_at_external_root_errors_predicate_context() {
                 .into_instructions(),
             CallKind::ExternalRoot,
             1_000_000,
-        ),
+        )
+        .with_readwrite(true),
     );
     let mut delegate = make_stub_delegate();
     let err = drive_external(&mut vm, &mut delegate).unwrap_err();
@@ -455,7 +458,7 @@ fn issuepriv_in_internal_context_yields_failure_marker() {
     // test_contracts.rs.
     use crate::vm::{Anchor, CallFrame, CallKind, VM};
     use curve25519_dalek::ristretto::CompressedRistretto;
-    let mut parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    let mut parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500).with_readwrite(true);
     parent.snap_failure_values = vec![Value::Scalar(Scalar::ZERO)];
     let script = ScriptBuilder::new().issuepriv().to_bytecode();
     let child_kind = CallKind::ContractOpen {
@@ -469,7 +472,8 @@ fn issuepriv_in_internal_context_yields_failure_marker() {
             .into_instructions(),
         child_kind,
         500,
-    );
+    )
+    .with_readwrite(true);
     let mut vm = VM::new(dummy_header(), parent);
     let p = core::mem::replace(&mut vm.current_call, child);
     vm.call_stack.push(p);

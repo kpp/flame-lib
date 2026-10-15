@@ -20,7 +20,7 @@ Successful VM execution equals to successful transaction verification. Therefore
 Flame supports two forms of smart contract. **Contracts** are immutable,
 single-use values held in Utreexo; each locks a payload under a **Predicate**.
 **Actors** are persistent identities with state and directly executable code,
-entered through asynchronous `send` or synchronous `call`. One stack machine
+entered through asynchronous `send`, synchronous `call`, or read-only `query`. One stack machine
 verifies both: external transactions consume and create Contracts and may emit
 messages; internal transactions deliver messages and synchronously call Actors.
 
@@ -46,9 +46,10 @@ also return entry-owned values: actor calls return their argument, while Contrac
 predicate calls return the original locked Contract followed by their explicit
 argument. Failure status `0` follows those restored values; there is no count.
 All downward call arguments must be portable, just like asynchronous `send`
-payloads. Return values are unrestricted: non-portable liabilities and
+payloads. Read/write return values are unrestricted: non-portable liabilities and
 VM-local values may travel upward so the caller can resolve them, but they may
-not be delegated to another callee.
+not be delegated to another callee. Read-only actor calls restrict both their
+argument and result to recursively data-only portable values; see [Actor queries](#actor-queries).
 
 Actor state is its re-entrancy lock. `load` moves state out of the registry;
 while checked out, another frame cannot enter, observe, or mutate that actor.
@@ -202,7 +203,7 @@ Storage-purchase pricing and issuance are specified in
 
 ## Types
 
-Ownership: every type on the stack is always owned. FlameVM does not allow reference-counting, borrowing, read-only access or implicit copies.
+Ownership: every type on the stack is always owned. FlameVM does not allow reference-counting, borrowed stack values or implicit copies. Read-only actor queries retain the same ownership and checkout rules; they restrict effects rather than borrowing actor state.
 
 Plain data types: scalars, immutable Cells, Ristretto points. These can be copied and ported.
 
@@ -605,8 +606,9 @@ Bare 32-byte payloads and byte-encoded CellEnvelopes are not VM destinations.
 | Initialized: ordinary ActorState root, possibly partial | Execute current code; never reinstall/reset | Execute current code | Authenticate against current image, merge bodies, execute current code |
 | Frozen: entire ActorState root pruned | ActorFrozen | ActorFrozen | Authenticate against frozen image, restore selected bodies, execute available code |
 
-The same resolution rules apply to asynchronous delivery and actor-to-actor
-`call`. Init creation and Restore are provisional within the execution
+The same resolution rules apply to asynchronous delivery and read/write actor-to-actor
+`call`. Read-only calls accept only `Address` and never initialize or restore actors.
+Init creation and Restore are provisional within the execution
 checkpoint: the actor must buy enough leased capacity for retained bodies.
 Successful restoration records `ActorRestore` before subsequent effects;
 failed resolution or code rolls back restored bodies, purchases and effects.
@@ -629,6 +631,82 @@ An exclusive checkout lock is independent of availability: missing/pruned data
 does not mean the actor's state has been checked out. The complete image
 reserves one of Cells' fifteen pruning levels for whole-root freezing.
 
+## Actor queries
+
+Every call frame has a `readwrite` permission, **false by default**. External and
+internal transaction entry points explicitly grant `true`. Actor `call` requests
+write permission; `query` requests none. Child permission is always
+`parent.readwrite && requested_readwrite`, so neither a nested `call` nor a tail
+`exec` can escape a read-only frame. This permission is independent of the
+external/internal arithmetic context and actor identity.
+
+Read-only execution has these consensus rules:
+
+- Entry accepts only an existing `ActorAddress::Address`; `Init` and `Restore`
+  are rejected even when their destination already exists. Missing, frozen and
+  checked-out actors retain their ordinary failure behavior.
+- Both argument and result must be query data: `Scalar`, `Point`, `Cell`, or a
+  portable `Dict` whose entries recursively satisfy the same rule. Empty and
+  nested Dicts are accepted, including DNS records with multiple fields. Tokens,
+  including zero-quantity tokens, and runtime values are rejected at any depth
+  with `NonDataInQuery`. This admission rule is independent of VM copyability:
+  Dicts still cannot be duplicated by `dup` or `getdup`. Raw token bytes inside
+  a Cell remain data and grant no token ownership.
+- Cross-boundary Dicts are hydrated and recursively checked, and Cell graphs
+  are materialized using the current scoped resolver and gas budget, preserving
+  explicit pruning and failing on missing ordinary bodies. Private annotations
+  are discarded; returned data does not require another actor's storage cache
+  after the query exits.
+- `load` checks out state normally and records the factual CellID of its public
+  Value encoding. Each matching `save` must put back that exact commitment, or
+  fail `QueryStateChanged`. This is the state at that checkout in the current
+  execution view, including writes completed before query entry.
+- A successful frame must restore every checkout; explicit `return` and implicit
+  fall-through fail `QueryStateNotRestored` otherwise. State may contain bearer
+  tokens: they remain linear inside the getter and cannot cross its boundaries.
+- `input`, `contract`, `output`, `open`, `signcall`, `signtx`, `send`, `log`,
+  `issuepriv`, `issuepub`, `retire`, `fee`, `setcode`, and `addstorage` fail
+  `ReadOnlyViolation`. `anchor`, `timelock`, and `version` also fail: a getter
+  has no transaction authority or transaction-specific input. Pure flavor
+  calculations and token inspection remain permitted.
+- Read-only saves emit no `ActorSave`. On success as well as failure, the frame's
+  registry checkpoint is rolled back, including storage hydration and caches.
+  Consumed gas is retained. The caller's anchor is preserved without splitting.
+
+Queries use internal computation rules. Scalar assertions and supported
+cryptographic checks complete before a result is accepted; external proof and
+batch-verification operations are unavailable. Registry rollback must not erase
+verification work needed to justify a successful result. The normal checkout
+lock remains authoritative: a getter cannot read an older snapshot of an actor
+whose state is currently held by another frame.
+
+**Onchain.** `arg gas addr query` enters a read-only actor frame and produces
+`result 1` or restores `arg 0`. It is callable from actor execution, including
+other getters, but not from external transactions or Contract predicate frames.
+It reads the current transaction's actor-state view and charges the caller's
+gas grant. Ordinary `call` from a writable actor retains read/write behavior;
+ordinary `call` from a getter inherits these query restrictions.
+
+**Offchain.** The host API is
+`flamevm::query_actor(actor, argument, gas_limit, registry, block, cells)` and
+returns `QueryResult { value, gas_used }`. The caller supplies one consistent
+registry/block snapshot and its explicit Cell lookup scope. The root has the
+queried actor's `selfid`, no authenticated caller (`callerid` is zero), no anchor,
+and the supplied block height. It returns one data Value through `return`, or
+Scalar `0` on clean empty-stack fall-through. It does not create a transaction,
+consume a Message, or emit `Receive` or any other committed effect.
+
+The node JSON-RPC method is
+`query_actor(id, argument, gas_limit, expected_block?)`, returning
+`{ block, height, value, gas_used }`. Argument and result use VM Value
+CellEnvelopes encoded as base64. It runs against one current committed tip;
+an optional expected block hash must match or the request fails `STALE_BLOCK`.
+Historical queries are not implemented. Node limits are 1,000,000 execution gas
+and 64 KiB per decoded argument/result envelope, with bounded typed Dict decoding.
+This is an offchain resource
+budget, not a paid transaction. Responses identify their snapshot but do not
+include state proofs; remote results require trust in the responding node.
+
 ## Messages
 
 Messages execute asynchronously with one portable payload Value. Each contains a
@@ -638,7 +716,8 @@ frame must finish with an empty stack; it cannot return to a caller.
 Messages are unique by construction, not by a duplicate-message table. Each
 accepted `send` embeds the left child of the current anchor ratchet and leaves
 the right child for subsequent execution. Calls split disjoint callee and
-caller-continuation subtrees. A failed delivery rolls back its actor effects and
+caller-continuation subtrees for read/write calls; read-only calls preserve the
+caller's anchor. A failed delivery rolls back its actor effects and
 produces one Contract containing the original payload under `refund_predicate`; it
 does not enqueue another Message. Failure to apply that refund rejects the
 whole candidate, so the originating Send does not commit.
@@ -715,7 +794,7 @@ The `left` half is embedded in the new entity (contract anchor / MessageID); the
 
 **Site that seeds without consuming**: [`input`](#input) sets `last_anchor = Anchor(contract.id())` directly (the spent UTXO's id is already unique on the wire — no split needed). Replacing any prior value is intentional: it lets a partial transaction depend only on its own input claim, not on what other parts of the tx contributed before it.
 
-**Sites that split at call entry**: [`call`](#call), [`open`](#open), [`signcall`](#signcall). All three create new call frames and each splits `last_anchor` at entry. The `left` half seeds the child frame's `last_anchor`; the `right` half is held in the parent frame's `post_call_anchor` slot and replaces `last_anchor` when control returns. This makes anchor flow deterministic across call success/failure boundaries — the caller's anchor chain is independent of whatever the callee did with its left half.
+**Sites that split at call entry**: read/write [`call`](#call), [`open`](#open), [`signcall`](#signcall). All three create new call frames and each splits `last_anchor` at entry. The `left` half seeds the child frame's `last_anchor`; the `right` half is held in the parent frame's `post_call_anchor` slot and replaces `last_anchor` when control returns. This makes anchor flow deterministic across call success/failure boundaries — the caller's anchor chain is independent of whatever the callee did with its left half. A [`query`](#query), or `call` inherited from a read-only parent, neither splits nor consumes an anchor and cannot read it.
 
 **Locality across parties.** Each `op_input` *replaces* the anchor unconditionally rather than mixing into a chain. So a multi-party tx where party A claims input A_in and produces outputs, then party B claims input B_in and produces outputs, has each party's output anchors rooted only in their own input id. B's claim wipes A's residue; that's fine because B's outputs derive from B_in's split-children, not from anything A did. A party signing their portion can predict their own output anchors locally from their own input contract ids.
 
@@ -734,13 +813,16 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
   per-opcode prose. `decrypt` also has a blank marker: it batches externally and
   checks immediately internally.
 - **actor** — requires a current actor identity. Available only in
-  `InternalRoot` and `ActorCall`, never `ExternalRoot` or `ContractOpen`.
+  `InternalRoot`, `ActorCall`, and `QueryRoot`, never `ExternalRoot` or `ContractOpen`.
 - **pred.ext.** — requires an external `ContractOpen` predicate context.
-- **caller** — requires a called frame (`InternalRoot`, `ActorCall`, or
+- **caller** — requires a called frame (`InternalRoot`, `ActorCall`, `QueryRoot`, or
   `ContractOpen`) with caller attribution; excludes `ExternalRoot`.
 - **int.** — internal chain context. Currently used only for planned chain-info
   operations.
 - *(blank)* — works in either context. Most opcodes, including `send`.
+
+These context markers do not grant write permission. The restrictions in
+[Actor queries](#actor-queries) additionally apply whenever `readwrite` is false.
 
 | Hex | Name | Ctx | Stack | Description |
 | --- | --- | --- | --- | --- |
@@ -830,7 +912,7 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | a1 | [label](#label) | | ø → ø | Mark a jump target (operand: label number); labels number 0,1,2… in order. |
 | a2 | [jump](#jump) | | ø → ø | Unconditional jump to a label (operand: label number). |
 | a3 | [jumpif](#jumpif) | | x → ø | Pop a scalar; jump to a label iff non-zero (operand: label number). |
-| a4 | [return](#return) | | result → ø | Exit current call frame, returning one Value to the parent. |
+| a4 | [return](#return) | | result → ø | Exit current call frame, returning one Value to the parent or offchain query host. |
 | a5 | [type](#type) | | x → x code | Push the type code of the top value (peek). |
 | a6 | [pushcell](#pushcell) | | ø → cell | Consume the next reference from the current program Cell. |
 | a7 | [exec](#exec) | | cell → ø | Replace the current program Cell, preserving this frame. |
@@ -856,6 +938,7 @@ Each instruction is a one-byte **opcode** optionally followed by **immediate dat
 | d4 | [setcode](#setcode) | actor | cell → ø | Replace the actor's native code graph (author-gated upgrade). |
 | d5 | [addstorage](#addstorage) | actor | q → {debt 1 \| 0} | Buy `q` bytes for one storage year and return a negative Flame token. |
 | d6 | [quotestorage](#quotestorage) | actor | q → {fee 1 \| 0} | Quote the positive integral storage fee in sparks without reserving bytes. |
+| d7 | [query](#query) | actor | arg gas addr → {result 1 \| arg 0} | Synchronously query an existing actor without write permission. |
 |    | **Frame introspection** | | | |
 | e0 | [selfid](#selfid) | actor | ø → c | Push the current actor's id in a 32-byte zero-ref Cell. |
 | e1 | [anchor](#anchor) | | ø → c | Push the current frame's anchor in a 32-byte zero-ref Cell. |
@@ -885,7 +968,7 @@ A **hard fail** aborts the current call.
 
 If that call has a parent, the VM rolls the child back and converts the failure
 to the call opcode's documented in-band failure shape. At the outermost frame,
-the error aborts the transaction. Synchronous failure never exposes the failed
+the error aborts the transaction or offchain query. Synchronous failure never exposes the failed
 child's mutated stack: it exposes only the entry escrow after rollback.
 
 A **soft fail** is an in-band signal: the opcode pushes an optional shape
@@ -910,6 +993,7 @@ Canonical failure-shape vectors (stack order is bottom-to-top):
 | `merge`: `CT(H,7), CT(1,7)` | `CT(H,7), CT(1,7), 0` | neither token (`H = (ℓ-1)/2`) |
 | unavailable `addstorage` / `quotestorage`: `q` | `0` | request `q` |
 | failed entered `call`: `arg` | `arg, 0` | address and gas; original argument restored |
+| failed entered `query`: `arg` | `arg, 0` | address and gas; original data argument restored |
 | failed entered `open`: `Contract, arg` | `Contract, arg, 0` | proof/script/gas operands; locked Contract and original argument restored |
 | failed entered `signcall`: `Contract, arg` | `Contract, arg, 0` | script/signature/gas operands; locked Contract and original argument restored |
 
@@ -1766,26 +1850,32 @@ _result_ → ø
 
 Atomic cross-frame return:
 
-1. Asserts an enclosing call frame exists (otherwise `ReturnAtRoot`).
+1. Asserts an enclosing call frame exists or this is an offchain `QueryRoot`
+   (otherwise `ReturnAtRoot`).
 2. Asserts the callee stack contains exactly one Value (`BadReturnArity` if empty,
    `StackNotClean` if additional values remain), and validates actor storage.
-3. Pops the frame and refunds leftover gas to the parent.
+3. For a child, pops the frame and refunds leftover gas to the parent.
 4. Pushes the result followed by success marker `1`; no count is emitted.
+   An offchain root instead completes with the result for its host.
 
 An empty-stack run-off-the-end child exit returns Scalar `0` (unit) followed by
 `1`. A failed child restores its entry escrow followed by `0`: one original
 argument for actor calls, or the original locked Contract and argument for
 `open`/`signcall`. The Contract payload is never returned separately on failure.
-Use a Dict for multiple application results. Error recovery uses prebuilt
+Use a Dict for multiple application results, including query results whose
+entries are recursively data-only. Error recovery uses prebuilt
 entry snapshots and requires no new encoding or Cell resolution.
 
-`return` deliberately performs no portability check. Non-portable values,
+In read/write execution, `return` deliberately performs no portability check. Non-portable values,
 including negative `ClearToken`s and `WideToken`s, may move upward to the
 caller, which owns responsibility for balancing or consuming them. Every
 downward boundary (`call`, `open`, `signcall`, and asynchronous `send`) accepts
-portable values only.
+portable values only. A read-only result must satisfy the recursive query-data
+rule; its Dict contents and Cell graphs are made available before discarding
+the callee's checkpoint.
+Both return paths reject an unrestored read-only checkout.
 
-At the outermost call frame, `return` always errors; a script terminates cleanly by running off the end of its instructions with an empty stack (jump to a trailing label to short-circuit).
+At a transaction root, `return` always errors; a script terminates cleanly by running off the end of its instructions with an empty stack (jump to a trailing label to short-circuit). At an offchain query root, `return` completes the query with one data Value and no status suffix; empty-stack fall-through returns Scalar `0`.
 
 ### type
 
@@ -1943,14 +2033,17 @@ fresh Contract under `refund_predicate` and emits an Output effect.
 
 _arg gas addr_ → _{result 1 | arg 0}_
 
-Synchronous actor-to-actor call. Same operand shape as [`send`](#send) minus
+Synchronous actor-to-actor call requesting write permission. The effective child
+permission is `parent.readwrite && true`: a read-only caller stays read-only,
+and then all [query rules](#actor-queries), including data-only arguments and
+results and `Address`-only routing, apply. Same operand shape as [`send`](#send) minus
 `refund` and, likewise, no method selector. A caller that wants the callee to
 purchase storage passes Flame as its argument or inside an argument Dict; allocation remains
 the callee's explicit decision. Init may provision an absent actor; Restore may
 authenticate and retain a partial state tree. Both commit only if the callee
 succeeds and retained usage fits its own leases. See [Actors](#actors).
 
-Only `InternalRoot` and `ActorCall` may invoke `call`. `ExternalRoot` and
+Only `InternalRoot`, `ActorCall`, and `QueryRoot` may invoke `call`. `ExternalRoot` and
 `ContractOpen` hard-fail `OpcodeRequiresActorContext` before consuming operands;
 caller attribution stored in a `ContractOpen` is read-only and is never used to
 fabricate an actor caller.
@@ -1983,13 +2076,31 @@ the failed child's current stack is discarded. `RegistryUnavailable`, malformed
 operands, non-portable arguments, or inability of the caller to fund the grant
 hard-fail the current frame before this soft boundary.
 
+### query
+
+_arg gas addr_ → _{result 1 | arg 0}_
+
+Synchronous actor-to-actor read-only call, opcode `0xd7`. It uses the same
+single-Value ABI, actor identity, gas grant/refund, depth bound, checkout lock,
+and failure escrow as [`call`](#call), but always enters with `readwrite = false`.
+It accepts only `ActorAddress::Address`; an `Init` or `Restore` destination
+returns `arg 0` without initialization or restoration. Non-data arguments
+hard-fail `NonDataInQuery` before entry. Callee write attempts, changed saves,
+unrestored checkouts, non-data results and unavailable result bodies fail the
+child and return the original `arg 0`.
+
+Successful explicit return produces `result 1`; clean empty-stack fall-through
+produces `0 1`. Success discards the child's registry checkpoint as failure does,
+while retaining computation charges. No effects or anchors cross this boundary.
+See [Actor queries](#actor-queries) for the full permission and host API rules.
+
 ### load
 
 ø → _value_
 
 **Checks out** the current actor's data: moves its portable `Value` out of the registry and pushes it onto the stack. The author chooses its structure. Code stays in the combined actor image; `setcode` replaces its code reference.
 
-While checked out, synchronous `call` and `load` against the actor fail
+While checked out, synchronous `call`, `query`, and `load` against the actor fail
 `ActorEmpty` — an **explicit checkout lock** guards ownership, independently
 of whether bodies are available. `send` is
 asynchronous and does not inspect recipient state when queued; availability is
@@ -2007,11 +2118,25 @@ fully dismantled state leaves the actor empty; the transaction emits
 and recycle only at their original expiry heights. Forgetting to discharge is
 caught loudly by `StackNotClean` and rolls the transaction back.
 
+In read-only execution, `load` also remembers the factual CellID of the public
+state encoding. The state must be restored with an unchanged `save` before a
+successful exit, even if it was droppable. Dismantling is not permitted;
+otherwise the getter fails `QueryStateNotRestored` and rolls back its checkout.
+
 ### save
 
 _value_ → ø
 
-Pops the state `Value`, **validates portability**, measures the prospective actor usage according to [Actor storage](storage.md), and **moves it back** into the current actor — which must be **checked out** by a prior `load`, else `SaveWithoutLoad` (saving to a non-checked-out actor would clobber, and silently drop the tokens of, live state). `save` hard-fails `StorageCapacityExceeded` if prospective usage exceeds capacity at the current core-block height. Emits `TxEntry::ActorSave { actor, state }` carrying the **full** post-save state — symmetric with `Output(Contract)` which carries the full Contract. The entry Cell contains the actor ID and a reference to the state Value Cell. The TxID commits to that root without flattening its graph.
+Pops the state `Value`, **validates portability**, and **moves it back** into the current actor — which must be **checked out** by a prior `load`, else `SaveWithoutLoad` (saving to a non-checked-out actor would clobber, and silently drop the tokens of, live state).
+
+In read/write execution, measures the prospective actor usage according to [Actor storage](storage.md) and hard-fails `StorageCapacityExceeded` if usage exceeds capacity at the current core-block height. Emits `TxEntry::ActorSave { actor, state }` carrying the **full** post-save state — symmetric with `Output(Contract)` which carries the full Contract. The entry Cell contains the actor ID and a reference to the state Value Cell. The TxID commits to that root without flattening its graph.
+
+In read-only execution, compares the factual CellID of the Value encoding to
+the commitment remembered by its matching `load`. A different commitment
+hard-fails `QueryStateChanged` before registry mutation. An unchanged save
+restores the checkout without emitting `ActorSave`; the entire query checkpoint
+is still discarded at exit. Temporary changes cannot be saved and observed by
+another actor before restoring the original later.
 
 **State is any portable Value.** The author structures state however they like (a Dict, a Scalar, a Token, …).
 
@@ -2145,13 +2270,13 @@ public bodies. Actor addressing is unchanged and will be designed separately.
 
 ø → _n {0|1}_
 
-Pushes the transaction's `locktime` (as `Scalar`) and a unit flag: `0` for block height, `1` for Unix timestamp. The split follows Bitcoin's BIP-65 convention — `flag = 1` iff `locktime ≥ 500_000_000` (`LOCKTIME_TIMESTAMP_THRESHOLD`). Values below the threshold are block heights; values at or above are Unix timestamps (the threshold corresponds to ~1985-11-05, before any practical timestamp range). Available in either context.
+Pushes the transaction's `locktime` (as `Scalar`) and a unit flag: `0` for block height, `1` for Unix timestamp. The split follows Bitcoin's BIP-65 convention — `flag = 1` iff `locktime ≥ 500_000_000` (`LOCKTIME_TIMESTAMP_THRESHOLD`). Values below the threshold are block heights; values at or above are Unix timestamps (the threshold corresponds to ~1985-11-05, before any practical timestamp range). Available in either transaction context; read-only execution fails `ReadOnlyViolation`.
 
 ### version
 
 ø → _n_
 
-Pushes `TxHeader::version` as a `Scalar`. Available in either context.
+Pushes `TxHeader::version` as a `Scalar`. Available in either transaction context; read-only execution fails `ReadOnlyViolation`.
 
 ### selfid
 
@@ -2163,7 +2288,7 @@ Pushes the current frame's actor id in a 32-byte zero-ref Cell. Hard-fails `Opco
 
 ø → _s_
 
-Pushes the frame's *current* `last_anchor` in a 32-byte zero-ref Cell — the value the next consume site would split. Hard-fails `AnchorMissing` if no anchor has been claimed yet (same rule as `contract` / `output` / `send` / `call`). Available in either context.
+Pushes the frame's *current* `last_anchor` in a 32-byte zero-ref Cell — the value the next consume site would split. Hard-fails `AnchorMissing` if no anchor has been claimed yet (same rule as `contract` / `output` / `send` / read/write `call`). Available in either transaction context; read-only execution fails `ReadOnlyViolation`.
 
 ### gas
 
@@ -2284,7 +2409,7 @@ checked-out committed state until `save` supplies a replacement. Hard-fails
 
 Pushes the directly invoking actor's canonical 32-byte id. `InternalRoot` and
 `ActorCall` use their recorded caller; `ContractOpen` uses its compact read-only
-`caller_id`. It pushes a zero-ref Cell containing 32 zero bytes when that caller is absent and
+`caller_id`. An offchain `QueryRoot` has no authenticated caller. It pushes a zero-ref Cell containing 32 zero bytes when that caller is absent and
 hard-fails only from `ExternalRoot`, which has no caller frame. A `ContractOpen`
 opened by another `ContractOpen` sees zero: actor attribution is not propagated
 through predicate frames.

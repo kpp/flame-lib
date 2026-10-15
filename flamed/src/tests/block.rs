@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use flamed_rpc::{
     ActorId, BlockId, BlockResult, BlocksResult, ClientError, ExecutionData, FlamedApiClient,
-    HttpClientBuilder, MAX_PAGE_SIZE, TxId,
+    HttpClientBuilder, TxId, MAX_PAGE_SIZE,
 };
 use flamevm::{ActorID, CellEncode, CellValue, ScriptBuilder};
 use jsonrpsee::{core::client::ClientT, rpc_params};
@@ -120,6 +120,14 @@ async fn block_pages_follow_height_order_and_survive_replay() {
 }
 
 pub(super) fn deploy(node: &mut Node, genesis: &GenesisFile) -> (ActorId, ContractID) {
+    deploy_with_code(node, genesis, counter_code())
+}
+
+pub(super) fn deploy_with_code(
+    node: &mut Node,
+    genesis: &GenesisFile,
+    runtime: Vec<u8>,
+) -> (ActorId, ContractID) {
     let input = contract_of(node, &genesis.contracts[0].id.0);
     let constructor = ScriptBuilder::new()
         .push_int(1_024u64)
@@ -132,7 +140,7 @@ pub(super) fn deploy(node: &mut Node, genesis: &GenesisFile) -> (ActorId, Contra
         .push_int(0u64)
         .push_int(2u64)
         .dict()
-        .push_literal(CellValue::from_bytes(counter_code()).unwrap())
+        .push_literal(CellValue::from_bytes(runtime).unwrap())
         .setcode()
         .load()
         .drop_()

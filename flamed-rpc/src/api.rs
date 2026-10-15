@@ -13,9 +13,9 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 
 use crate::types::{
-    ActorId, ActorResult, BlockResult, BlockTxEnvelope, BlocksResult, ContractId, ContractResult,
-    PendingTransactionsResult, PredicatePoint, ProofResult, ScanResult, TipResult,
-    TransactionResult, TransactionsResult, TxId, TxStatusResult,
+    ActorId, ActorQueryResult, ActorResult, BlockId, BlockResult, BlockTxEnvelope, BlocksResult,
+    ContractId, ContractResult, PendingTransactionsResult, PredicatePoint, ProofResult, ScanResult,
+    TipResult, TransactionResult, TransactionsResult, TxId, TxStatusResult, ValueEnvelope,
 };
 
 /// The `flamed` JSON-RPC 2.0 API. Parameters are positional, in the order
@@ -53,6 +53,21 @@ pub trait FlamedApi {
     /// Returns `NOT_FOUND` if the actor does not exist.
     #[method(name = "actor")]
     async fn actor(&self, id: ActorId) -> RpcResult<ActorResult>;
+
+    /// Runs an actor getter against the current committed tip, without effects.
+    /// Arguments and results are Scalar, Point, Cell, or portable Dicts whose
+    /// entries recursively contain only these data values, as Value envelopes.
+    /// Gas must be 1..=MAX_QUERY_GAS; envelopes are limited to MAX_QUERY_BYTES.
+    /// If supplied, `expected_block` must match the current tip; a mismatch
+    /// returns STALE_BLOCK. Historical blocks are not queried.
+    #[method(name = "query_actor")]
+    async fn query_actor(
+        &self,
+        id: ActorId,
+        argument: ValueEnvelope,
+        gas_limit: u64,
+        expected_block: Option<BlockId>,
+    ) -> RpcResult<ActorQueryResult>;
 
     /// The current tip: its hash, its height, and the contract accumulator root.
     #[method(name = "tip")]

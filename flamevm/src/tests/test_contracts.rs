@@ -1276,7 +1276,7 @@ fn open_rejects_negative_token_argument() {
 #[test]
 fn op_open_cs_blocked_when_external_context_false() {
     use crate::vm::{Anchor, CallFrame, CallKind, VM};
-    let mut parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    let mut parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500).with_readwrite(true);
     parent.snap_failure_values = vec![Value::Scalar(Scalar::ZERO)];
     // alloc is 0x62 — external-only CS op. push:0 + alloc + return.
     let child_kind = CallKind::ContractOpen {
@@ -1284,7 +1284,8 @@ fn op_open_cs_blocked_when_external_context_false() {
         external_context: false,
         caller_id: None,
     };
-    let child = CallFrame::new(vec![Instruction::Alloc(None)], child_kind, 500);
+    let child =
+        CallFrame::new(vec![Instruction::Alloc(None)], child_kind, 500).with_readwrite(true);
     let mut vm = VM::new(dummy_header(), parent);
     let parent_saved = std::mem::replace(&mut vm.current_call, child);
     vm.call_stack.push(parent_saved);

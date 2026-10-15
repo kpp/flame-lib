@@ -73,7 +73,8 @@ fn phase19_op_fee_rejects_negative_qty() {
             program.into_instructions(),
             CallKind::ExternalRoot,
             1_000_000,
-        ),
+        )
+        .with_readwrite(true),
     );
     let mut prover = Prover::new(&pc_gens);
     vm.step_external(&mut prover).expect("push qty");
@@ -94,7 +95,8 @@ fn phase19_op_fee_rejects_qty_over_cap() {
             program.into_instructions(),
             CallKind::ExternalRoot,
             1_000_000,
-        ),
+        )
+        .with_readwrite(true),
     );
     let mut prover = Prover::new(&pc_gens);
     vm.step_external(&mut prover).expect("push qty");
@@ -123,7 +125,8 @@ fn phase19_op_fee_rejects_aggregate_over_cap() {
             program.into_instructions(),
             CallKind::ExternalRoot,
             1_000_000,
-        ),
+        )
+        .with_readwrite(true),
     );
     let mut prover = Prover::new(&pc_gens);
     // First fee — running total becomes half (2^23).

@@ -116,7 +116,8 @@ fn eq_external_cells_peek_compare_not_cs_lift() {
         .eq();
     let mut vm = VM::new(
         dummy_header(),
-        CallFrame::new(prog.into_instructions(), CallKind::ExternalRoot, 1_000_000),
+        CallFrame::new(prog.into_instructions(), CallKind::ExternalRoot, 1_000_000)
+            .with_readwrite(true),
     );
     let mut prover = Prover::new(&pc_gens);
     vm.step_external(&mut prover).expect("push a");

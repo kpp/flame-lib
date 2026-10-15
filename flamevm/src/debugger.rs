@@ -222,6 +222,7 @@ fn frame(
         kind: match &frame.kind {
             CallKind::ExternalRoot => "ExternalRoot",
             CallKind::InternalRoot { .. } => "InternalRoot",
+            CallKind::QueryRoot { .. } => "QueryRoot",
             CallKind::ContractOpen { .. } => "ContractOpen",
             CallKind::ActorCall { .. } => "ActorCall",
         },

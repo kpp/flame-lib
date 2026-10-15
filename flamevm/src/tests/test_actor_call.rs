@@ -30,6 +30,7 @@ fn vm_for_actor(actor: ActorID, script: Vec<u8>) -> VM {
             kind,
             1_000_000,
         )
+        .with_readwrite(true)
         .with_anchor(Anchor([0u8; 32])),
     )
 }
@@ -410,6 +411,7 @@ fn call_grant_exceeding_caller_budget_is_out_of_gas() {
             kind,
             100,
         )
+        .with_readwrite(true)
         .with_anchor(Anchor([0u8; 32])),
     );
     let err = loop {
@@ -471,7 +473,12 @@ fn cell_read_warmth_survives_call_exit_without_leaking_actor_storage() {
         };
         let child = ActorID::from(crate::code_cell(&child_code).unwrap().id());
         registry
-            .deploy(child, child_code, Value::Cell(private.clone().into()), 10_000)
+            .deploy(
+                child,
+                child_code,
+                Value::Cell(private.clone().into()),
+                10_000,
+            )
             .unwrap();
         let caller_code = call_script(&child, 10_000);
         let caller = deploy_recv(&mut registry, caller_code.clone(), 10_000);
