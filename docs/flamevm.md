@@ -583,18 +583,10 @@ Cell holding size metadata and leases; freezing retains the protocol Cell.
 
 - **data** — **any portable `Value`** (Scalar, Cell, Point, Token, Dict, …), encoded in the second child Cell. [`load`](#load) checks it out, [`save`](#save) moves it back; the author structures it however they like.
 
-The immutable ActorID is the constructor's factual CellID, encoded as raw
-32 bytes. The canonical destination throughout the VM is an ActorAddress Cell:
-
-```ctl
-type ActorID = [U8; 32];
-enum ActorAddress: U8 {
-    Init { ctor: ^Cell } = 0,
-    Address { addr: ActorID } = 1,
-    Restore { addr: ActorID, state: ^Cell } = 2,
-}
-struct ActorState { code: ^Cell, data: ^Cell }
-```
+The immutable ActorID is the constructor's factual CellID. The canonical
+destination throughout the VM is an ActorAddress Cell. Its schema, ActorID
+encoding and ActorState layout are defined in
+[Cell-based encoding](encoding.md#actor-addresses-state-and-messages).
 
 The Restore field is the combined ActorState image, not just its data Value.
 Human-readable ActorIDs and other address forms are in [address.md](address.md).
@@ -741,7 +733,8 @@ Not only users, but also actors can send async messages to each other. This allo
 
 Human-readable wallet/actor address formatting is specified in
 [address.md](address.md), using [Bech32f](bech32f.md). Key derivation is separate
-in [FlameKD](flamekd.md). VM routing uses the ActorAddress schema above;
+in [FlameKD](flamekd.md). VM routing uses the
+[ActorAddress schema](encoding.md#actor-addresses-state-and-messages);
 payment formatting does not add another instruction-level destination format.
 
 ## Single-Value ABI compatibility
