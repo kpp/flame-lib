@@ -1,8 +1,11 @@
 # FlameVM
 
-This is the canonical design and specification of FlameVM. Explanatory sections
-give rationale; exact encodings, stack diagrams, and statements using **must** or
-**must not** define consensus behavior.
+This is the canonical design and execution specification of FlameVM, including
+value capabilities, instruction semantics and gas. Stack diagrams and statements
+using **must** or **must not** define consensus behavior. Application data layouts
+are specified in [encoding.md](encoding.md); Cell records, hashing and transport
+in [cells.md](cells.md); persistent storage policy in [storage.md](storage.md);
+and block validation and admission limits in [blockchain.md](blockchain.md).
 
 ## Introduction
 
@@ -58,9 +61,8 @@ interactions and may be saved afterward; it cannot become stale through
 re-entrancy. The VM does not interpret actor policy, so the actor must still
 account for a callee's status and effects when deciding what state to save.
 
-Persistent actor storage is purchased in one-year leases by the actor itself.
-Purchases burn Flame at a deterministic reserve price; storage is neither a
-token nor transferable between actors. See [Actor storage](storage.md).
+The actor buys its own persistent storage under the
+[Actor storage](storage.md) rules.
 
 Execution memory is independent of persistent actor storage. There is no
 separate memory-limit operand or storage-derived RAM allowance. Variable-size
@@ -71,13 +73,9 @@ EOF checks, and forward label scans consume gas. Synchronous calls return
 unused gas on success or failure; consumed work is never refunded.
 
 External transaction effects are atomic and independently verifiable. Internal
-transactions execute serially because they share actor state. Expired leases
-return to the byte pool; an actor is destroyed when an expiry leaves it with
-less capacity than its occupied storage.
-
-All Flame-defined multi-byte integers are little-endian. Decoders reject
-alternate-width integers, unordered or duplicate dictionary keys, excessive
-nesting, unknown tags, and trailing data where a complete value is required.
+transactions execute serially because they share actor state. Lease expiry
+follows [storage freezing policy](storage.md#global-state-and-block-order), not
+implicit destruction of linear values.
 
 
 ## External transactions
@@ -95,7 +93,10 @@ External transactions produce the following effects:
 5. Issuance and retirement — creation and removal of tokens to/from circulation.
 6. Data entry — for data logging that does not occupy permanent storage.
 
-External TxID is the factual CellID of TxBody: header, program, and a mask-one pruned TxLog reference. Program subcells carry all supplied execution witnesses. The VM recomputes the log and checks its level-zero hash and depth. The Tx root carries the 64-byte signature and U16-length inline R1CS proof; its factual ID is WitnessID. Transaction signatures and ZK proofs bind TxID, covering the code, data availability, and declared effects. An all-zero signature field denotes absent authorization. See [encoding](encoding.md#transactions-and-execution-witnesses).
+Transaction signatures and ZK proofs bind TxID, covering the code, data
+availability and declared effects. The VM recomputes the log and checks its
+claimed commitment. The envelope, log commitment, and TxID/WitnessID/EffectID
+definitions are specified in [encoding](encoding.md#transactions-and-execution-witnesses).
 
 ## Internal transactions
 
@@ -123,15 +124,16 @@ linear contents. Actor identity and lease metadata survive. A later explicit
 implicitly persist it. Explicit dismantling can still emit `ActorDestroy`. See
 [Actor storage](storage.md#global-state-and-block-order).
 
-Each external transaction immediately drains its FIFO message descendants
-before the next external transaction, with the same immutable execution witness hierarchy.
-Witness bodies from another external transaction are never added to that bag.
+The state machine schedules messages under
+[Derived internal transactions](blockchain.md#derived-internal-transactions).
+Their execution uses the initiating transaction's
+[scoped witness context](cells.md#resolution-and-witness-context).
 
 Calls themselves are intra-transaction control flow, not effects. Anything a callee does that the outer world cares about appears through one of the effects above.
 
-Canonical internal log shapes are enforced by the state machine. Success is `Header, Receive, effects...`; `ActorDeploy` and `ActorRestore` appear when address resolution performs them, including synchronous callees. Any `ActorDestroy` entries form a suffix. Failed delivery is exactly `Header, Receive, Output(refund)`. Lease expiry freezes the actor image without emitting retirement/destruction effects. External logs start with `Header` and cannot contain internal-only actor effects.
-
-**TxLog transport.** Effects are **re-derived by re-executing** the bytecode under the proof/signature binding; a supplied log does not authorize effects. External TxBody carries only its canonical 36-byte pruning record. `TxEntry` and `TxLog` implement `CellEncode` and `CellDecode` for archival and light-client transport. The log envelope holds a u64-LE count and a Trie of consecutive u64 big-endian indices, whose leaves reference tagged TxEntry Cells (tags 0–15). Blob fields use dedicated zero-ref Cells with at most 4095 raw payload bytes and no length prefix; typed fields use their expected Cell layouts. `TxLog::effect_id()` returns its level-zero hash, not the external TxID. See [Data encoding](encoding.md#txlog).
+The state machine enforces [canonical log shapes](blockchain.md#derived-internal-transactions).
+Effects are re-derived by execution; a supplied log does not authorize effects.
+The archival log and entry layouts are specified in [Data encoding](encoding.md#txlog).
 
 Internal transactions do not pay transaction-prioritization fees. Actors may
 nevertheless burn Flame for storage through `addstorage`. Internal transactions
@@ -145,17 +147,9 @@ one external transaction. It includes gas permanently reserved by direct
 `send` effects. The VM hard-fails before actual use can exceed the declaration,
 and the network envelope caps the declaration itself.
 
-**Gas credit:** for one verified external transaction:
-
-```text
-direct_send_gas = sum(gas grant of each Send in the derived TxLog)
-gas_credit      = gas_used - direct_send_gas
-```
-
-`gas_credit` is the actual external execution work. It has a per-transaction
-limit and contributes to the block's external-gas total. Direct send grants
-contribute instead to the block's internal-gas total. Nested sends are not
-counted again: they partition gas already granted to their ancestor message.
+**Gas credit:** [Consensus resource accounting](blockchain.md#consensus-limits)
+separates actual external work from direct send grants and defines their
+per-transaction and block bounds.
 
 **Script size limit:** currently counts the external root code Cell's payload, both
 per transaction and across a block. Dynamically loaded actor code is persistent
@@ -169,16 +163,15 @@ Bulletproofs multiplication gates in the final constraint system, including
 randomized constraints and excluding failed-child work rolled back at a call
 boundary. It is limited per transaction and in aggregate per block.
 
-**Issued storage:** `StorageParams.issued_units_per_block` adds exactly that
-many units to the global pool at each core block. Storage purchases do not
-issue bytes; they move already-issued units from the pool into actor leases.
-The storage supply invariant checks initial plus per-block issuance against the
-pool and all live leases.
+Network resource ceilings and aggregate accounting are specified in
+[Consensus limits](blockchain.md#consensus-limits). Storage issuance and its
+supply invariant belong to [Actor storage](storage.md#global-state-and-block-order).
 
 ## Fees
 
-Transaction fees are paid by external transactions and are necessary to prioritize common resources on the open network and mitigate denial-of-service attacks. As blockchain imposes limits on storage and computation costs, transactions paying higher fees (per resource used) are prioritised over transactions paying lower fees.
-BFT consensus implies that the block candidate is progressively built and already included transactions are not pruned by higher-paying ones.
+External transactions pay fees to prioritize common resources and mitigate
+denial-of-service attacks. Transaction-selection policy is specified in
+[Consensus ordering](consensus.md#ordering), separately from VM validity.
 
 Transaction fees are paid in Flame and cover computation for the external
 transaction and subsequent calls within internal transactions. Actor storage is paid separately by burning
@@ -195,8 +188,7 @@ Every `call`, `open`, and `signcall` has an explicit gas operand. There is no
 implicit default grant; a caller that wants to delegate its remaining budget
 must read `gas` and pass the desired amount explicitly.
 
-One Flame equals `100_000_000` sparks. Native token quantities and fees are
-integral sparks. 
+Native token units and flavor are defined under [Tokens](#tokens).
 
 Storage-purchase pricing and issuance are specified in
 [Actor storage](storage.md).
@@ -263,20 +255,9 @@ inline variant (`Token`), while `WideToken` is 40 bytes. Rust layout and byte
 counts are implementation details; the canonical wire representation is
 unchanged.
 
-Implemented generic `Value` Cell encodings:
-
-| Type | Tag | Representation after the tag |
-| --- | ---: | --- |
-| Scalar | 0 | canonical 32-byte LE residue |
-| Dict | 2 | one reference to count/flags/Trie envelope |
-| Point | 3 | compressed Ristretto:32 |
-| Token | 4 | qty commitment:32, flavor commitment:32 |
-| ClearToken | 6 | qty Scalar:32, flavor Scalar:32 |
-| Cell | 13 | one raw serialized Cell reference |
-
-Other Value tags are rejected, including reserved tag 1 (the removed String
-variant). Existing tags are not renumbered. An expected concrete type does not repeat a tag.
-See [Data encoding](encoding.md) for the complete Cell layouts.
+Generic Value tags and layouts are defined only in
+[Values and Contracts](encoding.md#values-and-contracts). Encoding does not
+change the capabilities in the table above.
 
 Stack-only types (non-portable and without an implemented `Value` encoding):
 
@@ -294,16 +275,9 @@ Stack-only types (non-portable and without an implemented `Value` encoding):
 
 ### Encoding
 
-FlameVM values use `CellEncode` / `CellDecode`, not the flat Reader/Writer
-layer. Cell IDs commit payload and ordered child IDs, independently of
-residency. Expected types have no schema/version prefixes. Byte data occupies
-ordinary Cell payloads; byte-only operands require zero references. Dict uses one fixed-width Trie format for all
-key patterns, with big-endian Scalar paths preserving numeric order.
-
-The encoder does not impose portability. Negative ClearTokens and Dicts with
-encodable non-portable members may be encoded. Business-logic admission into
-Contracts, actor state, messages, and downward calls checks portability.
-Unsupported computation-only variants have no Value encoding.
+FlameVM uses the expected-type [Cell encodings](encoding.md), independently of
+the [portability admission rules](#types). Byte-only instruction operands
+require zero references; they do not flatten Cell graphs.
 
 Typed imports reject malformed tags, noncanonical Scalar residues, invalid
 counts/flags/paths, trailing payload, and trailing references. Generic imports
@@ -312,11 +286,8 @@ Contract/Actor reads can retain pruned Dict branches and trust previously
 admitted count/capability summaries; a requested missing branch is an error,
 not an absent key.
 
-The VM resolves resident references first, then the current actor's explicitly
-retained code/state bodies, then the initiating transaction's immutable Cell hierarchy.
-Actor-layout and lease metadata are included in registry storage exports, not
-in the `actor_cells` execution fallback. No other actor or global cache supplies
-implicit witnesses.
+Body lookup and cross-domain access follow
+[Resolution and witness context](cells.md#resolution-and-witness-context).
 
 Group-element validation remains lazy: decoding a Point or Token preserves its
 32-byte compressed representation without decompression. Cryptographic use
@@ -329,10 +300,8 @@ their offset sub-varint encoding. These instruction bytes are carried inside
 raw executable Cell payloads, without a length prefix. Each frame consumes
 bytes and literal references independently; `exec` changes the current Cell.
 
-Utreexo is outside this migration: its accumulator, paths, hashing, and legacy
-`merkle`/`readerwriter` codecs remain unchanged. Outer block transport merely
-stores the existing Utreexo `Proof` bytes as raw payloads in dedicated
-zero-ref Cells, without an additional length prefix.
+Utreexo ownership checks and its independent proof format are specified in
+[Contracts and Utreexo](blockchain.md#contracts-and-utreexo).
 
 Canonical `pushint` opcode width boundaries:
 
@@ -362,9 +331,10 @@ Canonical `pushint` opcode width boundaries:
 ### Scalar values
 
 Flame scalars are elements of the field modulo the Ristretto255 group order
-`ℓ = 2^252 + 27742317777372353535851937790883648493`. Their canonical
-representation is the unsigned residue in `[0, ℓ)`, stored as 32 little-endian
-bytes. There is no stored sign. Addition, multiplication, and negation are
+`ℓ = 2^252 + 27742317777372353535851937790883648493`. A value is the unsigned
+residue in `[0, ℓ)`; its wire representation is specified in
+[encoding](encoding.md#primitives-and-containers). There is no stored sign.
+Addition, multiplication, and negation are
 ordinary field operations modulo ℓ; equality compares canonical residues.
 
 `abs` and `divmod` interpret a residue `r` through its centered lift:
@@ -387,14 +357,12 @@ bytecode must be regenerated or explicitly migrated before using this format.
 
 An immutable Cell handle, represented by `CellValue`. Its `CellRef` identifies
 the public graph and may be resident or unloaded; the handle can also point to
-an explicit pruning record. Ordinary Cells contain 0..4095 payload bytes and
-0..4 ordered child references. The descriptor supplies the payload length,
-without a separate byte-string prefix. Byte-only operations require zero refs;
-they do not flatten graphs. Reads use Slice and writes use Builder.
+an explicit pruning record. The [Cell model](cells.md#cell-model) defines its
+contents, limits and commitments. Reads use Slice and writes use Builder.
 
 There is no separate VM String type. Bounded data, signatures and hashes use
-Cell payloads. Blob fields use one zero-ref Cell, at most 4095 bytes, with
-no length prefix. Applications define layouts for larger pure-data transfers;
+Cell payloads. Blob fields follow [the byte-blob layout](encoding.md#primitives-and-containers).
+Applications define layouts for larger pure-data transfers;
 programs use explicit `pushcell exec` continuation. `CellValue::from_bytes` and
 `CellValue::script` are fallible, enforcing the single-payload capacity; fixed
 32-byte Point, Scalar and Contract-ID constructors are bounded by construction.
@@ -525,12 +493,10 @@ runtime bound is distinct from the unchanged typed encoding-depth bound of 128.
 
 The `dict` / `put` / `replace` opcodes may insert any Value. A non-portable Dict remains usable on the stack, but `contract`, `output`, `send`, `call`, `open`, `signcall`, and actor-state storage reject it at their portability boundary. Checking a Dict is O(1), including when it is nested: inserting a nested Dict reads that Dict's already-cached flag. Dict values are owned and cannot be mutated through an alias, so the cached parent flag cannot become stale.
 
-The Cell envelope serializes count:u64 LE and flags:u8 (portable bit 0,
-droppable bit 1), followed by a Trie reference unless empty. Sticky flags
-survive encode/decode, including on an empty Dict; emptiness still permits
-dropping it. Generic imports validate the count, paths, and all members against
-claimed capabilities. Previously authenticated storage can preserve pruned
-branches and use the committed summaries without loading every member.
+The [Dict encoding](encoding.md#values-and-contracts) preserves sticky flags,
+including on an empty Dict. Generic imports validate count, paths and members
+against claimed capabilities. Previously authenticated storage can preserve
+pruned branches and use committed summaries without loading every member.
 
 Drilling down the nested dict preserving ownership with `get` and `put` instructions: 
 
@@ -841,11 +807,11 @@ These context markers do not grant write permission. The restrictions in
 | 46 | [appendbytes](#appendbytes) | | s b → s' b' | Append all unread bytes; preserve unread refs. |
 | 47 | [writezeros](#writezeros) | | b n → b' | Append `n` zero bytes to a Builder; preserve refs. |
 | 48 | [bitnot](#bitnot) | | b → b' | Invert Builder payload bytes in place; preserve refs. |
-| 49 | [bitor](#bitor) | | b s → b' | OR Builder bytes with Cell/Slice payload bytes of equal length. |
-| 4a | [bitand](#bitand) | | b s → b' | AND Builder bytes with Cell/Slice payload bytes of equal length. |
-| 4b | [bitxor](#bitxor) | | b s → b' | XOR Builder bytes with Cell/Slice payload bytes of equal length. |
-| 4c | [shiftleft](#shiftleft) | | b n → b' | Shift Builder payload bits left in place, discarding displaced bits. |
-| 4d | [shiftright](#shiftright) | | b n → b' | Shift Builder payload bits right in place, discarding displaced bits. |
+| 49 | [bitor](#bitor--bitand--bitxor) | | b s → b' | OR Builder bytes with Cell/Slice payload bytes of equal length. |
+| 4a | [bitand](#bitor--bitand--bitxor) | | b s → b' | AND Builder bytes with Cell/Slice payload bytes of equal length. |
+| 4b | [bitxor](#bitor--bitand--bitxor) | | b s → b' | XOR Builder bytes with Cell/Slice payload bytes of equal length. |
+| 4c | [shiftleft](#shiftleft--shiftright) | | b n → b' | Shift Builder payload bits left in place, discarding displaced bits. |
+| 4d | [shiftright](#shiftleft--shiftright) | | b n → b' | Shift Builder payload bits right in place, discarding displaced bits. |
 | 4e | [appendrefs](#appendrefs) | | s b → s' b' | Append all unread refs without loading children; preserve unread bytes. |
 | 4f | [builder](#builder) | | ø → b | Create an empty Builder. |
 |    | **Math & logic**  | | | |
@@ -880,10 +846,10 @@ These context markers do not grant write permission. The restrictions in
 | 80 | [transcript](#transcript) | | label → merlin | Open a new Merlin transcript seeded with `label`. |
 | 81 | [twrite](#twrite) | | m label bytes → m | Absorb zero-ref byte payloads into a transcript. |
 | 82 | [tread](#tread) | | m label b n → m b' | Append `n` challenge bytes directly into the Builder. |
-| 83 | [sha256](#sha256) | | s b → b' | Append a 32-byte SHA-256 payload digest into the provided Builder. |
-| 84 | [sha512](#sha512) | | s b → b' | Append a 64-byte SHA-512 payload digest into the provided Builder. |
-| 85 | [sha3](#sha3) | | s b → b' | Append a 32-byte SHA3-256 payload digest into the provided Builder. |
-| 86 | [keccak256](#keccak256) | | s b → b' | Append a 32-byte Keccak-256 payload digest into the provided Builder. |
+| 83 | [sha256](#sha256--sha512--sha3--keccak256) | | s b → b' | Append a 32-byte SHA-256 payload digest into the provided Builder. |
+| 84 | [sha512](#sha256--sha512--sha3--keccak256) | | s b → b' | Append a 64-byte SHA-512 payload digest into the provided Builder. |
+| 85 | [sha3](#sha256--sha512--sha3--keccak256) | | s b → b' | Append a 32-byte SHA3-256 payload digest into the provided Builder. |
+| 86 | [keccak256](#sha256--sha512--sha3--keccak256) | | s b → b' | Append a 32-byte Keccak-256 payload digest into the provided Builder. |
 | 87 | [log](#log) | | bytes → ø | Emit a zero-ref Cell/Slice/Builder payload as a transaction-log data entry. |
 | 88 | [cellhash](#cellhash) | | c level b → b' | Append the cached Cell hash at an explicit level; no body read. |
 | 89 | [evalpoint](#evalpoint) | | msm → point | Compute public group arithmetic immediately, at 4× its batched-verification gas price. |
@@ -1116,8 +1082,8 @@ droppable plain serialization data, not authority to instantiate bearer assets.
 
 ø → _b_
 
-Creates an empty Builder. Payload capacity is 4095 bytes and reference capacity
-is four. Ordinary writes never spill or implicitly descend into another Cell.
+Creates an empty Builder with the [Cell capacity](cells.md#limits).
+Ordinary writes never spill or implicitly descend into another Cell.
 
 ### slice
 
@@ -2257,7 +2223,7 @@ CellID; old source-byte signatures are not accepted. `CellWitness::Script` and
 host `push_script` retain private native instruction overlays only after their
 compiled graph matches that ID. Continuations and child programs execute via
 the ordinary Cell frame machinery; private overlays do not supply missing
-public bodies. Actor addressing is unchanged and will be designed separately.
+public bodies. Actor routing is specified under [Actors](#actors).
 
 ### timelock
 
@@ -2418,12 +2384,8 @@ Pushes the current call's total gas budget cap (the value set at frame creation,
 _h_ → _n_
 
 Pops a nonnegative current or future core-block height and pushes the current
-actor's leased capacity in bytes at that height:
-
-```text
-capacity(h) = STORAGE_UNIT_BYTES
-            * sum(lease.units where lease.expiry_height > h)
-```
+actor's leased capacity in bytes at that height, calculated by
+[Actor usage and capacity](storage.md#actor-usage-and-capacity).
 
 The query is read-only and does not expose the lease list. A canonical residue
 outside the `u64` height range hard-fails `InvalidBitrange`; a height below the current

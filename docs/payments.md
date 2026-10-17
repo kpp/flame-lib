@@ -15,9 +15,8 @@ Implemented. `flamepayments` sends and receives: `build_transfer` seals a
 note for every output it creates, and `open_note` opens one. `flamed` keeps
 the note that follows each output and returns it from `scan`.
 
-The protocol follows the requirements `flamekd.md` sets for token encryption;
-[Compliance with flamekd](#compliance-with-flamekd) maps each of them to the
-section that meets it.
+The protocol uses [FlameKD keys](flamekd.md#key-types-and-capabilities);
+this document owns the payment-specific cryptography and validation rules.
 
 ## Scope and trust boundary
 
@@ -26,9 +25,7 @@ it is consensus. The chain validates a payment like any other transaction:
 its script, its `mix` range proofs, and its signature. To the chain a note is
 an ordinary `Data` entry, and no validator parses, checks, or decrypts one. A
 note that is malformed, or that misstates its output, is valid on chain; only
-its recipient can tell ([Receiving](#receiving)). That is why this document
-uses the uppercase keywords of `flamekd.md`: `flamevm.md` reserves bold
-**must** for consensus behavior, and this document states none.
+its recipient can tell ([Receiving](#receiving)).
 
 | Party | Holds | Does |
 | --- | --- | --- |
@@ -43,32 +40,29 @@ writer knew `V`, and anyone given the address knows `V`.
 
 ## Notation
 
-This document uses the notation and the transcript conventions of
-[`flamekd.md`](flamekd.md#transcript-conventions): `G` is the
-ristretto255 generator, `x*P` is scalar multiplication, `enc(x)` and `enc(P)`
-are the canonical 32-byte encodings of a scalar and a compressed point, `++`
-is concatenation, and `Transcript(domain)`, `P.append(label, bytes)` and
-`P.challenge_scalar(label)` are the Merlin operations defined there.
-`P.challenge_bytes(label, n)` is Merlin's `challenge_bytes` asked for exactly
-`n` bytes. Merlin binds the requested length into its output, so a longer
-challenge cut down to `n` bytes is a different value.
+Group notation, `G` and `enc` follow
+[FlameKD's representations](flamekd.md#group-and-representations);
+`Transcript`, `append`, `challenge_scalar` and `challenge_bytes` follow its
+[transcript conventions](flamekd.md#transcript-conventions).
+`++` denotes byte concatenation.
 
-`LE64(q)` is the 8-byte little-endian encoding of an unsigned 64-bit integer.
+`LE64(q)` applies the [U64 encoding](encoding.md#primitives-and-containers)
+to quantity `q`.
 
-An address in this document is always a `flamekd.md` address: a Receiving
-Address `(S, V)` or a Tracking address `(S)`. It is never the FlameVM
+Payment address tuples are defined in [FlameKD](flamekd.md#key-types-and-capabilities)
+and their human-readable forms in [Address formats](address.md#keys-and-payment-addresses).
+An address here is never the FlameVM
 `Address` type ([`flamevm.md`](flamevm.md#addresses)), which names a send
 target, a predicate or an actor message.
 
 `Com(x, b) = x*G + b*B̃` is a Pedersen commitment over flamevm's generators,
 `PedersenGens::default()` from `bulletproofs`: its base point is `G`, and
-`B̃` is its blinding generator. A confidential `Token` holds two of them, one
-to the quantity and one to the flavor.
+`B̃` is its blinding generator. The Token layout is defined in
+[Cell-based encoding](encoding.md#values-and-contracts).
 
 ## Overview
 
-A Receiving Address is two public keys, `(S, V)`
-([`flamekd.md`](flamekd.md#key-types-and-capabilities)). `S` locks
+For a [Receiving Address](flamekd.md#key-types-and-capabilities), `S` locks
 the payment: it becomes the output's predicate, and only its secret `s` can
 authorize a spend. `V` encrypts the payment: the sender runs a
 Diffie-Hellman exchange against it, and only its secret `v` recovers the
@@ -108,9 +102,8 @@ and a wallet can ask for its own. The cost is linkability: two payments to
 one address show the same predicate, although their amounts stay hidden.
 Wallets SHOULD hand out a fresh address for each payment.
 
-A Tracking address carries only `S`. With no `V` there is nothing to encrypt
-to, so it can receive only clear tokens, which carry no note and are outside
-this document.
+[Tracking Addresses](flamekd.md#key-types-and-capabilities) and clear-token
+payments carry no note and are outside this document.
 
 ## Sender randomness
 
@@ -136,8 +129,8 @@ X = r*V      (sender)
 X = v*R      (recipient)
 ```
 
-`V` comes from an address decoded as `flamekd.md` requires, so it is valid
-and not the identity. The recipient MUST decode `R` with Ristretto decoding
+`V` must satisfy [FlameKD's key validation](flamekd.md#group-and-representations).
+The recipient MUST decode `R` with Ristretto decoding
 and MUST reject an encoding that is invalid or decodes to the identity. With
 `v` nonzero and a prime-order group, `X` is then never the identity.
 
@@ -187,12 +180,10 @@ C_qty = Com(qty, qty_blinding)
 C_flv = Com(flv, flv_blinding)
 ```
 
-`C_qty` and `C_flv` are the two halves of the output's `Token`. In
-`flamevm` they are `Commitment::blinded_with_factor(qty, qty_blinding)` and
-`Commitment::blinded_with_factor(flv, flv_blinding)`. `qty` is a count of
-the token's smallest unit, sparks for native Flame, and the native flavor is
-`FLAME_FLAVOR = 1`
-([`flamevm.md`](flamevm.md#tokens)).
+These points fill the output's [Token fields](encoding.md#values-and-contracts).
+In `flamevm` they are `Commitment::blinded_with_factor(qty, qty_blinding)` and
+`Commitment::blinded_with_factor(flv, flv_blinding)`. Native-token flavor and
+quantity units are defined in [Tokens](flamevm.md#tokens).
 
 ## The note
 
@@ -224,29 +215,20 @@ The note is:
 | 89 | N | memo | encrypted |
 
 A note is `89 + N` bytes, and the memo's length is public: `N` is the note's
-length minus 89. The memo MUST be at most 4006 bytes (4095 minus 89). The note
-travels as a single zero-ref VM Cell, bounded by `cells::MAX_CELL_PAYLOAD`
-(4095 bytes), with no additional length prefix.
+length minus 89. The memo MUST be at most 4006 bytes, so the note fits the
+[TxLog Data blob](encoding.md#txlog) without additional framing.
 
 ## Building the transaction
 
-The script extends the transfer in
-[`flamepayments.md`](../flamepayments/flamepayments.md#a-transfer) by one
-`pushcell` and one `log` after each `output`:
+After each confidential `output`, append its note with:
 
 ```text
-per input:    push_literal(CellValue::contract(c))  input  signtx
-fee > 0:      push_int(fee)  fee
-per output:   push_literal(CellValue::commitment(commitment(qty, qty_blinding)))
-              push_literal(CellValue::commitment(commitment(flv, flv_blinding)))
-              push_int(m)  push_int(n)  mix
-per output i: roll_k(n-1-i) if > 0
-              push_point(enc(S_i))  output
-              pushcell(note_i)  log
+pushcell(note_i)  log
 ```
 
-`pushcell(note) log` leaves the stack as it found it, so the roll depths
-before each `output` are unchanged.
+This leaves the stack as it found it. The complete transfer-building example
+is in the [flamepayments crate guide](../flamepayments/flamepayments.md#a-transfer);
+opcode semantics are specified in [FlameVM](flamevm.md#instruction-set).
 
 ### Pairing
 
@@ -272,15 +254,11 @@ relies on an output's position.
 
 ### On the wire
 
-An `ExternalTx` carries a pruned `TxLog`
-([`encoding.md`](encoding.md#transactions-and-execution-witnesses)). The note
-travels once, as the `pushcell` literal in the script, and its `Data` entry
-is derived again when a verifier executes the script. The TxID covers the
-`Data` entry, so the `signtx` signature covers the note: nobody but the
-signer can alter it. `log` charges gas for every byte it writes: a note is
-byte-sized growth, which the "Execution memory" rule under
-[Storage](flamevm.md#storage) charges before allocation (`op_log` in
-`flamevm/src/vm.rs`).
+The transaction layout and IDs are specified in
+[Cell-based encoding](encoding.md#transactions-and-execution-witnesses).
+The note travels as a program Cell and becomes a `Data` entry on execution.
+Both are committed by the signed transaction, so nobody but the signer can
+alter it. Logging is charged under [FlameVM's log rules](flamevm.md#log).
 
 ## Receiving
 
@@ -332,15 +310,9 @@ input is derived from the seed or was published. A wallet restored from its
 seed re-derives its addresses, asks a node for their outputs, and recovers
 every opening and memo. Two things bound that promise.
 
-**History.** Outputs and their notes live in transaction logs, and a
-validating node does not keep them. A `Data` entry is logging that "does not
-occupy permanent storage"
-([`flamevm.md`](flamevm.md#external-transactions)), and a validating node
-keeps the contract accumulator, not history
-([`blockchain.md`](blockchain.md#contracts-and-utreexo)). Restoring needs an
-archival source, a node that keeps the blocks or the full logs, as `flamed`
-does. That source must keep, for every unspent output, the note that follows
-it ([The node](#the-node)).
+**History.** Restoring needs an archival source that retains outputs and their
+notes ([The node](#the-node)). Consensus validation alone does not require
+retaining this history; see [Contracts and Utreexo](blockchain.md#contracts-and-utreexo).
 
 **Lookahead.** A wallet finds only outputs to the addresses it derives. How
 far past its last used index a wallet looks is outside this specification,
@@ -358,14 +330,15 @@ path described in
    `Contract::new(opaque(S_n), anchor, …)`. Its id MUST equal the published
    id.
 2. Push it with `push_literal(CellValue::contract(c))`, then `input` and `signtx`.
-   The bytecode holds only the 32-byte contract id; the contract's public
-   body goes into the transaction's witness bag, where its token is two
-   points again; the openings stay with the prover.
+   Public cells and private annotations follow the VM's
+   [Cell witness rules](flamevm.md#cell) and
+   [transaction encoding](encoding.md#transactions-and-execution-witnesses);
+   openings stay with the prover.
 3. Authorize with `s_n`, the spending scalar of the address, through the
    transaction's `signtx` aggregate signature.
 
-On chain the spend is `TxEntry::Input(ContractID)`, and the input's Utreexo
-membership proof travels in `BlockTx.proofs`. A spender MUST NOT open the
+Input and membership-proof fields are defined in
+[Cell-based encoding](encoding.md#blocks-and-utreexo). A spender MUST NOT open the
 token with `decrypt`, which takes the quantity and both blinding factors as
 script literals that every verifier re-executes.
 
@@ -418,8 +391,8 @@ A sender or a recipient can show a third party what one output holds.
 | `X` | 32 bytes | Everything above. | Every output whose `r` was reused or related, and anything else ever derived from this exchange. A recipient that computes `v*R` on request for any `R` offered to it also answers Diffie-Hellman queries on `v`. |
 
 To prove an amount, disclose the opening; add `siv_key` only when the memo
-is part of what is being proved. Never disclose `X`, as `flamekd.md`
-requires. None of these values allows spending, which needs `s_n`.
+is part of what is being proved. Disclosure interfaces MUST NOT return `v` or
+`X`. None of the permitted disclosure values allows spending, which needs `s_n`.
 
 A sender that may need to prove a payment later must keep what it will
 disclose. It cannot recompute any of it: `r` was random, and `X` needs `v`.
@@ -437,22 +410,10 @@ it does not know keeps the output as **unknown version**.
 
 ## Compliance with flamekd
 
-`flamekd.md` leaves token encryption to another specification and sets its
-requirements in
-[Compromise boundaries](flamekd.md#compromise-boundaries):
-
-> An encryption protocol SHOULD use fresh sender randomness per output,
-> validated group inputs, and a domain-separated KDF bound to the output and
-> recipient […] For selective disclosure, share the final key for the
-> selected encrypted output, not a viewing scalar or the raw DH point.
-
-| flamekd requirement | Met in | How |
-| --- | --- | --- |
-| Fresh sender randomness per output | [Sender randomness](#sender-randomness) | `r` MUST be uniform, nonzero, and fresh for every output, never reused or related to another `r`. |
-| Validated group inputs | [The shared secret](#the-shared-secret) | `V` comes from a decoded address; the recipient rejects an `R` that is invalid or the identity. |
-| A domain-separated KDF | [Derivations](#derivations) | Two transcripts with distinct labels, one for the blinding factors and one for the note key. |
-| Bound to the output and recipient | [Derivations](#derivations) | Both transcripts append `R`, `S`, and `V` before `X`. |
-| Disclose the final key, not a viewing scalar or the raw DH point | [Disclosure](#disclosure) | The opening, or `siv_key`; never `v` or `X`. |
+Key derivation and its compromise boundaries are specified in
+[FlameKD](flamekd.md#compromise-boundaries). Payment-specific requirements live
+in [Sender randomness](#sender-randomness), [The shared secret](#the-shared-secret),
+[Derivations](#derivations) and [Disclosure](#disclosure).
 
 The binding follows
 [HPKE](https://www.rfc-editor.org/rfc/rfc9180.html#section-4.1), whose
@@ -462,7 +423,7 @@ group has prime order and one encoding per point, so `v*R' = v*R` only when
 `R' = R`. It is kept because it makes the construction the one HPKE's
 analysis covers, and because it keeps keys distinct if a later version
 shares one `R` across outputs or one `V` across predicates. It does not
-replace the other rows: an `r` reused toward one address repeats `R`, `S`,
+replace the other requirements: an `r` reused toward one address repeats `R`, `S`,
 and `V` along with `X`.
 
 An implementation shows compliance with four checks: two outputs to one
