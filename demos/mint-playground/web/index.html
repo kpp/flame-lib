@@ -26,8 +26,8 @@
       <div class="section-heading"><h2 id="chart-title">Burn rate and mining fees</h2></div>
       <div class="chart-legend"><span><i class="swatch other"></i><span id="others-label">Burn ↑</span></span><span id="own-legend" hidden><i id="own-swatch" class="swatch own"></i>You</span><span id="draft-legend" hidden><i id="draft-swatch" class="swatch draft"></i>Draft</span><span id="fees-legend"><i class="swatch fees"></i>Mining fees ↓</span></div>
       <div class="chart-units"><span>sat/block</span><span>sat/FLM</span></div>
-      <div id="chart-wrap" class="canvas-wrap with-fees"><canvas id="chart" role="img" aria-label="Burn above zero and mining fees below zero share a satoshis-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous and next 500 blocks."></canvas></div>
-      <div class="chart-footer"><span>Block <strong id="current-block">—</strong> · ±500 blocks</span><span>Future: submitted schedules</span></div>
+      <div id="chart-wrap" class="canvas-wrap with-fees"><canvas id="chart" role="img" aria-label="Burn above zero and mining fees below zero share a satoshis-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous 1,000 blocks; now is at the right edge."></canvas></div>
+      <div class="chart-footer"><span>Block <strong id="current-block">—</strong> · <span id="chart-window">Previous 1,000 blocks</span></span><span id="chart-note">History only</span></div>
     </section>
 
     <section id="mint-form" class="panel mint-panel" hidden aria-labelledby="mint-title">
@@ -48,7 +48,7 @@
         <div class="projection">
           <h3>Estimate</h3>
           <dl><div><dt>Reward (FLM)</dt><dd id="projected-reward">—</dd></div><div><dt>Fees</dt><dd id="projected-fees">—</dd></div><div><dt>Burn</dt><dd id="projected-burn">—</dd></div><div><dt>sat/FLM, incl. fees</dt><dd id="projected-rate">—</dd></div></dl>
-          <p class="muted small">Assumes no new contributions. Starts next block.</p>
+          <p class="muted small">Others stay at current burn rate. Your schedules stay exact. Starts next block.</p>
         </div>
       </div>
       <div class="wallet"><h3>Reward address (testnet)</h3><p id="wallet-status" class="muted small">Loading wallet…</p><code id="wallet-address">—</code><details id="seed-details"><summary>Recovery phrase</summary><p class="muted small">Demo only. Anyone with this phrase controls the wallet. Stored in this browser.</p><p id="seed-phrase" class="seed-phrase"></p></details><button id="retry-wallet" type="button" hidden>Retry wallet</button> <button id="reset-wallet" type="button" hidden>Reset wallet</button></div>

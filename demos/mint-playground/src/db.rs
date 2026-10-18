@@ -339,11 +339,11 @@ impl Database {
                  COALESCE(SUM(a.reward_sparks), 0), c.user_id
              FROM contributions c JOIN accounts u ON u.id = c.user_id
              LEFT JOIN accruals a ON a.contribution_id = c.id
-             WHERE ?1 OR c.start_block + c.duration - 1 >= ?2
+             WHERE ?1 OR (c.start_block <= ?2 AND c.start_block + c.duration - 1 >= ?3)
              GROUP BY c.id ORDER BY c.id DESC",
         )?;
         let contributions = statement
-            .query_map(params![full_history, height - 10_000], |row| {
+            .query_map(params![full_history, height, height - 10_000], |row| {
                 Ok(Contribution {
                     id: row.get(0)?,
                     user_id: row.get(8)?,
@@ -450,7 +450,7 @@ mod tests {
             assert!(matches!(db.submit(invalid), Err(Error::Invalid(_))));
         }
         db.submit(valid).unwrap();
-        assert_eq!(db.snapshot(false).unwrap().contributions.len(), 1);
+        assert_eq!(db.snapshot(true).unwrap().contributions.len(), 1);
         assert!(serde_json::from_str::<ContributionRequest>(
             r#"{"address":"a","budget_sats":2000,"duration":100,"request_id":"abcdefghijklmnop","seed":"secret"}"#
         ).is_err());
@@ -497,7 +497,7 @@ mod tests {
         let third = db.submit(request(2, 3, 100)).unwrap();
         assert_eq!((third.id, third.user_id), (3, 2));
         assert_eq!(db.submit(request(3, 4, 100)).unwrap().user_id, 3);
-        let snapshot = db.snapshot(false).unwrap();
+        let snapshot = db.snapshot(true).unwrap();
         let ids: Vec<_> = snapshot
             .contributions
             .iter()
@@ -521,10 +521,7 @@ mod tests {
         assert_eq!(db.snapshot(false).unwrap().totals.reward_sparks, "0");
         let submitted = db.submit(request(1, 1, 137)).unwrap();
         assert_eq!(submitted.start_block, 2);
-        assert_eq!(
-            db.snapshot(false).unwrap().contributions[0].burned_sats,
-            "0"
-        );
+        assert_eq!(db.snapshot(true).unwrap().contributions[0].burned_sats, "0");
         for offset in 0..100 {
             db.tick().unwrap();
             let burn: i64 = db
@@ -549,6 +546,35 @@ mod tests {
             db.snapshot(false).unwrap().totals.reward_sparks,
             snapshot.totals.reward_sparks
         );
+    }
+
+    #[test]
+    fn dashboard_hides_pending_contributions_until_their_start_block() {
+        let mut db = database();
+        let submitted = db.submit(request(1, 1, 100)).unwrap();
+        let pending = db.snapshot(false).unwrap();
+        assert_eq!(pending.height, 0);
+        assert!(pending.contributions.is_empty());
+        assert_eq!(pending.totals.contribution_count, 1);
+        assert_eq!(pending.totals.burned_sats, "0");
+        assert_eq!(pending.totals.fees_sats, "0");
+        assert_eq!(pending.totals.reward_sparks, "0");
+        let full = db.snapshot(true).unwrap();
+        assert_eq!(full.contributions.len(), 1);
+        assert_eq!(full.contributions[0].id, submitted.id);
+        assert_eq!(full.contributions[0].start_block, submitted.start_block);
+        assert_eq!(
+            serde_json::to_value(&full.totals).unwrap(),
+            serde_json::to_value(&pending.totals).unwrap()
+        );
+
+        db.tick().unwrap();
+        let started = db.snapshot(false).unwrap();
+        assert_eq!(started.height, submitted.start_block);
+        assert_eq!(started.contributions.len(), 1);
+        assert_eq!(started.contributions[0].id, submitted.id);
+        assert_eq!(started.contributions[0].burned_sats, "1");
+        assert_eq!(started.totals.contribution_count, 1);
     }
 
     #[test]
@@ -586,7 +612,7 @@ mod tests {
                 .iter()
                 .map(|c| c.id)
                 .collect::<Vec<_>>(),
-            [future.id, active.id, boundary.id]
+            [active.id, boundary.id]
         );
         // The last funded block is inclusive: 100 is 10,001 blocks ago, 101 is 10,000.
         assert_eq!(recent.totals.contribution_count, 4);
@@ -595,6 +621,7 @@ mod tests {
         assert_eq!(recent.totals.reward_sparks, "5000000000");
         let full = db.snapshot(true).unwrap();
         assert_eq!(full.contributions.len(), 4);
+        assert_eq!(full.contributions[0].id, future.id);
         assert_eq!(full.contributions[3].id, 1);
         assert_eq!(full.contributions[3].reward_sparks, "5000000000");
         assert_eq!(
@@ -716,7 +743,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(db.tick(), Err(Error::Storage(_))));
-        let snapshot = db.snapshot(false).unwrap();
+        let snapshot = db.snapshot(true).unwrap();
         assert_eq!(snapshot.height, 0);
         assert_eq!(snapshot.totals.reward_sparks, "0");
         assert!(snapshot

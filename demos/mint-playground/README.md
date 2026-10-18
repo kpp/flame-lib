@@ -35,7 +35,7 @@ Each contribution starts at the next block after submission. Its total budget in
 
 The budget slider runs linearly from 100,000 to 100,000,000 sat, in steps of 100,000. Submission requires `budget >= duration × 1,001`: enough for all fees and at least one burned sat per block. Invalid combinations are explained and cannot be submitted.
 
-Blocks advance once per second while the service is running. Restarting resumes at the last committed height; downtime does not produce blocks or retroactive rewards. A funded block distributes exactly 50 FLM in proportion to each contribution's burned sats, excluding fees. Empty blocks distribute nothing. One FLM is 100,000,000 sparks. Allocation uses integer arithmetic: floor each exact share, then assign leftover sparks to largest fractional remainders, breaking ties by contribution ID. Projections use only submitted schedules, not hypothetical future participants; they are estimates, not guarantees.
+Blocks advance once per second while the service is running. Restarting resumes at the last committed height; downtime does not produce blocks or retroactive rewards. A funded block distributes exactly 50 FLM in proportion to each contribution's burned sats, excluding fees. Empty blocks distribute nothing. One FLM is 100,000,000 sparks. Allocation uses integer arithmetic: floor each exact share, then assign leftover sparks to largest fractional remainders, breaking ties by contribution ID. Forecasts hold other users' current burn rate constant and use the viewer's actual schedules; this assumption affects estimates only, not block processing.
 
 
 The existing Flame wallet runs in the browser via WebAssembly and uses FlameKD to generate a mnemonic and testnet receiving address (`tf1…`). These are remembered in browser local storage, so subsequent contributions share the same reward destination. **The mnemonic, seed and private keys never go to the service or database.** Request parsing rejects extra fields, including mnemonic/private-key fields. Only the address and contribution parameters are submitted. The server validates the address with FlameKD and stores its canonical lowercase encoding.
@@ -67,7 +67,7 @@ A pending public request is saved locally before submission, keeping its ID and 
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/state` | Dashboard snapshot: height, server-computed lifetime totals/count, and current, scheduled or recently finished contributions, newest first. Contributions whose last block is over 10,000 blocks old are omitted. |
+| `GET /api/state` | Dashboard snapshot: height, server-computed lifetime totals/count, and started contributions, newest first. Not-yet-started contributions and those whose last block is over 10,000 blocks old are omitted. |
 | `GET /api/state?full_history=true` | Mint-page snapshot with complete contribution history, preserving personal lifetime totals. |
 | `POST /api/contributions` | JSON `{address, budget_sats, duration, request_id}`; returns `{id, user_id, start_block}`. |
 | `GET /api/rewards` | Address-sorted accumulated rewards: `[{"address":"tf1…","reward_sparks":"5000000000"}]`. |
@@ -85,8 +85,8 @@ URL: `/mint`
 The top counters show only this user's accrued totals: sats burned, FLM earned, and effective cost `(sats burned + mining fees paid) / FLM earned`. They include all of the user's contributions, not only the chart window. Scheduled future spending and the unsubmitted draft are excluded. Effective cost is `—` until rewards are earned; all three counters are `—` while the wallet is unavailable.
 
 User sees a chart of the burn rate in satoshis per block, with the equivalent mint rate (sat/FLM) on the right-hand axis.
-- Chart is centered around the current block and shows the previous 500 blocks and next 500 blocks. Contributions are drawn only within this window, without any extrapolation.
-- All other users' contributions (not including current user's) are drawn with the base color.
+- Chart is centered around the current block and shows the previous 500 blocks and next 500 blocks. The past shows actual schedules; the future is explicitly a forecast.
+- Other users are grey. Their combined burn rate at the current processed block is extended unchanged through the future, ignoring their scheduled expirations and not-yet-started contributions.
 - The user's submitted contributions are drawn on top using their assigned user-ID color, matching the dashboard.
 - The user's draft contribution is a dashed line in the same color; it changes with the sliders. Both legend swatches match. Before the first accepted contribution assigns a user ID, the draft and swatches are neutral grey rather than guessing a future ID.
 
@@ -95,6 +95,10 @@ Controls:
 - slider "duration": slider from 100 to 1000 blocks (linear scale, in steps of 50 blocks).
 - display: projected total amount of flames to be earned (based on currently running contributions), total amount of satoshis spent on fees, and resulting average mint rate (sats/FLM) that takes into account fees paid (that raise the price).
 - button "submit".
+
+For a draft starting after block `H`, let `O` be everyone else's combined burn at `H`. At each future block `b`, the draft's estimated reward is `50 FLM × draft_burn(b) / (O + existing_own_burn(b) + draft_burn(b))`. Existing contributions by this user retain their real start/end blocks, so overlapping contributions compete for the same issuance. Only the draft's share is included in its estimate. This flat-other-user assumption applies throughout the selected duration, including beyond the visible 500-block forecast; it never takes a scheduled drop in other users' contributions as a predicted price decrease. Actual future participation may differ.
+
+This is a presentation and forecasting convention, not commitment secrecy: the existing API still carries schedules for reconstructing history, but the forecast never uses another user's future schedule.
 
 Table below shows all user's contributions: 
 - their status (active, finished),
@@ -113,13 +117,13 @@ On top - add a button that opens dashboard (`/` url).
 
 URL: `/`
 
-Similar to per-user UI, but visible to everyone. The API, chart and table omit contributions when `height - (start_block + duration - 1) > 10,000`; the exact 10,000-block boundary remains included. Current and scheduled contributions are retained. The table is newest-first.
+Similar to per-user UI, but visible to everyone. The chart shows the previous 1,000 blocks, with the current block at its right edge and no future commitments. Public contribution summaries omit planned budgets and durations. The API and table exclude not-yet-started contributions and those with `height - (start_block + duration - 1) > 10,000`; the exact 10,000-block boundary remains included. The table is newest-first.
 
 The top counters and table footer use server-computed lifetime totals, including contributions omitted from the response. The footer's contribution count is also all-time, not just the number of visible rows.
 
-The dashboard chart, "Burn rate and mining fees", shows burned sats above zero and mining-fee income downward: 1,000 sat per active contribution per block, including overlapping contributions to the same address. Fees use a grey diagonal fill. Both areas share one scale in sat/block on the left; the right-hand scale is the same values divided by 50 FLM (sat/FLM), including negative ticks below zero. The downward direction separates fees from burning, not a loss of income. Only submitted schedules are shown; the future portion is lighter. The `/mint` chart shows burn rate without the fee area, with the same two axis units.
+The dashboard chart, "Burn rate and mining fees", shows historical burned sats above zero and mining-fee income downward: 1,000 sat per active contribution per block, including overlapping contributions to the same address. Fees use a grey diagonal fill. Both areas share one scale in sat/block on the left; the right-hand scale is the same values divided by 50 FLM (sat/FLM), including negative ticks below zero. The downward direction separates fees from burning, not a loss of income. The `/mint` chart uses the same two axis units without the fee area and shades its future forecast.
 
-The dashboard always shows contributions colored by user, with no color toggle. All clients use the fixed ordered palette `#ffd800`, `#ffc200`, `#ff9c00`, `#ff6922`, `#ff4242`, `#fff000`, with `palette[user_id % palette.length]`. Thus user 1 uses `#ffc200`, user 6 uses `#ffd800`, and colors repeat every six users. No randomization or browser-local palette is used. Participant colors are opaque; a light overlay distinguishes future blocks. Mining fees remain grey and hatched.
+The dashboard always shows contributions colored by user, with no color toggle. All clients use the fixed ordered palette `#ffd800`, `#ffc200`, `#ff9c00`, `#ff6922`, `#ff4242`, `#fff000`, with `palette[user_id % palette.length]`. Thus user 1 uses `#ffc200`, user 6 uses `#ffd800`, and colors repeat every six users. No randomization or browser-local palette is used. Participant colors are opaque; mining fees remain grey and hatched.
 
 The dashboard combines each user's contributions into one band. Bands are stacked by each user's latest contribution ID, oldest at the bottom and newest at the top. A new contribution moves that user's entire band upward without changing their color. The table remains newest-first.
 

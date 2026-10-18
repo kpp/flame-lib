@@ -386,6 +386,30 @@ mod tests {
         assert_eq!(first, retry);
         assert_eq!(first["user_id"], 1);
         assert_eq!(first["start_block"], 1);
+        let mut pending_states = Vec::new();
+        for path in ["/api/state", "/api/state?full_history=true"] {
+            pending_states.push(
+                json(
+                    app.clone()
+                        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap(),
+                )
+                .await,
+            );
+        }
+        assert!(pending_states[0]["contributions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            pending_states[1]["contributions"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(pending_states[0]["totals"], pending_states[1]["totals"]);
+        assert_eq!(pending_states[0]["totals"]["contribution_count"], 1);
+        assert_eq!(pending_states[0]["totals"]["burned_sats"], "0");
+        assert_eq!(pending_states[0]["totals"]["reward_sparks"], "0");
         store
             .request(Command::Tick)
             .await

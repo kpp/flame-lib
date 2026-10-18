@@ -4,7 +4,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('./app.js', import.meta.url), 'utf8');
-const { BUDGET_MIN, BUDGET_MAX, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const { BUDGET_MIN, BUDGET_MAX, burnAt, feeAt, projectedBurn, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 const plan = (options = {}) => ({ user_id: 1, budget_sats: 300005, duration: 100, start_block: 10, ...options });
 
 test('budget is a native linear slider with the requested endpoints', async () => {
@@ -44,15 +44,50 @@ test('mining fees count concurrent contributions, including the same address, no
 });
 
 test('projection awards all issuance to a sole contribution and halves it with equal competition', () => {
-  const contribution = plan({ budget_sats: 300000 });
-  assert.equal(projectedReward([], contribution), 5000 * SPARKS);
-  assert.equal(projectedReward([contribution], contribution), 2500 * SPARKS);
+  const draft = plan({ address: 'own', budget_sats: 300000, start_block: 11 });
+  const competing = plan({ address: 'other', budget_sats: 300000 });
+  assert.equal(projectedReward([], draft, 'own'), 5000 * SPARKS);
+  assert.equal(projectedReward([competing], draft, 'own'), 2500 * SPARKS);
 });
 
-test('projection accounts for a competitor ending halfway through a plan', () => {
-  const draft = plan({ budget_sats: 300000 });
-  const competing = plan({ budget_sats: 150000, duration: 50 });
-  assert.equal(projectedReward([competing], draft), 3750 * SPARKS);
+test('projection holds other users at their current rate, regardless of their future durations', () => {
+  const draft = plan({ address: 'own', budget_sats: 300000, start_block: 11 });
+  const short = plan({ address: 'other', budget_sats: 150000, duration: 50 });
+  const long = plan({ address: 'other', budget_sats: 3000000, duration: 1000 });
+  assert.equal(burnAt(short, 10), burnAt(long, 10));
+  assert.equal(projectedReward([short], draft, 'own'), 2500 * SPARKS);
+  assert.equal(projectedReward([long], draft, 'own'), 2500 * SPARKS);
+  assert.equal(projectedBurn(short, 999, 10, 'own'), 2000, 'the latest rate survives the competitor’s actual expiry');
+});
+
+test('future other-user schedules and already expired contributions never enter forecasts', () => {
+  const draft = plan({ address: 'own', budget_sats: 300000, start_block: 11 });
+  const expired = plan({ address: 'other', start_block: -90, budget_sats: 300000 });
+  const scheduled = plan({ address: 'other', start_block: 11, budget_sats: 100000000 });
+  assert.equal(projectedReward([expired, scheduled], draft, 'own'), 5000 * SPARKS);
+  assert.equal(projectedBurn(expired, 11, 10, 'own'), 0);
+  assert.equal(projectedBurn(scheduled, 11, 10, 'own'), 0);
+  assert.equal(projectedBurn(scheduled, 11, 10, 'other'), burnAt(scheduled, 11), 'a user’s own scheduled contribution is known');
+});
+
+test('known own contributions reduce the draft’s allocated share and expire on schedule', () => {
+  const draft = plan({ address: 'own', budget_sats: 300000, start_block: 11 });
+  const existing = plan({ address: 'own', start_block: 11, budget_sats: 150000, duration: 50 });
+  assert.equal(projectedReward([existing], draft, 'own'), 3750 * SPARKS);
+  assert.equal(projectedBurn(existing, 60, 10, 'own'), 2000);
+  assert.equal(projectedBurn(existing, 61, 10, 'own'), 0);
+  const later = { ...existing, start_block: 61 };
+  assert.equal(projectedReward([later], draft, 'own'), 3750 * SPARKS, 'known future overlap is included even if it has not begun');
+});
+
+test('the current block snapshot freezes its exact remainder rate for the full draft, not just the chart window', () => {
+  const competing = plan({ address: 'other' });
+  const draft = plan({ address: 'own', start_block: 15, duration: 1000, budget_sats: 3000000 });
+  const estimate = projectedReward([competing], draft, 'own');
+  assert.equal(projectedBurn(competing, 2000, 14, 'own'), 2001, 'the last current block’s remainder sat is retained');
+  assert.ok(Math.abs(estimate - 1000 * 50 * SPARKS * 2000 / 4001) < 1, 'all 1,000 planned blocks use the same frozen competing burn');
+  assert.equal(projectedBurn(competing, 2000, 15, 'own'), 2000, 'a later snapshot uses its own current remainder rate');
+  assert.equal(projectedBurn(competing, 14, 15, 'own'), 2001, 'historical samples remain factual');
 });
 
 test('a contribution finishes on the last inclusive block, not one block later', () => {
@@ -152,33 +187,42 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
   };
 }
 
-test('both charts span exactly 500 blocks before and after the current block', async () => {
+test('dashboard ends 1,000 historical blocks at now while mint centers 500 past and 500 projected blocks', async () => {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
-  assert.match(html, /±500 blocks/);
-  assert.match(html, /aria-label="[^"]*Previous and next 500 blocks\./);
+  assert.match(html, /<canvas\b[^>]*aria-label="[^"]*Previous 1,000 blocks; now is at the right edge\./);
+  assert.match(html, /id="chart-window">Previous 1,000 blocks</);
+  assert.match(html, /id="chart-note">History only</);
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
-    page.snapshot.height = 500;
-    page.snapshot.contributions = [plan({ id: 1, address: 'tf1demo-address', start_block: 300, duration: 1000, budget_sats: 3000000 })];
+    const minting = pathname === '/mint';
+    page.snapshot.height = minting ? 500 : 1500;
+    page.snapshot.contributions = [plan({ id: 1, address: 'tf1demo-address', start_block: page.snapshot.height - 200, duration: 1000, budget_sats: 3000000 })];
     page.draws.length = 0;
     await page.refresh();
     const draws = page.draws.filter(call => call.canvas === page.elements.get('chart'));
     const ticks = draws.filter(call => call.method === 'fillText' && call.args[2] === 267);
-    assert.deepEqual(ticks.map(call => call.args[0]), ['0', '250', '500', '750', '1,000']);
+    assert.deepEqual(ticks.map(call => call.args[0]), minting ? ['0', '250', '500', '750', '1,000'] : ['500', '750', '1,000', '1,250', '1,500']);
     assert.deepEqual(ticks.map(call => call.args[1]), [48, 224, 400, 576, 752]);
     const shading = draws.find(call => call.method === 'fillRect' && call.fillStyle === '#ffffff30');
-    assert.equal(shading.args[0], 400, 'future shading begins at the centered current block');
-    assert.equal(shading.args[2], 352, 'future shading ends at the right edge');
+    if (minting) {
+      assert.equal(shading.args[0], 400, 'future shading begins at the centered current block');
+      assert.equal(shading.args[2], 352, 'future shading ends at the right edge');
+    } else {
+      assert.equal(shading, undefined, 'the public chart has no future region');
+    }
     const pathBefore = index => {
       const start = draws.slice(0, index).findLastIndex(call => call.method === 'beginPath');
       return draws.slice(start + 1, index).filter(call => call.method === 'moveTo' || call.method === 'lineTo');
     };
+    const nowLine = pathBefore(draws.findLastIndex(call => call.method === 'stroke' && call.strokeStyle === '#666'));
+    assert.deepEqual(nowLine.map(call => call.args), [[minting ? 400 : 752, 14], [minting ? 400 : 752, 248]], 'now marks the center only on the mint page');
     const band = pathBefore(draws.findIndex(call => call.method === 'fill' && call.fillStyle === userColor(1)));
     assert.equal(band.length, 2003, 'a closed band contains 1,001 top and 1,001 bottom samples plus its starting point');
     assert.equal(Math.min(...band.map(call => call.args[0])), 48);
     assert.equal(Math.max(...band.map(call => call.args[0])), 752);
-    if (pathname === '/mint') {
+    if (minting) {
       assert.match(page.elements.get('chart')['aria-label'], /Previous and next 500 blocks\./);
+      assert.match(page.elements.get('chart-note').textContent, /current|rate|Others/i);
       const draft = pathBefore(draws.findIndex(call => call.method === 'stroke' && call.strokeStyle === userColor(1)));
       assert.equal(draft.length, 501, 'draft sampling stays within the visible future window');
       assert.equal(draft[0].args[0], 400);
@@ -187,8 +231,53 @@ test('both charts span exactly 500 blocks before and after the current block', a
   }
 });
 
+test('mint chart extends only the current other-user burn and overlays exact own schedules', async () => {
+  const page = await openPage('/mint');
+  const first = page.snapshot.contributions[0];
+  page.snapshot.contributions = [
+    { ...first, id: 1, user_id: 2, address: 'other', start_block: -89 },
+    { ...first, id: 2, user_id: 3, address: 'other-future', start_block: 11, budget_sats: 100000000 },
+    { ...first, id: 3, user_id: 4, address: 'other-expired', start_block: -190 },
+    { ...first, id: 4, start_block: 11, duration: 50, budget_sats: 150000 },
+  ];
+  page.draws.length = 0;
+  await page.refresh();
+  const paths = new Map();
+  let path = [];
+  for (const call of page.draws.filter(call => call.canvas === page.elements.get('chart'))) {
+    if (call.method === 'beginPath') path = [];
+    if (call.method === 'moveTo' || call.method === 'lineTo') path.push(call.args);
+    if (call.method === 'fill') paths.set(call.fillStyle, path);
+  }
+  const thickness = (color, block) => {
+    const index = block - (page.snapshot.height - 500);
+    const path = paths.get(color);
+    return path[2002 - index][1] - path[index + 1][1];
+  };
+  const otherHeight = thickness('#a3a3a3', 10);
+  assert.ok(otherHeight > 0);
+  for (const block of [11, 60, 61, 109, 110, 510]) {
+    assert.equal(thickness('#a3a3a3', block), otherHeight, `other-user burn remains fixed at block ${block}`);
+  }
+  assert.equal(thickness(userColor(1), 10), 0, 'own scheduled contribution has not started at now');
+  assert.equal(thickness(userColor(1), 11), otherHeight, 'own concrete schedule begins next block');
+  assert.equal(thickness(userColor(1), 60), otherHeight, 'own final funded block remains visible');
+  assert.equal(thickness(userColor(1), 61), 0, 'own schedule expires rather than being extrapolated');
+  assert.equal(thickness(userColor(1), 510), 0);
+  assert.equal(page.elements.get('contributions').children.length, 1, 'only the wallet’s own schedule appears in its table');
+  const draft = { budget_sats: 1000000, duration: 500, start_block: 11 };
+  const estimate = projectedReward(page.snapshot.contributions, draft, first.address, 10);
+  assert.equal(page.elements.get('projected-reward').textContent, new Intl.NumberFormat('en').format(Math.trunc(estimate / SPARKS)));
+  assert.equal(page.elements.get('projected-rate').textContent, `${new Intl.NumberFormat('en').format(Math.trunc(draft.budget_sats * SPARKS / estimate))} sat / FLM`);
+});
+
 test('dashboard burn and patterned downward fees share one sats scale, with mint rates on the right', async () => {
   const page = await openPage('/');
+  const pattern = page.draws.find(call => call.method === 'fill' && call.fillStyle?.kind === 'pattern').fillStyle;
+  const strokes = page.draws.filter(call => call.canvas === pattern.canvas);
+  page.snapshot.height = 109;
+  page.draws.length = 0;
+  await page.refresh();
   const areaPath = (fillStyle, outermost = false) => {
     const draws = page.draws.filter(call => call.canvas === page.elements.get('chart'));
     const fill = draws[outermost ? 'findLastIndex' : 'findIndex'](call => call.method === 'fill' && fillStyle(call.fillStyle));
@@ -206,9 +295,7 @@ test('dashboard burn and patterned downward fees share one sats scale, with mint
   const burnPath = areaPath(style => style === userColor(1));
   const burnHeight = baseline - Math.min(...burnPath.map(call => call.args[1]));
   assert.ok(Math.abs(burnHeight - 2 * oneDepth) < 1e-10, '2,000 sats burned and 1,000 sats in fees use identical pixels per sat');
-  const pattern = page.draws.find(call => call.method === 'fill' && call.fillStyle?.kind === 'pattern').fillStyle;
   assert.equal(pattern.repetition, 'repeat');
-  const strokes = page.draws.filter(call => call.canvas === pattern.canvas);
   const from = strokes.find(call => call.method === 'moveTo').args;
   const to = strokes.find(call => call.method === 'lineTo').args;
   assert.ok(from[0] !== to[0] && from[1] !== to[1], 'fee tile contains diagonal strokes');
@@ -225,9 +312,7 @@ test('dashboard burn and patterned downward fees share one sats scale, with mint
     negative ||= sats < 0;
   }
   assert.ok(positive && negative, 'both burn and fee regions have paired axis labels');
-  const tint = page.draws.find(call => call.method === 'fillRect' && call.canvas === page.elements.get('chart'));
-  assert.equal(tint.fillStyle, '#ffffff30', 'future tint is light enough to preserve saturated colors');
-  assert.ok(tint.args[1] + tint.args[3] >= baseline + oneDepth - 1e-10, 'future shading covers fees too');
+  assert.ok(!page.draws.some(call => call.method === 'fillRect' && call.fillStyle === '#ffffff30'), 'the dashboard never shades a future projection');
   page.snapshot.contributions.push({ ...page.snapshot.contributions[0], id: 2, budget_sats: 100100 });
   page.draws.length = 0;
   await page.refresh();
@@ -265,6 +350,7 @@ test('dashboard initializes, polls, draws, and renders the actual contribution s
   assert.equal(page.elements.get('current-block').textContent, '10');
   assert.equal(page.elements.get('connection').textContent, 'Live');
   assert.equal(page.elements.get('contributions').children.length, 1);
+  assert.equal(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, '#1', 'public rows do not disclose future budget or duration');
   assert.equal(page.requests.length, 1);
   assert.equal(page.storage.size, 0, 'dashboard does not need palette or wallet storage');
 });
@@ -320,7 +406,7 @@ test('FLM and sat/FLM displays truncate fractions without changing rewards or pr
     assert.equal(page.elements.get('total-rate').textContent, pathname === '/mint' ? '999' : '40');
     if (pathname === '/mint') {
       const draft = { budget_sats: 1000000, duration: 500, start_block: page.snapshot.height + 1 };
-      const estimate = projectedReward(page.snapshot.contributions, draft);
+      const estimate = projectedReward(page.snapshot.contributions, draft, 'tf1demo-address');
       assert.notEqual(estimate / SPARKS, Math.trunc(estimate / SPARKS));
       assert.equal(page.elements.get('projected-reward').textContent, new Intl.NumberFormat('en').format(Math.trunc(estimate / SPARKS)));
       assert.equal(page.elements.get('projected-rate').textContent, `${Math.trunc(draft.budget_sats * SPARKS / estimate)} sat / FLM`);
@@ -388,6 +474,8 @@ test('an unavailable wallet never substitutes global totals on the mint page', a
   const storage = new Map([['flame-mint-playground-wallet-v1', '{broken json']]);
   const page = await openPage('/mint', storage);
   for (const id of ['total-burned', 'total-reward', 'total-rate']) assert.equal(page.elements.get(id).textContent, '—');
+  assert.equal(page.elements.get('projected-reward').textContent, '—', 'an unknown identity cannot distinguish its own future schedules');
+  assert.equal(page.elements.get('projected-rate').textContent, '—');
   await page.refresh();
   for (const id of ['total-burned', 'total-reward', 'total-rate']) assert.equal(page.elements.get(id).textContent, '—');
   assert.equal(page.elements.get('contributions').children.length, 0);
@@ -434,14 +522,14 @@ test('dashboard sums each user’s burns and moves their complete band on top wh
     { ...first, id: 2, user_id: 26, address: 'another-user', budget_sats: 430000, start_block: 8 },
     { ...first, id: 3, budget_sats: 760000, start_block: 9 },
   ];
-  const bands = (page, colors = PALETTE) => {
+  const bands = (page, colors = PALETTE, currentX = 752) => {
     let path = [];
     const result = [];
     for (const call of page.draws.filter(call => call.canvas === page.elements.get('chart'))) {
       if (call.method === 'beginPath') path = [];
       if (call.method === 'moveTo' || call.method === 'lineTo') path.push(call.args);
       if (call.method === 'fill' && colors.includes(call.fillStyle)) {
-        const [top, base] = path.filter(point => point[0] === 400).map(point => point[1]);
+        const [top, base] = path.filter(point => point[0] === currentX).map(point => point[1]);
         assert.ok(Number.isFinite(top) && Number.isFinite(base));
         result.push({ color: call.fillStyle, top, base });
       }
@@ -486,7 +574,7 @@ test('dashboard sums each user’s burns and moves their complete band on top wh
   const mint = await openPage('/mint');
   mint.snapshot.height = 12;
   await redraw(mint, reversed);
-  const ownAndOthers = bands(mint, ['#a3a3a3', userColor(1)]);
+  const ownAndOthers = bands(mint, ['#a3a3a3', userColor(1)], 400);
   assert.deepEqual(ownAndOthers.map(band => band.color), ['#a3a3a3', userColor(1)], 'mint page still groups others below all of the wallet’s contributions');
   close(ownAndOthers[1].base, ownAndOthers[0].top);
   close((ownAndOthers[1].base - ownAndOthers[1].top) / (ownAndOthers[0].base - ownAndOthers[0].top), 7800 / 3300);

@@ -16,12 +16,16 @@ export function feeAt(contribution, block) {
   return block >= contribution.start_block && block < contribution.start_block + contribution.duration ? FEE : 0;
 }
 
-export function projectedReward(contributions, draft) {
+export function projectedBurn(contribution, block, height, address) {
+  return burnAt(contribution, block > height && contribution.address !== address ? height : block);
+}
+
+export function projectedReward(contributions, draft, address, height = draft.start_block - 1) {
   let reward = 0;
   for (let offset = 0; offset < draft.duration; offset++) {
     const block = draft.start_block + offset;
     const own = burnAt(draft, block);
-    const total = contributions.reduce((sum, contribution) => sum + burnAt(contribution, block), own);
+    const total = contributions.reduce((sum, contribution) => sum + projectedBurn(contribution, block, height, address), own);
     if (total > 0) reward += REWARD * own / total;
   }
   return reward;
@@ -69,7 +73,9 @@ if (typeof document !== 'undefined') {
     element('fees-legend').hidden = true;
     element('chart-wrap').className = 'canvas-wrap';
     element('chart-title').textContent = 'Burn rate';
-    element('chart').setAttribute('aria-label', 'Burn rate in satoshis per block on the left; mint rate in satoshis per FLM on the right. Previous and next 500 blocks.');
+    element('chart').setAttribute('aria-label', 'Burn rate in satoshis per block on the left; mint rate in satoshis per FLM on the right. Previous and next 500 blocks. Future contributions from others remain at their current rate; your contributions follow their schedules.');
+    element('chart-window').textContent = '±500 blocks';
+    element('chart-note').textContent = 'Future: others held at current rate';
     element('others-label').textContent = 'Others';
     element('contributions-title').textContent = 'Your contributions';
     try {
@@ -99,8 +105,9 @@ if (typeof document !== 'undefined') {
     element('budget').setAttribute('aria-valuetext', `${number(contribution.budget_sats)} satoshis`);
     element('duration').setAttribute('aria-valuetext', `${contribution.duration} blocks, about ${number(contribution.duration / 60, 1)} minutes`);
     element('budget-error').textContent = valid ? '' : `Minimum ${number(contribution.duration * (FEE + 1))} sat (${number(contribution.duration * FEE)} fees + 1 sat burned per block). Increase budget or shorten duration.`;
-    const estimate = state && valid ? projectedReward(state.contributions, contribution) : 0;
-    element('projected-reward').textContent = state && valid ? whole(estimate / SPARKS) : '—';
+    const canEstimate = state && wallet && valid;
+    const estimate = canEstimate ? projectedReward(state.contributions, contribution, wallet.address, state.height) : 0;
+    element('projected-reward').textContent = canEstimate ? whole(estimate / SPARKS) : '—';
     element('projected-fees').textContent = `${number(contribution.duration * FEE)} sat`;
     element('projected-burn').textContent = valid ? `${number(contribution.budget_sats - contribution.duration * FEE)} sat` : '—';
     element('projected-rate').textContent = estimate ? `${rate(contribution.budget_sats, estimate)} sat / FLM` : '—';
@@ -164,7 +171,7 @@ if (typeof document !== 'undefined') {
       dot.style.background = userColor(contribution.user_id);
       const title = document.createElement('span');
       title.className = 'contribution-id';
-      title.textContent = `#${contribution.id} · ${number(contribution.budget_sats)} sat / ${contribution.duration} blocks`;
+      title.textContent = minting ? `#${contribution.id} · ${number(contribution.budget_sats)} sat / ${contribution.duration} blocks` : `#${contribution.id}`;
       heading.append(dot, title);
       const address = document.createElement('p');
       address.className = 'address-label';
@@ -222,8 +229,9 @@ if (typeof document !== 'undefined') {
     context.scale(ratio, ratio);
     const margin = { left: 48, top: 14, right: 48, bottom: 27 };
     const w = width - margin.left - margin.right, h = height - margin.top - margin.bottom;
-    const halfWindow = 500;
-    const heightNow = state?.height ?? 0, firstBlock = heightNow - halfWindow, count = 2 * halfWindow + 1;
+    const pastBlocks = minting ? 500 : 1000;
+    const futureBlocks = minting ? 500 : 0;
+    const heightNow = state?.height ?? 0, firstBlock = heightNow - pastBlocks, count = pastBlocks + futureBlocks + 1;
     const colored = !minting;
     const groups = new Map();
     const fees = new Float64Array(count);
@@ -242,11 +250,9 @@ if (typeof document !== 'undefined') {
       // Move the whole user band to the top on each newer contribution.
       if (colored) groups.delete(key);
       groups.set(key, values);
-      const start = Math.max(firstBlock, contribution.start_block);
-      const end = Math.min(firstBlock + count, contribution.start_block + contribution.duration);
-      for (let block = start; block < end; block++) {
-        const i = block - firstBlock;
-        values[i] += burnAt(contribution, block);
+      for (let i = 0; i < count; i++) {
+        const block = firstBlock + i;
+        values[i] += minting ? projectedBurn(contribution, block, heightNow, wallet?.address) : burnAt(contribution, block);
         if (!minting) fees[i] += feeAt(contribution, block);
       }
     }
@@ -255,7 +261,7 @@ if (typeof document !== 'undefined') {
     const totals = new Float64Array(count);
     for (const values of groups.values()) for (let i = 0; i < count; i++) totals[i] += values[i];
     const pending = draft();
-    const showDraft = minting && validDraft(pending);
+    const showDraft = minting && wallet && validDraft(pending);
     let maximum = 0;
     for (let i = 0; i < count; i++) maximum = Math.max(maximum, totals[i] + (showDraft ? burnAt(pending, firstBlock + i) : 0));
     const minimum = minting ? 0 : -Math.max(0, ...fees);
@@ -303,24 +309,26 @@ if (typeof document !== 'undefined') {
       for (let i = 0; i < count; i++) base[i] += values[i];
     }
     context.globalAlpha = 1;
-    context.fillStyle = '#ffffff30'; context.fillRect(x(halfWindow), margin.top, w / 2, h);
+    if (minting) {
+      context.fillStyle = '#ffffff30'; context.fillRect(x(pastBlocks), margin.top, w * futureBlocks / (count - 1), h);
+    }
     if (!minting) {
       context.strokeStyle = '#666';
       context.beginPath(); context.moveTo(x(0), zero); context.lineTo(x(count - 1), zero); context.stroke();
     }
-    context.strokeStyle = '#666'; context.setLineDash([3, 4]); context.beginPath(); context.moveTo(x(halfWindow), margin.top); context.lineTo(x(halfWindow), margin.top + h); context.stroke(); context.setLineDash([]);
+    context.strokeStyle = '#666'; context.setLineDash([3, 4]); context.beginPath(); context.moveTo(x(pastBlocks), margin.top); context.lineTo(x(pastBlocks), margin.top + h); context.stroke(); context.setLineDash([]);
     if (showDraft) {
       context.beginPath();
-      for (let i = halfWindow; i < count; i++) {
+      for (let i = pastBlocks; i < count; i++) {
         const block = firstBlock + i;
         if (block > pending.start_block + pending.duration) break;
         const value = totals[i] + burnAt(pending, block);
-        if (i === halfWindow) context.moveTo(x(i), y(value)); else context.lineTo(x(i), y(value));
+        if (i === pastBlocks) context.moveTo(x(i), y(value)); else context.lineTo(x(i), y(value));
       }
       context.strokeStyle = ownColor; context.lineWidth = 1.8; context.setLineDash([5, 4]); context.stroke(); context.setLineDash([]);
     }
     context.fillStyle = '#666'; context.font = '10px -apple-system, sans-serif';
-    for (const i of [0, halfWindow / 2, halfWindow, 3 * halfWindow / 2, count - 1]) {
+    for (const i of [0, (count - 1) / 4, (count - 1) / 2, 3 * (count - 1) / 4, count - 1]) {
       context.textAlign = i === 0 ? 'left' : i === count - 1 ? 'right' : 'center';
       context.fillText(firstBlock + i < 0 ? '—' : number(firstBlock + i), x(i), height - 8);
     }
