@@ -1,0 +1,76 @@
+name: Mint playground image
+
+# Builds demos/mint-playground/Dockerfile and pushes it to GHCR as
+# ghcr.io/runflame/mint-playground:<short commit>. Nothing is deployed: the
+# dev deploy is a playbook in the infrastructure repo, run by hand with that
+# tag (printed in the run summary).
+#
+# The paths are what the image is built from: the demo, the wallet and
+# flamekd with the workspace crates they depend on, and the toolchain.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'demos/mint-playground/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'cells/**'
+      - 'flamechain/**'
+      - 'flamekd/**'
+      - 'flamepayments/**'
+      - 'flamevm/**'
+      - 'flamewallet-ffi/**'
+      - 'flamewallet-wasm/**'
+      - 'merkle/**'
+      - 'musig/**'
+      - 'readerwriter/**'
+      - 'spacesuit/**'
+      - 'starsig/**'
+      - '.github/workflows/mint-playground-image.yml'
+  workflow_dispatch:
+
+# A newer push supersedes a build still running; its commit gets no image.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/runflame/mint-playground
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Tag
+      id: tag
+      run: echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+    - name: Build
+      env:
+        TAG: ${{ steps.tag.outputs.tag }}
+      run: docker build -f demos/mint-playground/Dockerfile -t "$IMAGE:$TAG" .
+
+    - name: Push
+      env:
+        TAG: ${{ steps.tag.outputs.tag }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        docker push "$IMAGE:$TAG"
+        docker logout ghcr.io
+        {
+          echo "Pushed \`$IMAGE:$TAG\`. To deploy on dev, in the infrastructure repo:"
+          echo
+          echo "\`image_tag: \"$TAG\"\` in \`dev/playground/mint_playground/vars_service.yml\`, then \`ansible-playbook mint_playground/deploy.yml --ask-vault-pass\`"
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -179,9 +179,14 @@ async fn wallet_asset(js: bool) -> Response {
     } else {
         "flamewallet_wasm_bg.wasm"
     };
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/wallet-wasm/pkg")
-        .join(filename);
+    // `MINT_WALLET_DIR` for a deployed binary (the container image); otherwise
+    // where ./run.sh builds the wallet, next to this source tree.
+    let directory = std::env::var_os("MINT_WALLET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/wallet-wasm/pkg")
+        });
+    let path = directory.join(filename);
     match tokio::fs::read(path).await {
         Ok(bytes) => (
             [(
