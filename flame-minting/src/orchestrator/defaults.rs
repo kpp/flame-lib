@@ -6,43 +6,48 @@ use flame_storage::{chain::InMemoryChainStorage, state::canonical::InMemoryCanon
 
 use super::{consensus::ConsensusLoop, cursor_storage::InMemoryCursorStorage};
 use crate::{
-    FlameBlockArrivalHandler,
     block_processing::{
-        BitcoinBlockProcessor, ConsensusManager, journal::InMemoryBitcoinBlockJournal,
+        BitcoinBlockProcessor, ConsensusManager, FlameBlockProcessor,
+        journal::consensus::{
+            ConsensusJournal, InMemoryBitcoinJournal, InMemoryConsensusJournal,
+            InMemoryFlameJournal,
+        },
     },
     consensus::{MintingEngineFactory, MintingProtocolParams, storage::InMemoryConsensusStorage},
     rewards::{RewardsEngine, storage::InMemoryRewardsStorage},
 };
 
-pub type DefaultConsensusLoop<H, F> = ConsensusLoop<
-    ConsensusManager<
-        BitcoinBlockProcessor<
-            MintingEngineFactory<
-                InMemoryConsensusStorage,
-                InMemoryChainStorage,
-                InMemoryCanonicalStorage,
-            >,
-            InMemoryConsensusStorage,
-            H,
-            InMemoryBitcoinBlockJournal,
-            InMemoryCanonicalStorage,
-            InMemoryRewardsStorage,
-            InMemoryCursorStorage,
-            InMemoryChainStorage,
-        >,
-        F,
+type Engine =
+    MintingEngineFactory<InMemoryConsensusStorage, InMemoryChainStorage, InMemoryCanonicalStorage>;
+
+pub type DefaultConsensusLoop<H> = ConsensusLoop<
+    BitcoinBlockProcessor<
+        Engine,
+        InMemoryConsensusStorage,
+        H,
+        InMemoryBitcoinJournal,
+        InMemoryCanonicalStorage,
+        InMemoryRewardsStorage,
+        InMemoryCursorStorage,
+        InMemoryChainStorage,
     >,
+    FlameBlockProcessor<
+        Engine,
+        InMemoryConsensusStorage,
+        H,
+        InMemoryCanonicalStorage,
+        InMemoryRewardsStorage,
+        InMemoryCursorStorage,
+        InMemoryChainStorage,
+        InMemoryFlameJournal,
+    >,
+    InMemoryConsensusJournal,
 >;
 
-pub(super) fn consensus_loop<H, F>(
-    chain: H,
-    initial_cursor: BtcBlockTip,
-    flame_handler: F,
-) -> DefaultConsensusLoop<H, F>
+pub(super) fn consensus_loop<H>(chain: H, initial_cursor: BtcBlockTip) -> DefaultConsensusLoop<H>
 where
-    H: ChainAccess + Send + Sync + 'static,
+    H: ChainAccess + Clone + Send + Sync + 'static,
     H::Error: Send + 'static,
-    F: FlameBlockArrivalHandler,
 {
     let protocol_params = Arc::new(MintingProtocolParams {
         acquisition_maturity: 1,
@@ -53,7 +58,9 @@ where
     let consensus_storage = InMemoryConsensusStorage::new();
     let chain_storage = Arc::new(InMemoryChainStorage::new());
     let canonical_storage = InMemoryCanonicalStorage::new();
-
+    let rewards_storage = InMemoryRewardsStorage::new();
+    let cursor_storage = InMemoryCursorStorage::new(initial_cursor);
+    let journal = InMemoryConsensusJournal::new(initial_cursor);
     let bitcoin_processor = BitcoinBlockProcessor::new(
         MintingEngineFactory {
             protocol_params: protocol_params.clone(),
@@ -62,16 +69,39 @@ where
             canonical_storage: Arc::new(canonical_storage.clone()),
         },
         consensus_storage.clone(),
+        chain.clone(),
+        journal.bitcoin_journal(),
+        canonical_storage.clone(),
+        rewards_storage.clone(),
+        cursor_storage.clone(),
+        RewardsEngine {
+            chain_storage: chain_storage.clone(),
+            consensus_storage: Arc::new(consensus_storage.clone()),
+            protocol_params: protocol_params.clone(),
+        },
+    );
+    let flame_processor = FlameBlockProcessor::new(
+        Engine {
+            protocol_params: protocol_params.clone(),
+            consensus_storage: Arc::new(consensus_storage.clone()),
+            chain_storage: chain_storage.clone(),
+            canonical_storage: Arc::new(canonical_storage.clone()),
+        },
+        consensus_storage.clone(),
         chain,
-        InMemoryBitcoinBlockJournal::new(initial_cursor),
         canonical_storage,
-        InMemoryRewardsStorage::new(),
-        InMemoryCursorStorage::new(initial_cursor),
+        rewards_storage,
+        cursor_storage,
         RewardsEngine {
             chain_storage,
             consensus_storage: Arc::new(consensus_storage),
             protocol_params,
         },
+        journal.flame_journal(),
     );
-    ConsensusLoop::new(ConsensusManager::new(bitcoin_processor, flame_handler))
+    ConsensusLoop::new(ConsensusManager::new(
+        bitcoin_processor,
+        flame_processor,
+        journal,
+    ))
 }

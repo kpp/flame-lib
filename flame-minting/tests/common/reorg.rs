@@ -11,7 +11,10 @@ use corepc_client::bitcoin::{
 use ed25519_dalek::SigningKey;
 use flame_chain_service::{ChainAccess, InMemoryChain};
 use flame_minting::{
-    block_processing::{BitcoinBlockProcessor, journal::InMemoryBitcoinBlockJournal},
+    block_processing::{
+        BitcoinBlockProcessor,
+        journal::consensus::{ConsensusJournal, InMemoryBitcoinJournal, InMemoryConsensusJournal},
+    },
     consensus::{
         ConsensusStorage, MintingEngineFactory, MintingProtocolParams, WeightedBlockHeader,
         storage::InMemoryConsensusStorage,
@@ -35,7 +38,7 @@ type Processor = BitcoinBlockProcessor<
     MintingEngineFactory<InMemoryConsensusStorage, InMemoryChainStorage, InMemoryCanonicalStorage>,
     InMemoryConsensusStorage,
     InMemoryChain,
-    InMemoryBitcoinBlockJournal,
+    InMemoryBitcoinJournal,
     InMemoryCanonicalStorage,
     InMemoryRewardsStorage,
     InMemoryCursorStorage,
@@ -85,7 +88,7 @@ impl Fixture {
                 },
                 consensus.clone(),
                 chain.clone(),
-                InMemoryBitcoinBlockJournal::new(btc_tip(0, 0)),
+                InMemoryConsensusJournal::new(btc_tip(0, 0)).bitcoin_journal(),
                 canonical.clone(),
                 rewards.clone(),
                 cursor.clone(),

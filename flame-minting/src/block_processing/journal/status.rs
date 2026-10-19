@@ -17,10 +17,17 @@ pub enum ApplyStage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RollbackStage {
-    RestoreRewards,
-    RestoreFlameChain,
-    RestoreConsensus,
-    RestoreCursor,
+    RemoveEndorsements,
+    RestoreAcquisitions,
+    StoreDoubleSigns,
+    StoreEndorsements,
+    StorePendingEndorsements,
+    StoreBlockWeights,
+    PrepareFlameTransition,
+    ApplyFlameTransition,
+    PrepareRewards,
+    ApplyRewards,
+    StoreCursor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,16 +60,35 @@ impl JournalStatus {
                 ApplyStage::ApplyRewards => Self::Applying(ApplyStage::StoreCursor),
                 ApplyStage::StoreCursor => Self::Applied,
             }),
-            Self::Applied => Some(Self::RollingBack(RollbackStage::RestoreRewards)),
+            Self::Applied => Some(Self::RollingBack(RollbackStage::RemoveEndorsements)),
             Self::RollingBack(stage) => Some(match stage {
-                RollbackStage::RestoreRewards => {
-                    Self::RollingBack(RollbackStage::RestoreFlameChain)
+                RollbackStage::RemoveEndorsements => {
+                    Self::RollingBack(RollbackStage::RestoreAcquisitions)
                 }
-                RollbackStage::RestoreFlameChain => {
-                    Self::RollingBack(RollbackStage::RestoreConsensus)
+                RollbackStage::RestoreAcquisitions => {
+                    Self::RollingBack(RollbackStage::StoreDoubleSigns)
                 }
-                RollbackStage::RestoreConsensus => Self::RollingBack(RollbackStage::RestoreCursor),
-                RollbackStage::RestoreCursor => Self::RolledBack,
+                RollbackStage::StoreDoubleSigns => {
+                    Self::RollingBack(RollbackStage::StoreEndorsements)
+                }
+                RollbackStage::StoreEndorsements => {
+                    Self::RollingBack(RollbackStage::StorePendingEndorsements)
+                }
+                RollbackStage::StorePendingEndorsements => {
+                    Self::RollingBack(RollbackStage::StoreBlockWeights)
+                }
+                RollbackStage::StoreBlockWeights => {
+                    Self::RollingBack(RollbackStage::PrepareFlameTransition)
+                }
+                RollbackStage::PrepareFlameTransition => {
+                    Self::RollingBack(RollbackStage::ApplyFlameTransition)
+                }
+                RollbackStage::ApplyFlameTransition => {
+                    Self::RollingBack(RollbackStage::PrepareRewards)
+                }
+                RollbackStage::PrepareRewards => Self::RollingBack(RollbackStage::ApplyRewards),
+                RollbackStage::ApplyRewards => Self::RollingBack(RollbackStage::StoreCursor),
+                RollbackStage::StoreCursor => Self::RolledBack,
             }),
             Self::RolledBack => None,
         }

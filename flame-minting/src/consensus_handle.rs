@@ -2,28 +2,29 @@ use std::sync::Arc;
 
 use flamechain::BlockTip;
 
-use crate::block_processing::FlameBlockArrivalHandler;
+use crate::block_processing::{
+    BlockProcessor, ConsensusManager, ConsensusSendError, FlameProcessor,
+    journal::consensus::ConsensusJournal,
+};
 
-pub struct ConsensusHandle<C> {
-    consensus: Arc<C>,
+pub struct ConsensusHandle<B: BlockProcessor, F: FlameProcessor, J: ConsensusJournal> {
+    manager: Arc<ConsensusManager<B, F, J>>,
 }
 
-impl<C> ConsensusHandle<C> {
-    pub fn new(consensus: Arc<C>) -> Self {
-        Self { consensus }
+impl<B: BlockProcessor, F: FlameProcessor, J: ConsensusJournal> ConsensusHandle<B, F, J> {
+    pub(crate) fn new(manager: Arc<ConsensusManager<B, F, J>>) -> Self {
+        Self { manager }
+    }
+
+    pub async fn on_flame_block_arrival(&self, tip: BlockTip) -> Result<(), ConsensusSendError> {
+        self.manager.new_flame_block(tip)
     }
 }
 
-impl<C: FlameBlockArrivalHandler> ConsensusHandle<C> {
-    pub async fn on_flame_block_arrival(&self, tip: BlockTip) -> Result<(), C::Error> {
-        self.consensus.on_flame_block_arrival(tip).await
-    }
-}
-
-impl<C> Clone for ConsensusHandle<C> {
+impl<B: BlockProcessor, F: FlameProcessor, J: ConsensusJournal> Clone for ConsensusHandle<B, F, J> {
     fn clone(&self) -> Self {
         Self {
-            consensus: Arc::clone(&self.consensus),
+            manager: self.manager.clone(),
         }
     }
 }

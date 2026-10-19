@@ -13,6 +13,13 @@ pub use index::RewardIndex;
 pub trait RewardsStorage {
     type Error;
 
+    fn get_pending_rewards(
+        &self,
+        _target_block_height: CoreFlameHeight,
+    ) -> impl Future<Output = Result<Vec<PendingReward>, Self::Error>> + Send {
+        async { unimplemented!() }
+    }
+
     fn get_pending_reward(
         &self,
         _target_block_height: CoreFlameHeight,

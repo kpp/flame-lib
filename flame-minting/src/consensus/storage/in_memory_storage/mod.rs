@@ -12,7 +12,10 @@ use crate::consensus::{
     PendingEndorsements, WeightedBlockHeader, WeightedEndorsement,
 };
 
-use super::{AcquisitionIndex, ConsensusStorage, EndorsementIndex, MinterAcquisitions};
+use super::{
+    AcquisitionIndex, ConsensusStorage, EndorsementIndex, MinterAcquisitions,
+    MinterEndorsementState,
+};
 
 mod acquisition_storage;
 mod double_sign_storage;
@@ -76,6 +79,29 @@ fn insert_unique<K: Ord, V: PartialEq>(
 
 impl ConsensusStorage for InMemoryConsensusStorage {
     type Error = InMemoryConsensusStorageError;
+
+    async fn get_minter_endorsement_state(
+        &self,
+        minter: &MinterP2wsh,
+    ) -> Result<MinterEndorsementState, Self::Error> {
+        let state = self.read_state()?;
+        let (endorsements, pending_endorsements) = state.endorsements.for_minter(minter);
+        Ok(MinterEndorsementState {
+            endorsements,
+            pending_endorsements,
+            double_signs: state.double_signs.for_minter(minter),
+        })
+    }
+
+    async fn remove_endorsement_inclusion(
+        &self,
+        endorsement: &IncludedEndorsement,
+    ) -> Result<(), Self::Error> {
+        let mut state = self.write_state()?;
+        state.endorsements.remove_inclusion(endorsement);
+        state.double_signs.remove_inclusion(endorsement);
+        Ok(())
+    }
 
     async fn get_acquisition(
         &self,

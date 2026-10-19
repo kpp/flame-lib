@@ -3,22 +3,24 @@ use std::future::Future;
 use btc_integration::{BtcBlockTip, IndexedBlock};
 use flame_chain_service::ChainAccess;
 use flame_storage::{CanonicalStorage, ChainStorage};
-use tokio::sync::Mutex;
 
 use crate::{
     consensus::{ConsensusEngine, ConsensusStorage, ConsensusUndoManager},
     orchestrator::cursor_storage::CursorStorage,
-    rewards::{RewardsEngine, RewardsStorage, RewardsUndoManager},
+    rewards::{RewardsEngine, RewardsStorage},
 };
 
 use super::{
     consensus::ConsensusOperations,
     flame::{self, FlameOperations},
     journal::{
-        ApplyStage, BitcoinBlockJournal, BitcoinBlockJournalEntry, JournalStatus, RollbackStage,
+        ApplyStage, BitcoinBlockJournalEntry, JournalStatus, RollbackStage,
+        consensus::{BitcoinJournal, BitcoinJournalEntry, BitcoinJournalOperation, OperationId},
     },
     rewards,
 };
+
+mod rollback;
 
 pub trait BlockProcessor: Send + Sync + 'static {
     type Error: Send + 'static;
@@ -43,7 +45,6 @@ pub struct BitcoinBlockProcessor<E, C: ConsensusStorage, H, J, S, R, K, T: Chain
     rewards_storage: R,
     pub(crate) cursor_storage: K,
     rewards_engine: RewardsEngine<T, C>,
-    operation: Mutex<()>,
 }
 
 type ProcessingResult<P, V> = Result<V, <P as BlockProcessor>::Error>;
@@ -55,8 +56,7 @@ where
     C::Error: Send + 'static,
     H: ChainAccess + Send + Sync + 'static,
     H::Error: Send + 'static,
-    J: BitcoinBlockJournal + Send + Sync + 'static,
-    J::Error: Send + 'static,
+    J: BitcoinJournal,
     S: CanonicalStorage + Send + Sync + 'static,
     S::Error: Send + 'static,
     R: RewardsStorage + Send + Sync + 'static,
@@ -84,12 +84,10 @@ where
             rewards_storage,
             cursor_storage,
             rewards_engine,
-            operation: Mutex::new(()),
         }
     }
 
     pub async fn apply(&self, block: IndexedBlock) -> ProcessingResult<Self, BtcBlockTip> {
-        let _operation = self.operation.lock().await;
         let previous = self.drive().await?;
         let requested = block.btc_block_tip;
         if previous == requested {
@@ -105,7 +103,7 @@ where
         }
         let outcome = self
             .engine
-            .get_minting_outcome(block)
+            .get_minting_outcome(block.clone())
             .await
             .map_err(BlockProcessingError::Engine)?;
         if outcome.next_btc_cursor != requested {
@@ -114,35 +112,47 @@ where
                 actual: outcome.next_btc_cursor,
             });
         }
-        let undo = ConsensusUndoManager {
+        let mut undo = ConsensusUndoManager {
             consensus_storage: &self.consensus_storage,
         }
         .prepare(&outcome.consensus)
         .await
         .map_err(BlockProcessingError::Consensus)?;
+        undo.included_endorsements = block
+            .endorsements
+            .iter()
+            .cloned()
+            .map(|endorsement| crate::consensus::IncludedEndorsement {
+                btc_block: requested,
+                endorsement,
+            })
+            .collect();
         self.journal
-            .begin_apply(previous, &outcome, &undo)
+            .begin_apply(previous, &block, &outcome, &undo)
             .await
             .map_err(BlockProcessingError::Journal)?;
         self.drive().await
     }
 
     pub async fn resume(&self) -> ProcessingResult<Self, BtcBlockTip> {
-        let _operation = self.operation.lock().await;
         self.drive().await
     }
 
-    pub async fn rollback(&self, tip: BtcBlockTip) -> ProcessingResult<Self, BtcBlockTip> {
-        let _operation = self.operation.lock().await;
-        let current = self.drive().await?;
+    async fn rollback_required(
+        &self,
+        tip: BtcBlockTip,
+        current: BtcBlockTip,
+    ) -> ProcessingResult<Self, bool> {
         let entry = self
             .journal
             .get_entry(tip)
             .await
             .map_err(BlockProcessingError::Journal)?
-            .ok_or(BlockProcessingError::MissingEntry(tip))?;
+            .ok_or(BlockProcessingError::MissingEntry(tip))?
+            .operation
+            .entry;
         if entry.status == JournalStatus::RolledBack && current == entry.previous_btc_tip {
-            return Ok(current);
+            return Ok(false);
         }
         if current != tip {
             return Err(BlockProcessingError::RollbackTipMismatch {
@@ -150,32 +160,52 @@ where
                 current,
             });
         }
+        if entry.status != JournalStatus::Applied {
+            return Err(BlockProcessingError::UnexpectedPendingStatus(entry.status));
+        }
+        Ok(true)
+    }
+
+    pub async fn rollback(&self, tip: BtcBlockTip) -> ProcessingResult<Self, BtcBlockTip> {
+        let current = self.drive().await?;
+        if !self.rollback_required(tip, current).await? {
+            return Ok(current);
+        }
+        let entry = self
+            .journal
+            .get_entry(tip)
+            .await
+            .map_err(BlockProcessingError::Journal)?
+            .ok_or(BlockProcessingError::MissingEntry(tip))?;
+        let plan = self.prepare_rollback(&entry).await?;
         self.journal
-            .begin_rollback(tip)
+            .begin_rollback(tip, &plan)
             .await
             .map_err(BlockProcessingError::Journal)?;
         self.drive().await
     }
 
     async fn drive(&self) -> ProcessingResult<Self, BtcBlockTip> {
-        while let Some(entry) = self
+        while let Some(snapshot) = self
             .journal
-            .get_pending_entry()
+            .pending_entry()
             .await
             .map_err(BlockProcessingError::Journal)?
         {
+            let id = snapshot.id;
+            let entry = &snapshot.operation.entry;
             match entry.status {
                 JournalStatus::Applying(stage) => {
-                    self.apply_stage(&entry, stage).await?;
+                    self.apply_stage(id, entry, stage).await?;
                     self.journal
-                        .complete_apply_stage(entry.btc_tip, stage)
+                        .complete_apply_stage(id, stage)
                         .await
                         .map_err(BlockProcessingError::Journal)?;
                 }
                 JournalStatus::RollingBack(stage) => {
-                    self.restore_stage(&entry, stage).await?;
+                    self.rollback_stage(id, &snapshot.operation, stage).await?;
                     self.journal
-                        .complete_rollback_stage(entry.btc_tip, stage)
+                        .complete_rollback_stage(id, stage)
                         .await
                         .map_err(BlockProcessingError::Journal)?;
                 }
@@ -190,6 +220,7 @@ where
 
     async fn apply_stage(
         &self,
+        id: OperationId,
         entry: &BitcoinBlockJournalEntry,
         stage: ApplyStage,
     ) -> ProcessingResult<Self, ()> {
@@ -240,7 +271,7 @@ where
                         .await
                         .map_err(BlockProcessingError::PrepareFlame)?;
                     self.journal
-                        .store_flame_transition(entry.btc_tip, &transition)
+                        .store_flame_transition(id, &transition)
                         .await
                         .map_err(BlockProcessingError::Journal)?;
                 }
@@ -271,7 +302,7 @@ where
                     .await
                     .map_err(BlockProcessingError::PrepareRewards)?;
                     self.journal
-                        .store_rewards_changes(entry.btc_tip, &changes)
+                        .store_rewards_changes(id, &changes)
                         .await
                         .map_err(BlockProcessingError::Journal)?;
                 }
@@ -293,52 +324,6 @@ where
                 .map_err(BlockProcessingError::Cursor),
         }
     }
-
-    async fn restore_stage(
-        &self,
-        entry: &BitcoinBlockJournalEntry,
-        stage: RollbackStage,
-    ) -> ProcessingResult<Self, ()> {
-        match stage {
-            RollbackStage::RestoreRewards => {
-                let changes = entry
-                    .rewards_changes
-                    .as_ref()
-                    .ok_or(BlockProcessingError::MissingRewardsChanges)?;
-                RewardsUndoManager {
-                    rewards_storage: &self.rewards_storage,
-                }
-                .restore(&changes.undo)
-                .await
-                .map_err(BlockProcessingError::Rewards)
-            }
-            RollbackStage::RestoreFlameChain => {
-                let transition = entry
-                    .flame_transition
-                    .as_ref()
-                    .ok_or(BlockProcessingError::MissingFlameTransition)?;
-                FlameOperations {
-                    consensus_storage: &self.consensus_storage,
-                    chain: &self.chain,
-                    canonical_storage: &self.canonical_storage,
-                }
-                .restore(transition)
-                .await
-                .map_err(BlockProcessingError::Flame)
-            }
-            RollbackStage::RestoreConsensus => ConsensusUndoManager {
-                consensus_storage: &self.consensus_storage,
-            }
-            .restore(&entry.consensus_undo)
-            .await
-            .map_err(BlockProcessingError::Consensus),
-            RollbackStage::RestoreCursor => self
-                .cursor_storage
-                .store_cursor(entry.previous_btc_tip)
-                .await
-                .map_err(BlockProcessingError::Cursor),
-        }
-    }
 }
 
 impl<E, C, H, J, S, R, K, T> BlockProcessor for BitcoinBlockProcessor<E, C, H, J, S, R, K, T>
@@ -348,8 +333,7 @@ where
     C::Error: Send + 'static,
     H: ChainAccess + Send + Sync + 'static,
     H::Error: Send + 'static,
-    J: BitcoinBlockJournal + Send + Sync + 'static,
-    J::Error: Send + 'static,
+    J: BitcoinJournal,
     S: CanonicalStorage + Send + Sync + 'static,
     S::Error: Send + 'static,
     R: RewardsStorage + Send + Sync + 'static,
@@ -390,6 +374,10 @@ pub enum BlockProcessingError<E, C, H, J, S, R, K, T> {
     Flame(flame::ChainPathApplierError<S, H>),
     PrepareRewards(rewards::PrepareRewardsError<T, C, R>),
     MissingEntry(BtcBlockTip),
+    MissingRollbackPlan,
+    Chain(H),
+    MissingBlock(flamechain::BlockTip),
+    RewardHeightOverflow,
     MissingFlameTransition,
     MissingRewardsChanges,
     UnexpectedPendingStatus(JournalStatus),

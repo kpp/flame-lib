@@ -136,13 +136,13 @@ are generated from the same declaration and cannot drift.
 ```console
 $ cargo run -p flamed --features devnet -- genesis \
       --chainparams flamed/configs/chainparams.toml --out ./genesis.json
-genesis fc159f2a12e80c2fb711a0075cb7836df207b715d7726407ce2f6a9bdaf5dd25 with 1 allocation(s) -> ./genesis.json
+genesis aed6c23dea081daffa0ad8e09d7d1436b506bbe6c76d5b4abef4897c9cff7801 with 1 allocation(s) -> ./genesis.json
 
 $ cargo run -p flamed --features devnet -- run --config flamed/configs/flamed.toml
 flamed: height 0 with 1 unspent contract(s), 0 block(s) archived
 flamed: serving JSON-RPC on http://127.0.0.1:8545
 flamed: minting every 15s
-block 1 04e8da3d74ea0c67ee5469029f9d296a296721eb94e3429d5836654cee736ccc txs=0 dropped=0
+block 1 027658ba156843a40d3042b97334e1a61c8ea889fbc9d02a402c1bed6759acaf txs=0 dropped=0
 ```
 
 Running `genesis` twice on the same network definition gives identical
@@ -153,7 +153,7 @@ same network by comparing files.
 $ curl -s -X POST -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"tip","params":[]}' \
     http://127.0.0.1:8545
-{"jsonrpc":"2.0","id":1,"result":{"hash":"fc159f2a…","height":0,"contract_root":"8669b06a…"}}
+{"jsonrpc":"2.0","id":1,"result":{"hash":"aed6c23d…","height":0,"contract_root":"8669b06a…"}}
 
 $ curl -s -X POST -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":2,"method":"proof","params":["e870be9e…"]}' \

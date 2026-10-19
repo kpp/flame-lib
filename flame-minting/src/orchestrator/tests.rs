@@ -28,16 +28,6 @@ impl CoreBlockNotifier for Notifier {
     type Error = Infallible;
 }
 
-struct UnexpectedFlameBlockArrival;
-
-impl FlameBlockArrivalHandler for UnexpectedFlameBlockArrival {
-    type Error = Infallible;
-
-    async fn on_flame_block_arrival(&self, _: flamechain::BlockTip) -> Result<(), Self::Error> {
-        panic!("Flame block arrival is not expected in startup tests")
-    }
-}
-
 struct StartupProbe(Arc<IdentityManager>, Arc<AtomicBool>);
 
 impl ports::ConsensusIndexer for StartupProbe {
@@ -93,7 +83,6 @@ async fn check_startup(fail_sender: bool) {
         Notifier,
         Source,
         Chain,
-        UnexpectedFlameBlockArrival,
         BitcoinConfig {
             node_rpc_url: "http://127.0.0.1:1".into(),
             auth: Auth::UserPass("test".into(), "test".into()),
@@ -151,4 +140,138 @@ async fn check_startup(fail_sender: bool) {
     assert_eq!(sender_started.load(Ordering::SeqCst), !fail_sender);
     assert!(orchestrator.identity_manager.identity().is_some());
     orchestrator.shutdown().await.unwrap();
+}
+
+struct LifecycleIndexer {
+    tip: tokio::sync::watch::Sender<Option<BtcBlockTip>>,
+    stopped: AtomicBool,
+}
+
+impl ports::ConsensusIndexer for LifecycleIndexer {
+    async fn startup(&self) -> Result<(), StartupError> {
+        Ok(())
+    }
+    async fn shutdown(&self) -> Result<(), ShutdownError> {
+        self.stopped.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<BtcBlockTip>> {
+        self.tip.subscribe()
+    }
+}
+
+struct LifecycleMinter {
+    fail_startup: bool,
+    fail_shutdown: bool,
+}
+
+impl ports::MinterLifecycle for LifecycleMinter {
+    async fn startup(
+        &self,
+        _: tokio::sync::watch::Receiver<Option<BtcBlockTip>>,
+    ) -> Result<(), MinterStartupError> {
+        if self.fail_startup {
+            Err(MinterStartupError::AlreadyRunning)
+        } else {
+            Ok(())
+        }
+    }
+    async fn shutdown(&self) -> Result<(), MinterShutdownError> {
+        if self.fail_shutdown {
+            let error = tokio::spawn(async { panic!("minter failure") })
+                .await
+                .unwrap_err();
+            return Err(MinterShutdownError::WorkerJoin(error));
+        }
+        Ok(())
+    }
+}
+
+fn lifecycle_orchestrator(
+    minter: LifecycleMinter,
+) -> MintingOrchestrator<
+    SenderProbe,
+    Arc<LifecycleIndexer>,
+    DefaultConsensusLoop<Chain>,
+    LifecycleMinter,
+    Chain,
+    Notifier,
+> {
+    let identity_manager = Arc::new(IdentityManager::new(
+        Arc::new(InMemorySecretStorage::default()),
+        IdentityConfig {
+            flame_predicate: Predicate::opaque(Predicate::unspendable_key()),
+            access_predicate: Predicate::opaque(Predicate::unspendable_key()),
+            validator_pubkey: ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
+        },
+    ));
+    MintingOrchestrator {
+        btc_sender: SenderProbe {
+            identity: identity_manager.clone(),
+            started: Arc::new(AtomicBool::new(false)),
+            fail: false,
+        },
+        identity_manager,
+        btc_indexer: Arc::new(LifecycleIndexer {
+            tip: tokio::sync::watch::channel(None).0,
+            stopped: AtomicBool::new(false),
+        }),
+        consensus_manager: defaults::consensus_loop(
+            Chain,
+            BtcBlockTip {
+                hash: corepc_client::bitcoin::BlockHash::all_zeros(),
+                height: 0,
+            },
+        ),
+        minter_manager: minter,
+        chain_manager: Chain,
+        core_block_notifier: Notifier,
+    }
+}
+
+#[tokio::test]
+async fn minter_startup_failure_shuts_down_the_indexer_and_consensus_worker() {
+    let orchestrator = lifecycle_orchestrator(LifecycleMinter {
+        fail_startup: true,
+        fail_shutdown: false,
+    });
+    assert!(matches!(
+        orchestrator.startup().await,
+        Err(OrchestratorError::MinterStartup(
+            MinterStartupError::AlreadyRunning
+        ))
+    ));
+    assert!(orchestrator.btc_indexer.stopped.load(Ordering::SeqCst));
+    assert_eq!(
+        orchestrator.consensus_manager.manager().status(),
+        crate::ConsensusStatus::Stopped
+    );
+    assert_eq!(
+        orchestrator
+            .consensus_handle()
+            .on_flame_block_arrival(flamechain::BlockTip {
+                hash: flamechain::BlockHash::from([1; 32]),
+                height: 1.into()
+            })
+            .await,
+        Err(crate::ConsensusSendError::Stopped)
+    );
+}
+
+#[tokio::test]
+async fn minter_shutdown_failure_does_not_leave_the_indexer_or_consensus_worker_running() {
+    let orchestrator = lifecycle_orchestrator(LifecycleMinter {
+        fail_startup: false,
+        fail_shutdown: true,
+    });
+    orchestrator.startup().await.unwrap();
+    assert!(matches!(
+        orchestrator.shutdown().await,
+        Err(OrchestratorError::MinterShutdown(_))
+    ));
+    assert!(orchestrator.btc_indexer.stopped.load(Ordering::SeqCst));
+    assert_eq!(
+        orchestrator.consensus_manager.manager().status(),
+        crate::ConsensusStatus::Stopped
+    );
 }

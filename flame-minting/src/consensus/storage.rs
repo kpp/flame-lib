@@ -20,8 +20,29 @@ pub struct MinterAcquisitions {
     pub acquisitions: Vec<IncludedAcquisition>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MinterEndorsementState {
+    pub endorsements: Vec<WeightedEndorsement>,
+    pub pending_endorsements: Vec<IncludedEndorsement>,
+    pub double_signs: Vec<DoubleSign>,
+}
+
 pub trait ConsensusStorage {
     type Error;
+
+    fn get_minter_endorsement_state(
+        &self,
+        _minter: &MinterP2wsh,
+    ) -> impl Future<Output = Result<MinterEndorsementState, Self::Error>> + Send {
+        async { unimplemented!() }
+    }
+
+    fn remove_endorsement_inclusion(
+        &self,
+        _endorsement: &IncludedEndorsement,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { unimplemented!() }
+    }
 
     fn get_block_tip_with_most_weight(
         &self,

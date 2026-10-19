@@ -1,4 +1,4 @@
-use flame_chain_service::{ChainAccess, ChainPath};
+use flame_chain_service::ChainAccess;
 use flame_storage::CanonicalStorage;
 
 use super::journal::FlameTransition;
@@ -68,23 +68,6 @@ impl<C: ConsensusStorage, H: ChainAccess, S: CanonicalStorage> FlameOperations<'
             transition.next_tip,
             &transition.path,
         )
-        .await?;
-        Ok(())
-    }
-
-    pub(super) async fn restore(
-        &self,
-        transition: &FlameTransition,
-    ) -> Result<(), ChainPathApplierError<S::Error, H::Error>> {
-        let reverse = ChainPath {
-            detach: transition.path.attach.iter().rev().copied().collect(),
-            attach: transition.path.detach.iter().rev().copied().collect(),
-        };
-        ChainPathApplier {
-            canonical_storage: self.canonical_storage,
-            chain: self.chain,
-        }
-        .apply(transition.next_tip, transition.previous_tip, &reverse)
         .await?;
         Ok(())
     }

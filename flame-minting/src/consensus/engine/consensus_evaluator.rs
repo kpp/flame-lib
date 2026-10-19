@@ -25,7 +25,17 @@ impl<C: ConsensusStorage, H: ChainStorage> ConsensusEvaluator<'_, C, H> {
         endorsements: &[IncludedEndorsement],
         accepted_acquisitions: Vec<IncludedAcquisition>,
     ) -> Result<ConsensusOutcome, MintingEngineError<C::Error, H::Error>> {
-        let validated = EndorsementValidator {
+        self.evaluate_with_removals(endorsements, accepted_acquisitions, &[])
+            .await
+    }
+
+    pub(in crate::consensus) async fn evaluate_with_removals(
+        &self,
+        endorsements: &[IncludedEndorsement],
+        accepted_acquisitions: Vec<IncludedAcquisition>,
+        removed: &[crate::consensus::WeightedEndorsement],
+    ) -> Result<ConsensusOutcome, MintingEngineError<C::Error, H::Error>> {
+        let mut validated = EndorsementValidator {
             endorsements,
             protocol_params: self.protocol_params,
             consensus_storage: self.consensus_storage,
@@ -42,6 +52,7 @@ impl<C: ConsensusStorage, H: ChainStorage> ConsensusEvaluator<'_, C, H> {
                 MintingEngineError::ChainStorage(error)
             }
         })?;
+        validated.removed_endorsements.extend_from_slice(removed);
         let acquisition_provider = AcquisitionProvider {
             storage: self.consensus_storage,
             new_acquisitions: &accepted_acquisitions,

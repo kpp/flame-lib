@@ -35,6 +35,47 @@ fn double_sign(minter: u8, height: u32) -> DoubleSign {
     }
 }
 
+#[tokio::test]
+async fn removes_only_matching_inclusions_and_keeps_evidence_while_hashes_conflict() {
+    let storage = InMemoryConsensusStorage::new();
+    let mut sign = double_sign(0x51, 1);
+    let removed = sign.endorsements[1].clone();
+    let mut foreign = removed.clone();
+    foreign.btc_block.hash = BtcBlockHash::from_byte_array([4; 32]);
+    sign.endorsements.push(foreign.clone());
+    storage.add_double_sign(&sign).await.unwrap();
+    for _ in 0..2 {
+        storage
+            .remove_endorsement_inclusion(&removed)
+            .await
+            .unwrap();
+        let proof = storage
+            .get_double_sign(&sign.minter, sign.target_flame_height)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            proof.endorsements,
+            vec![sign.endorsements[0].clone(), foreign.clone()]
+        );
+        assert_minter_status(&storage, &sign.minter, true).await;
+    }
+    for _ in 0..2 {
+        storage
+            .remove_endorsement_inclusion(&foreign)
+            .await
+            .unwrap();
+        assert_minter_status(&storage, &sign.minter, false).await;
+        assert!(
+            storage
+                .get_double_sign(&sign.minter, sign.target_flame_height)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 async fn assert_minter_status(
     storage: &InMemoryConsensusStorage,
     minter: &MinterP2wsh,

@@ -8,7 +8,13 @@ use btc_integration::{
 use flame_chain_service::InMemoryChain;
 use flame_minting::{
     MintingOrchestrator,
-    block_processing::{BitcoinBlockProcessor, journal::InMemoryBitcoinBlockJournal},
+    block_processing::{
+        BitcoinBlockProcessor, ConsensusManager, FlameBlockProcessor,
+        journal::consensus::{
+            ConsensusJournal, InMemoryBitcoinJournal, InMemoryConsensusJournal,
+            InMemoryFlameJournal,
+        },
+    },
     consensus::{
         ConsensusEngine, ConsensusOutcome, IncludedEndorsement, MintingEngineFactory,
         MintingOutcome, MintingProtocolParams, storage::InMemoryConsensusStorage,
@@ -31,12 +37,23 @@ type DemoLoop = ConsensusLoop<
         RecordingEngine,
         InMemoryConsensusStorage,
         InMemoryChain,
-        InMemoryBitcoinBlockJournal,
+        InMemoryBitcoinJournal,
         InMemoryCanonicalStorage,
         InMemoryRewardsStorage,
         InMemoryCursorStorage,
         InMemoryChainStorage,
     >,
+    FlameBlockProcessor<
+        Engine,
+        InMemoryConsensusStorage,
+        InMemoryChain,
+        InMemoryCanonicalStorage,
+        InMemoryRewardsStorage,
+        InMemoryCursorStorage,
+        InMemoryChainStorage,
+        InMemoryFlameJournal,
+    >,
+    InMemoryConsensusJournal,
 >;
 type Orchestrator = MintingOrchestrator<
     Arc<MintingSender>,
@@ -60,6 +77,13 @@ pub(super) struct RecordingEngine {
 
 impl ConsensusEngine for RecordingEngine {
     type Error = <Engine as ConsensusEngine>::Error;
+
+    async fn get_rollback_plan(
+        &self,
+        input: flame_minting::consensus::BitcoinRollbackInput,
+    ) -> Result<flame_minting::consensus::BitcoinRollbackPlan, Self::Error> {
+        self.inner.get_rollback_plan(input).await
+    }
 
     async fn get_endorsements_outcome(
         &self,
@@ -117,7 +141,8 @@ impl DemoRuntime {
         let blocks = InMemoryChainStorage::new();
         let consensus = InMemoryConsensusStorage::new();
         let canonical = InMemoryCanonicalStorage::new();
-        let journal = InMemoryBitcoinBlockJournal::new(cursor);
+        let journal = InMemoryConsensusJournal::new(cursor);
+        let rewards = InMemoryRewardsStorage::new();
         let cursor = InMemoryCursorStorage::new(cursor);
         let history = Arc::new(Mutex::new(Vec::new()));
         let identity_manager = Arc::new(IdentityManager::new(
@@ -131,7 +156,7 @@ impl DemoRuntime {
             )?),
         ))));
         let btc_sender = Arc::new(MintingSender::new(bitcoin, identity_manager.clone()));
-        let consensus_manager = ConsensusLoop::new(BitcoinBlockProcessor::new(
+        let bitcoin_processor = BitcoinBlockProcessor::new(
             RecordingEngine {
                 inner: Engine {
                     protocol_params: parameters.clone(),
@@ -143,15 +168,39 @@ impl DemoRuntime {
             },
             consensus.clone(),
             chain.clone(),
-            journal,
+            journal.bitcoin_journal(),
             canonical.clone(),
-            InMemoryRewardsStorage::new(),
+            rewards.clone(),
             cursor.clone(),
             RewardsEngine {
                 chain_storage: Arc::new(blocks.clone()),
                 consensus_storage: Arc::new(consensus.clone()),
                 protocol_params: parameters.clone(),
             },
+        );
+        let flame_processor = FlameBlockProcessor::new(
+            Engine {
+                protocol_params: parameters.clone(),
+                consensus_storage: Arc::new(consensus.clone()),
+                chain_storage: Arc::new(blocks.clone()),
+                canonical_storage: Arc::new(canonical.clone()),
+            },
+            consensus.clone(),
+            chain.clone(),
+            canonical.clone(),
+            rewards,
+            cursor.clone(),
+            RewardsEngine {
+                chain_storage: Arc::new(blocks.clone()),
+                consensus_storage: Arc::new(consensus.clone()),
+                protocol_params: parameters.clone(),
+            },
+            journal.flame_journal(),
+        );
+        let consensus_manager = ConsensusLoop::new(ConsensusManager::new(
+            bitcoin_processor,
+            flame_processor,
+            journal,
         ));
         let minter_manager = MinterManager::new(
             Arc::new(chain.clone()),

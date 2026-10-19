@@ -1,10 +1,10 @@
 use btc_integration::{
-    BtcBlockTip, MintingEndorsementData, MintingEndorsementValidator, UncheckedMintingEndorsement,
+    BtcBlockTip, MintingEndorsementValidator, UncheckedMintingEndorsement,
     protocol::minter_witness_script,
 };
 use corepc_client::bitcoin::{
-    Amount, BlockHash as BtcBlockHash, Script, Transaction, TxIn, TxOut, Txid, Witness, absolute,
-    hashes::Hash, transaction,
+    Amount, BlockHash as BtcBlockHash, Script, ScriptBuf, Transaction, TxIn, TxOut, Txid, Witness,
+    absolute, hashes::Hash, script::PushBytes, transaction,
 };
 use flamechain::{BlockHash, CoreBlockTip};
 use flamevm::Predicate;
@@ -19,6 +19,10 @@ fn endorsements(minter: u8, height: u32, hash: u8) -> [IncludedEndorsement; 2] {
         &Predicate::opaque(Predicate::unspendable_key()),
         Script::from_bytes(&[minter]),
     );
+    let mut payload = b"FLMB".to_vec();
+    payload.push(1);
+    payload.extend_from_slice(&height.to_le_bytes());
+    payload.extend_from_slice(&[hash; 32]);
     let transaction = Transaction {
         version: transaction::Version::TWO,
         lock_time: absolute::LockTime::from_consensus(u32::from(minter)),
@@ -31,11 +35,9 @@ fn endorsements(minter: u8, height: u32, hash: u8) -> [IncludedEndorsement; 2] {
         ],
         output: vec![TxOut {
             value: Amount::ZERO,
-            script_pubkey: MintingEndorsementData::V1 {
-                flame_block_height: height,
-                flame_block_hash: BlockHash::from([hash; 32]),
-            }
-            .to_script(),
+            script_pubkey: ScriptBuf::new_op_return(
+                <&PushBytes>::try_from(payload.as_slice()).unwrap(),
+            ),
         }],
     };
     let unchecked: [UncheckedMintingEndorsement; 2] =
@@ -63,6 +65,75 @@ fn weighted_endorsement(minter: u8, height: u32, hash: u8) -> WeightedEndorsemen
     WeightedEndorsement {
         original,
         effective_minting_power: 42,
+    }
+}
+
+#[tokio::test]
+async fn removes_the_exact_bitcoin_inclusion_from_pending_and_counted_state_idempotently() {
+    let storage = InMemoryConsensusStorage::new();
+    let [first, other_input] = endorsements(0x51, 1, 1);
+    let mut foreign = first.clone();
+    foreign.btc_block.hash = BtcBlockHash::from_byte_array([4; 32]);
+    let tip = first.endorsement.block_tip();
+    let weighted = WeightedEndorsement {
+        original: foreign.clone(),
+        effective_minting_power: 42,
+    };
+    storage
+        .store_endorsement(foreign.btc_block, &weighted)
+        .await
+        .unwrap();
+    for entry in [&first, &other_input] {
+        storage.store_pending_endorsement(tip, entry).await.unwrap();
+    }
+    for _ in 0..2 {
+        storage.remove_endorsement_inclusion(&first).await.unwrap();
+        assert_eq!(
+            storage.get_endorsements_for_block(tip).await.unwrap(),
+            vec![weighted.clone()]
+        );
+        assert_eq!(
+            storage
+                .get_pending_endorsements_for_block(tip)
+                .await
+                .unwrap(),
+            vec![other_input.clone()]
+        );
+    }
+    storage
+        .store_pending_endorsement(tip, &foreign)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        storage.remove_endorsement_inclusion(&first).await.unwrap();
+        assert_eq!(
+            storage
+                .get_minter_endorsement_state(&first.endorsement.auth().minter().p2wsh())
+                .await
+                .unwrap()
+                .endorsements,
+            vec![weighted.clone()]
+        );
+    }
+    for _ in 0..2 {
+        storage
+            .remove_endorsement_inclusion(&foreign)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .get_endorsements_for_block(tip)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage
+                .get_pending_endorsements_for_block(tip)
+                .await
+                .unwrap(),
+            vec![other_input.clone()]
+        );
     }
 }
 

@@ -216,7 +216,7 @@ impl BitcoinBlockJournal for InMemoryBitcoinBlockJournal {
             .ok_or(Error::EntryNotFound(btc_tip))?;
         check_tip(entry.btc_tip, btc_tip)?;
         check_status(JournalStatus::Applied, entry.status)?;
-        entry.status = JournalStatus::RollingBack(RollbackStage::RestoreRewards);
+        entry.status = JournalStatus::RollingBack(RollbackStage::RemoveEndorsements);
         state.pending_tip = Some(btc_tip);
         Ok(())
     }

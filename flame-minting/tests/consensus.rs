@@ -5,9 +5,125 @@ use btc_integration::MintingEndorsementData;
 use corepc_client::bitcoin::Amount;
 use flame_minting::consensus::ConsensusStorage;
 use flame_storage::CanonicalStorage;
-use flamechain::{BlockTip, CoreBlockTip};
+use flamechain::{BlockTip, CoreBlockHeader, CoreBlockTip};
+use std::time::Duration;
+use tokio::time::{sleep, timeout};
 
 use common::TestContext;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn public_handle_and_indexer_share_state_across_arrivals_restart_and_bitcoin_reorg()
+-> Result<()> {
+    TestContext::run(|mut ctx| async move {
+        ctx.send_acquisition(Amount::from_sat(20_000)).await?;
+        let acquisition_tip = ctx.bitcoin.mine_block().await?;
+        ctx.start().await?;
+        ctx.wait_for_processing(acquisition_tip).await?;
+        let target_btc_height = u32::try_from(acquisition_tip.height + 1)?;
+        let mut state = ctx.flame_chain.state().clone();
+        let mut candidate = state.build_block([0; 32], vec![])?;
+        candidate.header.core_block = Some(CoreBlockHeader {
+            height: 1.into(),
+            target_btc_height,
+        });
+        ctx.orchestrator
+            .btc_sender
+            .send_endorsement(1, candidate.header.id())
+            .await?;
+        let confirmation = ctx.bitcoin.mine_block().await?;
+        ctx.wait_for_processing(confirmation).await?;
+        let core_tip = CoreBlockTip {
+            hash: candidate.header.id(),
+            height: 1.into(),
+        };
+        let consensus = ctx.orchestrator.get_consensus_storage();
+        assert_eq!(
+            consensus
+                .get_pending_endorsements_for_block(core_tip)
+                .await?
+                .len(),
+            1
+        );
+        assert!(
+            consensus
+                .get_endorsements_for_block(core_tip)
+                .await?
+                .is_empty()
+        );
+
+        let block = ctx.flame_chain.create_core_block(target_btc_height).await?;
+        assert_eq!(block.header, candidate.header);
+        let handle = ctx.orchestrator.consensus_handle();
+        handle
+            .on_flame_block_arrival(block.header.block_tip())
+            .await?;
+        timeout(Duration::from_secs(10), async {
+            while ctx.orchestrator.get_canonical_storage().get_tip().await?
+                != Some(block.header.block_tip())
+            {
+                sleep(Duration::from_millis(20)).await;
+            }
+            Ok::<_, bitcoind::anyhow::Error>(())
+        })
+        .await
+        .context("timed out applying the Flame arrival through the public handle")??;
+        let counted = consensus.get_endorsements_for_block(core_tip).await?;
+        assert_eq!(counted.len(), 1);
+        assert_eq!(counted[0].original.btc_block, confirmation);
+        assert_eq!(counted[0].effective_minting_power, 200);
+        assert!(
+            consensus
+                .get_pending_endorsements_for_block(core_tip)
+                .await?
+                .is_empty()
+        );
+        handle
+            .on_flame_block_arrival(block.header.block_tip())
+            .await?;
+        ctx.orchestrator
+            .shutdown()
+            .await
+            .map_err(|error| bitcoind::anyhow::anyhow!("shutdown: {error:?}"))?;
+        assert_eq!(
+            handle
+                .on_flame_block_arrival(block.header.block_tip())
+                .await,
+            Err(flame_minting::ConsensusSendError::Stopped)
+        );
+        let _: () = ctx
+            .bitcoin
+            .node
+            .client
+            .call("invalidateblock", &[confirmation.hash.to_string().into()])?;
+        let address = ctx.bitcoin.node.client.new_address()?;
+        ctx.bitcoin.node.client.generate_to_address(1, &address)?;
+        let replacement = ctx.bitcoin.rpc.best_block_tip().await?;
+        assert_ne!(replacement.hash, confirmation.hash);
+        let target = ctx.bitcoin.mine_block().await?;
+        ctx.start().await?;
+        ctx.wait_for_processing(target).await?;
+        handle
+            .on_flame_block_arrival(block.header.block_tip())
+            .await?;
+        let replaced = consensus.get_endorsements_for_block(core_tip).await?;
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].original.btc_block, replacement);
+        assert_eq!(
+            replaced[0].original.endorsement,
+            counted[0].original.endorsement
+        );
+        assert_eq!(
+            replaced[0].effective_minting_power,
+            counted[0].effective_minting_power
+        );
+        assert_eq!(
+            ctx.orchestrator.get_canonical_storage().get_tip().await?,
+            Some(block.header.block_tip())
+        );
+        Ok(())
+    })
+    .await
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stronger_late_endorsement_reorganizes_to_competing_core_block() -> Result<()> {

@@ -4,5 +4,5 @@ mod regtest_signer;
 mod test_context;
 
 #[allow(unused_imports)] // Helpers are shared by independent integration-test crates.
-pub use regtest_signer::create_connection;
+pub use regtest_signer::{create_connection, identity_from_script};
 pub use test_context::{TestContext, setup};

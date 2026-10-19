@@ -28,13 +28,12 @@ impl SecretStorage for UnreadStorage {
 
 #[tokio::test]
 async fn unsupported_authorization_is_rejected_before_connecting() {
-    let identity = MinterIdentity::new(
+    let identity = common::identity_from_script(
         btc_integration::protocol::minter_witness_script::build_with_authorization(
             &Predicate::opaque(Predicate::unspendable_key()),
             Script::from_bytes(&[0x51]),
         ),
-    )
-    .unwrap();
+    );
     let result = BitcoinConnection::regtest(
         BitcoinConfig {
             node_rpc_url: "not a URL".into(),
@@ -59,10 +58,10 @@ fn identity() -> MinterIdentity {
     let public_key = SecretKey::from_slice(&[0x41; 32])
         .unwrap()
         .public_key(&Secp256k1::new());
-    MinterIdentity::single_key(
+    common::identity_from_script(btc_integration::protocol::minter_witness_script::build(
         &Predicate::opaque(Predicate::unspendable_key()),
         &public_key,
-    )
+    ))
 }
 
 async fn connect(

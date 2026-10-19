@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, btree_map::Entry};
 use btc_integration::MinterP2wsh;
 use flamechain::CoreFlameHeight;
 
-use crate::consensus::DoubleSign;
+use crate::consensus::{DoubleSign, IncludedEndorsement};
 
 use super::InMemoryConsensusStorageError;
 
@@ -13,6 +13,37 @@ pub(super) struct DoubleSignStorage {
 }
 
 impl DoubleSignStorage {
+    pub(super) fn for_minter(&self, minter: &MinterP2wsh) -> Vec<DoubleSign> {
+        self.signs
+            .get(minter)
+            .into_iter()
+            .flat_map(|signs| signs.values())
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn remove_inclusion(&mut self, included: &IncludedEndorsement) {
+        let minter = included.endorsement.auth().minter().p2wsh();
+        if let Entry::Occupied(mut minter_signs) = self.signs.entry(minter) {
+            let height = included.block_height();
+            if let Entry::Occupied(mut entry) = minter_signs.get_mut().entry(height) {
+                let sign = entry.get_mut();
+                sign.endorsements
+                    .retain(|entry| !super::endorsement_storage::same_inclusion(entry, included));
+                if !sign.endorsements.first().is_some_and(|first| {
+                    sign.endorsements
+                        .iter()
+                        .any(|entry| entry.block_hash() != first.block_hash())
+                }) {
+                    entry.remove();
+                }
+            }
+            if minter_signs.get().is_empty() {
+                minter_signs.remove();
+            }
+        }
+    }
+
     pub(super) fn add_double_sign(
         &mut self,
         double_sign: &DoubleSign,

@@ -40,6 +40,13 @@ impl InMemoryRewardsStorage {
 impl RewardsStorage for InMemoryRewardsStorage {
     type Error = InMemoryRewardsStorageError;
 
+    async fn get_pending_rewards(
+        &self,
+        height: CoreFlameHeight,
+    ) -> Result<Vec<PendingReward>, Self::Error> {
+        self.get_pending_rewards(height).await
+    }
+
     async fn get_pending_reward(
         &self,
         target_block_height: CoreFlameHeight,

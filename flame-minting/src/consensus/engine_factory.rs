@@ -9,6 +9,11 @@ use std::{future::Future, sync::Arc};
 pub trait ConsensusEngine: Send + Sync + 'static {
     type Error: Send + 'static;
 
+    fn get_rollback_plan(
+        &self,
+        input: super::BitcoinRollbackInput,
+    ) -> impl Future<Output = Result<super::BitcoinRollbackPlan, Self::Error>> + Send;
+
     fn get_endorsements_outcome(
         &self,
         endorsements: Vec<IncludedEndorsement>,
@@ -38,6 +43,19 @@ where
     H::Error: Send + 'static,
 {
     type Error = MintingEngineError<C::Error, H::Error>;
+
+    async fn get_rollback_plan(
+        &self,
+        input: super::BitcoinRollbackInput,
+    ) -> Result<super::BitcoinRollbackPlan, Self::Error> {
+        super::rollback::calculate(
+            self.consensus_storage.as_ref(),
+            self.chain_storage.as_ref(),
+            &self.protocol_params,
+            input,
+        )
+        .await
+    }
 
     async fn get_endorsements_outcome(
         &self,

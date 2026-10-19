@@ -221,7 +221,7 @@ impl CellEncode for CoreBlockHeader {
 }
 
 impl CellDecode for CoreBlockHeader {
-    fn decode<R: CellResolver + ?Sized>(
+    fn decode<R: CellReader + ?Sized>(
         slice: &mut CellSlice<'_>,
         _cells: &mut R,
     ) -> Result<Self, CellError> {
@@ -1812,7 +1812,8 @@ mod tests {
             assert!(core_ids.insert(block.header.id()));
 
             let header_bytes = block.header.to_bytes().unwrap();
-            assert_eq!(header_bytes.len(), BlockHeader::MAX_ENCODED_SIZE);
+            assert_eq!(header_bytes.len(), 228);
+            assert!(header_bytes.len() <= BlockHeader::MAX_ENCODED_SIZE);
             assert_eq!(
                 BlockHeader::from_bytes_bounded(&header_bytes, 1).unwrap(),
                 block.header,

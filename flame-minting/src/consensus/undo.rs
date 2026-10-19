@@ -14,6 +14,7 @@ pub use manager::ConsensusUndoManager;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConsensusUndo {
+    pub included_endorsements: Vec<IncludedEndorsement>,
     pub acquisitions: BTreeMap<AcquisitionIndex, Option<IncludedAcquisition>>,
     pub endorsements: BTreeMap<(MinterP2wsh, CoreFlameHeight), Option<WeightedEndorsement>>,
     pub pending_endorsements:

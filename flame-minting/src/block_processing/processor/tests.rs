@@ -18,12 +18,16 @@ use flamevm::Predicate;
 
 use super::*;
 use crate::block_processing::journal::{
-    FlameTransition, InMemoryBitcoinBlockJournal, RewardsChanges,
+    FlameTransition, RewardsChanges,
+    consensus::{
+        BitcoinJournalEntry, ConsensusJournal, InMemoryBitcoinJournal, InMemoryConsensusJournal,
+    },
 };
 use crate::consensus::{
-    AcquisitionIndex, ConsensusUndo, DoubleSign, EndorsementIndex, IncludedAcquisition,
-    IncludedEndorsement, WeightedBlockHeader, WeightedEndorsement,
-    engine::tests::endorsement_for_tip, storage::InMemoryConsensusStorage,
+    AcquisitionIndex, BitcoinRollbackInput, BitcoinRollbackPlan, ConsensusUndo, DoubleSign,
+    EndorsementIndex, IncludedAcquisition, IncludedEndorsement, MinterEndorsementState,
+    WeightedBlockHeader, WeightedEndorsement, engine::tests::endorsement_for_tip,
+    storage::InMemoryConsensusStorage,
 };
 use crate::consensus::{ConsensusOutcome, MintingOutcome};
 use crate::orchestrator::cursor_storage::InMemoryCursorStorage;
@@ -101,6 +105,15 @@ impl ChainAccess for Chain {
         if self.reject_plans.load(Ordering::SeqCst) {
             return Err("path planning rejected");
         }
+        if from == to {
+            return Ok(ChainPath::default());
+        }
+        if from == self.transition.next_tip && to == self.transition.previous_tip {
+            return Ok(ChainPath {
+                detach: self.transition.path.attach.iter().rev().copied().collect(),
+                attach: self.transition.path.detach.iter().rev().copied().collect(),
+            });
+        }
         assert_eq!(from, self.transition.previous_tip);
         assert_eq!(to, self.transition.next_tip);
         Ok(self.transition.path.clone())
@@ -109,7 +122,7 @@ impl ChainAccess for Chain {
 
 struct Storage {
     state: Mutex<StoredState>,
-    journal: InMemoryBitcoinBlockJournal,
+    journal: InMemoryBitcoinJournal,
     transition: FlameTransition,
 }
 
@@ -132,13 +145,33 @@ impl CanonicalStorage for Storage {
     }
 
     async fn commit_state(&self, chain: &Blockchain) -> Result<(), Self::Error> {
-        let entry = self.journal.get_pending_entry().await.unwrap().unwrap();
+        let entry = self
+            .journal
+            .pending_entry()
+            .await
+            .unwrap()
+            .unwrap()
+            .operation
+            .entry;
         assert!(matches!(
             entry.status,
             JournalStatus::Applying(ApplyStage::ApplyFlameTransition)
-                | JournalStatus::RollingBack(RollbackStage::RestoreFlameChain)
+                | JournalStatus::RollingBack(RollbackStage::ApplyFlameTransition)
         ));
-        assert_eq!(entry.flame_transition.as_ref(), Some(&self.transition));
+        let expected = if matches!(entry.status, JournalStatus::RollingBack(_)) {
+            FlameTransition {
+                previous_tip: self.transition.next_tip,
+                next_tip: self.transition.previous_tip,
+                path: ChainPath {
+                    detach: self.transition.path.attach.iter().rev().copied().collect(),
+                    attach: self.transition.path.detach.iter().rev().copied().collect(),
+                },
+                attached_core_headers: Vec::new(),
+            }
+        } else {
+            self.transition.clone()
+        };
+        assert_eq!(entry.flame_transition.as_ref(), Some(&expected));
         let mut state = self.state.lock().unwrap();
         let failure = if state
             .failure
@@ -170,10 +203,11 @@ impl std::ops::Deref for Consensus {
 }
 struct ConsensusData {
     winner: BlockTip,
+    previous_winner: BlockTip,
     selections: AtomicUsize,
     reject_selection: AtomicBool,
     inner: InMemoryConsensusStorage,
-    journal: InMemoryBitcoinBlockJournal,
+    journal: InMemoryBitcoinJournal,
     outcome: MintingOutcome,
     undo: ConsensusUndo,
     reject_reads: AtomicBool,
@@ -191,7 +225,14 @@ impl Consensus {
     }
 
     async fn before_write(&self, stage: ApplyStage) {
-        let entry = self.journal.get_pending_entry().await.unwrap().unwrap();
+        let entry = self
+            .journal
+            .pending_entry()
+            .await
+            .unwrap()
+            .unwrap()
+            .operation
+            .entry;
         assert_eq!(entry.minting_outcome, self.outcome);
         assert_eq!(entry.consensus_undo, self.undo);
         assert_eq!(entry.status, JournalStatus::Applying(stage));
@@ -213,6 +254,28 @@ impl Consensus {
 
 impl ConsensusStorage for Consensus {
     type Error = &'static str;
+
+    async fn get_minter_endorsement_state(
+        &self,
+        minter: &MinterP2wsh,
+    ) -> Result<MinterEndorsementState, Self::Error> {
+        self.before_read()?;
+        self.inner
+            .get_minter_endorsement_state(minter)
+            .await
+            .map_err(|_| "storage read failed")
+    }
+
+    async fn remove_endorsement_inclusion(
+        &self,
+        included: &IncludedEndorsement,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .remove_endorsement_inclusion(included)
+            .await
+            .map_err(|_| "storage write failed")?;
+        self.after_write()
+    }
 
     async fn get_acquisition(
         &self,
@@ -315,7 +378,15 @@ impl ConsensusStorage for Consensus {
         tip: BlockTip,
         weighted: &WeightedBlockHeader,
     ) -> Result<(), Self::Error> {
-        self.before_write(ApplyStage::StoreBlockWeights).await;
+        if self
+            .journal
+            .pending_entry()
+            .await
+            .unwrap()
+            .is_some_and(|entry| matches!(entry.operation.entry.status, JournalStatus::Applying(_)))
+        {
+            self.before_write(ApplyStage::StoreBlockWeights).await;
+        }
         self.inner
             .store_cumulative_weight(tip, weighted)
             .await
@@ -350,7 +421,19 @@ impl ConsensusStorage for Consensus {
         if self.reject_selection.load(Ordering::SeqCst) {
             return Err("selection rejected");
         }
-        Ok(Some(self.winner))
+        let rollback = self
+            .journal
+            .pending_entry()
+            .await
+            .unwrap()
+            .is_some_and(|entry| {
+                matches!(entry.operation.entry.status, JournalStatus::RollingBack(_))
+            });
+        Ok(Some(if rollback {
+            self.previous_winner
+        } else {
+            self.winner
+        }))
     }
     async fn restore_acquisition(
         &self,
@@ -383,10 +466,10 @@ impl ConsensusStorage for Consensus {
     ) -> Result<(), Self::Error> {
         if matches!(
             self.journal
-                .get_pending_entry()
+                .pending_entry()
                 .await
                 .unwrap()
-                .map(|entry| entry.status),
+                .map(|entry| entry.operation.entry.status),
             Some(JournalStatus::Applying(
                 ApplyStage::StorePendingEndorsements
             ))
@@ -434,7 +517,7 @@ enum Point {
     Restore(RollbackStage),
 }
 struct Journal {
-    inner: InMemoryBitcoinBlockJournal,
+    inner: InMemoryBitcoinJournal,
     fault: Mutex<Option<(Point, bool)>>,
 }
 impl Journal {
@@ -447,96 +530,134 @@ impl Journal {
         Ok(())
     }
 }
-impl BitcoinBlockJournal for Journal {
+impl BitcoinJournal for Journal {
     type Error = &'static str;
+
     async fn begin_apply(
         &self,
         previous: BtcBlockTip,
+        block: &IndexedBlock,
         outcome: &MintingOutcome,
         undo: &ConsensusUndo,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<OperationId, Self::Error> {
         self.check(Point::Begin, false)?;
-        self.inner
-            .begin_apply(previous, outcome, undo)
+        let id = self
+            .inner
+            .begin_apply(previous, block, outcome, undo)
             .await
             .map_err(|_| "journal operation failed")?;
-        self.check(Point::Begin, true)
+        self.check(Point::Begin, true)?;
+        Ok(id)
     }
+
     async fn store_flame_transition(
         &self,
-        tip: BtcBlockTip,
+        id: OperationId,
         transition: &FlameTransition,
     ) -> Result<(), Self::Error> {
         self.check(Point::FlamePlan, false)?;
         self.inner
-            .store_flame_transition(tip, transition)
+            .store_flame_transition(id, transition)
             .await
             .map_err(|_| "journal operation failed")?;
         self.check(Point::FlamePlan, true)
     }
+
     async fn store_rewards_changes(
         &self,
-        tip: BtcBlockTip,
+        id: OperationId,
         changes: &RewardsChanges,
     ) -> Result<(), Self::Error> {
         self.check(Point::RewardsPlan, false)?;
         self.inner
-            .store_rewards_changes(tip, changes)
+            .store_rewards_changes(id, changes)
             .await
             .map_err(|_| "journal operation failed")?;
         self.check(Point::RewardsPlan, true)
     }
+
     async fn complete_apply_stage(
         &self,
-        tip: BtcBlockTip,
+        id: OperationId,
         stage: ApplyStage,
     ) -> Result<(), Self::Error> {
         self.check(Point::Apply(stage), false)?;
         self.inner
-            .complete_apply_stage(tip, stage)
+            .complete_apply_stage(id, stage)
             .await
             .map_err(|_| "journal operation failed")?;
         self.check(Point::Apply(stage), true)
     }
-    async fn begin_rollback(&self, tip: BtcBlockTip) -> Result<(), Self::Error> {
-        self.check(Point::BeginRollback, false)?;
-        self.inner
-            .begin_rollback(tip)
-            .await
-            .map_err(|_| "journal operation failed")?;
-        self.check(Point::BeginRollback, true)
-    }
-    async fn complete_rollback_stage(
+
+    async fn begin_rollback(
         &self,
         tip: BtcBlockTip,
+        plan: &BitcoinRollbackPlan,
+    ) -> Result<OperationId, Self::Error> {
+        self.check(Point::BeginRollback, false)?;
+        let id = self
+            .inner
+            .begin_rollback(tip, plan)
+            .await
+            .map_err(|_| "journal operation failed")?;
+        self.check(Point::BeginRollback, true)?;
+        Ok(id)
+    }
+
+    async fn complete_rollback_stage(
+        &self,
+        id: OperationId,
         stage: RollbackStage,
     ) -> Result<(), Self::Error> {
         self.check(Point::Restore(stage), false)?;
         self.inner
-            .complete_rollback_stage(tip, stage)
+            .complete_rollback_stage(id, stage)
             .await
             .map_err(|_| "journal operation failed")?;
         self.check(Point::Restore(stage), true)
     }
+
+    async fn get_applied_endorsements(&self) -> Result<Vec<IncludedEndorsement>, Self::Error> {
+        self.inner
+            .get_applied_endorsements()
+            .await
+            .map_err(|_| "history failed")
+    }
+
     async fn get_entry(
         &self,
         tip: BtcBlockTip,
-    ) -> Result<Option<BitcoinBlockJournalEntry>, Self::Error> {
+    ) -> Result<Option<BitcoinJournalEntry>, Self::Error> {
         self.inner.get_entry(tip).await.map_err(|_| "entry failed")
     }
-    async fn get_pending_entry(&self) -> Result<Option<BitcoinBlockJournalEntry>, Self::Error> {
+
+    async fn pending_entry(&self) -> Result<Option<BitcoinJournalEntry>, Self::Error> {
         self.inner
-            .get_pending_entry()
+            .pending_entry()
             .await
             .map_err(|_| "pending failed")
     }
 }
+
 struct Engine {
+    rollback: BitcoinRollbackPlan,
+    rollback_calls: AtomicUsize,
     outcome: MintingOutcome,
     calls: AtomicUsize,
 }
 impl ConsensusEngine for Engine {
     type Error = &'static str;
+
+    async fn get_rollback_plan(
+        &self,
+        input: BitcoinRollbackInput,
+    ) -> Result<BitcoinRollbackPlan, Self::Error> {
+        self.rollback_calls.fetch_add(1, Ordering::SeqCst);
+        let mut plan = self.rollback.clone();
+        plan.included_endorsements = input.included_endorsements;
+        plan.acquisition_undo = input.acquisition_undo;
+        Ok(plan)
+    }
 
     async fn get_endorsements_outcome(
         &self,
@@ -567,6 +688,7 @@ type Processor = BitcoinBlockProcessor<
 >;
 struct Fixture {
     processor: Processor,
+    journal: InMemoryConsensusJournal,
     states: Vec<Blockchain>,
 }
 impl Fixture {
@@ -659,12 +781,14 @@ impl Fixture {
         .prepare(&outcome.consensus)
         .await
         .unwrap();
-        let journal = InMemoryBitcoinBlockJournal::new(btc_tip(100));
+        let owner = InMemoryConsensusJournal::new(btc_tip(100));
+        let journal = owner.bitcoin_journal();
         let consensus = Consensus(Arc::new(ConsensusData {
             inner,
             journal: journal.clone(),
             outcome: outcome.clone(),
-            undo,
+            undo: undo.clone(),
+            previous_winner: tip(&old),
             winner: tip(&new),
             selections: AtomicUsize::new(0),
             reject_selection: AtomicBool::new(false),
@@ -674,6 +798,18 @@ impl Fixture {
         }));
         let processor = BitcoinBlockProcessor::new(
             Engine {
+                rollback: BitcoinRollbackPlan {
+                    endorsements: undo.endorsements.clone(),
+                    pending_endorsements: undo.pending_endorsements.clone(),
+                    double_signs: undo.double_signs.clone(),
+                    weighted_blocks: undo
+                        .weighted_blocks
+                        .into_iter()
+                        .filter_map(|(tip, value)| value.map(|value| (tip, value)))
+                        .collect(),
+                    ..BitcoinRollbackPlan::default()
+                },
+                rollback_calls: AtomicUsize::new(0),
                 outcome,
                 calls: AtomicUsize::new(0),
             },
@@ -718,6 +854,7 @@ impl Fixture {
         );
         Self {
             processor,
+            journal: owner,
             states: vec![old, old_intermediate, ancestor, new_intermediate, new],
         }
     }
@@ -735,20 +872,37 @@ impl Fixture {
             .await
             .unwrap()
             .unwrap()
+            .operation
+            .entry
     }
-    fn no_replanning(&self) {
+    fn allow_planning(&self) {
+        self.processor
+            .consensus_storage
+            .reject_reads
+            .store(false, Ordering::SeqCst);
+        self.processor
+            .consensus_storage
+            .reject_selection
+            .store(false, Ordering::SeqCst);
+        self.processor
+            .chain
+            .reject_plans
+            .store(false, Ordering::SeqCst);
+    }
+    async fn no_replanning(&self) {
         self.processor
             .consensus_storage
             .reject_reads
             .store(true, Ordering::SeqCst);
+        let planned = self.entry().await.flame_transition.is_some();
         self.processor
             .consensus_storage
             .reject_selection
-            .store(true, Ordering::SeqCst);
+            .store(planned, Ordering::SeqCst);
         self.processor
             .chain
             .reject_plans
-            .store(true, Ordering::SeqCst);
+            .store(planned, Ordering::SeqCst);
     }
     async fn snapshot(&self) -> ConsensusUndo {
         ConsensusUndoManager {
@@ -781,7 +935,7 @@ impl Fixture {
         assert!(
             self.processor
                 .journal
-                .get_pending_entry()
+                .pending_entry()
                 .await
                 .unwrap()
                 .is_none()
@@ -835,9 +989,10 @@ async fn apply_completes_the_whole_block_and_rollback_restores_all_consensus_rec
         p.canonical_storage.state.lock().unwrap().commits,
         fixture.states[1..].iter().map(tip).collect::<Vec<_>>()
     );
-    fixture.no_replanning();
+    fixture.no_replanning().await;
     assert_eq!(p.apply(fixture.block()).await.unwrap(), btc_tip(101));
     assert_eq!(p.engine.calls.load(Ordering::SeqCst), 1);
+    fixture.allow_planning();
     assert_eq!(p.rollback(btc_tip(101)).await.unwrap(), btc_tip(100));
     fixture.assert_restored().await;
     assert_eq!(p.rollback(btc_tip(101)).await.unwrap(), btc_tip(100));
@@ -860,7 +1015,7 @@ async fn resumes_before_and_after_every_apply_stage_marker_without_recomputing_u
                 .reject_reads
                 .store(true, Ordering::SeqCst);
             if saved.flame_transition.is_some() {
-                fixture.no_replanning();
+                fixture.no_replanning().await;
             }
             assert_eq!(p.apply(fixture.block()).await.unwrap(), btc_tip(101));
             fixture.assert_applied().await;
@@ -881,12 +1036,12 @@ async fn retries_plan_persistence_without_overwriting_saved_plans() {
                 p.apply(fixture.block()).await,
                 Err(BlockProcessingError::Journal("journal interrupted"))
             ));
-            if let Some(entry) = p.journal.get_pending_entry().await.unwrap() {
+            if let Some(entry) = p.journal.pending_entry().await.unwrap() {
                 p.consensus_storage
                     .reject_reads
                     .store(true, Ordering::SeqCst);
-                if entry.flame_transition.is_some() {
-                    fixture.no_replanning();
+                if entry.operation.entry.flame_transition.is_some() {
+                    fixture.no_replanning().await;
                 }
             }
             p.apply(fixture.block()).await.unwrap();
@@ -920,6 +1075,7 @@ async fn retries_a_partially_written_consensus_stage_using_the_original_undo() {
             .store(true, Ordering::SeqCst);
         p.resume().await.unwrap();
         fixture.assert_applied().await;
+        fixture.allow_planning();
         p.rollback(btc_tip(101)).await.unwrap();
         fixture.assert_restored().await;
     }
@@ -943,7 +1099,7 @@ async fn resumes_every_flame_commit_during_application_and_rollback() {
                     p.apply(fixture.block()).await
                 };
                 assert!(matches!(result, Err(BlockProcessingError::Flame(_))));
-                fixture.no_replanning();
+                fixture.no_replanning().await;
                 p.resume().await.unwrap();
                 if rollback {
                     fixture.assert_restored().await;
@@ -954,7 +1110,10 @@ async fn resumes_every_flame_commit_during_application_and_rollback() {
                     p.canonical_storage.state.lock().unwrap().commits.len(),
                     if rollback { 8 } else { 4 }
                 );
-                assert_eq!(p.chain.plans.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    p.chain.plans.load(Ordering::SeqCst),
+                    if rollback { 2 } else { 1 }
+                );
             }
         }
     }
@@ -962,13 +1121,26 @@ async fn resumes_every_flame_commit_during_application_and_rollback() {
 
 #[tokio::test]
 async fn resumes_every_rollback_marker_and_the_begin_record() {
-    for point in [
-        Point::BeginRollback,
-        Point::Restore(RollbackStage::RestoreRewards),
-        Point::Restore(RollbackStage::RestoreFlameChain),
-        Point::Restore(RollbackStage::RestoreConsensus),
-        Point::Restore(RollbackStage::RestoreCursor),
-    ] {
+    for point in [Point::BeginRollback, Point::FlamePlan, Point::RewardsPlan]
+        .into_iter()
+        .chain(
+            [
+                RollbackStage::RemoveEndorsements,
+                RollbackStage::RestoreAcquisitions,
+                RollbackStage::StoreDoubleSigns,
+                RollbackStage::StoreEndorsements,
+                RollbackStage::StorePendingEndorsements,
+                RollbackStage::StoreBlockWeights,
+                RollbackStage::PrepareFlameTransition,
+                RollbackStage::ApplyFlameTransition,
+                RollbackStage::PrepareRewards,
+                RollbackStage::ApplyRewards,
+                RollbackStage::StoreCursor,
+            ]
+            .into_iter()
+            .map(Point::Restore),
+        )
+    {
         for after in [false, true] {
             let fixture = Fixture::new().await;
             let p = &fixture.processor;
@@ -978,8 +1150,19 @@ async fn resumes_every_rollback_marker_and_the_begin_record() {
                 p.rollback(btc_tip(101)).await,
                 Err(BlockProcessingError::Journal("journal interrupted"))
             ));
-            fixture.no_replanning();
+            let saved = p.journal.pending_entry().await.unwrap().is_some();
+            if saved {
+                fixture.no_replanning().await;
+            }
             p.rollback(btc_tip(101)).await.unwrap();
+            assert_eq!(
+                p.engine.rollback_calls.load(Ordering::SeqCst),
+                if point == Point::BeginRollback && !after {
+                    2
+                } else {
+                    1
+                }
+            );
             fixture.assert_restored().await;
         }
     }
@@ -995,21 +1178,82 @@ async fn resumes_a_partially_restored_consensus_undo() {
         p.rollback(btc_tip(101)).await,
         Err(BlockProcessingError::Consensus(_))
     ));
-    fixture.no_replanning();
+    fixture.no_replanning().await;
     assert_eq!(p.resume().await.unwrap(), btc_tip(100));
     fixture.assert_restored().await;
 }
 
+struct ArrivalProbe(Arc<tokio::sync::Notify>);
+
+impl crate::FlameBlockArrivalHandler for ArrivalProbe {
+    type Error = std::convert::Infallible;
+    async fn on_flame_block_arrival(&self, _: BlockTip) -> Result<(), Self::Error> {
+        self.0.notify_one();
+        Ok(())
+    }
+}
+
 #[tokio::test]
-async fn concurrent_calls_serialize_calculation_and_the_entire_application() {
+async fn manager_serializes_bitcoin_calculation_and_the_entire_application() {
+    use crate::block_processing::{ConsensusManager, test_support::ArrivalHandlerProcessor};
     let fixture = Fixture::new().await;
-    let p = &fixture.processor;
-    let (first, second) = tokio::join!(p.apply(fixture.block()), p.apply(fixture.block()));
-    assert_eq!(first.unwrap(), btc_tip(101));
-    assert_eq!(second.unwrap(), btc_tip(101));
-    assert_eq!(p.engine.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(p.consensus_storage.writes.lock().unwrap().len(), 8);
-    fixture.assert_applied().await;
+    let block = fixture.block();
+    let done = Arc::new(tokio::sync::Notify::new());
+    let manager = Arc::new(ConsensusManager::new(
+        fixture.processor,
+        ArrivalHandlerProcessor::new(ArrivalProbe(done.clone())),
+        fixture.journal,
+    ));
+    manager.startup().await.unwrap();
+    manager.new_bitcoin_block(block.clone()).unwrap();
+    manager.new_bitcoin_block(block).unwrap();
+    manager.new_flame_block(tip(&fixture.states[0])).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), done.notified())
+        .await
+        .unwrap();
+    manager.shutdown().await.unwrap();
+    let processor = manager.bitcoin_processor();
+    assert_eq!(processor.engine.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(processor.consensus_storage.writes.lock().unwrap().len(), 8);
+    assert_eq!(
+        processor.cursor_storage.get_cursor().await.unwrap(),
+        btc_tip(101)
+    );
+    assert!(processor.journal.pending_entry().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn manager_startup_resumes_the_saved_bitcoin_operation_without_recalculation() {
+    use crate::block_processing::{ConsensusManager, test_support::ArrivalHandlerProcessor};
+    let fixture = Fixture::new().await;
+    *fixture.processor.journal.fault.lock().unwrap() =
+        Some((Point::Apply(ApplyStage::ApplyFlameTransition), true));
+    assert!(fixture.processor.apply(fixture.block()).await.is_err());
+    fixture.no_replanning().await;
+    let original_undo = fixture.entry().await.consensus_undo;
+    let manager = Arc::new(ConsensusManager::new(
+        fixture.processor,
+        ArrivalHandlerProcessor::new(ArrivalProbe(Arc::new(tokio::sync::Notify::new()))),
+        fixture.journal.clone(),
+    ));
+    assert_eq!(manager.startup().await.unwrap(), btc_tip(101));
+    manager.shutdown().await.unwrap();
+    assert_eq!(
+        manager
+            .bitcoin_processor()
+            .engine
+            .calls
+            .load(Ordering::SeqCst),
+        1
+    );
+    let latest = fixture.journal.latest_entry().await.unwrap().unwrap();
+    assert!(latest.is_complete());
+    let crate::block_processing::journal::consensus::ConsensusOperation::Bitcoin(operation) =
+        latest.operation
+    else {
+        panic!()
+    };
+    assert_eq!(operation.entry.consensus_undo, original_undo);
 }
 
 #[tokio::test]
@@ -1034,7 +1278,7 @@ async fn undo_read_failure_does_not_begin_an_operation() {
         p.apply(fixture.block()).await,
         Err(BlockProcessingError::Consensus("undo read rejected"))
     ));
-    assert!(p.journal.get_pending_entry().await.unwrap().is_none());
+    assert!(p.journal.pending_entry().await.unwrap().is_none());
     assert!(p.consensus_storage.writes.lock().unwrap().is_empty());
     assert_eq!(p.resume().await.unwrap(), btc_tip(100));
 }
@@ -1061,11 +1305,20 @@ async fn rejects_invalid_block_order_before_calculation() {
 use crate::rewards::{PendingReward, RewardIndex, RewardsOutcome, RewardsUndo};
 struct Rewards {
     inner: InMemoryRewardsStorage,
-    journal: InMemoryBitcoinBlockJournal,
+    journal: InMemoryBitcoinJournal,
     fail_after_write: AtomicBool,
 }
 impl RewardsStorage for Rewards {
     type Error = &'static str;
+    async fn get_pending_rewards(
+        &self,
+        height: CoreFlameHeight,
+    ) -> Result<Vec<PendingReward>, Self::Error> {
+        self.inner
+            .get_pending_rewards(height)
+            .await
+            .map_err(|_| "reward read failed")
+    }
     async fn get_pending_reward(
         &self,
         height: CoreFlameHeight,
@@ -1081,7 +1334,14 @@ impl RewardsStorage for Rewards {
         height: CoreFlameHeight,
         reward: &PendingReward,
     ) -> Result<(), Self::Error> {
-        let entry = self.journal.get_pending_entry().await.unwrap().unwrap();
+        let entry = self
+            .journal
+            .pending_entry()
+            .await
+            .unwrap()
+            .unwrap()
+            .operation
+            .entry;
         assert_eq!(
             entry.status,
             JournalStatus::Applying(ApplyStage::ApplyRewards)
@@ -1114,7 +1374,7 @@ impl RewardsStorage for Rewards {
 }
 struct Cursor {
     inner: InMemoryCursorStorage,
-    journal: InMemoryBitcoinBlockJournal,
+    journal: InMemoryBitcoinJournal,
     fault: Mutex<Option<bool>>,
 }
 impl CursorStorage for Cursor {
@@ -1126,11 +1386,18 @@ impl CursorStorage for Cursor {
             .map_err(|_| "cursor read failed")
     }
     async fn store_cursor(&self, tip: BtcBlockTip) -> Result<(), Self::Error> {
-        let entry = self.journal.get_pending_entry().await.unwrap().unwrap();
+        let entry = self
+            .journal
+            .pending_entry()
+            .await
+            .unwrap()
+            .unwrap()
+            .operation
+            .entry;
         assert!(matches!(
             entry.status,
             JournalStatus::Applying(ApplyStage::StoreCursor)
-                | JournalStatus::RollingBack(RollbackStage::RestoreCursor)
+                | JournalStatus::RollingBack(RollbackStage::StoreCursor)
         ));
         let failure = self.fault.lock().unwrap().take();
         if failure == Some(false) {
@@ -1166,7 +1433,7 @@ async fn resumes_cursor_writes_before_and_after_persistence_in_both_directions()
                 result,
                 Err(BlockProcessingError::Cursor("cursor interrupted"))
             ));
-            fixture.no_replanning();
+            fixture.no_replanning().await;
             p.resume().await.unwrap();
             if rollback {
                 fixture.assert_restored().await;
@@ -1199,7 +1466,10 @@ async fn saved_rewards_are_replayed_and_restored_after_interrupted_writes() {
         },
     };
     p.journal
-        .store_rewards_changes(btc_tip(101), &changes)
+        .store_rewards_changes(
+            p.journal.pending_entry().await.unwrap().unwrap().id,
+            &changes,
+        )
         .await
         .unwrap();
     p.rewards_storage
@@ -1210,7 +1480,7 @@ async fn saved_rewards_are_replayed_and_restored_after_interrupted_writes() {
         Err(BlockProcessingError::Rewards("reward interrupted"))
     ));
     assert_eq!(p.cursor_storage.get_cursor().await.unwrap(), btc_tip(100));
-    fixture.no_replanning();
+    fixture.no_replanning().await;
     p.resume().await.unwrap();
     assert_eq!(
         p.rewards_storage
@@ -1221,6 +1491,7 @@ async fn saved_rewards_are_replayed_and_restored_after_interrupted_writes() {
             .amount,
         42
     );
+    fixture.allow_planning();
     p.rewards_storage
         .fail_after_write
         .store(true, Ordering::SeqCst);

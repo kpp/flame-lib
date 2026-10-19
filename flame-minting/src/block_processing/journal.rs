@@ -6,6 +6,8 @@ use crate::rewards::{RewardsOutcome, RewardsUndo};
 
 use crate::consensus::{ConsensusUndo, MintingOutcome};
 
+pub mod consensus;
+pub mod flame;
 pub mod in_memory;
 mod status;
 mod storage;

@@ -4,11 +4,13 @@ use async_trait::async_trait;
 use btc_integration::{
     BitcoinConfig, BitcoinConnection, TestAcquisitionConfig,
     btc::rpc::Core31RpcApi,
-    protocol::{MinterIdentity, SecretStorage, TestSigner},
+    protocol::{
+        MinterIdentity, MintingEndorsementAuth, SecretStorage, TestSigner, minter_witness_script,
+    },
 };
 use corepc_client::{
     bitcoin::{
-        Address, Amount,
+        Address, Amount, ScriptBuf, TxIn, Witness,
         secp256k1::{Secp256k1, SecretKey},
     },
     client_sync::Auth,
@@ -17,6 +19,19 @@ use ed25519_dalek::SigningKey;
 use flamevm::Predicate;
 
 use super::TestContext;
+
+pub fn identity_from_script(script: ScriptBuf) -> MinterIdentity {
+    MintingEndorsementAuth::from_input(
+        0,
+        &TxIn {
+            witness: Witness::from_slice(&[script.as_bytes()]),
+            ..TxIn::default()
+        },
+    )
+    .expect("valid test minter witness script")
+    .minter()
+    .clone()
+}
 
 pub struct RegtestSecretStorage {
     secret_key_bytes: [u8; 32],
@@ -39,7 +54,8 @@ pub async fn create_connection(
     let secret_key = SecretKey::from_slice(&secret_key_bytes)?;
     let public_key = secret_key.public_key(&secp);
     let access_predicate = Predicate::opaque(Predicate::unspendable_key());
-    let identity = MinterIdentity::single_key(&access_predicate, &public_key);
+    let identity =
+        identity_from_script(minter_witness_script::build(&access_predicate, &public_key));
     let witness_script = identity.witness_script();
 
     let p2wsh_script_pubkey = witness_script.to_p2wsh();

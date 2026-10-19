@@ -9,14 +9,16 @@ use btc_integration::{
 use flame_chain_service::{ChainAccess, CoreBlockSource};
 use flame_storage::{chain::InMemoryChainStorage, state::canonical::InMemoryCanonicalStorage};
 
-use crate::block_processing::BlockProcessor;
+use crate::ConsensusHandle;
+use crate::block_processing::{
+    BlockProcessor, ConsensusManagerError, FlameProcessor, journal::consensus::ConsensusJournal,
+};
 use crate::consensus::storage::InMemoryConsensusStorage;
 use crate::core_block_notifier::CoreBlockNotifier;
 use crate::minter::manager::{
     ShutdownError as MinterShutdownError, StartupError as MinterStartupError,
 };
 use crate::minter::{EndorsementPolicy, MinterManager, journal::in_memory::InMemoryMinterJournal};
-use crate::{ConsensusHandle, FlameBlockArrivalHandler};
 
 pub use btc_integration::HistoryUpdate as BtcEvent;
 
@@ -54,11 +56,11 @@ pub struct MintingOrchestrator<S, I, C, M, H: ChainAccess, N: CoreBlockNotifier>
     pub core_block_notifier: N,
 }
 
-impl<B, H, N, F>
+impl<B, H, N>
     MintingOrchestrator<
         Arc<MintingSender>,
         Arc<ProtocolIndexerV31>,
-        DefaultConsensusLoop<H, F>,
+        DefaultConsensusLoop<H>,
         MinterManager<B, MintingSender, InMemoryMinterJournal>,
         H,
         N,
@@ -69,13 +71,11 @@ where
     H: ChainAccess + Clone + Send + Sync + 'static,
     H::Error: Send + 'static,
     N: CoreBlockNotifier,
-    F: FlameBlockArrivalHandler,
 {
     pub fn new(
         core_block_notifier: N,
         core_block_source: B,
         chain_manager: H,
-        flame_handler: F,
         bitcoin_config: BitcoinConfig,
         initial_btc_cursor: BtcBlockTip,
         identity_config: IdentityConfig,
@@ -91,8 +91,7 @@ where
             identity_config,
         ));
         let btc_sender = Arc::new(MintingSender::new(bitcoin_config, identity_manager.clone()));
-        let consensus_manager =
-            defaults::consensus_loop(chain_manager.clone(), initial_btc_cursor, flame_handler);
+        let consensus_manager = defaults::consensus_loop(chain_manager.clone(), initial_btc_cursor);
         let minter_manager = MinterManager::new(
             Arc::new(core_block_source),
             btc_sender.clone(),
@@ -112,48 +111,54 @@ where
     }
 
     pub fn get_consensus_storage(&self) -> &InMemoryConsensusStorage {
-        let processor = self.consensus_manager.processor().bitcoin_processor();
+        let processor = self.consensus_manager.manager().bitcoin_processor();
         &processor.engine.consensus_storage
     }
 
     pub fn get_chain_storage(&self) -> &InMemoryChainStorage {
-        let processor = self.consensus_manager.processor().bitcoin_processor();
+        let processor = self.consensus_manager.manager().bitcoin_processor();
         &processor.engine.chain_storage
     }
 
     pub fn get_canonical_storage(&self) -> &InMemoryCanonicalStorage {
-        let processor = self.consensus_manager.processor().bitcoin_processor();
+        let processor = self.consensus_manager.manager().bitcoin_processor();
         &processor.engine.canonical_storage
     }
 
     pub fn get_cursor_storage(&self) -> &InMemoryCursorStorage {
-        let processor = self.consensus_manager.processor().bitcoin_processor();
+        let processor = self.consensus_manager.manager().bitcoin_processor();
         &processor.cursor_storage
     }
 }
 
-impl<S, I, P, M, H, N> MintingOrchestrator<S, I, consensus::ConsensusLoop<P>, M, H, N>
+impl<S, I, B, F, J, M, H, N> MintingOrchestrator<S, I, consensus::ConsensusLoop<B, F, J>, M, H, N>
 where
-    P: BlockProcessor + FlameBlockArrivalHandler,
+    B: BlockProcessor,
+    F: FlameProcessor,
+    J: ConsensusJournal,
     H: ChainAccess,
     N: CoreBlockNotifier,
 {
-    pub fn consensus_handle(&self) -> ConsensusHandle<P> {
+    pub fn consensus_handle(&self) -> ConsensusHandle<B, F, J> {
         self.consensus_manager.consensus_handle()
     }
 }
 
-impl<S, I, P, M, H, N>
-    MintingOrchestrator<S, std::sync::Arc<I>, consensus::ConsensusLoop<P>, M, H, N>
+impl<S, I, B, F, J, M, H, N>
+    MintingOrchestrator<S, std::sync::Arc<I>, consensus::ConsensusLoop<B, F, J>, M, H, N>
 where
     S: ports::SenderLifecycle,
     I: ports::ConsensusIndexer,
-    P: BlockProcessor,
+    B: BlockProcessor,
+    F: FlameProcessor,
+    J: ConsensusJournal,
     M: ports::MinterLifecycle,
     H: ChainAccess,
     N: CoreBlockNotifier,
 {
-    pub async fn startup(&self) -> OrchestratorResult<P::Error> {
+    pub async fn startup(
+        &self,
+    ) -> OrchestratorResult<ConsensusManagerError<B::Error, F::Error, J::Error>> {
         self.identity_manager
             .startup()
             .await
@@ -166,20 +171,29 @@ where
             .startup(self.btc_indexer.clone())
             .await
             .map_err(OrchestratorError::Consensus)?;
-        self.minter_manager
+        if let Err(error) = self
+            .minter_manager
             .startup(self.btc_indexer.subscribe())
             .await
-            .map_err(OrchestratorError::MinterStartup)
+        {
+            self.consensus_manager
+                .shutdown()
+                .await
+                .map_err(OrchestratorError::Consensus)?;
+            return Err(OrchestratorError::MinterStartup(error));
+        }
+        Ok(())
     }
 
-    pub async fn shutdown(&self) -> OrchestratorResult<P::Error> {
-        self.minter_manager
-            .shutdown()
-            .await
-            .map_err(OrchestratorError::MinterShutdown)?;
-        self.consensus_manager
-            .shutdown()
-            .await
-            .map_err(OrchestratorError::Consensus)
+    pub async fn shutdown(
+        &self,
+    ) -> OrchestratorResult<ConsensusManagerError<B::Error, F::Error, J::Error>> {
+        let (minter, consensus) = tokio::join!(
+            self.minter_manager.shutdown(),
+            self.consensus_manager.shutdown(),
+        );
+        minter
+            .map_err(OrchestratorError::MinterShutdown)
+            .and(consensus.map_err(OrchestratorError::Consensus))
     }
 }

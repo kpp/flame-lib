@@ -16,11 +16,18 @@ const CONSENSUS_STAGES: [ApplyStage; 6] = [
     ApplyStage::StorePendingEndorsements,
 ];
 
-const ROLLBACK_STAGES: [RollbackStage; 4] = [
-    RollbackStage::RestoreRewards,
-    RollbackStage::RestoreFlameChain,
-    RollbackStage::RestoreConsensus,
-    RollbackStage::RestoreCursor,
+const ROLLBACK_STAGES: [RollbackStage; 11] = [
+    RollbackStage::RemoveEndorsements,
+    RollbackStage::RestoreAcquisitions,
+    RollbackStage::StoreDoubleSigns,
+    RollbackStage::StoreEndorsements,
+    RollbackStage::StorePendingEndorsements,
+    RollbackStage::StoreBlockWeights,
+    RollbackStage::PrepareFlameTransition,
+    RollbackStage::ApplyFlameTransition,
+    RollbackStage::PrepareRewards,
+    RollbackStage::ApplyRewards,
+    RollbackStage::StoreCursor,
 ];
 
 fn tip(height: u64, hash: u8) -> BtcBlockTip {
@@ -313,7 +320,7 @@ async fn incomplete_operations_cannot_finish_or_start_another_operation() {
     journal.begin_rollback(btc_tip).await.unwrap();
     assert!(matches!(
         journal
-            .complete_rollback_stage(btc_tip, RollbackStage::RestoreCursor)
+            .complete_rollback_stage(btc_tip, RollbackStage::StoreCursor)
             .await,
         Err(Error::UnexpectedStatus { .. })
     ));
@@ -325,7 +332,7 @@ async fn incomplete_operations_cannot_finish_or_start_another_operation() {
     );
     assert_eq!(
         journal.get_pending_entry().await.unwrap().unwrap().status,
-        JournalStatus::RollingBack(RollbackStage::RestoreRewards)
+        JournalStatus::RollingBack(RollbackStage::RemoveEndorsements)
     );
     for stage in ROLLBACK_STAGES {
         journal

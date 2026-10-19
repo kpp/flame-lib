@@ -9,7 +9,7 @@ use btc_integration::{
 use corepc_client::bitcoin::{Address, Amount, Network, Txid};
 use flame_chain_service::InMemoryChain;
 use flame_minting::{
-    FlameBlockArrivalHandler, MintingOrchestrator,
+    MintingOrchestrator,
     minter::{EndorsementPolicy, MinterManager, journal::in_memory::InMemoryMinterJournal},
     orchestrator::{DefaultConsensusLoop, cursor_storage::CursorStorage, sender::MintingSender},
 };
@@ -21,21 +21,11 @@ use super::{BitcoinRegtest, FlameChain, UnusedNotifier};
 type TestOrchestrator = MintingOrchestrator<
     Arc<MintingSender>,
     Arc<ProtocolIndexerV31>,
-    DefaultConsensusLoop<InMemoryChain, UnexpectedFlameBlockArrival>,
+    DefaultConsensusLoop<InMemoryChain>,
     MinterManager<InMemoryChain, MintingSender, InMemoryMinterJournal>,
     InMemoryChain,
     UnusedNotifier,
 >;
-
-pub struct UnexpectedFlameBlockArrival;
-
-impl FlameBlockArrivalHandler for UnexpectedFlameBlockArrival {
-    type Error = std::convert::Infallible;
-
-    async fn on_flame_block_arrival(&self, _: flamechain::BlockTip) -> Result<(), Self::Error> {
-        panic!("Flame block arrival is not expected in Bitcoin integration tests")
-    }
-}
 
 pub struct TestContext {
     pub bitcoin: Arc<BitcoinRegtest>,
@@ -59,7 +49,6 @@ impl TestContext {
             UnusedNotifier,
             chain.clone(),
             chain.clone(),
-            UnexpectedFlameBlockArrival,
             bitcoin.config(),
             initial_cursor,
             identity_config.clone(),

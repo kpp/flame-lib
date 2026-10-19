@@ -1,6 +1,6 @@
 use super::*;
 
-const LIFECYCLE: [JournalStatus; 17] = [
+const LIFECYCLE: [JournalStatus; 24] = [
     JournalStatus::Applying(ApplyStage::RemoveEndorsements),
     JournalStatus::Applying(ApplyStage::StoreEndorsements),
     JournalStatus::Applying(ApplyStage::StoreAcquisitions),
@@ -13,10 +13,17 @@ const LIFECYCLE: [JournalStatus; 17] = [
     JournalStatus::Applying(ApplyStage::ApplyRewards),
     JournalStatus::Applying(ApplyStage::StoreCursor),
     JournalStatus::Applied,
-    JournalStatus::RollingBack(RollbackStage::RestoreRewards),
-    JournalStatus::RollingBack(RollbackStage::RestoreFlameChain),
-    JournalStatus::RollingBack(RollbackStage::RestoreConsensus),
-    JournalStatus::RollingBack(RollbackStage::RestoreCursor),
+    JournalStatus::RollingBack(RollbackStage::RemoveEndorsements),
+    JournalStatus::RollingBack(RollbackStage::RestoreAcquisitions),
+    JournalStatus::RollingBack(RollbackStage::StoreDoubleSigns),
+    JournalStatus::RollingBack(RollbackStage::StoreEndorsements),
+    JournalStatus::RollingBack(RollbackStage::StorePendingEndorsements),
+    JournalStatus::RollingBack(RollbackStage::StoreBlockWeights),
+    JournalStatus::RollingBack(RollbackStage::PrepareFlameTransition),
+    JournalStatus::RollingBack(RollbackStage::ApplyFlameTransition),
+    JournalStatus::RollingBack(RollbackStage::PrepareRewards),
+    JournalStatus::RollingBack(RollbackStage::ApplyRewards),
+    JournalStatus::RollingBack(RollbackStage::StoreCursor),
     JournalStatus::RolledBack,
 ];
 

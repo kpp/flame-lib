@@ -17,6 +17,50 @@ pub(super) struct EndorsementStorage {
 }
 
 impl EndorsementStorage {
+    pub(super) fn for_minter(
+        &self,
+        minter: &MinterP2wsh,
+    ) -> (Vec<WeightedEndorsement>, Vec<IncludedEndorsement>) {
+        let endorsements = self
+            .endorsements
+            .range((*minter, 0.into())..=(*minter, u32::MAX.into()))
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        let pending = self
+            .pending_endorsements
+            .values()
+            .flat_map(|entries| entries.values())
+            .filter(|entry| entry.endorsement.auth().minter().p2wsh() == *minter)
+            .cloned()
+            .collect();
+        (endorsements, pending)
+    }
+
+    pub(super) fn remove_inclusion(&mut self, included: &IncludedEndorsement) {
+        let minter = included.endorsement.auth().minter().p2wsh();
+        if let Entry::Occupied(entry) = self.endorsements.entry((minter, included.block_height())) {
+            if same_inclusion(&entry.get().original, included) {
+                entry.remove();
+            }
+        }
+        if let Entry::Occupied(mut group) = self
+            .pending_endorsements
+            .entry(included.endorsement.block_tip())
+        {
+            let index = EndorsementIndex::from(&included.endorsement);
+            if group
+                .get()
+                .get(&index)
+                .is_some_and(|entry| same_inclusion(entry, included))
+            {
+                group.get_mut().remove(&index);
+            }
+            if group.get().is_empty() {
+                group.remove();
+            }
+        }
+    }
+
     pub(super) fn store_endorsement(
         &mut self,
         btc_block: BtcBlockTip,
@@ -163,6 +207,11 @@ impl EndorsementStorage {
         }
         Ok(())
     }
+}
+
+pub(super) fn same_inclusion(first: &IncludedEndorsement, second: &IncludedEndorsement) -> bool {
+    first.btc_block == second.btc_block
+        && EndorsementIndex::from(&first.endorsement) == EndorsementIndex::from(&second.endorsement)
 }
 
 #[cfg(test)]

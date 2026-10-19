@@ -4,6 +4,7 @@ pub use engine_factory::{ConsensusEngine, MintingEngineFactory};
 pub mod manager;
 pub mod outcome;
 pub mod params;
+pub mod rollback;
 pub mod storage;
 pub mod undo;
 pub mod weighted_block_header;
@@ -15,6 +16,8 @@ pub use outcome::{
     PendingEndorsements, WeightedEndorsement,
 };
 pub use params::MintingProtocolParams;
+pub use rollback::{BitcoinRollbackInput, BitcoinRollbackPlan};
+pub use storage::MinterEndorsementState;
 pub use storage::{AcquisitionIndex, ConsensusStorage, EndorsementIndex, MinterAcquisitions};
 pub use undo::{ConsensusUndo, ConsensusUndoManager};
 pub use weighted_block_header::WeightedBlockHeader;
