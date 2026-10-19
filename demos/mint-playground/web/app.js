@@ -3,6 +3,23 @@ export const BUDGET_MAX = 100000000;
 export const FEE = 1000;
 export const SPARKS = 100000000;
 export const REWARD = 50 * SPARKS;
+export const UNIT_KEY = 'flame-mint-playground-unit-v1';
+const SATS_PER_BTC = 100000000;
+
+export function formatMoney(sats, unit = 'sat', btcUsd = null, isRate = false, digits = null) {
+  if (unit === 'USD' && !(Number.isFinite(btcUsd) && btcUsd > 0)) return '—';
+  const value = unit === 'BTC' ? sats / SATS_PER_BTC : unit === 'USD' ? sats / SATS_PER_BTC * btcUsd : sats;
+  const minimumFractionDigits = digits ?? (unit === 'BTC' ? 8 : unit === 'USD' ? 2 : 0);
+  return new Intl.NumberFormat('en', { minimumFractionDigits, maximumFractionDigits: unit === 'USD' && isRate ? 6 : minimumFractionDigits, roundingMode: 'trunc' }).format(value);
+}
+
+export function parseBtcUsdQuote(quote) {
+  const data = quote?.data;
+  if (data?.base !== 'BTC' || data?.currency !== 'USD' || typeof data.amount !== 'string' || !data.amount.trim()) throw new Error('Invalid BTC/USD quote');
+  const price = Number(data.amount);
+  if (!Number.isFinite(price) || price <= 0) throw new Error('Invalid BTC/USD quote');
+  return price;
+}
 
 // Give the earliest blocks the remainder, matching the integer database schedule.
 export function burnAt(contribution, block) {
@@ -47,7 +64,31 @@ if (typeof document !== 'undefined') {
   const minting = location.pathname.replace(/\/$/, '') === '/mint';
   const number = (value, digits = 0) => new Intl.NumberFormat('en', { maximumFractionDigits: digits }).format(value);
   const whole = value => number(Math.trunc(value) || 0);
-  const rate = (sats, reward) => reward > 0 ? whole(sats * SPARKS / reward) : '—';
+  let unit = 'sat';
+  try {
+    const saved = localStorage.getItem(UNIT_KEY);
+    if (['sat', 'BTC', 'USD'].includes(saved)) unit = saved;
+  } catch { /* Unit selection also works without browser storage. */ }
+  let btcUsd = null;
+  let quoteRequest = false;
+  let quoteStatus = 'Loading BTC/USD…';
+  const unitLabel = () => unit === 'USD' ? '$' : unit;
+  const money = (sats, isRate = false) => formatMoney(sats, unit, btcUsd, isRate);
+  const amount = sats => {
+    const value = money(sats);
+    return value === '—' ? value : unit === 'USD' ? `$${value}` : `${value} ${unit}`;
+  };
+  const rate = (sats, reward) => reward > 0 ? money(sats * SPARKS / reward, true) : '—';
+  const rateAmount = (sats, reward) => {
+    const value = rate(sats, reward);
+    return value === '—' ? value : unit === 'USD' ? `$${value} / FLM` : `${value} ${unit} / FLM`;
+  };
+  const metricAmount = sats => {
+    const value = sats === null ? '—' : formatMoney(sats, unit, btcUsd, false, unit === 'USD' ? 3 : null);
+    return unit === 'USD' ? `$${value}` : `${value}\u00a0${unit.toLowerCase()}`;
+  };
+  const metricReward = sparks => `${sparks === null ? '—' : whole(sparks / SPARKS)}\u00a0FLM`;
+  const metricRate = (sats, reward) => `${rate(sats, reward)}\u00a0${unitLabel()}/FLM`;
   const walletKey = 'flame-mint-playground-wallet-v1';
   const pendingKey = 'flame-mint-playground-pending-v1';
   let state = null;
@@ -65,15 +106,14 @@ if (typeof document !== 'undefined') {
     element('page-title').textContent = 'Mint';
     element('navigation').href = '/';
     element('navigation').textContent = 'Dashboard';
-    element('total-rate-label').textContent = 'Effective sat/FLM';
-    element('total-rate-label').title = 'Your sats burned plus mining fees paid, divided by your FLM earned';
+    element('total-rate-label').textContent = 'Effective rate';
+    element('total-rate-label').title = 'Your burn plus mining fees paid, divided by your FLM earned';
     element('mint-form').hidden = false;
     element('own-legend').hidden = false;
     element('draft-legend').hidden = false;
     element('fees-legend').hidden = true;
     element('chart-wrap').className = 'canvas-wrap';
     element('chart-title').textContent = 'Burn rate';
-    element('chart').setAttribute('aria-label', 'Burn rate in satoshis per block on the left; mint rate in satoshis per FLM on the right. Previous and next 500 blocks. Future contributions from others remain at their current rate; your contributions follow their schedules.');
     element('chart-window').textContent = '±500 blocks';
     element('chart-note').textContent = 'Future: others held at current rate';
     element('others-label').textContent = 'Others';
@@ -100,17 +140,17 @@ if (typeof document !== 'undefined') {
     if (resetRequest && !pendingRequest) element('submit-message').textContent = '';
     const contribution = draft();
     const valid = validDraft(contribution);
-    element('budget-value').textContent = `${number(contribution.budget_sats)} sat`;
+    element('budget-value').textContent = amount(contribution.budget_sats);
     element('duration-value').textContent = `${number(contribution.duration)} blocks`;
-    element('budget').setAttribute('aria-valuetext', `${number(contribution.budget_sats)} satoshis`);
+    element('budget').setAttribute('aria-valuetext', amount(contribution.budget_sats));
     element('duration').setAttribute('aria-valuetext', `${contribution.duration} blocks, about ${number(contribution.duration / 60, 1)} minutes`);
-    element('budget-error').textContent = valid ? '' : `Minimum ${number(contribution.duration * (FEE + 1))} sat (${number(contribution.duration * FEE)} fees + 1 sat burned per block). Increase budget or shorten duration.`;
+    element('budget-error').textContent = valid ? '' : `Minimum ${amount(contribution.duration * (FEE + 1))} (${amount(contribution.duration * FEE)} fees + ${amount(1)} burned per block). Increase budget or shorten duration.`;
     const canEstimate = state && wallet && valid;
     const estimate = canEstimate ? projectedReward(state.contributions, contribution, wallet.address, state.height) : 0;
     element('projected-reward').textContent = canEstimate ? whole(estimate / SPARKS) : '—';
-    element('projected-fees').textContent = `${number(contribution.duration * FEE)} sat`;
-    element('projected-burn').textContent = valid ? `${number(contribution.budget_sats - contribution.duration * FEE)} sat` : '—';
-    element('projected-rate').textContent = estimate ? `${rate(contribution.budget_sats, estimate)} sat / FLM` : '—';
+    element('projected-fees').textContent = amount(contribution.duration * FEE);
+    element('projected-burn').textContent = valid ? amount(contribution.budget_sats - contribution.duration * FEE) : '—';
+    element('projected-rate').textContent = estimate ? rateAmount(contribution.budget_sats, estimate) : '—';
     element('budget').disabled = element('duration').disabled = submitting || !!pendingRequest || brokenPending;
     element('discard-pending').hidden = !pendingRequest && !brokenPending;
     element('discard-pending').disabled = submitting;
@@ -171,7 +211,7 @@ if (typeof document !== 'undefined') {
       dot.style.background = userColor(contribution.user_id);
       const title = document.createElement('span');
       title.className = 'contribution-id';
-      title.textContent = minting ? `#${contribution.id} · ${number(contribution.budget_sats)} sat / ${contribution.duration} blocks` : `#${contribution.id}`;
+      title.textContent = minting ? `#${contribution.id} · ${amount(contribution.budget_sats)} / ${contribution.duration} blocks` : `#${contribution.id}`;
       heading.append(dot, title);
       const address = document.createElement('p');
       address.className = 'address-label';
@@ -187,7 +227,7 @@ if (typeof document !== 'undefined') {
       statusCell.append(status);
       row.append(statusCell);
       const burn = Number(contribution.burned_sats), fee = Number(contribution.fees_sats), reward = Number(contribution.reward_sparks);
-      for (const value of [number(burn), whole(reward / SPARKS), number(fee), rate(burn + fee, reward)]) {
+      for (const value of [money(burn), whole(reward / SPARKS), money(fee), rate(burn + fee, reward)]) {
         const cell = document.createElement('td'); cell.className = 'number'; cell.textContent = value; row.append(cell);
       }
       burned += burn; fees += fee; rewards += reward;
@@ -202,15 +242,76 @@ if (typeof document !== 'undefined') {
     }
     const totalRow = document.createElement('tr');
     const count = minting ? contributions.length : state.totals.contribution_count;
-    for (const [index, value] of [minting ? 'Total' : 'All-time total', `${count} contributions`, number(burned), whole(rewards / SPARKS), number(fees), rate(burned + fees, rewards)].entries()) {
+    for (const [index, value] of [minting ? 'Total' : 'All-time total', `${count} contributions`, money(burned), whole(rewards / SPARKS), money(fees), rate(burned + fees, rewards)].entries()) {
       const cell = document.createElement('td'); if (index > 1) cell.className = 'number'; cell.textContent = value; totalRow.append(cell);
     }
     element('contribution-totals').replaceChildren(totalRow);
     if (minting) {
-      element('total-burned').textContent = wallet ? number(burned) : '—';
-      element('total-reward').textContent = wallet ? whole(rewards / SPARKS) : '—';
-      element('total-rate').textContent = wallet ? rate(burned + fees, rewards) : '—';
+      element('total-burned').textContent = metricAmount(wallet ? burned : null);
+      element('total-reward').textContent = metricReward(wallet ? rewards : null);
+      element('total-rate').textContent = metricRate(burned + fees, wallet ? rewards : 0);
     }
+  }
+
+  function renderMoney() {
+    const label = unitLabel();
+    for (const value of ['sat', 'BTC', 'USD']) element(`unit-${value.toLowerCase()}`).setAttribute('aria-pressed', String(unit === value));
+    element('price-status').textContent = quoteStatus;
+    element('table-burned-label').textContent = unit === 'sat' ? 'Sats burned' : `${label} burned`;
+    element('table-fees-label').textContent = `Mining fees (${label})`;
+    element('table-rate-label').textContent = `${label} / FLM`;
+    element('chart-burn-unit').textContent = `${label}/block`;
+    element('chart-rate-unit').textContent = `${label}/FLM`;
+    const spokenUnit = unit === 'sat' ? 'satoshis' : unit === 'USD' ? 'US dollars' : 'BTC';
+    element('chart').setAttribute('aria-label', minting
+      ? `Burn rate in ${spokenUnit} per block on the left; mint rate in ${spokenUnit} per FLM on the right. Previous and next 500 blocks. Future contributions from others remain at their current rate; your contributions follow their schedules.`
+      : `Burn above zero and mining fees below zero share a ${spokenUnit}-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous 1,000 blocks; now is at the right edge.`);
+    element('budget-min').textContent = amount(BUDGET_MIN);
+    element('budget-max').textContent = amount(BUDGET_MAX);
+    element('fee-label').textContent = `Fee: ${amount(FEE)}/block`;
+    element('projected-rate-label').textContent = `${label}/FLM, incl. fees`;
+    if (state) {
+      renderTable();
+      if (!minting) {
+        element('total-burned').textContent = metricAmount(Number(state.totals.burned_sats));
+        element('total-reward').textContent = metricReward(Number(state.totals.reward_sparks));
+        const currentBurn = state.contributions.reduce((sum, contribution) => sum + burnAt(contribution, state.height), 0);
+        element('total-rate').textContent = metricRate(currentBurn, currentBurn ? REWARD : 0);
+      }
+    } else {
+      element('total-burned').textContent = metricAmount(null);
+      element('total-reward').textContent = metricReward(null);
+      element('total-rate').textContent = metricRate(0, 0);
+    }
+    updateDraft();
+  }
+
+  async function refreshQuote() {
+    if (quoteRequest) return;
+    quoteRequest = true;
+    if (btcUsd === null) {
+      quoteStatus = 'Loading BTC/USD…';
+      renderMoney();
+    }
+    try {
+      const response = await fetch('https://api.coinbase.com/v2/prices/BTC-USD/spot', { credentials: 'omit', referrerPolicy: 'no-referrer', cache: 'no-store', signal: AbortSignal.timeout(10000) });
+      if (!response.ok) throw new Error(`Price service returned ${response.status}`);
+      btcUsd = parseBtcUsdQuote(await response.json());
+      quoteStatus = `BTC/USD $${formatMoney(SATS_PER_BTC, 'USD', btcUsd)} · Coinbase`;
+    } catch {
+      btcUsd = null;
+      quoteStatus = 'BTC/USD unavailable. Retrying in 60 seconds.';
+    } finally {
+      quoteRequest = false;
+      renderMoney();
+      setTimeout(refreshQuote, 60000);
+    }
+  }
+
+  function selectUnit(value) {
+    unit = value;
+    try { localStorage.setItem(UNIT_KEY, value); } catch { /* Unit selection still applies in this page. */ }
+    renderMoney();
   }
 
   function queueChart() {
@@ -227,7 +328,8 @@ if (typeof document !== 'undefined') {
     canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
     const context = canvas.getContext('2d');
     context.scale(ratio, ratio);
-    const margin = { left: 48, top: 14, right: 48, bottom: 27 };
+    const side = unit === 'sat' ? 48 : unit === 'BTC' ? 94 : 82;
+    const margin = { left: side, top: 14, right: side, bottom: 27 };
     const w = width - margin.left - margin.right, h = height - margin.top - margin.bottom;
     const pastBlocks = minting ? 500 : 1000;
     const futureBlocks = minting ? 500 : 0;
@@ -273,7 +375,7 @@ if (typeof document !== 'undefined') {
     const x = i => margin.left + i / (count - 1) * w;
     const y = value => margin.top + (high - value) / (high - low) * h;
     const zero = y(0);
-    const axisNumber = value => Math.abs(value) >= 1000000 ? `${number(value / 1000000, 2)}m` : Math.abs(value) >= 1000 ? `${number(value / 1000, 2)}k` : number(value, 2);
+    const axisNumber = value => unit !== 'sat' ? money(value) : Math.abs(value) >= 1000000 ? `${number(value / 1000000, 2)}m` : Math.abs(value) >= 1000 ? `${number(value / 1000, 2)}k` : number(value, 2);
     context.font = '10px -apple-system, sans-serif';
     context.textBaseline = 'middle';
     for (let tick = Math.round(low / step); tick <= Math.round(high / step); tick++) {
@@ -283,7 +385,7 @@ if (typeof document !== 'undefined') {
       context.fillStyle = '#666'; context.textAlign = 'right';
       context.fillText(axisNumber(value), margin.left - 9, y(value));
       context.textAlign = 'left';
-      context.fillText(whole(value / (REWARD / SPARKS)), width - margin.right + 8, y(value));
+      context.fillText(money(value / (REWARD / SPARKS), true), width - margin.right + 8, y(value));
     }
     if (!minting) {
       if (!feeFill) {
@@ -343,14 +445,8 @@ if (typeof document !== 'undefined') {
       lastReceived = Date.now();
       element('connection').className = 'connection';
       element('connection').textContent = 'Live';
-      if (!minting) {
-        element('total-burned').textContent = number(Number(state.totals.burned_sats));
-        element('total-reward').textContent = whole(Number(state.totals.reward_sparks) / SPARKS);
-        const currentBurn = state.contributions.reduce((sum, contribution) => sum + burnAt(contribution, state.height), 0);
-        element('total-rate').textContent = currentBurn ? whole(currentBurn / (REWARD / SPARKS)) : '—';
-      }
       element('current-block').textContent = number(state.height);
-      renderTable(); updateDraft();
+      renderMoney();
     } catch (error) {
       element('connection').className = 'connection error';
       element('connection').textContent = `Disconnected${state ? ' (last snapshot)' : ''}. ${error.message}. Retrying…`;
@@ -359,6 +455,7 @@ if (typeof document !== 'undefined') {
   }
 
   element('budget').addEventListener('input', () => updateDraft(true));
+  for (const value of ['sat', 'BTC', 'USD']) element(`unit-${value.toLowerCase()}`).addEventListener('click', () => selectUnit(value));
   element('duration').addEventListener('input', () => updateDraft(true));
   element('retry-wallet').addEventListener('click', prepareWallet);
   element('reset-wallet').addEventListener('click', () => {
@@ -406,7 +503,8 @@ if (typeof document !== 'undefined') {
     }
   });
   new ResizeObserver(queueChart).observe(element('chart'));
-  updateDraft();
+  renderMoney();
+  refreshQuote();
   if (minting) prepareWallet();
   poll();
 }

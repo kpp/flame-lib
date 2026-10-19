@@ -74,15 +74,17 @@ A pending public request is saved locally before submission, keeping its ID and 
 
 The reward export represents **lifetime earned rewards**, not a spendable balance or an instruction to pay them again. Creating actual Flame UTXOs is deliberately out of scope. The wallet integration must add an atomic issuance/checkpoint ledger (or export an immutable snapshot at a selected height) to track already-issued rewards and avoid duplicate payouts. It can use the stored receiving address directly; it must not require a user's private keys.
 
-The database retains all contributions and per-block accruals; the dashboard response filter does not delete or archive records. Pagination, archival, authentication, real Bitcoin/Flame connectivity, cancellation and withdrawals are intentionally absent. No external assets, analytics or third-party scripts are loaded by the UI.
+The database retains all contributions and per-block accruals; the dashboard response filter does not delete or archive records. Pagination, archival, authentication, real Bitcoin/Flame connectivity, cancellation and withdrawals are intentionally absent. No external assets, analytics or third-party scripts are loaded by the UI; both pages make a public price-data request for the BTC/USD ticker.
 
-FLM amounts and sat/FLM rates are displayed as whole numbers with decimal fractions truncated, including projections. Calculations, stored sparks, and API values retain their precision. Effective rates use the untruncated reward amount, not the displayed whole-FLM value.
+The sat / BTC / USD switch changes display only and remembers the selection in this browser. FLM counts remain whole numbers; sat amounts and rates have no decimals, BTC has exactly eight, and USD has two (three in the top total, up to six for $/FLM rates). Top counters use short currency-free labels (`Burned`, `Earned`, and `Current rate` or `Effective rate`) above values with units: `$X.XXX`, `X btc`, or `X sat`; `X FLM`; and `X $/FLM`, `X BTC/FLM`, or `X sat/FLM`, using non-breaking spaces between numbers and units. Decimal fractions are truncated for display only. Calculations, stored satoshis/sparks, submissions, and API values retain their precision. Effective rates use the untruncated reward amount, not the displayed whole-FLM value.
+
+Both pages always show the BTC/USD price in a reserved single-line ticker. Coinbase's public [BTC/USD spot endpoint](https://docs.cdp.coinbase.com/coinbase-app/track-apis/prices) is requested without credentials on page load and refreshed once a minute, regardless of selected currency. The last valid quote stays visible during refresh; failed or invalid quotes clear it and leave USD values unavailable. Switching to USD uses the preloaded quote without a new request. The current reference quote revalues all amounts, including historical totals; these are not historical USD costs or execution prices.
 
 ## User UI
 
 URL: `/mint`
 
-The top counters show only this user's accrued totals: sats burned, FLM earned, and effective cost `(sats burned + mining fees paid) / FLM earned`. They include all of the user's contributions, not only the chart window. Scheduled future spending and the unsubmitted draft are excluded. Effective cost is `—` until rewards are earned; all three counters are `—` while the wallet is unavailable.
+The top counters show only this user's accrued totals: sats burned, FLM earned, and effective cost `(sats burned + mining fees paid) / FLM earned`. They include all of the user's contributions, not only the chart window. Scheduled future spending and the unsubmitted draft are excluded. Effective cost is `—` until rewards are earned; all three numeric values are `—` while the wallet is unavailable, with their labels and units retained.
 
 User sees a chart of the burn rate in satoshis per block, with the equivalent mint rate (sat/FLM) on the right-hand axis.
 - Chart is centered around the current block and shows the previous 500 blocks and next 500 blocks. The past shows actual schedules; the future is explicitly a forecast.

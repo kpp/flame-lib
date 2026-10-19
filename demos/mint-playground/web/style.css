@@ -4,6 +4,12 @@ body { margin: 0; }
 [hidden] { display: none !important; }
 .wrap { max-width: 1280px; margin: auto; padding: 0 16px; }
 .topbar { display: flex; align-items: baseline; justify-content: space-between; padding-top: 12px; padding-bottom: 8px; border-bottom: 1px solid #ccc; }
+.topbar-actions { display: flex; align-items: baseline; gap: 16px; }
+.unit-switch { display: flex; }
+.unit-switch button { border: 1px solid #aaa; background: #fff; border-radius: 0; }
+.unit-switch button + button { border-left: 0; }
+.unit-switch button[aria-pressed="true"] { background: #ddd; font-weight: 600; }
+.price-status { margin: -4px 0 10px; color: #666; min-height: 1.4em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 h1 { margin: 0; font-size: 18px; }
 h2, h3 { margin: 0; font-size: 14px; font-weight: 600; }
 p { margin: 0; }
@@ -16,7 +22,7 @@ button:disabled { cursor: default; }
 .small, .service-status, .chart-footer, .range-labels, .chart-units { font-size: 12px; }
 .service-status, .section-heading, .chart-footer { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .service-status { margin: 8px 0 12px; }
-.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 16px; }
 .metrics > div > p:first-child { color: #666; font-size: 12px; }
 .metric-value { font-size: 24px; font-variant-numeric: tabular-nums; }
 .panel { margin-top: 16px; padding-top: 12px; border-top: 1px solid #ddd; }

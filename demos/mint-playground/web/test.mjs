@@ -4,7 +4,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('./app.js', import.meta.url), 'utf8');
-const { BUDGET_MIN, BUDGET_MAX, burnAt, feeAt, projectedBurn, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const { BUDGET_MIN, BUDGET_MAX, burnAt, feeAt, projectedBurn, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 const plan = (options = {}) => ({ user_id: 1, budget_sats: 300005, duration: 100, start_block: 10, ...options });
 
 test('budget is a native linear slider with the requested endpoints', async () => {
@@ -131,7 +131,9 @@ test('linear slider budgets conserve the complete budget at every allowed durati
   }
 });
 
-async function openPage(pathname, storage = new Map(), post = async () => ({ id: 2, user_id: 1, start_block: 11 }), walletReady = Promise.resolve()) {
+const quoteResponse = amount => ({ ok: true, json: async () => ({ data: { base: 'BTC', currency: 'USD', amount: String(amount) } }) });
+
+async function openPage(pathname, storage = new Map(), post = async () => ({ id: 2, user_id: 1, start_block: 11 }), walletReady = Promise.resolve(), pageOptions = {}) {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
   const draws = [];
   class Element {
@@ -144,19 +146,22 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
       return new Proxy({}, { get: (context, method) => (...args) => {
         draws.push({ method, args, fillStyle: context.fillStyle, strokeStyle: context.strokeStyle, globalAlpha: context.globalAlpha, canvas: this });
         if (method === 'createPattern') return { kind: 'pattern', canvas: args[0], repetition: args[1] };
+        if (method === 'measureText') return { width: String(args[0]).length * 6 };
       } });
     }
     get clientWidth() { return 800; }
     get clientHeight() { return 275; }
   }
   const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => [id, new Element()]));
+  for (const [, id, text] of html.matchAll(/\bid="([^"]+)"[^>]*>([^<]*)</g)) elements.get(id).textContent = text.replaceAll('&nbsp;', '\u00a0');
   elements.get('budget').value = '1000000'; elements.get('duration').value = '500';
-  const requests = [], frames = [], timers = new Map();
+  const requests = [], frames = [], timers = new Map(), abortTimeouts = [];
   let nextTimer = 0;
   const snapshot = { height: 10, totals: { contribution_count: 1, burned_sats: '100000', fees_sats: '1000', reward_sparks: '50000000000' }, contributions: [{ id: 1, user_id: 1, address: 'tf1demo-address', budget_sats: 300000, duration: 100, start_block: 10, burned_sats: '2000', fees_sats: '1000', reward_sparks: '5000000000' }] };
   const context = vm.createContext({
     document: { getElementById: id => elements.get(id), createElement: tag => new Element(tag), createDocumentFragment: () => new Element('fragment') },
-    location: { pathname }, window: { devicePixelRatio: 1 }, AbortSignal, console,
+    location: { pathname }, window: { devicePixelRatio: 1 }, console,
+    AbortSignal: { timeout: delay => { abortTimeouts.push(delay); return AbortSignal.timeout(delay); } },
     localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
     crypto: { randomUUID: () => '11111111-1111-4111-8111-111111111111' },
     confirm: () => true,
@@ -168,6 +173,8 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
     fetch: async (url, options = {}) => {
       requests.push({ url, options });
       if (url === '/api/state' || url === '/api/state?full_history=true') return { ok: true, json: async () => snapshot };
+      if (url === 'https://api.coinbase.com/v2/prices/BTC-USD/spot') return pageOptions.quote ? pageOptions.quote() : quoteResponse(50000);
+      assert.equal(url, '/api/contributions', 'unexpected request');
       return { ok: true, json: async () => post(JSON.parse(options.body)) };
     },
   });
@@ -176,8 +183,16 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
   const settle = async () => { for (let i = 0; i < 4; i++) await new Promise(resolve => setImmediate(resolve)); while (frames.length) frames.shift()(); };
   await settle();
   return {
-    elements, requests, storage, snapshot, draws, settle,
+    elements, requests, storage, snapshot, draws, settle, timers, abortTimeouts,
     event: async (id, event) => { await elements.get(id).handlers[event]({ preventDefault() {} }); await settle(); },
+    timer: async delay => {
+      const pending = [...timers].find(([, timer]) => timer.delay === delay);
+      assert.ok(pending, `no ${delay}ms timer scheduled`);
+      const [id, timer] = pending;
+      timers.delete(id);
+      await timer.callback();
+      await settle();
+    },
     refresh: async () => {
       const [id, timer] = [...timers].find(([, timer]) => timer.delay === 1000);
       timers.delete(id);
@@ -344,14 +359,15 @@ test('dashboard burn and patterned downward fees share one sats scale, with mint
 
 test('dashboard initializes, polls, draws, and renders the actual contribution snapshot', async () => {
   const page = await openPage('/');
-  assert.equal(page.elements.get('total-burned').textContent, '100,000');
-  assert.equal(page.elements.get('total-reward').textContent, '500');
-  assert.equal(page.elements.get('total-rate').textContent, '40');
+  assert.equal(page.elements.get('total-burned').textContent, '100,000\u00a0sat');
+  assert.equal(page.elements.get('total-reward').textContent, '500\u00a0FLM');
+  assert.equal(page.elements.get('total-rate').textContent, '40\u00a0sat/FLM');
   assert.equal(page.elements.get('current-block').textContent, '10');
   assert.equal(page.elements.get('connection').textContent, 'Live');
   assert.equal(page.elements.get('contributions').children.length, 1);
   assert.equal(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, '#1', 'public rows do not disclose future budget or duration');
-  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests.filter(request => request.url === '/api/state').length, 1);
+  assert.equal(page.requests.length, 2, 'state and BTC/USD quote are loaded independently');
   assert.equal(page.storage.size, 0, 'dashboard does not need palette or wallet storage');
 });
 
@@ -362,8 +378,8 @@ test('dashboard requests recent contributions but uses server all-time totals, e
   const footer = () => page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
   assert.equal(page.elements.get('contributions').children.length, 1, 'only the returned recent row is displayed');
   assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '8,999']);
-  assert.equal(page.elements.get('total-burned').textContent, '9,876,543');
-  assert.equal(page.elements.get('total-reward').textContent, '1,234');
+  assert.equal(page.elements.get('total-burned').textContent, '9,876,543\u00a0sat');
+  assert.equal(page.elements.get('total-reward').textContent, '1,234\u00a0FLM');
   page.snapshot.contributions = [];
   page.draws.length = 0;
   await page.refresh();
@@ -372,7 +388,7 @@ test('dashboard requests recent contributions but uses server all-time totals, e
   assert.equal(page.elements.get('empty-table').textContent, 'No recent contributions.');
   assert.ok(!page.draws.some(call => call.method === 'fill' && PALETTE.includes(call.fillStyle)), 'omitted contributions create no chart bands');
   assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '8,999']);
-  assert.ok(page.requests.every(request => request.url === '/api/state'), 'dashboard never requests full history');
+  assert.ok(page.requests.filter(request => request.url.startsWith('/api/state')).every(request => request.url === '/api/state'), 'dashboard never requests full history');
 });
 
 test('mint requests full history and retains personal totals for contributions finished more than 10,000 blocks ago', async () => {
@@ -380,12 +396,12 @@ test('mint requests full history and retains personal totals for contributions f
   page.snapshot.height = 20000;
   page.snapshot.contributions[0].reward_sparks = '199999999';
   await page.refresh();
-  assert.ok(page.requests.every(request => request.url === '/api/state?full_history=true'));
+  assert.ok(page.requests.filter(request => request.url.startsWith('/api/state')).every(request => request.url === '/api/state?full_history=true'));
   assert.equal(page.elements.get('contributions').children.length, 1);
   assert.equal(page.elements.get('contributions').children[0].children[1].children[0].textContent, 'Finished');
-  assert.equal(page.elements.get('total-burned').textContent, '2,000');
-  assert.equal(page.elements.get('total-reward').textContent, '1');
-  assert.equal(page.elements.get('total-rate').textContent, '1,500');
+  assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
+  assert.equal(page.elements.get('total-reward').textContent, '1\u00a0FLM');
+  assert.equal(page.elements.get('total-rate').textContent, '1,500\u00a0sat/FLM');
   assert.deepEqual(page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent), ['Total', '1 contributions', '2,000', '1', '1,000', '1,500']);
 });
 
@@ -402,8 +418,8 @@ test('FLM and sat/FLM displays truncate fractions without changing rewards or pr
     const footer = page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
     assert.deepEqual(row.slice(2), ['1,000', '1', '999', '999']);
     assert.deepEqual(footer.slice(2), ['1,000', '1', '999', '999']);
-    assert.equal(page.elements.get('total-reward').textContent, '1');
-    assert.equal(page.elements.get('total-rate').textContent, pathname === '/mint' ? '999' : '40');
+    assert.equal(page.elements.get('total-reward').textContent, '1\u00a0FLM');
+    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/mint' ? '999' : '40'}\u00a0sat/FLM`);
     if (pathname === '/mint') {
       const draft = { budget_sats: 1000000, duration: 500, start_block: page.snapshot.height + 1 };
       const estimate = projectedReward(page.snapshot.contributions, draft, 'tf1demo-address');
@@ -443,8 +459,8 @@ test('mint totals show only accrued wallet burns and rewards, with mining fees i
   ];
   await page.refresh();
   const totals = () => ['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent);
-  assert.deepEqual(totals(), ['122,345', '133', '1,795']);
-  assert.equal(page.elements.get('total-rate-label').textContent, 'Effective sat/FLM');
+  assert.deepEqual(totals(), ['122,345\u00a0sat', '133\u00a0FLM', '1,795\u00a0sat/FLM']);
+  assert.equal(page.elements.get('total-rate-label').textContent, 'Effective rate');
   assert.match(page.elements.get('total-rate-label').title, /mining fees/);
   const table = page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
   assert.deepEqual(table.slice(2), ['122,345', '133', '117,000', '1,795'], 'header and table truncate only displayed reward and cost');
@@ -453,31 +469,31 @@ test('mint totals show only accrued wallet burns and rewards, with mining fees i
   await page.event('budget', 'input');
   page.elements.get('duration').value = '1000';
   await page.event('duration', 'input');
-  assert.deepEqual(totals(), ['122,345', '133', '1,795'], 'draft budgets and projected rewards never change the accrued header');
+  assert.deepEqual(totals(), ['122,345\u00a0sat', '133\u00a0FLM', '1,795\u00a0sat/FLM'], 'draft budgets and projected rewards never change the accrued header');
 });
 
 test('mint effective cost is undefined before any FLM is earned, and a ready unregistered wallet has zero totals', async () => {
   const page = await openPage('/mint');
   page.snapshot.contributions[0].reward_sparks = '0';
   await page.refresh();
-  assert.equal(page.elements.get('total-burned').textContent, '2,000');
-  assert.equal(page.elements.get('total-reward').textContent, '0');
-  assert.equal(page.elements.get('total-rate').textContent, '—');
+  assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
+  assert.equal(page.elements.get('total-reward').textContent, '0\u00a0FLM');
+  assert.equal(page.elements.get('total-rate').textContent, '—\u00a0sat/FLM');
   page.snapshot.contributions[0].address = 'another-user';
   await page.refresh();
-  assert.equal(page.elements.get('total-burned').textContent, '0');
-  assert.equal(page.elements.get('total-reward').textContent, '0');
-  assert.equal(page.elements.get('total-rate').textContent, '—');
+  assert.equal(page.elements.get('total-burned').textContent, '0\u00a0sat');
+  assert.equal(page.elements.get('total-reward').textContent, '0\u00a0FLM');
+  assert.equal(page.elements.get('total-rate').textContent, '—\u00a0sat/FLM');
 });
 
 test('an unavailable wallet never substitutes global totals on the mint page', async () => {
   const storage = new Map([['flame-mint-playground-wallet-v1', '{broken json']]);
   const page = await openPage('/mint', storage);
-  for (const id of ['total-burned', 'total-reward', 'total-rate']) assert.equal(page.elements.get(id).textContent, '—');
+  assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
   assert.equal(page.elements.get('projected-reward').textContent, '—', 'an unknown identity cannot distinguish its own future schedules');
   assert.equal(page.elements.get('projected-rate').textContent, '—');
   await page.refresh();
-  for (const id of ['total-burned', 'total-reward', 'total-rate']) assert.equal(page.elements.get(id).textContent, '—');
+  assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
   assert.equal(page.elements.get('contributions').children.length, 0);
 });
 
@@ -486,12 +502,12 @@ test('a wallet arriving after the first poll fills personal totals without waiti
   const walletReady = new Promise(resolve => { finishWallet = resolve; });
   const page = await openPage('/mint', new Map(), undefined, walletReady);
   assert.equal(page.elements.get('connection').textContent, 'Live', 'the snapshot arrived while wallet initialization is pending');
-  for (const id of ['total-burned', 'total-reward', 'total-rate']) assert.equal(page.elements.get(id).textContent, '—');
+  assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
   finishWallet();
   await page.settle();
-  assert.equal(page.elements.get('total-burned').textContent, '2,000');
-  assert.equal(page.elements.get('total-reward').textContent, '50');
-  assert.equal(page.elements.get('total-rate').textContent, '60');
+  assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
+  assert.equal(page.elements.get('total-reward').textContent, '50\u00a0FLM');
+  assert.equal(page.elements.get('total-rate').textContent, '60\u00a0sat/FLM');
   assert.equal(page.requests.filter(request => request.url === '/api/state?full_history=true').length, 1, 'wallet completion reuses the current full-history snapshot');
 });
 
@@ -653,8 +669,8 @@ test('user colors match across clients, reloads, reordered snapshots, and repeat
   assert.equal(page.storage.size, 0);
 });
 
-test('dashboard colors do not access browser storage', async () => {
-  const page = await openPage('/', { get() { assert.fail('Unexpected storage read'); }, set() { assert.fail('Unexpected storage write'); } });
+test('dashboard colors need no storage beyond the independent unit preference', async () => {
+  const page = await openPage('/', { get(key) { assert.equal(key, UNIT_KEY); return null; }, set() { assert.fail('Unexpected storage write'); } });
   assert.equal(page.elements.get('connection').textContent, 'Live');
   const firstColor = page.elements.get('contributions').children[0].children[0].children[0].children[0].style.background;
   assert.equal(firstColor, userColor(1));
@@ -666,16 +682,16 @@ test('the top mint rate follows the current block, ignoring historical totals an
   const page = await openPage('/');
   page.snapshot.contributions.push({ ...page.snapshot.contributions[0], id: 2, budget_sats: 200000, start_block: 11 });
   await page.refresh();
-  assert.equal(page.elements.get('total-rate').textContent, '40', 'future contribution does not affect this block');
+  assert.equal(page.elements.get('total-rate').textContent, '40\u00a0sat/FLM', 'future contribution does not affect this block');
   page.snapshot.height = 11;
   await page.refresh();
-  assert.equal(page.elements.get('total-rate').textContent, '60', '3,000 sats burned this block / 50 FLM');
+  assert.equal(page.elements.get('total-rate').textContent, '60\u00a0sat/FLM', '3,000 sats burned this block / 50 FLM');
   page.snapshot.height = 110;
   await page.refresh();
-  assert.equal(page.elements.get('total-rate').textContent, '20', 'first contribution no longer burns');
+  assert.equal(page.elements.get('total-rate').textContent, '20\u00a0sat/FLM', 'first contribution no longer burns');
   page.snapshot.height = 111;
   await page.refresh();
-  assert.equal(page.elements.get('total-rate').textContent, '—', 'no issuance in an empty block');
+  assert.equal(page.elements.get('total-rate').textContent, '—\u00a0sat/FLM', 'no issuance in an empty block');
 });
 
 test('budget slider values are satoshis directly, including its linear midpoint', async () => {
@@ -698,7 +714,7 @@ test('mint page keeps keys local and persists the exact retry request across a p
   assert.equal(first.elements.get('wallet-status').textContent, 'Saved locally. Keys stay in this browser.');
   assert.equal(first.elements.get('submit').disabled, false);
   assert.equal(first.elements.get('submit').textContent, 'Submit');
-  assert.equal(first.elements.get('seed-phrase').textContent, undefined);
+  assert.equal(first.elements.get('seed-phrase').textContent, '');
   await first.event('contribution-form', 'submit');
   const original = JSON.parse(first.requests.find(request => request.url === '/api/contributions').options.body);
   assert.deepEqual(Object.keys(original).sort(), ['address', 'budget_sats', 'duration', 'request_id']);
@@ -744,4 +760,404 @@ test('a saved reward address must match the address derived from its saved recov
   assert.match(page.elements.get('wallet-status').textContent, /does not match/);
   assert.equal(page.elements.get('submit').disabled, true);
   assert.equal(storage.get('flame-mint-playground-wallet-v1'), saved);
+});
+
+test('money formatting preserves eight BTC decimals, truncates display values, and keeps small USD rates', () => {
+  assert.equal(formatMoney(123456789), '123,456,789');
+  assert.equal(formatMoney(123456789, 'BTC'), '1.23456789');
+  assert.equal(formatMoney(1, 'BTC'), '0.00000001');
+  assert.equal(formatMoney(0, 'BTC'), '0.00000000');
+  assert.equal(formatMoney(100000000, 'BTC'), '1.00000000');
+  assert.equal(formatMoney(1.99, 'BTC', null, true), '0.00000001');
+  assert.equal(formatMoney(123456789, 'USD', 50000), '61,728.39');
+  assert.equal(formatMoney(1999, 'USD', 50000), '0.99');
+  assert.equal(formatMoney(1.99, 'USD', 50000, true), '0.000995', 'conversion uses the raw rate, not its truncated sat display');
+  assert.equal(formatMoney(2000, 'USD', 50000, true), '1.00');
+  assert.equal(formatMoney(1000, 'USD'), '—');
+  assert.equal(formatMoney(1000, 'USD', NaN), '—');
+  assert.equal(formatMoney(1000, 'USD', 0), '—');
+});
+
+test('the quote parser accepts only positive finite USD prices of BTC', () => {
+  assert.equal(parseBtcUsdQuote({ data: { base: 'BTC', currency: 'USD', amount: '50000.12' } }), 50000.12);
+  for (const amount of ['', ' ', '0', '-1', 'NaN', 'Infinity', '1e999', 50000, null]) {
+    assert.throws(() => parseBtcUsdQuote({ data: { base: 'BTC', currency: 'USD', amount } }));
+  }
+  for (const payload of [null, {}, { data: {} }, { data: { base: 'ETH', currency: 'USD', amount: '50000' } }, { data: { base: 'BTC', currency: 'EUR', amount: '50000' } }]) {
+    assert.throws(() => parseBtcUsdQuote(payload));
+  }
+});
+
+const quoteRequests = page => page.requests.filter(request => request.url.startsWith('https:'));
+const stateRequests = page => page.requests.filter(request => request.url.startsWith('/api/state'));
+const rowValues = page => page.elements.get('contributions').children[0].children.slice(2).map(cell => cell.textContent);
+const footerValues = page => page.elements.get('contribution-totals').children[0].children.slice(2).map(cell => cell.textContent);
+const chartGeometry = page => page.draws.filter(call => call.canvas === page.elements.get('chart') && ['moveTo', 'lineTo'].includes(call.method)).map(call => [call.method, call.args[1]]);
+
+test('both pages offer an accessible three-state unit selection while always showing the BTC/USD quote', async () => {
+  const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
+  const quoteRow = html.match(/<p\b[^>]*id="price-status"[^>]*>[^<]*<\/p>/)[0];
+  assert.doesNotMatch(quoteRow, /\bhidden\b/);
+  assert.match(quoteRow, />Loading BTC\/USD…<\/p>/);
+  assert.match(html, /<div><p>Earned<\/p><p[^>]*id="total-reward">—&nbsp;FLM<\/p><\/div>/);
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    for (const [unit, selected] of [['sat', true], ['btc', false], ['usd', false]]) {
+      assert.equal(page.elements.get(`unit-${unit}`)['aria-pressed'], String(selected));
+    }
+    assert.equal(quoteRequests(page).length, 1, 'the reference quote is fetched at startup in sat mode');
+    assert.equal(page.elements.get('price-status').hidden, false);
+    assert.match(page.elements.get('price-status').textContent, /BTC\/USD.*50,000|50,000.*BTC\/USD/);
+    assert.equal(page.storage.has(UNIT_KEY), false, 'the default does not need a storage write');
+    await page.event('unit-btc', 'click');
+    assert.equal(page.elements.get('unit-btc')['aria-pressed'], 'true');
+    assert.equal(page.elements.get('unit-sat')['aria-pressed'], 'false');
+    assert.equal(quoteRequests(page).length, 1, 'unit changes reuse the loaded quote');
+    assert.equal(stateRequests(page).length, 1, 'changing the unit reuses the same snapshot');
+    assert.equal(page.elements.get('price-status').hidden, false);
+    assert.equal(page.storage.get(UNIT_KEY), 'BTC');
+  }
+});
+
+test('unit switches reuse the preloaded BTC/USD quote and preserve its refresh timer on both pages', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    const row = page.elements.get('price-status').textContent;
+    const quoteTimer = [...page.timers].find(([, timer]) => timer.delay === 60000)[0];
+    for (const [unit, amount, rate] of [
+      ['usd', pathname === '/' ? '$50.000' : '$1.000', pathname === '/' ? '0.02\u00a0$/FLM' : '0.03\u00a0$/FLM'],
+      ['btc', pathname === '/' ? '0.00100000\u00a0btc' : '0.00002000\u00a0btc', pathname === '/' ? '0.00000040\u00a0BTC/FLM' : '0.00000060\u00a0BTC/FLM'],
+      ['sat', pathname === '/' ? '100,000\u00a0sat' : '2,000\u00a0sat', pathname === '/' ? '40\u00a0sat/FLM' : '60\u00a0sat/FLM'],
+    ]) {
+      await page.event(`unit-${unit}`, 'click');
+      assert.equal(page.elements.get('total-burned').textContent, amount);
+      assert.equal(page.elements.get('total-reward').textContent, pathname === '/' ? '500\u00a0FLM' : '50\u00a0FLM');
+      assert.equal(page.elements.get('total-rate').textContent, rate);
+      assert.equal(page.elements.get('total-burned-label').textContent, 'Burned');
+      assert.equal(page.elements.get('total-rate-label').textContent, pathname === '/' ? 'Current rate' : 'Effective rate');
+      assert.equal(page.elements.get('price-status').hidden, false);
+      assert.equal(page.elements.get('price-status').textContent, row, 'reference quote does not depend on the display unit');
+      assert.equal(quoteRequests(page).length, 1, 'switching units never fetches a price');
+      assert.equal([...page.timers].find(([, timer]) => timer.delay === 60000)[0], quoteTimer, 'switching units does not reset the refresh timer');
+    }
+  }
+});
+
+test('a pending quote refresh retains its previous value and USD display until success or failure', async () => {
+  let calls = 0, finish;
+  const page = await openPage('/', new Map(), undefined, undefined, { quote: () => ++calls === 1 ? quoteResponse(50000) : new Promise(resolve => { finish = resolve; }) });
+  await page.event('unit-usd', 'click');
+  const row = page.elements.get('price-status').textContent;
+  const pending = page.timer(60000);
+  await page.settle();
+  assert.equal(page.elements.get('price-status').textContent, row, 'a refresh does not blink to Loading');
+  assert.equal(page.elements.get('total-burned').textContent, '$50.000');
+  await page.event('unit-sat', 'click');
+  await page.event('unit-usd', 'click');
+  assert.equal(quoteRequests(page).length, 2, 'unit changes do not duplicate the pending refresh');
+  finish({ ok: false, status: 503 });
+  await pending;
+  assert.equal(page.elements.get('total-burned').textContent, '$—', 'failure clears the old quote');
+  assert.equal(page.elements.get('price-status').hidden, false);
+  assert.match(page.elements.get('price-status').textContent, /unavailable/i);
+  assert.equal([...page.timers.values()].filter(timer => timer.delay === 60000).length, 1, 'failed refresh schedules exactly one retry');
+});
+
+test('BTC mode converts totals, tables, and rates on both pages without touching FLM rewards', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    const snapshotBefore = JSON.stringify(page.snapshot);
+    const rewardBefore = page.elements.get('total-reward').textContent;
+    await page.event('unit-btc', 'click');
+    assert.equal(page.elements.get('total-burned').textContent, `${pathname === '/' ? '0.00100000' : '0.00002000'}\u00a0btc`);
+    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/' ? '0.00000040' : '0.00000060'}\u00a0BTC/FLM`);
+    assert.deepEqual(rowValues(page), ['0.00002000', '50', '0.00001000', '0.00000060']);
+    assert.deepEqual(footerValues(page), pathname === '/' ? ['0.00100000', '500', '0.00001000', '0.00000202'] : ['0.00002000', '50', '0.00001000', '0.00000060']);
+    assert.equal(page.elements.get('total-reward').textContent, rewardBefore);
+    assert.equal(page.elements.get('total-burned-label').textContent, 'Burned');
+    assert.equal(page.elements.get('total-rate-label').textContent, pathname === '/' ? 'Current rate' : 'Effective rate');
+    assert.match(page.elements.get('table-burned-label').textContent, /BTC/);
+    assert.match(page.elements.get('table-fees-label').textContent, /BTC/);
+    assert.match(page.elements.get('table-rate-label').textContent, /BTC\s*\/\s*FLM/);
+    assert.equal(page.elements.get('chart-burn-unit').textContent, 'BTC/block');
+    assert.equal(page.elements.get('chart-rate-unit').textContent, 'BTC/FLM');
+    assert.match(page.elements.get('chart')['aria-label'], /BTC/);
+    assert.equal(JSON.stringify(page.snapshot), snapshotBefore);
+    assert.equal(stateRequests(page).length, 1);
+  }
+});
+
+test('mint budget, fees, contribution labels, validation, and projection follow the unit without altering the draft', async () => {
+  const page = await openPage('/mint');
+  const budgetBefore = page.elements.get('budget').value;
+  const projectedBefore = page.elements.get('projected-reward').textContent;
+  await page.event('unit-btc', 'click');
+  assert.equal(page.elements.get('budget-value').textContent, '0.01000000 BTC');
+  assert.equal(page.elements.get('budget')['aria-valuetext'], '0.01000000 BTC');
+  assert.equal(page.elements.get('budget-min').textContent, '0.00100000 BTC');
+  assert.equal(page.elements.get('budget-max').textContent, '1.00000000 BTC');
+  assert.equal(page.elements.get('projected-fees').textContent, '0.00500000 BTC');
+  assert.equal(page.elements.get('projected-burn').textContent, '0.00500000 BTC');
+  assert.match(page.elements.get('fee-label').textContent, /0\.00001000 BTC/);
+  assert.match(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, /0\.00300000 BTC/);
+  const draft = { budget_sats: 1000000, duration: 500, start_block: 11 };
+  const estimate = projectedReward(page.snapshot.contributions, draft, 'tf1demo-address', 10);
+  assert.equal(page.elements.get('projected-rate').textContent, `${formatMoney(draft.budget_sats * SPARKS / estimate, 'BTC', null, true)} BTC / FLM`);
+  assert.equal(page.elements.get('projected-reward').textContent, projectedBefore);
+  assert.equal(page.elements.get('budget').value, budgetBefore);
+  page.elements.get('budget').value = String(BUDGET_MIN);
+  await page.event('budget', 'input');
+  assert.equal(page.elements.get('submit').disabled, true);
+  assert.match(page.elements.get('budget-error').textContent, /0\.00500500 BTC/);
+  assert.doesNotMatch(page.elements.get('budget-error').textContent, /\bsat\b/);
+});
+
+test('USD mode reuses the public quote fetched without identity and converts all accounting displays, not accounting', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    const snapshotBefore = JSON.stringify(page.snapshot);
+    await page.event('unit-usd', 'click');
+    const requests = quoteRequests(page);
+    assert.equal(requests.length, 1);
+    const request = requests[0];
+    assert.equal(request.url, 'https://api.coinbase.com/v2/prices/BTC-USD/spot');
+    assert.equal(request.options.credentials, 'omit');
+    assert.equal(request.options.referrerPolicy, 'no-referrer');
+    assert.equal(request.options.body, undefined, 'wallet addresses and keys are never sent to the quote API');
+    assert.ok(request.options.signal instanceof AbortSignal);
+    assert.equal(page.abortTimeouts.length, 2, 'the snapshot and the quote each have a timeout');
+    assert.ok(page.abortTimeouts.every(delay => delay === 10000), 'price requests cannot hang beyond ten seconds');
+    assert.equal(page.elements.get('price-status').hidden, false);
+    assert.match(page.elements.get('price-status').textContent, /50,000|50000/);
+    assert.equal(page.elements.get('total-burned').textContent, pathname === '/' ? '$50.000' : '$1.000');
+    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/' ? '0.02' : '0.03'}\u00a0$/FLM`);
+    assert.deepEqual(rowValues(page), ['1.00', '50', '0.50', '0.03']);
+    assert.deepEqual(footerValues(page), pathname === '/' ? ['50.00', '500', '0.50', '0.101'] : ['1.00', '50', '0.50', '0.03']);
+    assert.equal(page.elements.get('chart-burn-unit').textContent, '$/block');
+    assert.equal(page.elements.get('chart-rate-unit').textContent, '$/FLM');
+    assert.equal(page.elements.get('total-rate-label').textContent, pathname === '/' ? 'Current rate' : 'Effective rate');
+    if (pathname === '/mint') {
+      assert.equal(page.elements.get('budget-value').textContent, '$500.00');
+      assert.equal(page.elements.get('projected-fees').textContent, '$250.00');
+      assert.equal(page.elements.get('projected-burn').textContent, '$250.00');
+      assert.equal(page.elements.get('budget-min').textContent, '$50.00');
+      assert.equal(page.elements.get('budget-max').textContent, '$50,000.00');
+      assert.match(page.elements.get('projected-rate').textContent, /^\$[\d,.]+ \/ FLM$/);
+    }
+    assert.equal(JSON.stringify(page.snapshot), snapshotBefore);
+    assert.equal(stateRequests(page).length, 1);
+    assert.equal([...page.storage.values()].some(value => value === '50000'), false, 'quotes are not persisted');
+  }
+});
+
+test('USD rates convert raw fractional sat/FLM rather than the truncated sat display', async () => {
+  const page = await openPage('/mint');
+  const contribution = page.snapshot.contributions[0];
+  contribution.burned_sats = '199'; contribution.fees_sats = '0'; contribution.reward_sparks = '10000000000';
+  await page.refresh();
+  assert.equal(page.elements.get('total-rate').textContent, '1\u00a0sat/FLM');
+  await page.event('unit-usd', 'click');
+  assert.equal(page.elements.get('total-rate').textContent, '0.000995\u00a0$/FLM');
+  assert.equal(rowValues(page)[3], '0.000995');
+  assert.equal(footerValues(page)[3], '0.000995');
+  assert.equal(page.elements.get('total-reward').textContent, '100\u00a0FLM');
+});
+
+test('top counters on both pages keep units without label prefixes and retain three truncated USD decimals across updates', async () => {
+  for (const pathname of ['/', '/mint']) {
+    let price = 50000;
+    const page = await openPage(pathname, new Map(), undefined, undefined, { quote: () => quoteResponse(price) });
+    page.snapshot.totals.burned_sats = '1999';
+    page.snapshot.contributions[0].burned_sats = '1999';
+    await page.refresh();
+    const before = JSON.stringify(page.snapshot);
+    assert.equal(page.elements.get('total-burned').textContent, '1,999\u00a0sat');
+    await page.event('unit-btc', 'click');
+    assert.equal(page.elements.get('total-burned').textContent, '0.00001999\u00a0btc');
+    await page.event('unit-usd', 'click');
+    assert.equal(page.elements.get('total-burned').textContent, '$0.999', 'top USD amounts truncate, rather than round, to exactly three places');
+    assert.equal(rowValues(page)[0], '0.99', 'table precision is unchanged');
+    assert.equal(page.elements.get('total-reward').textContent, `${pathname === '/' ? '500' : '50'}\u00a0FLM`);
+    assert.match(page.elements.get('total-rate').textContent, /^[\d,.]+\u00a0\$\/FLM$/);
+    assert.equal(JSON.stringify(page.snapshot), before, 'labels do not alter accounting');
+    page.snapshot.totals.burned_sats = '2000';
+    page.snapshot.contributions[0].burned_sats = '2000';
+    await page.refresh();
+    assert.equal(page.elements.get('total-burned').textContent, '$1.000');
+    price = 100000;
+    await page.timer(60000);
+    assert.equal(page.elements.get('total-burned').textContent, '$2.000', 'quote refresh keeps the self-contained format');
+    await page.event('unit-sat', 'click');
+    assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
+  }
+});
+
+test('unknown wallet totals and undefined rates keep their labels and selected units', async () => {
+  const storage = new Map([['flame-mint-playground-wallet-v1', '{broken json']]);
+  const page = await openPage('/mint', storage);
+  for (const [unit, amount, rateUnit] of [['sat', '—\u00a0sat', 'sat'], ['btc', '—\u00a0btc', 'BTC'], ['usd', '$—', '$']]) {
+    await page.event(`unit-${unit}`, 'click');
+    await page.refresh();
+    assert.equal(page.elements.get('total-burned').textContent, amount);
+    assert.equal(page.elements.get('total-reward').textContent, '—\u00a0FLM');
+    assert.equal(page.elements.get('total-rate').textContent, `—\u00a0${rateUnit}/FLM`);
+  }
+  for (const pathname of ['/', '/mint']) {
+    const ready = await openPage(pathname);
+    ready.snapshot.contributions = [];
+    ready.snapshot.totals = { contribution_count: 0, burned_sats: '0', fees_sats: '0', reward_sparks: '0' };
+    await ready.refresh();
+    for (const [unit, amount, rateUnit] of [['sat', '0\u00a0sat', 'sat'], ['btc', '0.00000000\u00a0btc', 'BTC'], ['usd', '$0.000', '$']]) {
+      await ready.event(`unit-${unit}`, 'click');
+      assert.equal(ready.elements.get('total-burned').textContent, amount);
+      assert.equal(ready.elements.get('total-reward').textContent, '0\u00a0FLM');
+      assert.equal(ready.elements.get('total-rate').textContent, `—\u00a0${rateUnit}/FLM`);
+    }
+  }
+});
+
+test('both chart axes use selected currency while retaining the raw burn and fee scale', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    const ticks = () => page.draws.filter(call => call.canvas === page.elements.get('chart') && call.method === 'fillText' && call.args[2] !== 267);
+    const parseAxis = text => Number(String(text).replaceAll(',', '').replace(/k$/, 'e3').replace(/m$/, 'e6'));
+    const satTicks = ticks().filter(call => call.args[1] < 50).map(call => [parseAxis(call.args[0]), call.args[2]]);
+    assert.ok(satTicks.some(([sats]) => sats > 0));
+    if (pathname === '/') assert.ok(satTicks.some(([sats]) => sats < 0), 'the dashboard fee region is covered');
+    for (const unit of ['BTC', 'USD']) {
+      page.draws.length = 0;
+      await page.event(`unit-${unit.toLowerCase()}`, 'click');
+      const converted = ticks();
+      for (const [sats, y] of satTicks) {
+        const pair = converted.filter(call => call.args[2] === y);
+        assert.equal(pair.length, 2, 'a shared horizontal line still has both vertical labels');
+        assert.equal(pair[0].args[0], formatMoney(sats, unit, 50000));
+        assert.equal(pair[1].args[0], formatMoney(sats / 50, unit, 50000, true));
+      }
+    }
+  }
+});
+
+test('USD pending and failed quotes show unavailable amounts, never fictitious zeroes, while the snapshot stays live', async () => {
+  let finish;
+  const page = await openPage('/mint', new Map(), undefined, undefined, { quote: () => new Promise(resolve => { finish = resolve; }) });
+  await page.event('unit-usd', 'click');
+  assert.match(page.elements.get('price-status').textContent, /Loading/i);
+  assert.equal(page.elements.get('total-burned').textContent, '$—');
+  assert.equal(page.elements.get('total-rate').textContent, '—\u00a0$/FLM');
+  for (const id of ['budget-value', 'projected-fees', 'projected-burn', 'projected-rate']) assert.equal(page.elements.get(id).textContent, '—', id);
+  assert.deepEqual(rowValues(page), ['—', '50', '—', '—']);
+  assert.equal(page.elements.get('total-reward').textContent, '50\u00a0FLM');
+  finish({ ok: false, status: 503 });
+  await page.settle();
+  assert.match(page.elements.get('price-status').textContent, /unavailable|503/i);
+  assert.equal(page.elements.get('total-burned').textContent, '$—');
+  assert.equal(page.elements.get('connection').textContent, 'Live');
+  await page.event('unit-btc', 'click');
+  assert.equal(page.elements.get('total-burned').textContent, '0.00002000\u00a0btc');
+  assert.equal(page.elements.get('price-status').hidden, false);
+  assert.match(page.elements.get('price-status').textContent, /unavailable/i);
+});
+
+test('invalid, failed, and unreadable quotes leave USD unknown and retain functioning offline units', async () => {
+  const variants = [
+    () => { throw new Error('Network unavailable'); },
+    () => ({ ok: true, json: async () => { throw new Error('Invalid JSON'); } }),
+    ...['0', '-1', 'NaN'].map(amount => () => quoteResponse(amount)),
+    () => ({ ok: true, json: async () => ({ data: { base: 'ETH', currency: 'USD', amount: '50000' } }) }),
+  ];
+  for (const quote of variants) {
+    const page = await openPage('/', new Map(), undefined, undefined, { quote });
+    await page.event('unit-usd', 'click');
+    assert.equal(page.elements.get('total-burned').textContent, '$—');
+    assert.match(page.elements.get('price-status').textContent, /unavailable/i);
+    await page.event('unit-sat', 'click');
+    assert.equal(page.elements.get('total-burned').textContent, '100,000\u00a0sat');
+    assert.equal(page.elements.get('connection').textContent, 'Live');
+  }
+});
+
+test('BTC/USD refreshes every minute in all units and discards stale values on failure', async () => {
+  let count = 0;
+  const page = await openPage('/', new Map(), undefined, undefined, { quote: () => ++count === 3 ? { ok: false, status: 503 } : quoteResponse(count * 50000) });
+  await page.event('unit-usd', 'click');
+  assert.equal(page.elements.get('total-burned').textContent, '$50.000');
+  await page.timer(60000);
+  assert.equal(page.elements.get('total-burned').textContent, '$100.000');
+  assert.equal(quoteRequests(page).length, 2);
+  await page.timer(60000);
+  assert.equal(page.elements.get('total-burned').textContent, '$—', 'a failed refresh does not keep an apparently current old price');
+  assert.match(page.elements.get('price-status').textContent, /unavailable/i);
+  await page.event('unit-btc', 'click');
+  assert.equal([...page.timers.values()].filter(timer => timer.delay === 60000).length, 1);
+  assert.equal(page.elements.get('price-status').hidden, false);
+  assert.equal(quoteRequests(page).length, 3, 'leaving USD does not fetch again');
+  await page.timer(60000);
+  assert.equal(quoteRequests(page).length, 4, 'the quote refreshes while BTC is selected');
+  assert.equal(page.elements.get('total-burned').textContent, '0.00100000\u00a0btc');
+  assert.match(page.elements.get('price-status').textContent, /200,000/);
+  await page.event('unit-sat', 'click');
+  await page.timer(60000);
+  assert.equal(quoteRequests(page).length, 5, 'the quote refreshes while sat is selected');
+  assert.equal(page.elements.get('total-burned').textContent, '100,000\u00a0sat');
+  assert.equal(stateRequests(page).length, 1, 'quote refresh never fetches contribution history');
+});
+
+test('rapid unit changes reuse the in-flight quote and do not overlap or replace the selected unit', async () => {
+  let finish;
+  const page = await openPage('/', new Map(), undefined, undefined, { quote: () => new Promise(resolve => { finish = resolve; }) });
+  await page.event('unit-usd', 'click');
+  await page.event('unit-btc', 'click');
+  await page.event('unit-usd', 'click');
+  assert.equal(quoteRequests(page).length, 1);
+  await page.event('unit-sat', 'click');
+  finish(quoteResponse(50000));
+  await page.settle();
+  assert.equal(page.elements.get('unit-sat')['aria-pressed'], 'true');
+  assert.equal(page.elements.get('total-burned').textContent, '100,000\u00a0sat');
+  assert.equal(page.elements.get('price-status').hidden, false);
+  assert.match(page.elements.get('price-status').textContent, /50,000/);
+  assert.equal([...page.timers.values()].filter(timer => timer.delay === 60000).length, 1);
+});
+
+test('unit preferences persist, invalid values fall back to sats, and blocked storage never blocks the dashboard', async () => {
+  for (const unit of ['sat', 'BTC', 'USD', 'invalid']) {
+    const storage = new Map([[UNIT_KEY, unit]]);
+    const page = await openPage('/', storage);
+    assert.equal(page.elements.get(`unit-${unit === 'invalid' ? 'sat' : unit.toLowerCase()}`)['aria-pressed'], 'true');
+    assert.equal(quoteRequests(page).length, 1, 'all initial units fetch the reference quote');
+    assert.equal(storage.get(UNIT_KEY), unit, 'startup does not rewrite stored preferences or store quotes');
+  }
+  const page = await openPage('/', { get() { throw new Error('Storage blocked'); }, set() { throw new Error('Storage blocked'); } });
+  assert.equal(page.elements.get('unit-sat')['aria-pressed'], 'true');
+  await page.event('unit-btc', 'click');
+  assert.equal(page.elements.get('total-burned').textContent, '0.00100000\u00a0btc');
+  assert.equal(page.elements.get('connection').textContent, 'Live');
+});
+
+test('unit changes leave chart data, forecast, requests, and pending idempotence in satoshis', async () => {
+  const storage = new Map();
+  const page = await openPage('/mint', storage, async () => { throw new Error('Response lost'); });
+  const projectedBefore = page.elements.get('projected-reward').textContent;
+  const capture = async unit => {
+    page.draws.length = 0;
+    await page.event(`unit-${unit}`, 'click');
+    return chartGeometry(page);
+  };
+  const satGeometry = await capture('sat');
+  assert.deepEqual(await capture('btc'), satGeometry, 'chart heights retain raw-satoshi accounting');
+  assert.deepEqual(await capture('usd'), satGeometry);
+  assert.equal(page.elements.get('projected-reward').textContent, projectedBefore);
+  assert.equal(page.elements.get('budget').value, '1000000');
+  await page.event('contribution-form', 'submit');
+  const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(request.budget_sats, 1000000);
+  assert.equal(request.duration, 500);
+  assert.deepEqual(Object.keys(request).sort(), ['address', 'budget_sats', 'duration', 'request_id']);
+  assert.deepEqual(JSON.parse(storage.get('flame-mint-playground-pending-v1')), request);
+  const reloaded = await openPage('/mint', storage);
+  assert.equal(reloaded.elements.get('unit-usd')['aria-pressed'], 'true');
+  await reloaded.event('contribution-form', 'submit');
+  assert.deepEqual(JSON.parse(reloaded.requests.find(request => request.url === '/api/contributions').options.body), request);
+  assert.equal(storage.has('flame-mint-playground-pending-v1'), false);
 });
