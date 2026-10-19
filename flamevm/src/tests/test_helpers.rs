@@ -53,7 +53,7 @@ pub(crate) fn fixture_vm(program: impl TestProgram, kind: CallKind) -> VM {
     let scripts = program.script_witnesses().unwrap();
     let mut vm = VM::new(
         dummy_header(),
-        CallFrame::new(program.into_instructions(), kind, 1_000_000),
+        CallFrame::new(program.into_instructions(), kind, 1_000_000).with_readwrite(true),
     )
     .with_cells(cells)
     .unwrap();
@@ -500,7 +500,7 @@ pub(crate) fn dispatch_cells(arms: &[(u64, Cell)]) -> Cell {
 /// exercise the inner checks (root frame would short-circuit with
 /// `ReturnAtRoot`).
 pub(crate) fn vm_with_nested_child_script(script: Vec<u8>) -> VM {
-    let mut parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    let mut parent = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500).with_readwrite(true);
     parent.snap_failure_values = vec![Value::Scalar(Scalar::ZERO)];
     let child_kind = CallKind::ContractOpen {
         predicate: Predicate::opaque(CompressedRistretto([0u8; 32])),
@@ -513,7 +513,8 @@ pub(crate) fn vm_with_nested_child_script(script: Vec<u8>) -> VM {
             .into_instructions(),
         child_kind,
         500,
-    );
+    )
+    .with_readwrite(true);
     let mut vm = VM::new(dummy_header(), parent);
     let p = mem::replace(&mut vm.current_call, child);
     vm.call_stack.push(p);
@@ -750,7 +751,8 @@ pub(crate) fn run_external_steps<'g>(
             program.into_instructions(),
             CallKind::ExternalRoot,
             1_000_000,
-        ),
+        )
+        .with_readwrite(true),
     );
     let mut prover = Prover::new(pc_gens);
     for _ in 0..n_steps {

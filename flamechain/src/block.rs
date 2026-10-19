@@ -751,6 +751,21 @@ impl Blockchain {
         Ok(self.actors.actor_info(actor, self.height())?)
     }
 
+    /// Runs a data-only actor getter at the current committed height.
+    /// The VM restores the registry on success and failure; no chain state changes.
+    pub fn query_actor(
+        &mut self,
+        actor: ActorID,
+        argument: flamevm::Value,
+        gas_limit: u64,
+        cells: Arc<CellIndex>,
+    ) -> Result<flamevm::QueryResult, VMError> {
+        let block = BlockContext {
+            height: self.height(),
+        };
+        flamevm::query_actor(actor, argument, gas_limit, &mut self.actors, &block, cells)
+    }
+
     pub fn actor_capacity(&self, actor: &ActorID, height: u64) -> Result<u64, ChainError> {
         if height < self.height() {
             return Err(VMError::StorageHeightInPast.into());
@@ -2669,6 +2684,96 @@ mod tests {
         assert_eq!(
             state_root(&chain.actors.load_state(&child).unwrap()),
             state_root(&Value::Scalar(Scalar::from(2u64)))
+        );
+    }
+
+    #[test]
+    fn onchain_query_effects_replay_without_saving_target() {
+        let mut baseline = ActorStore::new(StorageParams::default()).unwrap();
+        let target = deploy_actor(
+            &mut baseline,
+            84,
+            ScriptBuilder::new()
+                .drop_()
+                .load()
+                .push_int(0u64)
+                .get_dup()
+                .verify()
+                .roll_k(1)
+                .save()
+                .return_()
+                .to_bytecode(),
+        );
+        let target_state = Value::Dict(Dict::from_values(vec![
+            Value::Scalar(Scalar::from(42u64)),
+            Value::ClearToken(ClearToken::new(Scalar::from(7u64), FLAME_FLAVOR)),
+        ]));
+        baseline.load_state(&target).unwrap();
+        baseline.save_state(&target, target_state.clone()).unwrap();
+        let target_root = baseline.actor_info(&target, 0).unwrap().root;
+        let reader = deploy_actor(
+            &mut baseline,
+            85,
+            ScriptBuilder::new()
+                .drop_()
+                .push_int(0u64)
+                .push_int(100_000u64)
+                .push_literal(ActorAddress::from(target.clone()).to_cell().unwrap().into())
+                .query()
+                .verify()
+                .load()
+                .drop_()
+                .save()
+                .to_bytecode(),
+        );
+
+        let mut executed = baseline.clone();
+        let log = message(reader.clone(), Value::Scalar(Scalar::ZERO), 1_000_000, 85)
+            .execute_tx(&mut executed, &BlockContext { height: 0 })
+            .expect("internal actor reads target and saves the result")
+            .into_log();
+        let saves: Vec<_> = log
+            .iter()
+            .filter_map(|entry| match entry {
+                TxEntry::ActorSave { actor, .. } => Some(actor.to_hash()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(saves, vec![reader.to_hash()]);
+        assert_eq!(executed.actor_info(&target, 0).unwrap().root, target_root);
+        let expected = (executed.actor_root().unwrap(), executed.available_units());
+
+        let mut chain = Blockchain::new(ChainParams::default()).unwrap();
+        chain.actors = baseline;
+        let hasher = utreexo::utreexo_hasher::<ContractLeaf>();
+        let mut work = chain.contracts.work_forest();
+        chain
+            .apply_log(
+                &mut work,
+                &hasher,
+                ExecutionKind::Internal,
+                log,
+                &[],
+                &mut VecDeque::new(),
+                &mut BTreeSet::new(),
+                0,
+            )
+            .expect("query-derived write replays with no target save");
+        assert_eq!(
+            (
+                chain.actors.actor_root().unwrap(),
+                chain.actors.available_units()
+            ),
+            expected
+        );
+        assert_eq!(chain.actors.actor_info(&target, 0).unwrap().root, target_root);
+        assert_eq!(
+            state_root(&chain.actors.load_state(&reader).unwrap()),
+            state_root(&Value::Scalar(Scalar::from(42u64)))
+        );
+        assert_eq!(
+            state_root(&chain.actors.load_state(&target).unwrap()),
+            state_root(&target_state)
         );
     }
 

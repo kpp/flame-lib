@@ -71,14 +71,9 @@ same rule lets FIFO mempool children depend on admitted parents. The work forest
 is normalized once after the ordered batch, and its resulting commitment must
 equal the block's committed contract root.
 
-Utreexo is not part of the Cell migration. `Forest`, `Proof`, and Merkle `Path`
-retain their existing `readerwriter` encodings and validation, including the
-occupied-level bitmap, ordered roots, proof kind, position, depth, and neighbor
-hashes. The block transport stores each legacy Proof byte string as the raw
-payload of a dedicated zero-ref Cell, without another length prefix. It does
-not add Cell codecs to the Utreexo types or change the forest format. Proofs
-are bounded to the existing depth-63 representation, fit the 4095-byte Cell
-limit, and are decoded with exact byte consumption. The Serde forms of
+Utreexo is not part of the Cell migration. Its retained byte encodings and
+block proof transport are specified in
+[Blocks and Utreexo](encoding.md#blocks-and-utreexo). The Serde forms of
 `Forest`, `WorkForest`, `Catchup`, and `Proof` remain local working-state formats.
 
 Utreexo retains its specialized Merkle hashing and proof-update algorithm, and
@@ -97,29 +92,16 @@ validated state. Their capacity, pricing, expiry, destruction, and opcodes are
 defined in [storage.md](storage.md). `flamechain` owns this state; FlameVM reaches
 it only through the actor-registry interface and an explicit block context.
 
-At the beginning of core block `h`, before user execution, the state machine:
-
-1. expires leases at `h` and returns their units to the pool;
-2. marks newly under-capacity actors for freezing and prevents their
-   execution in this block; and
-3. issues the configured storage units for `h`.
-
-Storage purchases execute serially in transaction order. Each successful
-purchase immediately changes the reserve used by the next quote. At block end,
-marked actors lose their resident code/state bodies in lexicographic actor-ID
-order. Their code/state roots, size metadata, identity, and leases remain;
-linear values stay owned by those authenticated roots and are not retired.
-Freezing changes the actor-state commitment but emits no system destruction
-transaction. Later transactions can supply missing bodies through their own
-execution Cell index. Explicit actor destruction still leaves unexpired leases locked
-until their original expiry.
+Lease expiry, issuance, purchase ordering and end-of-block freezing follow
+[Global state and block order](storage.md#global-state-and-block-order).
+Restoration and retained-body charging follow
+[Content, availability, and recovery](storage.md#content-availability-and-recovery).
 
 Serial pricing is deterministic and maintains a hard storage bound, but ordering
 has economic value: a proposer can place one valid purchase before another.
 Burning storage fees prevents the proposer from directly recovering the fee; it
-does not remove ordering advantage or general MEV. The specified endpoint quote
-also makes split purchases cheaper than a single bulk purchase; this is an
-explicit harmonic marginal-price policy, not a sybil-resistant bulk premium.
+does not remove ordering advantage or general MEV. Purchase-splitting economics
+are discussed with the canonical [pricing formula](storage.md#pricing).
 
 ## Blocks and commitments
 
@@ -127,31 +109,18 @@ A block has a header and an ordered body of external transactions. Internal
 transactions are execution records derived by the state machine; they are not
 independently submitted or selected by a proposer.
 
-The header is a canonical Cell, identified by its factual CellID using the
-[Cell hashing rules](cells.md#identity). It commits to:
+Block/header layouts, sequence commitments and BlockHash are defined in
+[Blocks and Utreexo](encoding.md#blocks-and-utreexo); TxID, WitnessID and the
+execution witness hierarchy are defined in
+[Transactions and execution witnesses](encoding.md#transactions-and-execution-witnesses).
+Generic transport and typed snapshot wrappers follow
+[Cells](cells.md#root-last-graph-transport).
 
-- protocol/network version, parent, and height;
-- the authenticated core-block context;
-- the exact ordered external-transaction witness;
-- the resulting contract-accumulator commitment;
-- the resulting actor/storage-state commitment, including exact body availability;
-- the ordered execution-record Trie.
-
-The exact layouts live in [encoding.md](encoding.md). `Block`, `BlockTx`, and
-`BlockHeader` use `CellEncode` / `CellDecode`, with bounded root-last DAG
-transport. Their `CellEnvelope` is a normal Cell carrying a level cap and a
-reference to the physical proof root, not a root-ID packet prefix.
-Block Cells refer to the header
-and ordered transaction Trie; each transaction refers to its ExternalTx and
-ordered proof Trie whose leaves contain raw legacy Utreexo Proof bytes
-in dedicated zero-ref Cells. Scalar fields use little-endian encoding;
-ordered Trie indices use fixed-width big-endian keys.
-
-Each ExternalTx body references its program, whose subcells carry the supplied
-execution witness hierarchy. Body TxID commits the program and canonical pruned
-log; Tx WitnessID additionally commits the inline signature and R1CS proof.
-Its restored execution Cell index is immutable. The
-outer block transport graph is not an execution witness pool. Bounded decoders
+Validation binds the authenticated core-block context, ordered transaction
+witnesses, execution records and resulting contract and actor/storage states to
+those header commitments. Actor commitments include exact body availability,
+not just logical contents. The outer block transport graph is not an execution
+witness pool. Bounded decoders
 check root code payload length before execution, enforce counts/depths and exact
 typed payload/reference consumption, and reject malformed signatures/proofs.
 Re-encoding must reproduce the exact outer envelope, rejecting unused transport
@@ -159,11 +128,8 @@ bodies. Unused bodies inside an execution Cell index are permitted because their
 availability is explicitly committed. Network code never accepts a supplied
 TxLog in place of execution.
 
-`BlockTx::witness_hash` is its root CellID; `witness_root` is the ordered
-transaction-sequence CellID. `BlockHeader::id` is the CellID of the Cell holding
-the 213-byte regular-header or 221-byte Core-header payload, including its Cell descriptor. Tests cover
-canonical round trips, exact bounds, witness isolation, and retained Utreexo
-golden vectors.
+Tests cover canonical round trips, exact bounds, witness isolation, and retained
+Utreexo golden vectors.
 
 ## Staged block application
 
@@ -206,11 +172,8 @@ long send chain serial and lets early transactions influence all later actor and
 storage outcomes. Gas, message-count, call-depth, and block limits must bound
 that work.
 
-No duplicate-message table is part of consensus. Every accepted `Send` gets its
-anchor by splitting the VM's current ratchet: the left child enters the Message
-and the right child continues execution. Ratchet roots come from a spent input
-ContractID or the unique anchor of the delivering Message, and synchronous calls
-split disjoint child and caller-continuation subtrees. The queue is derived once
+No duplicate-message table is part of consensus: message uniqueness follows
+the VM's [anchor ratchet](flamevm.md#anchors). The queue is derived once
 from each executed `Send` effect and fully drained before commit. A
 reorganization may execute a message again only after rolling back its former
 delivery or refund.
@@ -222,6 +185,13 @@ fails, the whole candidate is rejected, including the Send that originated the
 message; a failed candidate never commits consumption without recovery.
 
 ## Derived internal transactions
+
+Successful logs have shape `Header, Receive, effects...`; address resolution may
+add `ActorDeploy` or `ActorRestore` before the target's effects, including for
+synchronous callees. Any `ActorDestroy` entries form a suffix. Failed delivery
+has exactly `Header, Receive, Output(refund)`. External logs start with `Header`
+and cannot contain internal-only actor effects. Entry layouts are defined in
+[TxLog](encoding.md#txlog).
 
 An internal transaction is a receipt of deterministic execution, not another
 consensus input. It starts from a `Send`, records its `Receive`, runs the target
@@ -292,13 +262,13 @@ are charged each time: a small shared DAG cannot allocate an unbounded number
 of proof vectors or other typed values. In-memory block candidates pass the
 same bounded admission check as received blocks.
 
-Message gas is not created by the delivery loop. Every `send` permanently
-debits its grant from the sending frame before the effect is committed. An
-internal transaction and all descendants therefore partition a grant that was
-already counted when the external transaction seeded the queue. Consensus sums
-only those direct grants for the internal-gas bound; summing nested message
-grants again would double-count the same budget. The message-count limit
-independently bounds queue fan-out.
+For resource accounting, `gas_used` is the verified external execution's metered
+total, including gas reserved for sends. `direct_send_gas` is the sum of Message
+gas grants in its derived TxLog; `gas_credit = gas_used - direct_send_gas` is the
+actual external work. The VM's [gas grant rules](flamevm.md#gas)
+make each descendant message partition that already-counted budget. Consensus
+sums only direct grants for the internal-gas bound; summing nested grants again
+would double-count it. The message-count limit independently bounds queue fan-out.
 
 Storage parameters are listed in [storage.md](storage.md). Every active parameter
 set must be selected by a committed protocol version; node-local configuration

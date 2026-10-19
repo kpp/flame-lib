@@ -12,7 +12,10 @@ use core::mem;
 use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::scalar::Scalar as DalekScalar;
 use merlin::Transcript;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::actor::{empty_state, ActorAddress, ActorID, ActorRegistry};
 use crate::cell_value::array32;
@@ -178,6 +181,10 @@ const GAS_PER_INSTRUCTION: u64 = 1;
 /// upper bound on peak live allocation.
 const GAS_PER_ALLOC_BYTE: u64 = 1;
 const GAS_PER_ALLOC_ITEM: u64 = 1;
+
+/// Warm reads still validate/decode; discount their body work by four, not to zero.
+const GAS_CELL_READ: u64 = 1;
+const GAS_CELL_WARM_DIVISOR: u64 = 4;
 
 // Calibrated with `cargo bench -p flamevm --bench gas` on 2026-08-23.
 // One gas represents roughly 100 ns of verifier work on the reference machine;
@@ -441,6 +448,9 @@ pub enum CallKind {
     /// Outer scope of an external transaction.
     ExternalRoot,
 
+    /// Offchain actor getter: no message, transaction authority, or caller.
+    QueryRoot { actor: ActorID },
+
     /// Outer scope of an internal tx; dispatched to the target's method.
     InternalRoot {
         actor: ActorID,
@@ -468,7 +478,9 @@ impl CallKind {
     /// re-entrancy guard.
     pub fn actor(&self) -> Option<&ActorID> {
         match self {
-            Self::InternalRoot { actor, .. } | Self::ActorCall { actor, .. } => Some(actor),
+            Self::InternalRoot { actor, .. }
+            | Self::ActorCall { actor, .. }
+            | Self::QueryRoot { actor } => Some(actor),
             Self::ExternalRoot | Self::ContractOpen { .. } => None,
         }
     }
@@ -480,7 +492,7 @@ impl CallKind {
             Self::InternalRoot { caller, .. } => caller.as_ref().map(ActorID::to_hash),
             Self::ActorCall { caller, .. } => Some(caller.to_hash()),
             Self::ContractOpen { caller_id, .. } => *caller_id,
-            Self::ExternalRoot => None,
+            Self::ExternalRoot | Self::QueryRoot { .. } => None,
         }
     }
 }
@@ -509,6 +521,11 @@ pub struct CallFrame {
 
     /// Identity / dispatch context for this frame.
     pub(crate) kind: CallKind,
+
+    /// Write authority is explicit and can only decrease across child calls.
+    pub(crate) readwrite: bool,
+    /// State checked out by a getter must be saved with this exact commitment.
+    query_state: Option<CellID>,
 
     /// This frame's starting anchor (todo #4 — previously stored in
     /// every `CallKind` variant). Only the root internal frame uses it:
@@ -580,6 +597,11 @@ impl CallFrame {
         self
     }
 
+    pub(crate) fn with_readwrite(mut self, readwrite: bool) -> Self {
+        self.readwrite = readwrite;
+        self
+    }
+
     pub(crate) fn from_code(code: Script, kind: CallKind, gas_limit: u64) -> Self {
         Self {
             stack: Vec::new(),
@@ -593,6 +615,8 @@ impl CallFrame {
             cursor: 0,
             labels: Vec::new(),
             kind,
+            readwrite: false,
+            query_state: None,
             anchor: None,
             gas_limit,
             gas_used: 0,
@@ -680,6 +704,72 @@ pub struct TxResult {
     pub deferred_sigs: Vec<DeferredSig>,
 }
 
+/// Public data returned by a metered, effect-free actor query.
+#[derive(Debug)]
+pub struct QueryResult {
+    pub value: Value,
+    pub gas_used: u64,
+}
+
+/// Execute an offchain getter against the supplied snapshot. The registry is
+/// restored on both success and failure; only public data leaves the query.
+pub fn query_actor(
+    actor: ActorID,
+    arg: Value,
+    gas_limit: u64,
+    registry: &mut dyn ActorRegistry,
+    block: &BlockContext,
+    cells: Arc<CellIndex>,
+) -> Result<QueryResult, VMError> {
+    if !arg.is_portable() || (!arg.is_copyable() && !matches!(arg, Value::Dict(_))) {
+        return Err(VMError::NonDataInQuery);
+    }
+    let result = (|| {
+        let mut initial_gas = registry
+            .actor_code_bytes(&actor)?
+            .saturating_mul(GAS_PER_ALLOC_BYTE);
+        if initial_gas > gas_limit {
+            return Err(VMError::OutOfGas);
+        }
+        let actor_cells = registry.actor_cells(&actor)?;
+        let mut resolved_cells = BTreeSet::new();
+        let mut reader = ExecutionCells {
+            external: &cells,
+            actor: &actor_cells,
+            address_sender: None,
+            resolved_cells: &mut resolved_cells,
+            gas_used: &mut initial_gas,
+            gas_limit,
+        };
+        let program = registry.load_program_with_cells(&actor, &mut reader)?;
+        let mut frame = CallFrame::from_cell(program, CallKind::QueryRoot { actor }, gas_limit)?;
+        frame.charge_gas(initial_gas)?;
+        // Queries have no transaction header; header-reading opcodes are forbidden.
+        let mut vm = VM::new(TxHeader { version: 0, locktime: 0 }, frame).with_cells(cells)?;
+        vm.txlog.clear();
+        vm.block_height = block.height;
+        vm.resolved_cells = resolved_cells;
+        let arg = vm.query_value(arg)?;
+        vm.charge_alloc_items(1)?;
+        vm.current_call.stack.push(arg);
+        vm.current_call.actor_cells = actor_cells;
+        registry.push_checkpoint();
+        let result = (|| {
+            while vm.step_internal_with_registry(registry)? {}
+            Ok(QueryResult {
+                value: vm.query_result.take().ok_or(VMError::BadReturnArity)?,
+                gas_used: vm.current_call.gas_used,
+            })
+        })();
+        registry.pop_checkpoint_rollback();
+        result
+    })();
+    result.map_err(|error| match error {
+        VMError::Cell(CellError::ResourceExhausted) => VMError::OutOfGas,
+        other => other,
+    })
+}
+
 /// Manual Debug — the linear `Contract` in `txlog` blocks `#[derive]`.
 impl core::fmt::Debug for TxResult {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -718,6 +808,10 @@ pub(crate) struct VM {
 
     current_call: CallFrame,
     call_stack: Vec<CallFrame>,
+    query_result: Option<Value>,
+
+    /// Pricing history for this execution, not a source of available Cell bodies.
+    resolved_cells: BTreeSet<CellID>,
 
     /// Effects committed by the external body or the derived internal ID.
     pub(crate) txlog: Vec<TxEntry>,
@@ -735,13 +829,14 @@ pub(crate) struct VM {
     debug_error: Option<std::string::String>,
 }
 
-/// Execution-local resolution, priced identically for resident and unloaded refs.
-/// A cache hit cannot turn an absent transaction witness into an available one.
+/// Logical cold/warm pricing is independent of host residency. Warmth never
+/// authorizes a body absent from the current actor/transaction scope.
 struct ExecutionCells<'a> {
     external: &'a CellIndex,
     actor: &'a CellIndex,
     // Explicit address witnesses can use sender storage; callee execution cannot.
     address_sender: Option<&'a CellIndex>,
+    resolved_cells: &'a mut BTreeSet<CellID>,
     gas_used: &'a mut u64,
     gas_limit: u64,
 }
@@ -761,7 +856,7 @@ impl ExecutionCells<'_> {
 
 impl CellReader for ExecutionCells<'_> {
     fn read(&mut self, id: CellID, resident: Option<&Arc<Cell>>) -> Result<Arc<Cell>, CellError> {
-        self.charge(1)?;
+        self.charge(GAS_CELL_READ)?;
         let cell = match resident {
             Some(cell) => Arc::clone(cell),
             None => self
@@ -771,7 +866,22 @@ impl CellReader for ExecutionCells<'_> {
                 .or_else(|| self.external.get(&id))
                 .ok_or(CellError::MissingCell(id))?,
         };
-        self.charge((cell.record_size() as u64).saturating_add(cell.refs().len() as u64))?;
+        if cell.id() != id {
+            return Err(CellError::CellHashMismatch {
+                expected: id,
+                actual: cell.id(),
+            });
+        }
+        let body_gas = (cell.record_size() as u64).saturating_add(cell.refs().len() as u64);
+        let warm = self.resolved_cells.contains(&id);
+        self.charge(if warm {
+            (body_gas + GAS_CELL_WARM_DIVISOR - 1) / GAS_CELL_WARM_DIVISOR
+        } else {
+            body_gas
+        })?;
+        if !warm {
+            self.resolved_cells.insert(id);
+        }
         Ok(cell)
     }
 }
@@ -799,6 +909,7 @@ fn prepare_actor_address(
     address: &ActorAddress,
     external: &CellIndex,
     sender: Option<&CellIndex>,
+    resolved_cells: &mut BTreeSet<CellID>,
     gas_used: &mut u64,
     gas_limit: u64,
 ) -> Result<Option<TxEntry>, VMError> {
@@ -813,6 +924,7 @@ fn prepare_actor_address(
         external,
         actor: &actor_cells,
         address_sender: sender,
+        resolved_cells,
         gas_used,
         gas_limit,
     });
@@ -846,6 +958,7 @@ impl VM {
             external: &self.cells,
             actor: &self.current_call.actor_cells,
             address_sender: None,
+            resolved_cells: &mut self.resolved_cells,
             gas_limit: self.current_call.gas_limit,
             gas_used: &mut self.current_call.gas_used,
         }
@@ -870,7 +983,8 @@ impl VM {
         gas_limit: u64,
         mut delegate: D,
     ) -> Result<TxResult, VMError> {
-        let mut frame = CallFrame::from_bytecode(script.clone(), CallKind::ExternalRoot, gas_limit);
+        let mut frame = CallFrame::from_bytecode(script.clone(), CallKind::ExternalRoot, gas_limit)
+            .with_readwrite(true);
         frame.charge_gas(alloc_byte_gas(script.len())?)?;
         frame.charge_gas(GAS_EXTERNAL_FINALIZE_BASE)?;
         let mut vm = Self::new(header, frame);
@@ -908,7 +1022,8 @@ impl VM {
         if initial_gas > gas_limit {
             return Err(VMError::OutOfGas);
         }
-        let mut frame = CallFrame::from_cell(root, CallKind::ExternalRoot, gas_limit)?;
+        let mut frame = CallFrame::from_cell(root, CallKind::ExternalRoot, gas_limit)?
+            .with_readwrite(true);
         frame.instructions = private_scripts
             .get(&frame.entry_program.as_ref().unwrap().id())
             .cloned();
@@ -934,7 +1049,8 @@ impl VM {
         if initial_gas > gas_limit {
             return Err(VMError::OutOfGas);
         }
-        let mut frame = CallFrame::from_cell(program, CallKind::ExternalRoot, gas_limit)?;
+        let mut frame = CallFrame::from_cell(program, CallKind::ExternalRoot, gas_limit)?
+            .with_readwrite(true);
         frame.charge_gas(initial_gas)?;
         let mut vm = Self::new(header, frame).with_cells(Arc::new(cells.clone()))?;
         while vm.step_external(delegate)? {}
@@ -987,6 +1103,7 @@ impl VM {
             return Err(VMError::OutOfGas);
         }
 
+        let mut resolved_cells = BTreeSet::new();
         registry.push_checkpoint();
         let result = (|| {
             let target = message.target.to_actor_id();
@@ -995,6 +1112,7 @@ impl VM {
                 &message.target,
                 &cells,
                 None,
+                &mut resolved_cells,
                 &mut initial_gas,
                 message.gas,
             )?;
@@ -1011,6 +1129,7 @@ impl VM {
                 external: &cells,
                 actor: &actor_cells,
                 address_sender: None,
+                resolved_cells: &mut resolved_cells,
                 gas_used: &mut initial_gas,
                 gas_limit: message.gas,
             };
@@ -1019,12 +1138,14 @@ impl VM {
                 actor: target,
                 caller: message.caller,
             };
-            let mut frame =
-                CallFrame::from_cell(script, kind, message.gas)?.with_anchor(message.anchor);
+            let mut frame = CallFrame::from_cell(script, kind, message.gas)?
+                .with_readwrite(true)
+                .with_anchor(message.anchor);
             frame.actor_cells = actor_cells;
             frame.charge_gas(initial_gas)?;
             frame.stack.push(payload);
             let mut vm = Self::new(header, frame).with_cells(cells)?;
+            vm.resolved_cells = resolved_cells;
             vm.block_height = block.height;
             vm.txlog.push(TxEntry::Receive(message_cell.id()));
             if let Some(effect) = address_effect {
@@ -1075,6 +1196,8 @@ impl VM {
             last_anchor,
             current_call: initial_call,
             call_stack: Vec::new(),
+            query_result: None,
+            resolved_cells: BTreeSet::new(),
             txlog,
             total_fee: CheckedFee::zero(),
             deferred_sigs: Vec::new(),
@@ -1107,12 +1230,54 @@ impl VM {
         let parent_anchor = self.last_anchor.ok_or(VMError::AnchorMissing)?;
         let (left, right) = parent_anchor.split();
         self.current_call.post_call_anchor = Some(right);
-        // Snapshot effect counters for failure rollback.
+        self.snapshot_effects();
+        Ok(left)
+    }
+
+    fn snapshot_effects(&mut self) {
         self.current_call.snap_txlog_len = self.txlog.len();
         self.current_call.snap_deferred_sigs_len = self.deferred_sigs.len();
         self.current_call.snap_deferred_multiplications = self.deferred_multiplications;
         self.current_call.snap_total_fee = self.total_fee;
-        Ok(left)
+    }
+
+    /// Export data while its source frame is still available; never export
+    /// host witnesses or make a caller depend on the callee's storage cache.
+    fn query_value(&mut self, value: Value) -> Result<Value, VMError> {
+        if !value.is_portable() || (!value.is_copyable() && !matches!(value, Value::Dict(_))) {
+            return Err(VMError::NonDataInQuery);
+        }
+        match value {
+            value @ Value::Dict(_) => {
+                self.charge_value_encoding(&value, 1)?;
+                let root = value.to_cell()?;
+                let mut reader = CodeCells(self.resolver());
+                let root = root.load_graph_scoped(&mut reader)?;
+                // Eager metered decoding validates every leaf, including lazy Dicts.
+                let value = Value::from_cell(&root, &mut reader)?;
+                fn data_only(value: &Value) -> bool {
+                    match value {
+                        Value::Dict(dict) => {
+                            dict.is_portable() && dict.entries().all(|(_, value)| data_only(value))
+                        }
+                        value => value.is_copyable() && value.is_portable(),
+                    }
+                }
+                if !data_only(&value) {
+                    return Err(VMError::NonDataInQuery);
+                }
+                Ok(value)
+            }
+            Value::Cell(cell) => {
+                let mut reader = CodeCells(self.resolver());
+                let root = cells::read_cell(&mut reader, &cell)?;
+                Ok(Value::Cell(root.load_graph_scoped(&mut reader)?.into()))
+            }
+            Value::Point(point) => Ok(Value::Point(Point::Opaque(CompressedRistretto(
+                point.to_bytes(),
+            )))),
+            value => Ok(value),
+        }
     }
 
     /// External IDs bind the body; derived internal IDs retain the effect root.
@@ -1220,6 +1385,7 @@ impl VM {
             self.debug_error = None;
         }
         let depth_before = self.call_stack.len();
+        let readwrite_before = self.current_call.readwrite;
         // Reborrow for step_inner, then hand the original to post_step
         // (one borrow live at a time — borrow checker requires the split).
         let (result, registry) = match registry {
@@ -1235,16 +1401,17 @@ impl VM {
                 (result, Some(r))
             }
         };
-        self.post_step(delegate, registry, depth_before, result)
+        self.post_step(delegate, registry, depth_before, readwrite_before, result)
     }
 
     /// Shared step post-processing: snapshot/checkpoint on frame entry,
-    /// checkpoint-commit on clean exit, fail_current_call on error.
+    /// checkpoint-commit on writable exit, rollback on query exit or error.
     fn post_step<D: Delegate>(
         &mut self,
         delegate: &mut D,
         mut registry: Option<&mut dyn ActorRegistry>,
         depth_before: usize,
+        readwrite_before: bool,
         result: Result<bool, VMError>,
     ) -> Result<bool, VMError> {
         match result {
@@ -1265,9 +1432,13 @@ impl VM {
                         }
                     }
                 } else if depth_after < depth_before {
-                    // Clean exit: keep effects, drop the snapshot.
                     if let Some(r) = registry.as_mut() {
-                        r.pop_checkpoint_commit();
+                        if readwrite_before {
+                            r.pop_checkpoint_commit();
+                        } else {
+                            // A getter never persists even same-commitment hydration.
+                            r.pop_checkpoint_rollback();
+                        }
                     }
                 }
                 Ok(cont)
@@ -1317,6 +1488,9 @@ impl VM {
         delegate: &mut D,
         registry: Option<&mut dyn ActorRegistry>,
     ) -> Result<bool, VMError> {
+        if self.query_result.is_some() {
+            return Ok(false);
+        }
         self.current_call.charge_gas(GAS_PER_INSTRUCTION)?;
         if !self.program_scope_ready && matches!(self.current_call.kind, CallKind::ExternalRoot) {
             self.current_call.prepare_program()?;
@@ -1332,6 +1506,13 @@ impl VM {
             return self.finish_call(registry);
         };
         use Instruction as I;
+        if !self.current_call.readwrite && matches!(instr,
+            I::Input | I::Contract | I::Output | I::Open | I::Signcall | I::Signtx
+            | I::Send | I::Log | I::IssuePriv | I::IssuePub | I::Retire | I::Fee
+            | I::Setcode | I::AddStorage | I::Timelock | I::Version | I::Anchor
+        ) {
+            return Err(VMError::ReadOnlyViolation);
+        }
         match instr {
             I::PushInt(i) => {
                 self.push_value(Value::Scalar(i));
@@ -1479,7 +1660,8 @@ impl VM {
             I::Output => self.op_output(),
             I::Open => self.op_open(),
             I::Send => self.op_send(),
-            I::Call => self.op_call(registry),
+            I::Call => self.op_call(registry, true),
+            I::Query => self.op_call(registry, false),
             I::Load => self.op_load(registry),
             I::Save => self.op_save(registry),
             I::Setcode => self.op_setcode(registry),
@@ -1538,6 +1720,12 @@ impl VM {
         &self,
         registry: Option<&dyn ActorRegistry>,
     ) -> Result<(), VMError> {
+        if !self.current_call.readwrite {
+            if self.current_call.query_state.is_some() {
+                return Err(VMError::QueryStateNotRestored);
+            }
+            return Ok(());
+        }
         let CallKind::ActorCall { actor, .. } = &self.current_call.kind else {
             return Ok(());
         };
@@ -1570,7 +1758,10 @@ impl VM {
             self.current_call.stack.push(Value::Scalar(Scalar::ONE));
             return Ok(true);
         }
-        // Outermost call returned: entire tx complete.
+        if matches!(self.current_call.kind, CallKind::QueryRoot { .. }) {
+            self.query_result = Some(Value::Scalar(Scalar::ZERO));
+        }
+        // Outermost call returned: execution complete.
         Ok(false)
     }
 
@@ -2667,7 +2858,8 @@ impl VM {
     /// Errors `ReturnAtRoot` at the outermost frame.
     fn op_return(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
         // Outermost frame has no recipient for a result.
-        if self.call_stack.is_empty() {
+        let query_root = matches!(self.current_call.kind, CallKind::QueryRoot { .. });
+        if self.call_stack.is_empty() && !query_root {
             return Err(VMError::ReturnAtRoot);
         }
 
@@ -2679,7 +2871,14 @@ impl VM {
         }
 
         self.validate_actor_call_storage(registry.as_deref())?;
-        let result = self.current_call.stack.pop().expect("one result checked above");
+        let mut result = self.current_call.stack.pop().expect("one result checked above");
+        if !self.current_call.readwrite {
+            result = self.query_value(result)?;
+        }
+        if query_root {
+            self.query_result = Some(result);
+            return Ok(());
+        }
         let leftover_gas = self
             .current_call
             .gas_limit
@@ -3231,6 +3430,7 @@ impl VM {
             },
             gas,
         )
+        .with_readwrite(self.current_call.readwrite)
         .with_anchor(child_anchor);
         frame.gas_used = alloc_byte_gas(code_bytes)?
             .saturating_add(alloc_item_gas(2)?);
@@ -3309,15 +3509,25 @@ impl VM {
     ///
     /// Canonical actor routing, initialization/restoration and execution share
     /// one checkpoint. A failed call restores its argument and all mutations.
-    fn op_call(&mut self, registry: Option<&mut dyn ActorRegistry>) -> Result<(), VMError> {
+    fn op_call(
+        &mut self,
+        registry: Option<&mut dyn ActorRegistry>,
+        requested_readwrite: bool,
+    ) -> Result<(), VMError> {
         let caller = *self.require_actor()?;
+        let readwrite = self.current_call.readwrite && requested_readwrite;
         let registry = registry.ok_or(VMError::RegistryUnavailable)?;
         let address = self.pop_actor_address()?;
         let callee = address.to_actor_id();
         let gas = self.pop_gas_limit()?;
         self.current_call.charge_gas(gas)?;
         let arg = self.pop_value()?;
-        Self::require_portable_call_arg(&arg)?;
+        let arg = if readwrite {
+            Self::require_portable_call_arg(&arg)?;
+            arg
+        } else {
+            self.query_value(arg)?
+        };
 
         registry.push_checkpoint();
         let mut initial_gas = 0;
@@ -3325,14 +3535,22 @@ impl VM {
             if self.call_stack.len() >= MAX_CALL_DEPTH {
                 return Err(VMError::CallDepthExceeded);
             }
-            let effect = prepare_actor_address(
-                registry,
-                &address,
-                &self.cells,
-                Some(&self.current_call.actor_cells),
-                &mut initial_gas,
-                gas,
-            )?;
+            if !readwrite && !matches!(address, ActorAddress::Address { .. }) {
+                return Err(VMError::ReadOnlyViolation);
+            }
+            let effect = if readwrite {
+                prepare_actor_address(
+                    registry,
+                    &address,
+                    &self.cells,
+                    Some(&self.current_call.actor_cells),
+                    &mut self.resolved_cells,
+                    &mut initial_gas,
+                    gas,
+                )?
+            } else {
+                None
+            };
             initial_gas = initial_gas
                 .saturating_add(
                     registry
@@ -3348,6 +3566,7 @@ impl VM {
                 external: &self.cells,
                 actor: &actor_cells,
                 address_sender: None,
+                resolved_cells: &mut self.resolved_cells,
                 gas_used: &mut initial_gas,
                 gas_limit: gas,
             };
@@ -3359,7 +3578,8 @@ impl VM {
                     caller,
                 },
                 gas,
-            )?;
+            )?
+            .with_readwrite(readwrite);
             Ok((frame, actor_cells, effect))
         })();
         let (mut frame, actor_cells, effect) = match pre_frame {
@@ -3383,7 +3603,13 @@ impl VM {
             self.charge_alloc_items(1)?;
             self.current_call.charge_gas(arg.clone_gas())?;
             self.current_call.snap_failure_values = vec![arg.clone()];
-            self.split_anchor_for_call()
+            if readwrite {
+                self.split_anchor_for_call().map(Some)
+            } else {
+                self.current_call.post_call_anchor = self.last_anchor;
+                self.snapshot_effects();
+                Ok(None)
+            }
         })();
         let callee_anchor = match enter {
             Ok(anchor) => anchor,
@@ -3392,13 +3618,13 @@ impl VM {
                 return Err(error);
             }
         };
-        frame.anchor = Some(callee_anchor);
+        frame.anchor = callee_anchor;
         frame.gas_used = initial_gas;
         frame.actor_cells = actor_cells;
         frame.stack.push(arg);
         let parent = core::mem::replace(&mut self.current_call, frame);
         self.call_stack.push(parent);
-        self.last_anchor = Some(callee_anchor);
+        self.last_anchor = callee_anchor;
         if let Some(effect) = effect {
             self.txlog.push(effect);
         }
@@ -3423,6 +3649,10 @@ impl VM {
         self.current_call
             .charge_gas(state_bytes.saturating_mul(GAS_PER_ALLOC_BYTE))?;
         let state = registry.load_state_with_cells(&actor, &mut self.resolver())?;
+        if !self.current_call.readwrite {
+            self.charge_value_encoding(&state, 1)?;
+            self.current_call.query_state = Some(state.to_cell()?.id());
+        }
         self.push_value(state);
         Ok(())
     }
@@ -3449,6 +3679,17 @@ impl VM {
         // or may not implement for a given variant).
         if !state.is_portable() {
             return Err(VMError::NonPortableInState);
+        }
+        if !self.current_call.readwrite {
+            let expected = self.current_call.query_state.ok_or(VMError::SaveWithoutLoad)?;
+            // The commitment comparison and registry save both encode the state.
+            self.charge_value_encoding(&state, 2)?;
+            if state.to_cell()?.id() != expected {
+                return Err(VMError::QueryStateChanged);
+            }
+            registry.save_state(&actor, state)?;
+            self.current_call.query_state = None;
+            return Ok(());
         }
         self.charge_value_encoding(&state, 2)?;
         self.current_call.charge_gas(state.clone_gas())?;
@@ -4211,7 +4452,7 @@ mod cell_execution_tests {
             }
         }
         assert_eq!(&costs[..4], &[3; 4]);
-        assert_eq!(costs[4], costs[5]);
+        assert!(costs[4] > costs[5]);
         assert!(costs[4] > 10 * costs[0]);
     }
 
@@ -4296,7 +4537,8 @@ mod cell_execution_tests {
                 Err(VMError::Cell(CellError::MissingCell(_)))
             ));
         }
-        assert!(costs.iter().all(|cost| *cost == costs[0]));
+        assert_eq!(&costs[..2], &costs[2..]);
+        assert!(costs[0] > costs[1]);
     }
 
     #[test]
@@ -4399,10 +4641,12 @@ mod cell_execution_tests {
             (None, &empty, &empty, Some(&bag)),
         ] {
             let mut gas = 0;
+            let mut resolved_cells = BTreeSet::new();
             let mut resolver = ExecutionCells {
                 external,
                 actor,
                 address_sender,
+                resolved_cells: &mut resolved_cells,
                 gas_used: &mut gas,
                 gas_limit: 1000,
             };
@@ -4417,14 +4661,96 @@ mod cell_execution_tests {
     }
 
     #[test]
-    fn cell_read_misses_are_scoped_and_charge_attempts_before_lookup() {
+    fn cell_read_warmth_uses_physical_ids_and_resets_for_each_execution() {
+        let cell = Arc::new(Cell::new(vec![7; 128], vec![]).unwrap());
+        let same = Arc::new(Cell::new(vec![7; 128], vec![]).unwrap());
+        assert!(!Arc::ptr_eq(&cell, &same));
+        let pruned = Arc::new(cell.prune(1).unwrap());
+        assert_eq!(cell.hash(0).unwrap(), pruned.hash(0).unwrap());
+        assert_ne!(cell.id(), pruned.id());
+        for _ in 0..2 {
+            let frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 10_000);
+            let mut vm = VM::new(TxHeader { version: 1, locktime: 0 }, frame);
+            let mut costs = Vec::new();
+            for body in [&cell, &same, &pruned, &pruned] {
+                let before = vm.current_call.gas_used;
+                read_cell(&mut vm.resolver(), &CellRef::resident(body.clone())).unwrap();
+                costs.push(vm.current_call.gas_used - before);
+            }
+            assert_eq!(costs, vec![131, 34, 37, 10]);
+            assert_eq!(vm.resolved_cells.len(), 2);
+        }
+    }
+
+    #[test]
+    fn warm_cells_never_supply_bodies_outside_the_current_scope() {
+        let body = Arc::new(Cell::new(vec![7; 128], vec![]).unwrap());
+        let bag = CellIndex::collect(body.clone()).unwrap();
         let empty = CellIndex::new();
-        let id = [9; 32];
+        let mut resolved_cells = BTreeSet::new();
         let mut gas = 0;
+        {
+            let mut reader = ExecutionCells {
+                external: &empty,
+                actor: &empty,
+                address_sender: Some(&bag),
+                resolved_cells: &mut resolved_cells,
+                gas_used: &mut gas,
+                gas_limit: 10_000,
+            };
+            cells::resolve_cell(&mut reader, body.id()).unwrap();
+        }
+        assert!(resolved_cells.contains(&body.id()));
+        let before = gas;
         let mut reader = ExecutionCells {
             external: &empty,
             actor: &empty,
             address_sender: None,
+            resolved_cells: &mut resolved_cells,
+            gas_used: &mut gas,
+            gas_limit: 10_000,
+        };
+        assert_eq!(
+            read_cell(&mut reader, &CellRef::resident(body.clone()).to_unloaded()).unwrap_err(),
+            CellError::MissingCell(body.id())
+        );
+        assert_eq!(gas - before, GAS_CELL_READ);
+    }
+
+    #[test]
+    fn unpaid_or_mismatched_body_reads_do_not_warm_cells() {
+        let cell = Arc::new(Cell::new(vec![7; 128], vec![]).unwrap());
+        let empty = CellIndex::new();
+        for (id, limit, expected) in [
+            (cell.id(), 130, CellError::ResourceExhausted),
+            ([9; 32], 1000, CellError::CellHashMismatch { expected: [9; 32], actual: cell.id() }),
+        ] {
+            let mut gas = 0;
+            let mut resolved_cells = BTreeSet::new();
+            let mut reader = ExecutionCells {
+                external: &empty,
+                actor: &empty,
+                address_sender: None,
+                resolved_cells: &mut resolved_cells,
+                gas_used: &mut gas,
+                gas_limit: limit,
+            };
+            assert_eq!(reader.read(id, Some(&cell)).unwrap_err(), expected);
+            assert!(resolved_cells.is_empty());
+        }
+    }
+
+    #[test]
+    fn cell_read_misses_are_scoped_and_charge_attempts_before_lookup() {
+        let empty = CellIndex::new();
+        let id = [9; 32];
+        let mut gas = 0;
+        let mut resolved_cells = BTreeSet::new();
+        let mut reader = ExecutionCells {
+            external: &empty,
+            actor: &empty,
+            address_sender: None,
+            resolved_cells: &mut resolved_cells,
             gas_used: &mut gas,
             gas_limit: 1000,
         };
@@ -4433,14 +4759,17 @@ mod cell_execution_tests {
             CellError::MissingCell(id)
         );
         assert_eq!(gas, 1);
+        assert!(resolved_cells.is_empty());
 
         let cell = Arc::new(Cell::new(vec![7], vec![]).unwrap());
         for reference in [Some(CellRef::resident(cell.clone())), None] {
             let mut gas = 0;
+            let mut resolved_cells = BTreeSet::new();
             let mut reader = ExecutionCells {
                 external: &empty,
                 actor: &empty,
                 address_sender: None,
+                resolved_cells: &mut resolved_cells,
                 gas_used: &mut gas,
                 gas_limit: 0,
             };

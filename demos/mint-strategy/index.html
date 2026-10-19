@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mint strategy</title>
+  <style>
+    :root { color-scheme: light dark; --paper: #fff; --ink: #20201e; --muted: #686861; --line: #e7e7e1; --market: #777970; --you: #ca5428; --selection: #ca54280d; --error: #ad322a; }
+    @media (prefers-color-scheme: dark) { :root { --paper: #181918; --ink: #eeeee8; --muted: #aaa99f; --line: #343631; --market: #a5a79c; --you: #ff986b; --selection: #ff986b0d; --error: #ff9f97; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.5 system-ui, sans-serif; }
+    main { max-width: 1060px; margin: auto; padding: 48px 28px 32px; }
+    h1 { margin: 0; font-size: 30px; font-weight: 550; letter-spacing: -.04em; }
+    header p { color: var(--muted); margin: 6px 0 32px; }
+    label { display: block; font-size: 13px; }
+    input, select { font: inherit; color: inherit; background: var(--paper); }
+    select { width: 100%; height: 44px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 5px; margin-top: 7px; }
+    input:focus-visible, select:focus-visible, svg:focus-visible, summary:focus-visible { outline: 2px solid var(--you); outline-offset: 3px; }
+    input[type=range] { width: 100%; height: 28px; margin: 12px 0 0; accent-color: var(--you); }
+    .trend { display: grid; grid-template-columns: 1fr 1.7fr 1.3fr; gap: 28px; align-items: center; }
+    .choices { display: grid; grid-template-columns: 1.3fr 1fr 1fr; gap: 20px; margin-top: 22px; }
+    .slider-label { display: flex; justify-content: space-between; gap: 12px; }
+    .slider-label output { white-space: nowrap; }
+    .range-hint { display: block; color: var(--muted); font-size: 12px; }
+    output, input, .value, #detail { font-variant-numeric: tabular-nums; }
+    #slope-value { color: var(--muted); }
+    #error { color: var(--error); margin: 12px 0 0; }
+    [hidden] { display: none !important; }
+    .results { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 26px 0 22px; margin-top: 20px; border-top: 1px solid var(--line); }
+    .caption { display: block; color: var(--muted); font-size: 13px; }
+    .value { display: block; font-size: clamp(24px, 4vw, 34px); letter-spacing: -.035em; line-height: 1.35; margin-top: 3px; }
+    .value small { font-size: 14px; letter-spacing: 0; color: var(--muted); }
+    #allocation { color: var(--muted); font-size: 13px; margin: 0 0 30px; }
+    figure { margin: 0; }
+    #duration-figure { margin-top: 28px; }
+    .chart-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+    h2 { font-size: 15px; font-weight: 550; margin: 0; }
+    .legend { display: flex; gap: 20px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+    .legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .swatch { width: 22px; border-top: 2px dashed var(--market); }
+    .swatch.you { border-top: 2px solid var(--you); }
+    #chart, #duration-chart { width: 100%; height: 350px; display: block; overflow: hidden; margin-top: 14px; }
+    #chart text, #duration-chart text { fill: var(--muted); font: 12px system-ui, sans-serif; }
+    .grid { stroke: var(--line); stroke-width: 1; }
+    .market-path { stroke: var(--market); stroke-width: 1.8; stroke-dasharray: 5 4; fill: none; }
+    .user-path { stroke: var(--you); stroke-width: 2.5; fill: none; stroke-linejoin: round; }
+    .duration-path { stroke: var(--market); stroke-width: 1.8; fill: none; }
+    #detail, #duration-detail { min-height: 24px; font-size: 13px; color: var(--muted); margin: 6px 0 18px; }
+    details { border-top: 1px solid var(--line); padding-top: 16px; color: var(--muted); font-size: 13px; }
+    summary { width: fit-content; cursor: pointer; }
+    details p { max-width: 760px; margin: 10px 0 0; }
+    @media (max-width: 600px) { main { padding: 26px 18px; } .trend { grid-template-columns: 1fr; gap: 18px; } .choices { grid-template-columns: 1fr 1fr; gap: 16px; } .budget { grid-column: 1 / -1; } .results { gap: 12px; } .value small { display: block; } #chart, #duration-chart { height: 300px; } .legend { gap: 14px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Mint strategy</h1>
+      <p>Same budget. Different timing. Explore how much Flame you mint.</p>
+    </header>
+
+    <form id="controls" novalidate>
+      <div class="trend">
+        <label for="trend">Market trend
+          <select id="trend" name="trend">
+            <option value="linear">Linear</option>
+            <option value="quadratic">Quadratic</option>
+            <option value="exponential">Exponential</option>
+            <option value="sqrt">Square root</option>
+          </select>
+        </label>
+        <label for="slope">
+          <span class="slider-label"><span>Trend slope · end-to-end change</span><output id="slope-value" for="slope">+200%</output></span>
+          <input id="slope" name="slope" type="range" min="-95" max="900" step="5" value="200">
+        </label>
+        <label for="noise">
+          <span class="slider-label"><span>Market noise</span><output id="noise-value" for="noise">0%</output></span>
+          <input id="noise" name="noise" type="range" min="0" max="30" step="1" value="0" aria-describedby="noise-hint">
+          <span class="range-hint" id="noise-hint">Standard deviation · 0–30%</span>
+        </label>
+      </div>
+      <div class="choices">
+        <label class="budget" for="budget">
+          <span class="slider-label"><span>Budget · satoshis</span><output id="budget-value" for="budget"></output></span>
+          <input id="budget" name="budget" type="range" min="0" max="1000" step="1" value="750">
+          <span class="range-hint">1,000–10,000,000 · log scale</span>
+        </label>
+        <label for="start">
+          <span class="slider-label"><span>Starting block</span><output id="start-value" for="start"></output></span>
+          <input id="start" name="start" type="range" min="0" max="7498" step="1" value="2000">
+          <span class="range-hint" id="start-hint"></span>
+        </label>
+        <label for="duration">
+          <span class="slider-label"><span>Blocks to mint</span><output id="duration-value" for="duration"></output></span>
+          <input id="duration" name="duration" type="range" min="0" max="1000" step="1" value="823">
+          <span class="range-hint">100–5,000 · log scale</span>
+        </label>
+      </div>
+      <p id="error" role="alert" hidden></p>
+    </form>
+
+    <section class="results" aria-label="Simulation results" aria-live="polite" aria-atomic="true">
+      <div><span class="caption">Total Flame minted</span><output class="value" id="reward" for="trend slope noise budget duration start">—</output></div>
+      <div><span class="caption">Average mint rate · lower is better</span><output class="value" id="average" for="trend slope noise budget duration start">—</output></div>
+    </section>
+    <p id="allocation"></p>
+
+    <figure id="figure">
+      <div class="chart-heading">
+        <h2>Mint rate <span class="caption" style="display:inline">· satoshis per FLM</span></h2>
+        <div class="legend" aria-label="Chart legend">
+          <span><i class="swatch" aria-hidden="true"></i>Market without you</span>
+          <span><i class="swatch you" aria-hidden="true"></i>Market including you</span>
+        </div>
+      </div>
+      <svg id="chart" role="img" tabindex="0" aria-labelledby="chart-title" aria-describedby="chart-description chart-help"></svg>
+      <figcaption id="detail" aria-live="off"></figcaption>
+      <span id="chart-help" hidden>Move over or tap the chart to inspect a block. With the chart focused, use the arrow keys, Home or End.</span>
+    </figure>
+
+    <figure id="duration-figure">
+      <h2>Flame minted by duration <span class="caption" style="display:inline">· FLM</span></h2>
+      <p class="caption" id="duration-scope"></p>
+      <svg id="duration-chart" role="img" aria-labelledby="duration-title" aria-describedby="duration-description duration-detail"></svg>
+      <figcaption id="duration-detail"></figcaption>
+    </figure>
+
+    <details>
+      <summary>Simple model</summary>
+      <p>Every block distributes 50 FLM in proportion to satoshis burned. The underlying smooth trend starts at 100 sat/FLM; the slope slider sets its change over 10,000 blocks, numbered 0–9,999. The four smooth curves share those endpoints; noise can move the actual endpoints. Your budget is split equally across your blocks, allowing fractional satoshis.</p>
+      <p>Noise is a seeded, mean-reverting Gaussian walk in log space, with roughly 100-block correlation. The multiplier is lognormal and positive, with mean 1: 30% means its standard deviation is 0.30, not a ±30% bound. The same random path is reused for every trend and strategy, and zero noise gives the smooth trend exactly.</p>
+      <p>The combined rate is the market rate plus your per-block burn divided by 50. Your reward is your burn divided by that combined rate. The average shown above is your total budget divided by your total FLM, not the arithmetic mean of block rates. This is a toy simulation, not Flame consensus or a price forecast.</p>
+    </details>
+  </main>
+
+  <script>
+    "use strict";
+
+    const BLOCKS = 10000;
+    const ISSUANCE = 50;
+    const BASE_RATE = 100;
+
+    function gaussianWalk() {
+      let seed = 0x4d494e54;
+      const uniform = () => {
+        seed = (Math.imul(1664525, seed) + 1013904223) >>> 0;
+        return (seed + 0.5) / 4294967296;
+      };
+      const normal = () => Math.sqrt(-2 * Math.log(uniform())) * Math.cos(2 * Math.PI * uniform());
+      const correlation = Math.exp(-1 / 100);
+      const innovation = Math.sqrt(1 - correlation * correlation);
+      let previous = normal();
+      return Array.from({ length: BLOCKS }, (_, index) => {
+        if (index > 0) previous = correlation * previous + innovation * normal();
+        return previous;
+      });
+    }
+
+    const NOISE_PATH = gaussianWalk();
+
+    function logValue(position, min, max) {
+      if (!Number.isFinite(position) || position < 0 || position > 1000) throw new Error("Choose a slider position between 0 and 1,000.");
+      return position === 0 ? min : position === 1000 ? max : Math.round(min * Math.pow(max / min, position / 1000));
+    }
+
+    function marketRates(trend, change, noise = 0) {
+      if (!["linear", "quadratic", "exponential", "sqrt"].includes(trend) ||
+          !Number.isFinite(change) || change <= -100) {
+        throw new Error("Choose a valid trend with a change above −100%.");
+      }
+      if (!Number.isFinite(noise) || noise < 0 || noise > 30) throw new Error("Choose market noise between 0% and 30%.");
+      const variance = Math.log1p((noise / 100) ** 2);
+      const sigma = Math.sqrt(variance);
+      return Array.from({ length: BLOCKS }, (_, index) => {
+        const t = index / (BLOCKS - 1);
+        const slope = change / 100;
+        const progress = trend === "quadratic" ? t * t : trend === "sqrt" ? Math.sqrt(t) : t;
+        const rate = trend === "exponential" ? BASE_RATE * Math.pow(1 + slope, t) : BASE_RATE * (1 + slope * progress);
+        return noise === 0 ? rate : rate * Math.exp(sigma * NOISE_PATH[index] - variance / 2);
+      });
+    }
+
+    function simulate(rates, budget, duration, start) {
+      if (!Number.isSafeInteger(budget) || budget < 0) throw new Error("Enter a whole-satoshi budget of zero or more, within the safe integer range.");
+      if (!Number.isInteger(duration) || duration < 1 || duration > rates.length) throw new Error("Choose between 1 and 10,000 blocks to mint.");
+      if (!Number.isInteger(start) || start < 0 || start >= rates.length) throw new Error("Choose a starting block between 0 and 9,999.");
+      if (start + duration > rates.length) throw new Error("Minting must finish within 10,000 blocks. Reduce the duration or start earlier.");
+      const burn = budget / duration;
+      const end = start + duration - 1;
+      for (let block = start; block <= end; block++) {
+        const rate = rates[block];
+        if (!Number.isFinite(rate) || rate < 0) throw new Error("Market rates must be finite and nonnegative.");
+      }
+      const reward = minted(rates, budget, duration, start);
+      return { budget, duration, start, end, burn, reward, average: reward > 0 ? budget / reward : null };
+    }
+
+    function minted(rates, budget, duration, start) {
+      const burn = budget / duration;
+      if (burn === 0) return 0;
+      let reward = 0;
+      for (let block = start; block < start + duration; block++) reward += ISSUANCE * burn / (ISSUANCE * rates[block] + burn);
+      return reward;
+    }
+
+    function rewardsByDuration(rates, budget, start) {
+      const last = Math.min(5000, rates.length - start);
+      if (last < 100) throw new Error("At least 100 blocks must remain to compare durations.");
+      // Validate the whole candidate window once, not for every duration.
+      simulate(rates, budget, last, start);
+      const points = [];
+      for (let duration = 100; duration <= last; duration++) points.push({ duration, reward: minted(rates, budget, duration, start) });
+      return points;
+    }
+
+    const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+    const precise = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 6 });
+    const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+    const get = id => document.getElementById(id);
+    const chart = get("chart");
+    let state = null;
+    let plot = null;
+    let inspected = null;
+    let frame = 0;
+
+    function redraw() {
+      if (!state) return;
+      const { rates, result } = state;
+      const width = Math.max(280, chart.getBoundingClientRect().width);
+      const height = chart.getBoundingClientRect().height || 350;
+      const left = 66, right = width - 18, top = 15, bottom = height - 40;
+      let peak = 0;
+      for (let index = 0; index < rates.length; index++) {
+        const block = index;
+        const rate = rates[index] + (block >= result.start && block <= result.end ? result.burn / ISSUANCE : 0);
+        peak = Math.max(peak, rate);
+      }
+      const ceiling = peak * 1.1 || 1;
+      const x = block => left + block / (BLOCKS - 1) * (right - left);
+      const y = rate => bottom - rate / ceiling * (bottom - top);
+      plot = { left, right, top, bottom, x, y, width, height };
+      chart.setAttribute("viewBox", `0 0 ${width} ${height}`);
+
+      function path(first, last, uplift) {
+        const points = [];
+        for (let block = first; block < last; block++) points.push(block);
+        points.push(last);
+        return points.map((block, index) => `${index ? "L" : "M"}${x(block).toFixed(2)},${y(rates[block] + uplift).toFixed(2)}`).join(" ");
+      }
+
+      let grid = "";
+      for (let tick = 0; tick <= 4; tick++) {
+        const value = ceiling * tick / 4;
+        grid += `<line class="grid" x1="${left}" x2="${right}" y1="${y(value)}" y2="${y(value)}"/><text x="${left - 10}" y="${y(value) + 4}" text-anchor="end">${compact.format(value)}</text>`;
+      }
+      const ticks = width < 500 ? [0, 5000, 9999] : [0, 2000, 4000, 6000, 8000, 9999];
+      for (const block of ticks) grid += `<text x="${x(block)}" y="${bottom + 22}" text-anchor="${block === 0 ? "start" : block === BLOCKS - 1 ? "end" : "middle"}">${number.format(block)}</text>`;
+      const activeWidth = Math.max(1, x(result.end) - x(result.start));
+      const userLine = result.budget > 0 ? `<path class="user-path" d="${path(result.start, result.end, result.burn / ISSUANCE)}"/>${result.duration === 1 ? `<circle cx="${x(result.start)}" cy="${y(rates[result.start] + result.burn / ISSUANCE)}" r="3.5" fill="var(--you)"/>` : ""}` : "";
+      chart.innerHTML = `<title id="chart-title">Mint rate over 10,000 blocks</title>
+        <desc id="chart-description">Dashed: other miners' rate with ${state.noise}% noise standard deviation. ${result.budget > 0 ? `Solid: the total including your burn, only during blocks ${result.start} through ${result.end}.` : "No user burn; only the market line is shown."} Your total is ${precise.format(result.reward)} FLM.</desc>
+        <rect x="${x(result.start)}" y="${top}" width="${activeWidth}" height="${bottom - top}" fill="var(--selection)"/>
+        ${grid}<path class="market-path" d="${path(0, BLOCKS - 1, 0)}"/>${userLine}
+        <text x="${right}" y="${height - 1}" text-anchor="end">Block</text>
+        <g id="inspection" hidden><line id="guide" y1="${top}" y2="${bottom}" stroke="var(--muted)" stroke-width="1"/><circle id="market-dot" r="3" fill="var(--market)"/><circle id="user-dot" r="3.5" fill="var(--you)"/></g>`;
+      inspect(inspected);
+      redrawDurations();
+    }
+
+    function redrawDurations() {
+      if (!state) return;
+      const { curve, result } = state;
+      const svg = get("duration-chart");
+      const width = Math.max(280, svg.getBoundingClientRect().width);
+      const height = svg.getBoundingClientRect().height || 350;
+      const left = 66, right = width - 18, top = 15, bottom = height - 40;
+      const last = curve[curve.length - 1].duration;
+      const span = Math.log(last / 100);
+      const x = duration => span === 0 ? (left + right) / 2 : left + Math.log(duration / 100) / span * (right - left);
+      let peak = result.reward;
+      for (const point of curve) peak = Math.max(peak, point.reward);
+      const ceiling = peak * 1.1 || 1;
+      const y = reward => bottom - reward / ceiling * (bottom - top);
+      let grid = "";
+      for (let tick = 0; tick <= 4; tick++) {
+        const value = ceiling * tick / 4;
+        grid += `<line class="grid" x1="${left}" x2="${right}" y1="${y(value)}" y2="${y(value)}"/><text x="${left - 10}" y="${y(value) + 4}" text-anchor="end">${compact.format(value)}</text>`;
+      }
+      const ticks = [100];
+      for (const duration of [200, 500, 1000, 2000]) {
+        if (duration < last && x(duration) - x(ticks[ticks.length - 1]) > 60 && x(last) - x(duration) > 60) ticks.push(duration);
+      }
+      if (last !== 100) ticks.push(last);
+      for (const duration of ticks) grid += `<text x="${x(duration)}" y="${bottom + 22}" text-anchor="${span === 0 ? "middle" : duration === 100 ? "start" : duration === last ? "end" : "middle"}">${number.format(duration)}</text>`;
+      const path = curve.map((point, index) => `${index ? "L" : "M"}${x(point.duration).toFixed(2)},${y(point.reward).toFixed(2)}`).join(" ");
+      svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+      svg.innerHTML = `<title id="duration-title">Flame minted for each valid duration</title>
+        <desc id="duration-description">Each duration from 100 to ${last} blocks splits the same ${result.budget} satoshis evenly, starting at block ${result.start}. Duration uses a logarithmic axis. The marked selection is ${result.duration} blocks, minting ${precise.format(result.reward)} FLM.</desc>
+        ${grid}<path class="duration-path" d="${path}"/>
+        <line x1="${x(result.duration)}" x2="${x(result.duration)}" y1="${y(result.reward)}" y2="${bottom}" stroke="var(--line)"/>
+        <circle id="selected-duration" cx="${x(result.duration)}" cy="${y(result.reward)}" r="5" fill="var(--you)" data-duration="${result.duration}" data-reward="${result.reward}"><title>Selected: ${number.format(result.duration)} blocks · ${precise.format(result.reward)} FLM</title></circle>
+        <text x="${right}" y="${height - 1}" text-anchor="end">Duration · blocks</text>`;
+      get("duration-scope").textContent = `${number.format(result.budget)} sats · Starting block ${number.format(result.start)} · Noise ${state.noise}% · Logarithmic duration axis`;
+      get("duration-detail").textContent = `Selected window: ${number.format(result.duration)} blocks → ${precise.format(result.reward)} FLM`;
+    }
+
+    function inspect(block) {
+      if (!state || !plot) return;
+      inspected = block;
+      const { rates, result } = state;
+      const group = get("inspection");
+      group.toggleAttribute("hidden", block === null);
+      if (block === null) {
+        get("detail").textContent = "Inspect a block by hovering, tapping, or using the arrow keys on the chart.";
+        return;
+      }
+      const rate = rates[block];
+      const active = block >= result.start && block <= result.end && result.budget > 0;
+      const combined = rate + result.burn / ISSUANCE;
+      const px = plot.x(block);
+      get("guide").setAttribute("x1", px);
+      get("guide").setAttribute("x2", px);
+      get("market-dot").setAttribute("cx", px);
+      get("market-dot").setAttribute("cy", plot.y(rate));
+      get("user-dot").toggleAttribute("hidden", !active);
+      if (active) {
+        get("user-dot").setAttribute("cx", px);
+        get("user-dot").setAttribute("cy", plot.y(combined));
+      }
+      get("detail").textContent = `Block ${number.format(block)} · Market ${precise.format(rate)} sat/FLM${active ? ` · Including you ${precise.format(combined)} sat/FLM · You mint ${precise.format(result.burn / combined)} FLM` : " · You are not minting"}`;
+    }
+
+    function update() {
+      frame = 0;
+      const change = Number(get("slope").value);
+      const noise = Number(get("noise").value);
+      get("slope-value").textContent = `${change > 0 ? "+" : ""}${change}%`;
+      get("noise-value").textContent = `${noise}%`;
+      get("noise").setAttribute("aria-valuetext", `${noise}% standard deviation around the trend`);
+      try {
+        const budget = logValue(Number(get("budget").value), 1000, 10000000);
+        const duration = logValue(Number(get("duration").value), 100, 5000);
+        const lastStart = BLOCKS - duration;
+        get("start").max = String(lastStart);
+        get("start").value = String(Math.max(0, Math.min(Number(get("start").value), lastStart)));
+        const start = Number(get("start").value);
+        get("budget-value").textContent = number.format(budget);
+        get("duration-value").textContent = number.format(duration);
+        get("start-value").textContent = number.format(start);
+        get("start-hint").textContent = `0–${number.format(lastStart)} · fits your duration`;
+        get("budget").setAttribute("aria-valuetext", `${number.format(budget)} satoshis`);
+        get("duration").setAttribute("aria-valuetext", `${number.format(duration)} blocks`);
+        const trend = get("trend").value;
+        const rates = marketRates(trend, change, noise);
+        const result = simulate(rates, budget, duration, start);
+        const curve = state && state.trend === trend && state.change === change && state.noise === noise && state.result.budget === budget && state.result.start === start
+          ? state.curve : rewardsByDuration(rates, budget, start);
+        state = { rates, result, curve, trend, change, noise };
+        get("error").hidden = true;
+        get("figure").hidden = false;
+        get("duration-figure").hidden = false;
+        get("reward").innerHTML = `${precise.format(result.reward)} <small>FLM</small>`;
+        get("average").innerHTML = result.average === null ? "— <small>no burn</small>" : `${precise.format(result.average)} <small>sat / FLM</small>`;
+        get("allocation").textContent = `${precise.format(result.burn)} sats per block · Blocks ${number.format(result.start)}–${number.format(result.end)} · Market ${precise.format(rates[0])} → ${precise.format(rates[BLOCKS - 1])} sat/FLM`;
+        redraw();
+      } catch (error) {
+        state = null;
+        get("error").textContent = error.message;
+        get("error").hidden = false;
+        get("figure").hidden = true;
+        get("duration-figure").hidden = true;
+        get("reward").textContent = "—";
+        get("average").textContent = "—";
+        get("allocation").textContent = "";
+      }
+    }
+
+    get("controls").addEventListener("submit", event => event.preventDefault());
+    get("controls").addEventListener("input", () => { if (!frame) frame = requestAnimationFrame(update); });
+    function inspectPointer(event) {
+      if (!plot || !state) return;
+      get("detail").setAttribute("aria-live", "off");
+      const bounds = chart.getBoundingClientRect();
+      const px = event.clientX - bounds.left;
+      inspect(Math.max(0, Math.min(BLOCKS - 1, Math.round((px - plot.left) / (plot.right - plot.left) * (BLOCKS - 1)))));
+    }
+    chart.addEventListener("pointermove", inspectPointer);
+    chart.addEventListener("pointerdown", inspectPointer);
+    chart.addEventListener("pointerleave", event => { if (event.pointerType !== "touch") inspect(null); });
+    chart.addEventListener("focus", () => {
+      get("detail").setAttribute("aria-live", "polite");
+      if (state && inspected === null) inspect(state.result.start);
+    });
+    chart.addEventListener("blur", () => inspect(null));
+    chart.addEventListener("keydown", event => {
+      if (!state || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      get("detail").setAttribute("aria-live", "polite");
+      const current = inspected === null ? state.result.start : inspected;
+      inspect(event.key === "Home" ? 0 : event.key === "End" ? BLOCKS - 1 : Math.max(0, Math.min(BLOCKS - 1, current + (event.key === "ArrowLeft" ? -1 : 1))));
+    });
+    const resize = new ResizeObserver(redraw);
+    resize.observe(chart);
+    resize.observe(get("duration-chart"));
+    update();
+  </script>
+</body>
+</html>

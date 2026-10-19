@@ -1,94 +1,36 @@
 # Address formats
 
-This document specifies Flame's binary actor addresses and human-readable actor,
-key and payment-address formats. [Bech32f](bech32f.md) specifies the text codec;
+This document specifies Flame's human-readable actor, key and payment-address
+formats. [Bech32f](bech32f.md) specifies the text codec;
 [FlameKD](flamekd.md) specifies key derivation and raw cryptographic tuples.
-[Cell-based encodings](encoding.md) specify the common binary encoding rules.
 
 The words MUST, MUST NOT, SHOULD and MAY specify implementation requirements.
 
+All formats use Bech32f's encoding, checksum, case and padding rules. Decoders
+MUST enforce the expected type, selected network's HRP and exact payload length
+from the tables below.
+
 ## Keys and payment addresses
 
-`enc(s)` is a canonical 32-byte little-endian scalar; `enc(S)` is a canonical
-32-byte compressed Ristretto point. Tuple order and cryptographic validation
-are defined in [FlameKD](flamekd.md#group-and-representations).
+Encode the raw tuple defined in [FlameKD's key types](flamekd.md#key-types-and-capabilities).
+After text decoding, validate it using FlameKD's
+[scalar and point rules](flamekd.md#group-and-representations).
+Network-specific derivation follows its
+[standard wallet paths](flamekd.md#standard-wallet-derivation-paths).
 
-| Type | Mainnet HRP | Testnet HRP | Raw bytes | Bytes | Payload symbols | Total characters: mainnet / testnet |
-| --- | --- | --- | --- | --- | --- | --- |
-| Spend Key | `spend` | `testspend` | `enc(s) ++ enc(v) ++ enc(t)` | 96 | 154 | 166 / 170 |
-| View Key | `view` | `testview` | `enc(S) ++ enc(v) ++ enc(t)` | 96 | 154 | 165 / 169 |
-| Recv Key | `recv` | `testrecv` | `enc(S) ++ enc(V) ++ enc(t)` | 96 | 154 | 165 / 169 |
-| Receiving Address | `f` | `tf` | `enc(S) ++ enc(V)` | 64 | 103 | 111 / 112 |
-| Tracking Address | `c` | `tc` | `enc(S)` | 32 | 52 | 60 / 61 |
-
-`++` denotes concatenation. Encode the entire tuple in one 8-to-5-bit
-conversion. Zero padding is two bits for 96 bytes, three for 64 bytes and four
-for 32 bytes; do not independently pad its 32-byte elements.
-
-Decoders MUST select the expected type/network HRP, enforce the exact lengths
-above, and validate each scalar and point after checksum and padding checks.
-Spending/viewing scalars MUST be nonzero and spending/viewing points MUST be
-nonidentity. Derivation scalar `t` may be zero. No trailing bytes or fields
-are permitted. A valid checksum is not cryptographic validation.
-
-Testnet uses `"test" ++ mainnet_HRP` for keys and `"t" ++ mainnet_HRP` for
-payment addresses. Prefixes are case-sensitive after Bech32f case normalization.
-Changing a prefix changes neither the tuple nor its derivation path; the
-checksum must nevertheless be recomputed.
-
-Wallets MUST use the HRP matching their selected network and
-[standard wallet derivation path](flamekd.md#standard-wallet-derivation-paths).
-Producing the corresponding key on another network requires deriving that
-network's hardened branch, not merely changing the prefix. Network and origin
-path are wallet context, not recoverable from the raw tuple.
-
-Extended keys contain sensitive or account-linking material. Receiving and
-tracking addresses omit derivation material and path/index metadata. Their
-different lengths and HRPs MUST NOT be treated as interchangeable encodings.
+| Type | Mainnet HRP | Testnet HRP | Bytes | Payload symbols | Total characters: mainnet / testnet |
+| --- | --- | --- | --- | --- | --- |
+| Spend Key | `spend` | `testspend` | 96 | 154 | 166 / 170 |
+| View Key | `view` | `testview` | 96 | 154 | 165 / 169 |
+| Recv Key | `recv` | `testrecv` | 96 | 154 | 165 / 169 |
+| Receiving Address | `f` | `tf` | 64 | 103 | 111 / 112 |
+| Tracking Address | `c` | `tc` | 32 | 52 | 60 / 61 |
 
 ## Actor addresses
 
-The following CTL is the canonical actor-address schema throughout FlameVM.
-Actor identity is a raw 32-byte hash, not a public key or a tagged sum:
-
-```ctl
-type ActorID = [U8; 32];
-
-enum ActorAddress: U8 {
-    Init { ctor: ^Cell } = 0,
-    Address { addr: ActorID } = 1,
-    Restore { addr: ActorID, state: ^Cell } = 2,
-}
-```
-
-`ActorID` has exactly 32 payload bytes in their existing order: no tag, length
-prefix or endian reversal. The actor's immutable ID is the constructor Cell's
-factual ID (highest-level hash). It is not recomputed from current code/data,
-and `Restore` cannot choose a new identity.
-
-| Variant | Address Cell payload | Address Cell references |
-| --- | --- | --- |
-| `Init` | `00` | `[ctor]` |
-| `Address` | `01 ++ addr:32` | None |
-| `Restore` | `02 ++ addr:32` | `[state]` |
-
-All other tags, incorrect payload lengths and extra references MUST be rejected.
-`Init` carries constructor availability; `Address` carries only the ID;
-`Restore` supplies availability authenticated against the registered actor
-state commitment. Absence of supplied data never means empty logical data.
-
-An actor's content is one root Cell with no payload and exactly two references,
-ordered `[code, data]`. Freezing prunes that **whole root**, not code and data
-independently. The `state` reference in `Restore` targets that complete root;
-its descendants may remain pruned. Reading an unavailable branch fails the
-internal transaction rather than returning a default or authorizing guessed
-data. Detailed compression and lifecycle requirements are in
-[Compression](compression.md).
-
-The Rust actor codecs are generated from `flamevm/actor.ctl`. This replaces the
-previous Hash/Constructor sum and reverses its two tags; that earlier wire form
-is not accepted. VM `send` and `call` take the native address Cell itself, not
-bare identity bytes or a serialized transport envelope.
+Actor identity and invocation rules are specified in [Actors](flamevm.md#actors);
+binary routing operands are defined in
+[Cell-based encoding](encoding.md#actor-addresses-state-and-messages).
 
 ### Human-readable actor identifiers
 
@@ -98,16 +40,10 @@ ActorIDs use [Bech32f](bech32f.md) with these network-specific prefixes:
 | --- | --- | --- | --- | --- |
 | `a` | `ta` | 32 | 52 | 60 / 61 |
 
-Encode the 32 raw ActorID bytes in their existing order with one 8-to-5-bit
-conversion and four final zero padding bits. The payload has no ActorAddress
-tag, length prefix or endian reversal. Constructor/restoration Cell graphs
-remain invocation attachments.
-
-Encoders MUST emit lowercase. Decoders MUST apply Bech32f's checksum, case and
-padding rules, enforce the exact length and selected network's HRP, and reject
-the other network. The prefix identifies the network without changing the ID.
-ActorIDs are hashes: any 32-byte value is valid for formatting, with no scalar
-or curve-point validation. Actor existence is checked separately. `c` / `tc`
+Encode only the 32 raw ActorID bytes in their existing order, without routing
+tags, length prefixes or invocation attachments. The network prefix does not
+change the ID. Any 32-byte value is valid for formatting, with no scalar or
+curve-point validation; actor existence is checked separately. `c` / `tc`
 identify Tracking Addresses and MUST NOT be accepted as actor prefixes.
 
 This formatting vector uses the bytes `00` through `1f`, without claiming an

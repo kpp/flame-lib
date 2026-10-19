@@ -12,26 +12,20 @@ are defined in [Addresses](address.md), using [Bech32f](bech32f.md).
 
 All group operations use
 [ristretto255](https://www.rfc-editor.org/rfc/rfc9496.html#section-4).
-Its prime order is:
-
-```
-q = 2^252 + 27742317777372353535851937790883648493
-```
+`q` denotes the Ristretto255 group order.
 
 Lowercase letters denote scalars modulo `q`; uppercase letters denote points.
-Scalar addition and subtraction are modulo `q`. Point addition is the group
-operation, and `x*G` denotes scalar multiplication by the standard generator.
+Point addition is the group operation, and `x*G` denotes scalar multiplication
+by the standard generator.
 The canonical compressed encoding of `G` is:
 
 ```
 e2f2ae0a6abc4e71a884a961c500515f58e30b6aa582dd8db6a65945e08d2d76
 ```
 
-`enc(x)` for a scalar is its canonical 32-byte little-endian representation,
-whose unsigned integer value is less than `q`. Decoding MUST reject values
-greater than or equal to `q`; it MUST NOT reduce imported scalars modulo `q`.
-`enc(P)` for a point is its canonical 32-byte compressed Ristretto encoding.
-Point decoding MUST use Ristretto decoding and reject invalid encodings.
+`enc(x)` and `enc(P)` use the canonical Ristretto scalar and point byte encodings.
+Key import MUST reject noncanonical scalars rather than reducing them modulo
+`q`, and MUST Ristretto-decode points and reject invalid encodings.
 
 Spending and viewing scalars `s` and `v` MUST be nonzero. Their public points
 `S = s*G` and `V = v*G` MUST be nonidentity. Derivation material `t` is a scalar;
@@ -121,6 +115,10 @@ Merlin supplies its own framing.
 `P.challenge_scalar(label)` requests exactly 64 challenge bytes from Merlin,
 interprets them as one unsigned 512-bit little-endian integer, and reduces that
 integer modulo `q`. It is not a 32-byte challenge or rejection sampling.
+
+`P.challenge_bytes(label, n)` requests exactly `n` bytes from Merlin. The
+requested length is bound into the challenge; taking a prefix of a longer
+challenge does not produce the same value.
 
 All appends and challenges occur sequentially in the stated order on the same
 transcript. Each root or child derivation starts a fresh transcript. Transcript
@@ -284,14 +282,6 @@ adjustments. Hardened derivation requires both parent secret scalars: recovering
 only `s`, while knowing `S`, `V`, and `t`, does not enable hardened derivation.
 Use hardened account boundaries when independently delegated subtrees must not
 expose their ancestors through these normal-child disclosure relationships.
-
-Token encryption is outside this specification. An encryption protocol SHOULD
-use fresh sender randomness per output, validated group inputs, and a
-domain-separated KDF bound to the output and recipient; see
-[HPKE](https://www.rfc-editor.org/rfc/rfc9180.html#section-4.1).
-For selective disclosure, share the final key for the selected encrypted output,
-not a viewing scalar or the raw DH point. Raw DH disclosure can also unlock
-other outputs when sender points repeat or have known scalar relationships.
 
 ## Raw test vectors
 

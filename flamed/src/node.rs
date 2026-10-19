@@ -17,13 +17,16 @@ use flamechain::{
     ExecutionKind, Mempool, MempoolError, MempoolPolicy, RebaseReport,
 };
 use flamed_rpc::{
-    ActorCode, ActorId, ActorResult, ActorStateEnvelope, BlockHeader, BlockId, BlockResult,
-    BlockSummary, BlockTxEnvelope, BlocksResult, ContractEnvelope, ContractId, ExecutionData,
-    NoteEnvelope, PendingTransaction, PendingTransactionsResult, PredicatePoint, ScanEntry,
-    SpentAt, StateCommitment, TransactionResult, TransactionSummary, TransactionsResult, TxId,
-    MAX_PAGE_SIZE,
+    ActorCode, ActorId, ActorQueryResult, ActorResult, ActorStateEnvelope, BlockHeader, BlockId,
+    BlockResult, BlockSummary, BlockTxEnvelope, BlocksResult, ContractEnvelope, ContractId,
+    ExecutionData, NoteEnvelope, PendingTransaction, PendingTransactionsResult, PredicatePoint,
+    ScanEntry, SpentAt, StateCommitment, TransactionResult, TransactionSummary, TransactionsResult,
+    TxId, ValueEnvelope, MAX_PAGE_SIZE, MAX_QUERY_BYTES, MAX_QUERY_GAS,
 };
-use flamevm::{ActorID, CellError, ContractID, TxEntry, TxID, VMError};
+use flamevm::{
+    ActorID, Cell, CellDecode, CellEncode, CellEnvelope, CellError, CellID, CellReader, ContractID,
+    TxEntry, TxID, VMError, Value,
+};
 use sha2::{Digest, Sha256};
 
 use crate::cells::{contract_bytes, log_bytes};
@@ -40,6 +43,23 @@ pub const GENESIS_TXID: TxID = TxID([0; 32]);
 
 /// One node, shared by the RPC handlers and the minter.
 pub type SharedNode = Arc<Mutex<Node>>;
+
+// A compact shared Cell graph can expand into many Dict values during decoding.
+struct QueryDecode<'a> {
+    envelope: &'a mut CellEnvelope,
+    gas: u64,
+}
+
+impl CellReader for QueryDecode<'_> {
+    fn read(&mut self, id: CellID, resident: Option<&Arc<Cell>>) -> Result<Arc<Cell>, CellError> {
+        let cell = self.envelope.read(id, resident)?;
+        self.gas = self
+            .gas
+            .checked_sub(1 + cell.record_size() as u64 + cell.refs().len() as u64)
+            .ok_or(CellError::ResourceExhausted)?;
+        Ok(cell)
+    }
+}
 
 /// This devnet's stand-in for a core-chain identity.
 ///
@@ -293,6 +313,75 @@ impl Node {
             state_error: None,
             instructions: Vec::new(),
             code_error: None,
+        })
+    }
+
+    /// Executes a getter with no authenticated caller and no write permission.
+    /// An expected tip pins multi-hop lookups: callers restart if the tip changes.
+    pub fn query_actor(
+        &mut self,
+        id: ActorId,
+        argument: ValueEnvelope,
+        gas_limit: u64,
+        expected_block: Option<BlockId>,
+    ) -> Result<ActorQueryResult, NodeError> {
+        if gas_limit == 0 || gas_limit > MAX_QUERY_GAS {
+            return Err(NodeError::QueryGasLimit(gas_limit));
+        }
+        if argument.0.len() > MAX_QUERY_BYTES {
+            return Err(NodeError::Limit {
+                max: MAX_QUERY_BYTES,
+                got: argument.0.len(),
+            });
+        }
+        let tip = self.tip();
+        let block = BlockId(tip.hash.into_bytes());
+        if expected_block.is_some_and(|expected| expected != block) {
+            return Err(NodeError::StaleBlock);
+        }
+        let mut decode_gas = MAX_QUERY_GAS;
+        let mut envelope = CellEnvelope::decode(&argument.0, MAX_QUERY_BYTES, &mut decode_gas)
+            .map_err(NodeError::QueryDecode)?;
+        let root = envelope
+            .cells()
+            .get(&envelope.root())
+            .ok_or_else(|| NodeError::QueryDecode(CellError::MissingCell(envelope.root())))?;
+        // Dict leaves receive the same recursive data checks inside the VM.
+        if !matches!(root.payload().first(), Some(0 | 2 | 3 | 13)) {
+            return Err(NodeError::QueryDecode(CellError::InvalidFormat));
+        }
+        let argument = Value::from_cell(
+            &root,
+            &mut QueryDecode {
+                envelope: &mut envelope,
+                gas: decode_gas,
+            },
+        )
+        .map_err(NodeError::QueryDecode)?;
+        let result = self
+            .chain
+            .query_actor(
+                ActorID::from(id.0),
+                argument,
+                gas_limit,
+                Arc::new(envelope.into_parts().1),
+            )
+            .map_err(|error| match error {
+                VMError::ActorNotFound => NodeError::NotFound(format!("actor {id}")),
+                other => NodeError::Query(other),
+            })?;
+        let value = result.value.to_envelope()?.encode();
+        if value.len() > MAX_QUERY_BYTES {
+            return Err(NodeError::Limit {
+                max: MAX_QUERY_BYTES,
+                got: value.len(),
+            });
+        }
+        Ok(ActorQueryResult {
+            block,
+            height: tip.height,
+            value: ValueEnvelope(value),
+            gas_used: result.gas_used,
         })
     }
 
@@ -877,6 +966,18 @@ pub enum NodeError {
     /// `CellError` says which.
     #[error("the submitted bytes do not decode as a transaction under this chain's limits: {0}")]
     Decode(CellError),
+    /// A query argument is not a bounded, data-only Value envelope.
+    #[error("invalid actor query argument: {0}")]
+    QueryDecode(CellError),
+    /// Query execution gas must be positive and fit the node's bound.
+    #[error("actor query gas must be 1..={MAX_QUERY_GAS}, got {0}")]
+    QueryGasLimit(u64),
+    /// A lookup's pinned block is no longer the current tip.
+    #[error("the expected query block is not the current tip")]
+    StaleBlock,
+    /// A getter failed without committing effects.
+    #[error("actor query failed: {0}")]
+    Query(VMError),
     /// The mempool refused a transaction.
     #[error(transparent)]
     Mempool(#[from] MempoolError),

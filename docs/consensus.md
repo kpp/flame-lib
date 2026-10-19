@@ -20,8 +20,8 @@ chain data in issuance or minter selection. The mechanism is **TBD**. It must
 specify proposer eligibility and selection; Flame issuance schedule and rounding;
 any authorizing Bitcoin proof; maturity and Bitcoin-reorg handling; rewards,
 fees, penalties, and equivocation consequences; and the scarce resource from
-which influence derives. VM flavor `1` (`FLAME_FLAVOR`) identifies Flame but
-does not define its issuance.
+which influence derives. The VM's [native Flame flavor](flamevm.md#tokens)
+identifies the asset but does not define its issuance.
 
 ## BFT
 
@@ -36,16 +36,15 @@ finality.
 
 ## Ordering
 
-Consensus orders external transactions. The state machine derives internal
-message order from external order and ordered send effects. Proposers may select
-and order valid transactions within block limits. Fair ordering, encrypted
+Consensus orders external transactions; [staged block application](blockchain.md#staged-block-application)
+defines the derived internal message order. Proposers may select and order valid
+transactions within [block limits](blockchain.md#consensus-limits). Fair ordering, encrypted
 mempools, and MEV controls are not specified.
 
 Minter transaction selection should account for the lower parallelism of actor
-execution without changing FlameVM gas or block validity. Let
-`direct_send_gas` be the sum of Message gas grants in an external transaction's
-TxLog. Because those grants are already included once in `gas_used`, the local
-selection score uses:
+execution without changing FlameVM gas or block validity. Using `gas_used` and
+`direct_send_gas` from [consensus resource accounting](blockchain.md#consensus-limits),
+the local selection score uses:
 
 ```text
 effective_gas = gas_used + (internal_gas_weight - 1) * direct_send_gas

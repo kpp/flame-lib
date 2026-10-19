@@ -326,10 +326,8 @@ What the numbers show:
 
 ## Size and gas
 
-**What gas is.** Gas is FlameVM's deterministic count of verifier work.
-The VM charges it from a price list that the prover and the verifier both
-apply, so a transaction's gas depends on the transaction alone, never on
-the hardware. The prices that matter here are 1 gas per instruction, 1 per
+**Gas in this measurement.** The current metering rules are specified in
+[FlameVM gas](../flamevm.md#gas). The measured revision's prices were 1 gas per instruction, 1 per
 allocated byte or item, 350 per signature, 120 per R1CS item, and 2,000 to
 finish an external proof. The schedule was calibrated on an arm64 machine
 in 2026-08, with the rule that 1 gas is about 100 ns of verifier work,

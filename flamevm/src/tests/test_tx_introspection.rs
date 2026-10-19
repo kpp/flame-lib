@@ -11,7 +11,8 @@ fn external_vm(header: TxHeader, script: Vec<u8>, gas: u64) -> VM {
             ScriptBuilder::parse(&script).unwrap().into_instructions(),
             CallKind::ExternalRoot,
             gas,
-        ),
+        )
+        .with_readwrite(true),
     )
 }
 
@@ -86,6 +87,7 @@ fn usage_and_capacity_read_actor_storage() {
             kind,
             1_000_000,
         )
+        .with_readwrite(true)
         .with_anchor(Anchor([0u8; 32])),
     );
     for _ in 0..3 {
@@ -103,7 +105,9 @@ fn storage_introspection_requires_registry() {
     };
     let mut vm = VM::new(
         dummy_header(),
-        CallFrame::new(vec![Instruction::Usage], kind, 1_000_000).with_anchor(Anchor([0u8; 32])),
+        CallFrame::new(vec![Instruction::Usage], kind, 1_000_000)
+            .with_readwrite(true)
+            .with_anchor(Anchor([0u8; 32])),
     );
     assert!(matches!(
         vm.step_internal(),
@@ -151,6 +155,7 @@ fn storage_quote_and_purchase_use_host_result() {
             },
             1_000_000,
         )
+        .with_readwrite(true)
         .with_anchor(Anchor([0u8; 32])),
     );
     quote_vm.step_internal_with_registry(&mut reg).unwrap();
@@ -168,6 +173,7 @@ fn storage_quote_and_purchase_use_host_result() {
             kind,
             1_000_000,
         )
+        .with_readwrite(true)
         .with_anchor(Anchor([0u8; 32])),
     );
     buy_vm.step_internal_with_registry(&mut reg).unwrap();

@@ -1,27 +1,24 @@
 # Cell-based encoding
 
-FlameVM values are [Cells](cells.md), described using [CTL](../cells/ctl.md).
-Fields follow declaration order: inline fields append payload bytes; `^T`
-appends a child reference. Only enums add tags. Integers are little-endian.
-Human-readable formats are specified in [Addresses](address.md).
+This document owns Flame's application data layouts and identifier definitions.
+Schemas use [CTL](../cells/ctl.md#type-reference); generic Cell records, hashing
+and transport are specified in [Cells](cells.md). VM behavior is specified in
+[FlameVM](flamevm.md), and human-readable formats in [Addresses](address.md).
 
 ## Primitives and containers
 
 | Type | Encoding |
 | --- | --- |
-| `U8 / U16 / U32 / U64` | Fixed-width unsigned LE integer. |
-| `V128` | Canonical unsigned LEB128, bounded to U64. |
-| `[U8; N]` | Exactly N bytes, no length prefix. |
-| `Cell` | 0..4095 payload bytes, 0..4 refs, or explicit pruning record. |
-| Scalar | Canonical 32-byte LE residue below the Ristretto scalar order. |
-| Point / Predicate | 32-byte CompressedRistretto representation; curve validation at cryptographic use. |
-| Byte blob | Dedicated zero-ref Cell, 0..4095 raw payload bytes with no length prefix. |
-| Trie | One radix-4 Patricia Cell format; owning schema fixes key width. |
+| `U8 / U16 / U32 / U64`, `V128`, `[T; N]`, `^T` | [CTL type reference](../cells/ctl.md#type-reference). |
+| `Cell` | [Canonical Cell record](cells.md#canonical-cell-record). |
+| Scalar | Canonical 32-byte LE residue below the [Scalar field order](flamevm.md#scalar-values). |
+| Point / Predicate | 32-byte CompressedRistretto representation; [VM validation rules](flamevm.md#point). |
+| Byte blob | Dedicated zero-ref Cell containing raw bytes, without a length prefix, within the [payload limit](cells.md#limits). |
+| Trie | [Patricia Cell format](cells.md#trie); the owning schema fixes key width. |
 
-`CellID` is the highest-level factual hash. References commit hash/depth
-summaries; pruning preserves lower commitments but changes the factual ID.
-Transport is a root-last DAG: V128 record count, Cell records and backward
-V128 reference distances. See [Cells](cells.md) for records and proof levels.
+CellID, pruning levels and transport use the [Cell identity](cells.md#identity),
+[virtualization](cells.md#pruning-and-virtualization) and
+[root-last graph transport](cells.md#root-last-graph-transport) definitions.
 
 Schemas below share preceding declarations. Conditional refs use handwritten
 codecs; CTL does not automatically spill fields into children. Applications
@@ -58,29 +55,23 @@ struct Contract {
 
 Dict keys reverse canonical Scalar bytes into 32-byte BE ordered paths.
 The count and sticky flags belong to the Dict, not the Trie: portable bit 0,
-droppable bit 1; other bits are invalid. A drained Dict is droppable regardless
-of its sticky bit. No special list encoding exists.
+droppable bit 1; other bits are invalid. No special list encoding exists.
+Runtime representations, capability rules and admission checks are specified
+under [Dict](flamevm.md#dict) and [Types](flamevm.md#types).
 
-Runtime construction uses a native ordered map and defers Trie construction
-and hashing until commitment/serialization. This does not change the encoded
-layout. Decoded Dicts remain cell-backed and preserve lazy authenticated access;
-serialization never grants authority to resolve missing or pruned branches.
-
-Other Value tags and runtime-only types are rejected. Private witnesses never
-enter encoding or hashes. ContractID is the Contract root's factual CellID;
-`input` takes that root. Authenticated Dict summaries can be read lazily;
-arbitrary imports validate their contents. Portability and ownership are
-enforced by the VM separately from layout validation.
+Other Value tags and runtime-only types are rejected, including reserved tag 1
+(the removed String variant); existing tags are not renumbered.
+ContractID is the Contract root's factual CellID. Typed import validation is
+specified in [VM encoding](flamevm.md#encoding), and private annotations in
+[CellValue](flamevm.md#cell).
 
 ## Programs and predicates
 
-Programs are raw bytecode in Cell payloads. `pushcell` consumes a program ref;
-`exec` enters its continuation. There is no length prefix or automatic spilling.
-
-A Taproot predicate is a compressed key, with the tweak committing
-`policy.hash(0)`. `open` executes the supplied policy Cell; optional child
-selection uses ordinary `runslice / loadref / exec` bytecode. Unselected branches
-may be pruned. `signcall` binds `policy.id()`, the factual highest-level hash.
+Programs are raw bytecode in Cell payloads, without a length prefix or automatic
+spilling. Bytecode semantics are specified in the [Instruction set](flamevm.md#instruction-set).
+Predicate representation is listed above; its Taproot binding and execution
+are specified by [`open`](flamevm.md#open), and program authorization by
+[`signcall`](flamevm.md#signcall).
 
 ## Actor addresses, state and messages
 
@@ -118,17 +109,13 @@ enum Address: U8 {
 }
 ```
 
-ActorID is the constructor's factual CellID: 32 bytes, without a tag or reversal.
-`send` and `call` take an ActorAddress Cell. ActorState has empty payload and two
-refs: code and a portable Value root. Freeze prunes the entire ActorState;
-Restore authenticates it against the saved snapshot, preserving older cuts.
-See [Actors](flamevm.md#actors) for execution and rollback rules.
+ActorID is 32 bytes without a tag or reversal; its derivation and routing
+behavior are specified under [Actors](flamevm.md#actors). ActorState has empty
+payload and two refs: code and a portable Value root.
 
 Message payload is one tagged portable Value, without an implicit argument-list
-Dict. Applications group fields explicitly in a Dict; Scalar zero conventionally
-represents no application data. MessageID is the Message Cell's factual ID; each
-send ratchets the anchor for uniqueness. Failed delivery seals that same Value
-directly into the refund Contract.
+Dict. MessageID is the Message Cell's factual ID. Delivery, uniqueness and
+failure handling are specified under [Messages](flamevm.md#messages).
 The routing `Address::MessageTarget` also carries one portable Value directly;
 its encoder and decoder both reject nonportable payloads.
 
@@ -150,9 +137,8 @@ struct LeasesHeader { count: U32 }
 // Optional Trie ref; U64 BE expiry keys, U64 LE unit-count leaves.
 ```
 
-Present stores the content root and protocol cell as two refs. Freezing prunes
-only content; protocol metadata survives. LeasesOnly retains outstanding leases
-after destruction. Storage charging is specified in [Actor storage](storage.md).
+Present stores the content root and protocol cell as two refs. Registry lifecycle
+and storage charging are specified in [Actor storage](storage.md).
 
 ## Transactions and execution witnesses
 
@@ -173,13 +159,12 @@ struct TxLog { entry_count: U64, entries: ^Cell }
 struct ProgramGraph { code: ^Cell, witnesses: ^Cell }
 ```
 
-ProgramGraph witnesses have U32 count, U8 original cap and a 32-byte-keyed Trie
-ref iff nonempty, mapping original factual IDs to proof bodies. This immutable
-transaction scope is shared by calls and async descendants. Private prover
-assignments are excluded; caches and other transactions do not enlarge it.
+ProgramGraph witnesses use the [CellIndex snapshot layout](cells.md#a-snapshot-is-an-ordinary-cell-hierarchy).
+Execution scope and witness discovery are specified under
+[Resolution and witness context](cells.md#resolution-and-witness-context).
 
 The transmitted log is a canonical mask-one pruning Cell retaining the computed
-log's hash(0) and LE depth(0). It is checked by re-execution, not decoded as a log.
+log's hash(0) and depth(0). It is checked by re-execution, not decoded as a log.
 TxID = TxBody.id(); WitnessID = Tx.id(); EffectID = computed TxLog.hash(0).
 Internal execution IDs use their factual computed logs, including Receive.
 
@@ -211,10 +196,10 @@ enum TxEntry: U8 {
 }
 ```
 
-Data is a raw byte blob in one zero-ref Cell, at most 4095 bytes, without a
-length prefix. ActorSave data is a Value root; ActorRestore state is the
-supplied ActorState proof. External Tx transport carries its root directly.
-Typed CellEnvelope snapshots wrap U8 cap and one proof-root reference.
+Data uses the byte-blob layout above. ActorSave data is a Value root;
+ActorRestore state is the supplied ActorState proof. External Tx transport
+carries its root directly. Other typed CellEnvelope snapshots use
+[the generic snapshot layout](cells.md#typed-object-snapshots).
 
 ## Blocks and Utreexo
 
@@ -232,12 +217,13 @@ struct SequenceHeader { count: U32 }
 // Optional Trie ref; consecutive U32 BE keys, expected-type leaves.
 ```
 
-BlockHeader has 212 payload bytes and no refs; BlockHash is its CellID.
+BlockHash is the BlockHeader CellID.
 Witness root is the transaction sequence's factual ID; effects root is the
 execution-record sequence's factual ID. Block transport uses CellEnvelope.
 
 Utreexo proofs keep their existing `merkle / readerwriter` byte encoding,
 stored as raw payloads in dedicated zero-ref Cells inside BlockTx, with no
 additional length prefix. Each depth-63 proof fits the 4095-byte Cell limit.
+The legacy Proof decoder must consume the entire blob, rejecting trailing bytes.
 These Cell layouts change consensus identities; no legacy decoder or state
 migration is provided.

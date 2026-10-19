@@ -1099,7 +1099,8 @@ fn slice_access_rejects_missing_or_pruned_bodies_and_old_pushstr_is_not_an_opcod
             },
             1_000_000,
         )
-        .unwrap(),
+        .unwrap()
+        .with_readwrite(true),
     );
     assert!(matches!(
         run_to_end(&mut vm),

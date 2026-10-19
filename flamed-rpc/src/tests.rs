@@ -53,6 +53,27 @@ fn a_tip_names_its_fields() {
 }
 
 #[test]
+fn a_query_result_pins_its_block_and_encodes_data_as_base64() {
+    let result = crate::ActorQueryResult {
+        block: BlockId([0x11; 32]),
+        height: 7,
+        value: crate::ValueEnvelope(vec![1, 2, 3]),
+        gas_used: 42,
+    };
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "block": "11".repeat(32), "height": 7, "value": "AQID", "gas_used": 42,
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<crate::ActorQueryResult>(json).unwrap(),
+        result
+    );
+}
+
+#[test]
 fn a_status_is_an_internally_tagged_enum() {
     // The tagged path deserializes through serde's buffered content, which is
     // why the codec modules take an owned `String` rather than a `&str`.

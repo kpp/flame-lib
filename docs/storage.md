@@ -18,7 +18,6 @@ the global pool are restricted to whole `STORAGE_UNIT_BYTES` units.
 
 | Parameter | Initial value |
 | --- | ---: |
-| `SPARKS_PER_FLAME` | `100_000_000` |
 | `STORAGE_UNIT_BYTES` | `1_024` |
 | `INITIAL_POOL_BYTES` | `128 * 1_024 * 1_024 = 134_217_728` |
 | `INITIAL_POOL_UNITS` | `131_072` |
@@ -30,8 +29,8 @@ the global pool are restricted to whole `STORAGE_UNIT_BYTES` units.
 | `LEASE_RECORD_BYTES` | `16` |
 | `INITIAL_PRICE_SPARKS_PER_UNIT` | `10 * SPARKS_PER_FLAME = 1_000_000_000` |
 
-One Flame is divisible into `100_000_000` sparks, analogous to satoshis in
-Bitcoin. All Flame token quantities and storage fees are integral sparks.
+`SPARKS_PER_FLAME` is the native [Flame denomination](flamevm.md#tokens).
+Storage fees use those integral sparks.
 
 A core-block height is the protocol's Bitcoin-coupled block counter. Lease
 duration and expiry use that counter, never timestamps; every internal
@@ -75,6 +74,12 @@ survives actor destruction because destroying an actor does not refund its
 unexpired leases. It is a cache derived from the committed per-actor lease
 lists; block validation checks that both representations match before commit.
 
+The storage supply invariant is: the activated initial pool plus all units
+issued so far equals available units plus all outstanding lease units, including
+leases retained after actor destruction. Purchases allocate existing units;
+they do not issue storage. Expiry returns units to the pool without changing
+this total.
+
 At the beginning of core block `h`, before executing transactions:
 
 1. Remove leases whose `expiry_height == h` and return their units to the pool.
@@ -87,16 +92,15 @@ pool immediately. This makes every quote a deterministic function of preceding
 block execution.
 
 At the end of the block, marked actors are frozen in lexicographic actor-ID
-order. Their entire two-reference ActorState root becomes one explicit pruned
+order. Their entire ActorState root becomes one explicit pruned
 Cell; application bodies are removed, but identity, size metadata and
 outstanding leases remain. No system internal
 transaction is generated and no token or other linear value is retired.
 Unexpired leases recycle only at their original expiration heights.
 
-The total actor Cell holds two references: ActorState and a protocol Cell
-containing size metadata and the lease-list reference. Freezing replaces only
-the ActorState reference; protocol metadata remains available. The exact
-layouts are in [Cell-based encoding](encoding.md#actor-addresses-state-and-messages).
+Freezing affects only content, not protocol metadata; the actor-state and
+registry layouts are specified in
+[Cell-based encoding](encoding.md#actor-addresses-state-and-messages).
 
 A later transaction uses the canonical ActorAddress Restore variant with an
 authenticated partial image. This is not redeployment: actor identity and
@@ -151,39 +155,32 @@ body into the current execution is not a storage purchase or persistent restore.
 ### Content, availability, and recovery
 
 Actor layouts and their ordered lease Tries are specified in
-[encoding.md](encoding.md). The content image has empty payload and exactly
-two refs: native code and an encoded portable Value. The actor registry commits
-its whole image/lease layout and the exact retained graph's snapshot CellID.
+[Cell-based encoding](encoding.md#actor-addresses-state-and-messages).
+The registry commits the exact retained graph's snapshot CellID.
 Initialized images can be partially available; frozen images contain one
-whole-root cut. Actor images reserve the outermost of fifteen pruning levels
+whole-root cut. Actor images reserve the outermost available pruning level
 so expiry cannot fail because another proof level is unavailable.
 
-The VM resolver is scoped to the current actor's resident code/state body set
-and the initiating external transaction's frozen execution Cell index. Actor-layout
-and lease-index metadata belong to the registry commitment and archival export,
-not this implicit execution source. Instruction-boundary scope refreshes share
-the immutable body set rather than copying or rebuilding it. Loaded bodies do not
-silently become rent-bearing. `save` and `setcode` retain newly constructed
+Resolver sources are specified in
+[Resolution and witness context](cells.md#resolution-and-witness-context).
+Loaded bodies do not silently become rent-bearing. `save` and `setcode` retain newly constructed
 reachable bodies and previously owned reachable bodies; they do not union the
-external witness bag into actor storage. Restore explicitly authenticates a
-supplied partial image and merges its bodies without erasing prior retention.
-The actor buys any required capacity itself during execution. Restoration,
-method effects and purchases share one checkpoint and roll back on failure;
-partial progress is retained only by a successful transaction. Removed branches cease to contribute
+external witness bag into actor storage. Restore explicitly merges supplied
+bodies without erasing prior retention; its authentication and atomic execution
+rules are specified in [Actors](flamevm.md#actors). The actor buys any required
+capacity itself during that execution. Removed branches cease to contribute
 to stored availability or rent. Partial Dicts retain their authenticated
 portability and linearity metadata when their descendants are absent.
 
-Storage reads decode canonical Cells even when an in-memory Value cache exists.
-This prevents earlier executions' private witnesses or loaded Dict branches
-from changing behavior after a restart. Each logical root/continuation access
-still goes through the metered resolver. Failure and re-entrancy checks preserve
-checkout ownership: successful `load` checks out the state once, `save` requires
-that checkout, and enclosing call/transaction rollback restores it.
+Canonical storage reads must not depend on earlier executions' private witnesses
+or host caches. Metering follows [Cell-read gas](flamevm.md#cell-read-gas);
+checkout ownership and failure recovery follow [`load`](flamevm.md#load),
+[`save`](flamevm.md#save) and [Actors](flamevm.md#actors).
 
 `Blockchain::actor_storage` returns a read-only `StoredActor` snapshot containing
 the layout root and exact resident Cell index for archival and witness construction.
-Expiry freezing is implemented; a dedicated VM operation for arbitrary partial
-pruning or persistent restoration is not yet provided.
+Expiry freezing and ActorAddress restoration are implemented. A dedicated VM
+operation for arbitrary partial pruning is not yet provided.
 
 ## Pricing
 
@@ -232,10 +229,9 @@ parameters:
 | `134_216_704` bytes | `1` unit | `17_179_738_112_000_000_000` | available |
 | `134_217_728` bytes | `0` units | — | unavailable |
 
-Storage-purchase effects use the TxEntry Cell encoding in
-[encoding.md](encoding.md): the expected actor identity, byte amount, expiry,
-and fixed-width Scalar fee are committed by the transaction-log Trie. Actor
-registry roots likewise use Cell Tries, including lease-only tombstones.
+Storage-purchase effects and registry commitments use the canonical
+[TxLog](encoding.md#txlog) and
+[actor registry](encoding.md#actor-addresses-state-and-messages) encodings.
 Tests cover exact price vectors, content/availability commitments, canonical
 public storage reads, expiry freezing, and checkpoint/reorganization recovery.
 
@@ -253,21 +249,18 @@ Only an actor may purchase storage. It may fund itself from Flame in its state,
 its one call argument, or a delivered message. There is no transferable virtual-
 byte asset and callers do not allocate storage directly to callees.
 
-For a valid byte request `q`, [`quotestorage`](flamevm.md#quotestorage) returns
-the positive integral `fee_sparks` without changing state.
-[`addstorage`](flamevm.md#addstorage) recomputes the same quote, immediately
+[`quotestorage`](flamevm.md#quotestorage) is read-only.
+[`addstorage`](flamevm.md#addstorage) applies the same pricing rules, immediately
 deducts the units from the pool, and adds a lease expiring at:
 
 ```text
 current_height + LEASE_DURATION_CORE_BLOCKS
 ```
 
-It emits a storage-purchase effect and returns
-`ClearToken(-fee_sparks, FLAME_FLAVOR)`. The transaction must balance that debt
-with actual Flame. A successful storage-purchase effect burns the balanced
-amount irrevocably; minters do not collect it. `retire` rejects clear tokens
-whose quantities have a negative centered interpretation, so the debt cannot
-be erased instead of balanced.
+The VM's storage-purchase debt must be balanced with actual Flame. A successful
+purchase burns that amount irrevocably; minters do not collect it. Debt creation
+and validation are specified with [`addstorage`](flamevm.md#addstorage) and
+[`retire`](flamevm.md#retire).
 
 `quotestorage` is advisory, not a reservation. Any intervening successful
 purchase changes the reserve and therefore the result of a later `addstorage`.
@@ -277,23 +270,8 @@ fails at finalization and rolls the purchase back.
 
 ## Introspection
 
-Actors can inspect their lease schedule without receiving the underlying list:
-
-```text
-height             -> h
-usage              -> bytes
-h capacity         -> bytes
-q quotestorage     -> { fee_sparks 1 | 0 }
-q addstorage       -> { flame_debt 1 | 0 }
-```
-
-`height` returns the current core-block height during an internal transaction
-and zero throughout an external transaction. `usage` returns the current
-actor's charged usage. `capacity(h)` returns its capacity at current or future
-height `h`. Scalar residues outside the `u64` height range hard-fail `InvalidBitrange`, and a
-height below the current block hard-fails `StorageHeightInPast`. `usage` and
-`capacity` require actor context and a registry.
-
-When state is checked out by `load`, `usage` continues to describe the checked-
-out committed state until `save` supplies its replacement. `save` measures the
-replacement before committing it and fails if it exceeds current capacity.
+Actors can query storage without receiving the underlying lease list. Stack
+interfaces, permitted contexts and failures are specified with
+[`height`](flamevm.md#height), [`usage`](flamevm.md#usage),
+[`capacity`](flamevm.md#capacity), [`quotestorage`](flamevm.md#quotestorage) and
+[`addstorage`](flamevm.md#addstorage).

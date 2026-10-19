@@ -200,6 +200,18 @@ pub enum VMError {
     #[error("Actor not found in registry")]
     ActorNotFound,
 
+    #[error("Operation requires readwrite permission")]
+    ReadOnlyViolation,
+
+    #[error("Actor queries accept and return only portable data and data-only Dicts")]
+    NonDataInQuery,
+
+    #[error("Read-only save changed the actor state commitment")]
+    QueryStateChanged,
+
+    #[error("Read-only actor state was not restored")]
+    QueryStateNotRestored,
+
     /// The actor's combined state root is pruned and requires explicit Restore.
     #[error("Actor is frozen")]
     ActorFrozen,

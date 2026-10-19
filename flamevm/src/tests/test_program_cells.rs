@@ -14,6 +14,7 @@ fn native_vm(program: Cell) -> VM {
             1_000_000,
         )
         .unwrap()
+        .with_readwrite(true)
         .with_anchor(Anchor([3; 32])),
     )
 }
@@ -305,7 +306,8 @@ fn exec_failure_restores_entry_assets_without_touching_the_parent_loan() {
         },
         500,
     )
-    .unwrap();
+    .unwrap()
+    .with_readwrite(true);
     let credit = Value::ClearToken(ClearToken::new(Scalar::from(5u64), Scalar::from(3u64)));
     vm.current_call.stack.push(credit.clone());
     let parent = vm.call_stack.last_mut().unwrap();

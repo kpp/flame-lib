@@ -80,7 +80,7 @@ names the byte offset, and truncating the file there is the recovery.
 
 ## The RPC
 
-Seven methods, no prefix, positional parameters. Ids and points are
+Methods have no prefix and use positional parameters. Ids and points are
 lowercase hex strings; blobs are standard base64.
 
 | Method | Parameters | Answers |
@@ -89,14 +89,33 @@ lowercase hex strings; blobs are standard base64.
 | `proof` | `id` | `unspent` with a proof, `spent` with where, or `unknown` |
 | `proofs` | `ids` | the same, for up to 1024 ids at once |
 | `contract` | `id` | the contract as published, with its height and predicate |
+| `query_actor` | `id`, `argument`, `gas_limit`, `expected_block?` | read-only result `{block, height, value, gas_used}` at the current tip |
 | `submit_tx` | `block_tx` | the txid, once the mempool has taken it |
 | `tx_status` | `txid` | `unknown`, `mempool`, or `confirmed` with where |
 | `scan` | `predicates`, `since_height` | every contract created under those predicates since that height, each with its note |
 
 Server-defined error codes, in the JSON-RPC 2.0 server range: `-32001`
 `NOT_FOUND`, `-32002` `MEMPOOL_REJECTED`, `-32003` `LIMIT_EXCEEDED`,
-`-32004` `INVALID_BYTES`. Anything else is `-32603`, which means the node is
+`-32004` `INVALID_BYTES`, `-32005` `STALE_BLOCK`, `-32006` `QUERY_FAILED`.
+Anything else is `-32603`, which means the node is
 broken rather than the request.
+
+`query_actor` invokes the actor with one data argument, no authenticated
+caller, and `readwrite = false`. Its argument and result are base64
+`CellEnvelope`s encoding one VM `Value`: Scalar, Point, Cell, or a portable
+Dict containing only these values recursively. Empty and nested Dicts are
+accepted; token and runtime values are rejected at any depth. Envelopes
+are limited to 64 KiB, typed Dict decoding is bounded, and execution gas must
+be 1..=1,000,000. The result's
+`gas_used` includes VM work but excludes bounded envelope decoding. No fee
+is paid and no effects persist, including on failure. Ordinary writes enter
+through messages in transactions submitted with `submit_tx`.
+
+An optional `expected_block` pins the query to that current tip; it returns
+`STALE_BLOCK` if the tip has changed. It does not query historical state.
+For a multi-hop lookup, reuse the first result's `block` and restart the
+lookup if it becomes stale. A block hash labels the answer; it is not a
+proof that a remote node executed the getter correctly.
 
 `proofs` answers about the tip it holds at that moment, and a proof survives
 exactly one block after the one it was made against. A wallet that fetches
@@ -108,7 +127,7 @@ The protocol lives in its own crate, `flamed-rpc`, which depends on neither
 `flamevm` nor `flamechain` and needs neither: every wire type is a newtype
 over bytes with a public field, so a conversion is a one-liner at the call
 site. That is what lets an explorer, a monitor or a WASM client speak these
-seven methods without the VM behind them. The crate defines them once with
+methods without the VM behind them. The crate defines them once with
 `#[rpc(server, client)]`, so the node's server and every consumer's client
 are generated from the same declaration and cannot drift.
 

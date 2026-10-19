@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Mint playground · Flame</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar wrap">
+    <h1 id="page-title">Mint playground</h1>
+    <div class="topbar-actions"><div class="unit-switch" role="group" aria-label="Display currency"><button id="unit-sat" type="button" aria-pressed="true">sat</button><button id="unit-btc" type="button" aria-pressed="false">BTC</button><button id="unit-usd" type="button" aria-pressed="false">USD</button></div><a id="navigation" href="/mint">Mint</a></div>
+  </header>
+  <main class="wrap">
+    <div class="service-status"><p>Simulation only. No real funds.</p><p id="connection" class="connection" role="status">Connecting…</p></div>
+    <p id="price-status" class="small price-status" role="status">Loading BTC/USD…</p>
+
+    <section class="metrics" aria-label="Minting metrics">
+      <div><p id="total-burned-label">Burned</p><p class="metric-value" id="total-burned">—&nbsp;sat</p></div>
+      <div><p>Earned</p><p class="metric-value" id="total-reward">—&nbsp;FLM</p></div>
+      <div><p id="total-rate-label" title="Current block's burn divided by 50 FLM, excluding fees">Current rate</p><p class="metric-value" id="total-rate">—&nbsp;sat/FLM</p></div>
+    </section>
+
+    <section class="panel chart-panel" aria-labelledby="chart-title">
+      <div class="section-heading"><h2 id="chart-title">Burn rate and mining fees</h2></div>
+      <div class="chart-legend"><span><i class="swatch other"></i><span id="others-label">Burn ↑</span></span><span id="own-legend" hidden><i id="own-swatch" class="swatch own"></i>You</span><span id="draft-legend" hidden><i id="draft-swatch" class="swatch draft"></i>Draft</span><span id="fees-legend"><i class="swatch fees"></i>Mining fees ↓</span></div>
+      <div class="chart-units"><span id="chart-burn-unit">sat/block</span><span id="chart-rate-unit">sat/FLM</span></div>
+      <div id="chart-wrap" class="canvas-wrap with-fees"><canvas id="chart" role="img" aria-label="Burn above zero and mining fees below zero share a satoshis-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous 1,000 blocks; now is at the right edge."></canvas></div>
+      <div class="chart-footer"><span>Block <strong id="current-block">—</strong> · <span id="chart-window">Previous 1,000 blocks</span></span><span id="chart-note">History only</span></div>
+    </section>
+
+    <section id="mint-form" class="panel mint-panel" hidden aria-labelledby="mint-title">
+      <div class="section-heading"><h2 id="mint-title">Contribution</h2><span id="fee-label" class="muted">Fee: 1,000 sat/block</span></div>
+      <div class="mint-grid">
+        <form id="contribution-form">
+          <div class="slider-heading"><label for="budget">Budget, incl. fees</label><output id="budget-value" for="budget"></output></div>
+          <input id="budget" type="range" min="100000" max="100000000" step="100000" value="1000000">
+          <div class="range-labels"><span id="budget-min">100,000 sat</span><span id="budget-max">100,000,000 sat</span></div>
+          <div class="slider-heading duration-heading"><label for="duration">Duration</label><output id="duration-value" for="duration"></output></div>
+          <input id="duration" type="range" min="100" max="1000" step="50" value="500">
+          <div class="range-labels"><span>100 blocks</span><span>1,000 blocks</span></div>
+          <p id="budget-error" class="form-message" role="status"></p>
+          <button id="submit" type="submit" disabled>Loading wallet…</button>
+          <p id="submit-message" class="form-message" role="status"></p>
+          <button id="discard-pending" class="text-button" type="button" hidden>Discard pending request</button>
+        </form>
+        <div class="projection">
+          <h3>Estimate</h3>
+          <dl><div><dt>Reward (FLM)</dt><dd id="projected-reward">—</dd></div><div><dt>Fees</dt><dd id="projected-fees">—</dd></div><div><dt>Burn</dt><dd id="projected-burn">—</dd></div><div><dt id="projected-rate-label">sat/FLM, incl. fees</dt><dd id="projected-rate">—</dd></div></dl>
+          <p class="muted small">Others stay at current burn rate. Your schedules stay exact. Starts next block.</p>
+        </div>
+      </div>
+      <div class="wallet"><h3>Reward address (testnet)</h3><p id="wallet-status" class="muted small">Loading wallet…</p><code id="wallet-address">—</code><details id="seed-details"><summary>Recovery phrase</summary><p class="muted small">Demo only. Anyone with this phrase controls the wallet. Stored in this browser.</p><p id="seed-phrase" class="seed-phrase"></p></details><button id="retry-wallet" type="button" hidden>Retry wallet</button> <button id="reset-wallet" type="button" hidden>Reset wallet</button></div>
+    </section>
+
+    <section class="panel table-panel" aria-labelledby="contributions-title">
+      <div class="section-heading"><h2 id="contributions-title">Contributions</h2><a href="/api/rewards" target="_blank" rel="noopener">Rewards JSON</a></div>
+      <div class="table-scroll"><table><thead><tr><th>Contribution</th><th>Status</th><th id="table-burned-label" class="number">Sats burned</th><th class="number">FLM earned</th><th id="table-fees-label" class="number">Mining fees (sat)</th><th class="number"><span id="table-rate-label">sat / FLM</span> <span class="muted">incl. fees</span></th></tr></thead><tbody id="contributions"></tbody><tfoot id="contribution-totals"></tfoot></table></div>
+      <p id="empty-table" class="empty" hidden>No contributions.</p>
+    </section>
+  </main>
+</body>
+</html>

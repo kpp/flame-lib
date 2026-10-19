@@ -240,6 +240,7 @@ fn infinite_loop_exhausts_gas() {
             kind,
             1_000,
         )
+        .with_readwrite(true)
         .with_anchor(Anchor([0u8; 32])),
     );
     assert!(matches!(
@@ -269,6 +270,7 @@ fn skip_scan_charges_gas() {
             kind,
             10,
         )
+        .with_readwrite(true)
         .with_anchor(Anchor([0u8; 32])),
     );
     assert!(matches!(
@@ -281,7 +283,8 @@ fn skip_scan_charges_gas() {
 
 #[test]
 fn gas_counter_overflow_is_out_of_gas() {
-    let mut frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, u64::MAX);
+    let mut frame =
+        CallFrame::new(Vec::new(), CallKind::ExternalRoot, u64::MAX).with_readwrite(true);
     frame.gas_used = u64::MAX;
     assert!(matches!(frame.charge_gas(1), Err(VMError::OutOfGas)));
 }
@@ -308,6 +311,7 @@ fn gas_bounds_cumulative_builder_growth() {
             kind,
             100,
         )
+        .with_readwrite(true)
         .with_anchor(Anchor([0u8; 32])),
     );
     assert!(matches!(
@@ -331,6 +335,7 @@ fn allocation_gas_trips_on_pushstr_append_and_tread() {
                 kind,
                 gas,
             )
+            .with_readwrite(true)
             .with_anchor(Anchor([0u8; 32])),
         );
         run_until_tx_done(&mut vm)
@@ -438,7 +443,7 @@ fn return_too_few_items_errors() {
 fn return_transfers_values_to_parent() {
     // Child script returns one scalar directly.
     let child_script = ScriptBuilder::new().push_int(7u64).return_().to_bytecode();
-    let parent_frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500);
+    let parent_frame = CallFrame::new(Vec::new(), CallKind::ExternalRoot, 500).with_readwrite(true);
     let child_kind = CallKind::ContractOpen {
         predicate: Predicate::opaque(CompressedRistretto([0u8; 32])),
         external_context: true,
@@ -450,7 +455,8 @@ fn return_transfers_values_to_parent() {
             .into_instructions(),
         child_kind,
         500,
-    );
+    )
+    .with_readwrite(true);
     let mut vm = VM::new(dummy_header(), parent_frame);
     let initial_parent = mem::replace(&mut vm.current_call, child_frame);
     vm.call_stack.push(initial_parent);

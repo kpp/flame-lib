@@ -74,8 +74,9 @@ fn context_registry() -> MemRegistry {
 }
 
 fn step(context: Context, instruction: Instruction) -> Result<bool, VMError> {
-    let frame =
-        CallFrame::new(vec![instruction], kind(context), 1_000_000).with_anchor(Anchor([0x33; 32]));
+    let frame = CallFrame::new(vec![instruction], kind(context), 1_000_000)
+        .with_readwrite(true)
+        .with_anchor(Anchor([0x33; 32]));
     let mut vm = VM::new(dummy_header(), frame);
     if is_external(context) {
         vm.step_external(&mut make_stub_delegate())
@@ -148,6 +149,7 @@ fn restricted_opcode_context_matrix() {
     for (name, instruction) in [
         ("issuepub", Instruction::IssuePub),
         ("call", Instruction::Call),
+        ("query", Instruction::Query),
         ("load", Instruction::Load),
         ("save", Instruction::Save),
         ("setcode", Instruction::Setcode),
@@ -180,7 +182,8 @@ fn raw_scalar_range_checks_in_every_context_and_preserves_type() {
     ];
     for context in CONTEXTS {
         for (value, bits, expected_error) in &cases {
-            let frame = CallFrame::new(vec![Instruction::Range], kind(context), 1_000_000);
+            let frame = CallFrame::new(vec![Instruction::Range], kind(context), 1_000_000)
+                .with_readwrite(true);
             let mut vm = VM::new(dummy_header(), frame);
             vm.push_value(Value::Scalar(*value));
             vm.push_value(Value::Scalar(Scalar::from(*bits)));
@@ -208,7 +211,8 @@ fn raw_scalar_range_checks_in_every_context_and_preserves_type() {
 #[test]
 fn range_expression_context_matrix() {
     for context in CONTEXTS {
-        let frame = CallFrame::new(vec![Instruction::Range], kind(context), 1_000_000);
+        let frame =
+            CallFrame::new(vec![Instruction::Range], kind(context), 1_000_000).with_readwrite(true);
         let mut vm = VM::new(dummy_header(), frame);
         vm.push_value(Value::Expression(Expression::Constant(Scalar::ONE)));
         vm.push_value(Value::Scalar(Scalar::from(64u64)));
@@ -235,7 +239,8 @@ fn callerid_reports_attribution_without_granting_actor_context() {
         (Context::ExternalContractOpen, [0; 32]),
         (Context::InternalContractOpen, [0x22; 32]),
     ] {
-        let frame = CallFrame::new(vec![Instruction::Callerid], kind(context), 100);
+        let frame =
+            CallFrame::new(vec![Instruction::Callerid], kind(context), 100).with_readwrite(true);
         let mut vm = VM::new(dummy_header(), frame);
         if is_external(context) {
             vm.step_external(&mut make_stub_delegate()).unwrap();
@@ -263,7 +268,8 @@ fn nested_contractopen_does_not_transitively_inherit_actor_identity() {
             caller: None,
         },
         1_000,
-    );
+    )
+    .with_readwrite(true);
     let mut vm = VM::new(dummy_header(), frame);
     let make_contract = || {
         Contract::new(
@@ -319,7 +325,8 @@ fn contractopen_call_rejects_before_consuming_operands() {
             caller_id: Some([0x22; 32]),
         },
         1_000,
-    );
+    )
+    .with_readwrite(true);
     let mut vm = VM::new(dummy_header(), frame);
     vm.current_call.stack = vec![
         Value::Scalar(Scalar::from(7u64)),
@@ -351,7 +358,8 @@ fn issuepub_is_available_in_actorcall() {
             caller: ActorID::from([0x22; 32]),
         },
         1_000,
-    );
+    )
+    .with_readwrite(true);
     let mut vm = VM::new(dummy_header(), frame);
 
     run_to_end(&mut vm).unwrap();
@@ -379,6 +387,7 @@ fn send_is_available_everywhere_but_contractopen_never_delegates_its_caller() {
             kind(context),
             1_000,
         )
+        .with_readwrite(true)
         .with_anchor(Anchor([0x33; 32]));
         let mut vm = VM::new(dummy_header(), frame);
         while !vm.current_call.is_finished() {
