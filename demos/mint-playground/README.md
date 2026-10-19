@@ -18,7 +18,7 @@ The default database is `data/mint.sqlite3` in this directory. To choose a persi
 MINT_LISTEN=127.0.0.1:3001 ./run.sh /absolute/path/mint.sqlite3
 ```
 
-Once browser-wallet assets have been built, `cargo run --locked` starts just the service. This is a standalone crate with its own lockfile; it does not change the protocol workspace's dependencies.
+Once browser-wallet assets have been built, `cargo run --locked` starts just the service. A binary deployed away from this source tree finds them through `MINT_WALLET_DIR`, the directory holding `flamewallet_wasm.js` and `flamewallet_wasm_bg.wasm`; the [container image](Dockerfile) sets it, along with `MINT_LISTEN`. This is a standalone crate with its own lockfile; it does not change the protocol workspace's dependencies.
 
 ```sh
 cargo test --locked
