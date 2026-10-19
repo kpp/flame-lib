@@ -4,13 +4,13 @@ mod db;
 
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::LazyLock, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 type Reply<T> = oneshot::Sender<Result<T, db::Error>>;
@@ -246,7 +246,28 @@ fn router(store: Store) -> Router {
         .route("/api/contributions", post(submit))
         .layer(DefaultBodyLimit::max(2048))
         .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn(revision_header))
         .with_state(store)
+}
+
+/// The commit this build is from, set by the container image; unset in a
+/// local ./run.sh build. Every response carries it as `X-Mint-Revision`, which
+/// is how to tell from outside whether a deploy has landed.
+static REVISION: LazyLock<Option<HeaderValue>> = LazyLock::new(|| {
+    std::env::var("MINT_REVISION")
+        .ok()
+        .and_then(|revision| HeaderValue::from_str(&revision).ok())
+        .filter(|revision| !revision.is_empty())
+});
+
+async fn revision_header(request: axum::extract::Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if let Some(revision) = &*REVISION {
+        response
+            .headers_mut()
+            .insert("x-mint-revision", revision.clone());
+    }
+    response
 }
 
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
@@ -289,6 +310,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = std::env::var("MINT_LISTEN").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("Mint playground: http://{address} (simulated funds, testnet addresses only)");
+    if let Some(revision) = &*REVISION {
+        println!("Build: {}", revision.to_str().unwrap_or_default());
+    }
     let result = tokio::select! {
         result = axum::serve(listener, router(store.clone())) => result,
         result = clock(store.clone()) => Err(std::io::Error::other(result.err().map(|error| error.1).unwrap_or_default())),

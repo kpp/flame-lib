@@ -1,9 +1,10 @@
 name: Mint playground image
 
 # Builds demos/mint-playground/Dockerfile and pushes it to GHCR as
-# ghcr.io/runflame/mint-playground:<short commit>. Nothing is deployed: the
-# dev deploy is a playbook in the infrastructure repo, run by hand with that
-# tag (printed in the run summary).
+# ghcr.io/runflame/mint-playground:<short commit> and, from main, moves
+# `:main` to it. This job deploys nothing and holds no keys to any server: the
+# dev host runs `:main` with podman auto-update and pulls a new image on its
+# own within a minute or two (infrastructure repo, dev README → mint-playground).
 #
 # The paths are what the image is built from: the demo, the wallet and
 # flamekd with the workspace crates they depend on, and the toolchain.
@@ -55,11 +56,19 @@ jobs:
       id: tag
       run: echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
+    # The commit, twice: the label is how the host tells which commit `:main`
+    # is, MINT_REVISION is the X-Mint-Revision header the service sends.
     - name: Build
       env:
         TAG: ${{ steps.tag.outputs.tag }}
-      run: docker build -f demos/mint-playground/Dockerfile -t "$IMAGE:$TAG" .
+        REVISION: ${{ github.sha }}
+      run: |
+        docker build -f demos/mint-playground/Dockerfile \
+          --label "org.opencontainers.image.revision=$REVISION" \
+          --build-arg "MINT_REVISION=$REVISION" \
+          -t "$IMAGE:$TAG" .
 
+    # `:main` only from main: a manual run on another branch must not deploy.
     - name: Push
       env:
         TAG: ${{ steps.tag.outputs.tag }}
@@ -68,9 +77,16 @@ jobs:
         set -euo pipefail
         echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
         docker push "$IMAGE:$TAG"
+        if [ "$GITHUB_REF" = refs/heads/main ]; then
+          docker tag "$IMAGE:$TAG" "$IMAGE:main"
+          docker push "$IMAGE:main"
+          deployed="\`:main\` moved to it: dev picks it up within a minute or two: \`curl -sI https://dev-mint.safely.app/api/state | grep -i x-mint-revision\` shows this commit once it has."
+        else
+          deployed="Not from main, so \`:main\` is unchanged and nothing deploys."
+        fi
         docker logout ghcr.io
         {
-          echo "Pushed \`$IMAGE:$TAG\`. To deploy on dev, in the infrastructure repo:"
+          echo "Pushed \`$IMAGE:$TAG\`. $deployed"
           echo
-          echo "\`image_tag: \"$TAG\"\` in \`dev/playground/mint_playground/vars_service.yml\`, then \`ansible-playbook mint_playground/deploy.yml --ask-vault-pass\`"
+          echo "To pin dev to this build instead, in the infrastructure repo: \`image_tag: \"$TAG\"\` in \`dev/playground/mint_playground/vars_service.yml\`, then \`ansible-playbook mint_playground/deploy.yml --ask-vault-pass\`."
         } >> "$GITHUB_STEP_SUMMARY"

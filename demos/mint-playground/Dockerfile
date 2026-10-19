@@ -5,8 +5,8 @@
 # Dockerfile.dockerignore next to this file keeps target/ and .git out of the
 # context; podman does not read it, so pass it there:
 #   podman build --ignorefile demos/mint-playground/Dockerfile.dockerignore ...
-# CI builds and pushes it as ghcr.io/runflame/mint-playground:<commit>
-# (.github/workflows/mint-playground-image.yml).
+# CI builds and pushes it as ghcr.io/runflame/mint-playground:<commit> and
+# `:main` (.github/workflows/mint-playground-image.yml).
 FROM docker.io/library/rust:1.90-bookworm AS build
 
 # The image already ships 1.90.0. Naming it here overrides
@@ -45,6 +45,11 @@ COPY --from=build /out/wallet/flamewallet_wasm.js /out/wallet/flamewallet_wasm_b
 
 ENV MINT_LISTEN=0.0.0.0:3000
 ENV MINT_WALLET_DIR=/usr/share/mint-playground/wallet
+
+# The commit, sent as the X-Mint-Revision response header; CI passes it.
+# Last, so a new commit rebuilds only this layer of the final stage.
+ARG MINT_REVISION=
+ENV MINT_REVISION=$MINT_REVISION
 
 USER mint
 WORKDIR /var/lib/mint-playground
