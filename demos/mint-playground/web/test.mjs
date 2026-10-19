@@ -4,7 +4,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('./app.js', import.meta.url), 'utf8');
-const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, blockDate, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, ZOOM_KEY, ZOOM_LEVELS, blockDate, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const DEFAULT_ZOOM = 432;
 const plan = (options = {}) => ({ user_id: 1, budget_sats: 300005, duration: 100, start_block: 10, ...options });
 
 test('budget is a native linear slider with the requested endpoints', async () => {
@@ -45,6 +46,11 @@ test('calendar dates start at block one and use exact 144-block UTC days, includ
   assert.equal(blockDate(414 * 144 + 1), 'Feb 29');
   assert.equal(blockDate(415 * 144 + 1), 'Mar 1');
   assert.equal(blockDate(-1), '—');
+});
+
+test('zoom levels cover one to thirty-one days in exact two-day increments', () => {
+  assert.equal(ZOOM_KEY, 'flame-mint-playground-zoom-v1');
+  assert.deepEqual(ZOOM_LEVELS, Array.from({ length: 16 }, (_, index) => 144 + 288 * index));
 });
 
 test('integer schedule spreads the remainder into the first blocks and conserves sats', () => {
@@ -130,13 +136,17 @@ test('a contribution finishes on the last inclusive block, not one block later',
   assert.equal(contributionStatus(plan(), 109), 'finished');
 });
 
-test('the fixed palette follows user ID modulo six with no shuffle or assignment state', () => {
-  assert.deepEqual(PALETTE, ['#ffd800', '#ffc200', '#ff9c00', '#ff6922', '#ff4242', '#fff000']);
-  assert.equal(userColor(1), '#ffc200', 'the first user has ID one, not zero');
-  assert.equal(userColor(5), '#fff000');
-  assert.equal(userColor(6), '#ffd800');
-  assert.equal(userColor(7), '#ffc200');
-  for (const id of [0, 1, 2, 3, 4, 5, 6, 7, 18, 999, Number.MAX_SAFE_INTEGER]) assert.equal(userColor(id), PALETTE[id % PALETTE.length]);
+test('the twelve-color fixed palette preserves the originals and their rounded RGB midpoints with stable modulo mapping', () => {
+  const original = ['#ffd800', '#ffc200', '#ff9c00', '#ff6922', '#ff4242', '#fff000'];
+  const middle = original.map((color, index) => `#${[1, 3, 5].map(offset => Math.round((parseInt(color.slice(offset, offset + 2), 16) + parseInt(original[(index + 1) % original.length].slice(offset, offset + 2), 16)) / 2).toString(16).padStart(2, '0')).join('')}`);
+  assert.equal(PALETTE.length, 12);
+  assert.equal(new Set(PALETTE).size, 12);
+  assert.deepEqual(new Set(PALETTE), new Set([...original, ...middle]));
+  assert.deepEqual(PALETTE, ['#ffd800', '#ff6922', '#ffc200', '#ff4242', '#ff9c00', '#ffe400', '#ff9921', '#fff000', '#ffaf00', '#ff5632', '#ffcd00', '#ff8311']);
+  assert.equal(userColor(1), PALETTE[1], 'the first user has ID one, not zero');
+  assert.equal(userColor(12), PALETTE[0]);
+  assert.equal(userColor(13), PALETTE[1]);
+  for (const id of [0, 1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 18, 26, 999, Number.MAX_SAFE_INTEGER]) assert.equal(userColor(id), PALETTE[id % PALETTE.length]);
   assert.doesNotMatch(source, /Math\.random|shuffledPalette|addressColors|paletteKey/);
 });
 
@@ -146,6 +156,54 @@ test('every referenced UI element exists once in the page', async () => {
   assert.equal(ids.length, new Set(ids).size, 'duplicate element IDs');
   for (const [, id] of source.matchAll(/element\('([^']+)'\)/g)) assert.ok(ids.includes(id), `missing #${id}`);
   assert.doesNotMatch(html, /\bcomposition(?:-label)?\b|type="checkbox"/, 'contribution colors have no toggle');
+});
+
+test('reward address follows the contribution table outside the mint form, with the palette footer last', async () => {
+  const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
+  const main = html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/)[1];
+  const mint = main.match(/<section\b[^>]*id="mint-form"[^>]*>([\s\S]*?)<\/section>/)[1];
+  assert.doesNotMatch(mint, /id="(?:wallet-panel|wallet-address|seed-details)"/, 'wallet controls do not belong to the contribution form');
+  const wallet = main.match(/<section\b[^>]*id="wallet-panel"[^>]*>[\s\S]*?<\/section>/)[0];
+  assert.match(wallet, /class="panel wallet"/);
+  assert.match(wallet, /\bhidden(?:\s|>)/);
+  assert.match(wallet, /aria-labelledby="wallet-title"/);
+  assert.match(wallet, /<h[23]\b[^>]*id="wallet-title"[^>]*>Reward address \(testnet\)</);
+  for (const id of ['wallet-status', 'wallet-address', 'seed-details', 'seed-phrase', 'retry-wallet', 'reset-wallet']) assert.match(wallet, new RegExp(`id="${id}"`));
+  assert.match(wallet, /<details\b[^>]*id="seed-details"(?![^>]*\bopen)[^>]*>/, 'the recovery phrase is collapsed by default');
+  assert.ok(main.indexOf('id="contribution-totals"') < main.indexOf('id="wallet-panel"'));
+  assert.ok(main.indexOf('id="wallet-panel"') < main.indexOf('id="palette-preview"'));
+  const footer = main.match(/<div\b[^>]*id="palette-preview"[^>]*>[\s\S]*?<\/div>\s*$/)[0];
+  assert.match(footer, /\brole="list"/);
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    assert.equal(page.elements.get('wallet-panel').hidden, pathname !== '/mint');
+    assert.equal(page.elements.get('mint-form').hidden, pathname !== '/mint');
+    assert.equal(page.elements.get('palette-preview').hidden, false);
+    assert.equal(page.elements.get('seed-phrase').textContent, '');
+    assert.equal(page.storage.has('flame-mint-playground-wallet-v1'), pathname === '/mint', 'the dashboard does not initialize a wallet merely to render the footer');
+  }
+});
+
+test('both pages render exactly one accessible swatch per palette color and never accumulate swatches on redraw', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    const preview = page.elements.get('palette-preview');
+    const check = () => {
+      assert.equal(preview.children.length, PALETTE.length);
+      assert.deepEqual(preview.children.map(swatch => swatch.tag), PALETTE.map(() => 'span'));
+      assert.deepEqual(preview.children.map(swatch => swatch.style.background), PALETTE);
+      assert.deepEqual(preview.children.map(swatch => swatch.title), PALETTE);
+      assert.deepEqual(preview.children.map(swatch => swatch['aria-label']), PALETTE);
+      assert.ok(preview.children.every(swatch => swatch.role === 'listitem'));
+    };
+    check();
+    await page.refresh();
+    await page.refresh();
+    await page.event('unit-btc', 'click');
+    await page.event('time-days', 'click');
+    await page.event('zoom-out', 'click');
+    check();
+  }
 });
 
 test('linear slider budgets conserve the complete budget at duration boundaries and representative single-block choices', () => {
@@ -185,7 +243,11 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
     get clientWidth() { return 800; }
     get clientHeight() { return 275; }
   }
-  const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => [id, new Element()]));
+  const elements = new Map([...html.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)].map(([, tag, id]) => [id, new Element(tag)]));
+  for (const [tag, , id] of html.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)) {
+    elements.get(id).hidden = /\bhidden(?:\s|>)/.test(tag);
+    elements.get(id).disabled = /\bdisabled(?:\s|>)/.test(tag);
+  }
   for (const [, id, text] of html.matchAll(/\bid="([^"]+)"[^>]*>([^<]*)</g)) elements.get(id).textContent = text.replaceAll('&nbsp;', '\u00a0');
   elements.get('budget').value = '1000000'; elements.get('duration').value = '500';
   elements.get('delay').value = '0';
@@ -198,7 +260,7 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
     AbortSignal: { timeout: delay => { abortTimeouts.push(delay); return AbortSignal.timeout(delay); } },
     localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
     crypto: { randomUUID: () => '11111111-1111-4111-8111-111111111111' },
-    confirm: () => true,
+    confirm: (...args) => pageOptions.confirm ? pageOptions.confirm(...args) : true,
     requestAnimationFrame: callback => frames.push(callback),
     ResizeObserver: class { observe() {} },
     setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
@@ -236,9 +298,9 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
   };
 }
 
-test('both charts center now between 500 past and 500 known future blocks', async () => {
+test('both charts center now between 432 past and 432 known future blocks by default', async () => {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
-  assert.match(html, /<canvas\b[^>]*aria-label="[^"]*Previous and next 500 blocks\./);
+  assert.match(html, /<canvas\b[^>]*aria-label="[^"]*Previous and next 432 blocks\./);
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
     const minting = pathname === '/mint';
@@ -248,7 +310,7 @@ test('both charts center now between 500 past and 500 known future blocks', asyn
     await page.refresh();
     const draws = page.draws.filter(call => call.canvas === page.elements.get('chart'));
     const ticks = draws.filter(call => call.method === 'fillText' && call.args[2] === 267);
-    assert.deepEqual(ticks.map(call => call.args[0]), minting ? ['0', '250', '500', '750', '1,000'] : ['1,000', '1,250', '1,500', '1,750', '2,000']);
+    assert.deepEqual(ticks.map(call => call.args[0]), minting ? ['68', '284', '500', '716', '932'] : ['1,068', '1,284', '1,500', '1,716', '1,932']);
     assert.deepEqual(ticks.map(call => call.args[1]), [48, 224, 400, 576, 752]);
     const shading = draws.find(call => call.method === 'fillRect' && call.fillStyle === '#ffffff30');
     assert.equal(shading.args[0], 400, 'future shading begins at the centered current block');
@@ -260,16 +322,177 @@ test('both charts center now between 500 past and 500 known future blocks', asyn
     const nowLine = pathBefore(draws.findLastIndex(call => call.method === 'stroke' && call.strokeStyle === '#666'));
     assert.deepEqual(nowLine.map(call => call.args), [[400, 14], [400, 248]], 'now marks the center of both charts');
     const band = pathBefore(draws.findIndex(call => call.method === 'fill' && call.fillStyle === userColor(1)));
-    assert.equal(band.length, 2003, 'a closed band contains 1,001 top and 1,001 bottom samples plus its starting point');
+    assert.equal(band.length, 1731, 'a closed band contains 865 top and 865 bottom samples plus its starting point');
     assert.equal(Math.min(...band.map(call => call.args[0])), 48);
     assert.equal(Math.max(...band.map(call => call.args[0])), 752);
     if (minting) {
-      assert.match(page.elements.get('chart')['aria-label'], /Previous and next 500 blocks[, .]/);
+      assert.match(page.elements.get('chart')['aria-label'], /Previous and next 432 blocks[, .]/);
       assert.match(page.elements.get('chart-note').textContent, /known|scheduled|future/i);
       const draft = pathBefore(draws.findIndex(call => call.method === 'stroke' && call.strokeStyle === userColor(1)));
-      assert.equal(draft.length, 501, 'draft sampling stays within the visible future window');
+      assert.equal(draft.length, 433, 'draft sampling stays within the visible future window');
       assert.equal(draft[0].args[0], 400);
       assert.equal(draft.at(-1).args[0], 752);
+    }
+  }
+});
+
+test('zoom controls traverse every allowed radius and stop at each endpoint without touching accounting', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    page.snapshot.height = 6000;
+    page.snapshot.contributions = [plan({ ...page.snapshot.contributions[0], start_block: 1, duration: 20000, budget_sats: 60000000 })];
+    await page.refresh();
+    const before = JSON.stringify(page.snapshot);
+    const stateCount = stateRequests(page).length;
+    const totals = ['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent);
+    const estimate = ['projected-reward', 'projected-rate'].map(id => page.elements.get(id).textContent);
+    const assertRadius = radius => {
+      const draws = page.draws.filter(call => call.canvas === page.elements.get('chart'));
+      const ticks = draws.filter(call => call.method === 'fillText' && call.args[2] === 267);
+      assert.deepEqual(ticks.map(call => call.args[0]), Array.from({ length: 5 }, (_, index) => new Intl.NumberFormat('en').format(6000 - radius + radius / 2 * index)));
+      assert.deepEqual(ticks.map(call => call.args[1]), [48, 224, 400, 576, 752]);
+      assert.match(page.elements.get('chart-window').textContent, new RegExp(`${new Intl.NumberFormat('en').format(radius)} blocks`));
+      assert.match(page.elements.get('chart')['aria-label'], new RegExp(`Previous and next ${radius} blocks`));
+      let path = [];
+      let band;
+      let now;
+      for (const call of draws) {
+        if (call.method === 'beginPath') path = [];
+        if (call.method === 'moveTo' || call.method === 'lineTo') path.push(call.args);
+        if (call.method === 'fill' && call.fillStyle === userColor(1)) band = path;
+        if (call.method === 'stroke' && call.strokeStyle === '#666') now = path;
+      }
+      assert.equal(band.length, 2 * (2 * radius + 1) + 1, 'every block has one top and one base sample');
+      assert.equal(band[1][0], 48);
+      assert.equal(band[2 * radius + 1][0], 752);
+      assert.deepEqual(now, [[400, 14], [400, 248]], 'now stays centered at every zoom');
+      assert.equal(page.elements.get('zoom-in').disabled, radius === 144);
+      assert.equal(page.elements.get('zoom-out').disabled, radius === 4464);
+      assert.equal(JSON.stringify(page.snapshot), before);
+      assert.equal(stateRequests(page).length, stateCount, 'zoom never fetches another snapshot');
+      assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), totals);
+      assert.deepEqual(['projected-reward', 'projected-rate'].map(id => page.elements.get(id).textContent), estimate);
+      assert.equal(page.elements.get('budget').value, '1000000');
+      assert.equal(page.elements.get('duration').value, '500');
+      assert.equal(page.elements.get('delay').value, '0');
+    };
+    assert.equal(page.storage.has(ZOOM_KEY), false, 'default zoom does not need a storage write');
+    page.draws.length = 0;
+    await page.event('zoom-in', 'click');
+    assertRadius(144);
+    await page.event('zoom-in', 'click');
+    assert.equal(page.storage.get(ZOOM_KEY), '144', 'an off-limit click cannot leave the allowed sequence');
+    for (const radius of ZOOM_LEVELS.slice(1)) {
+      page.draws.length = 0;
+      await page.event('zoom-out', 'click');
+      assertRadius(radius);
+      assert.equal(page.storage.get(ZOOM_KEY), String(radius));
+    }
+    await page.event('zoom-out', 'click');
+    assert.equal(page.storage.get(ZOOM_KEY), '4464');
+    for (const radius of ZOOM_LEVELS.slice(0, -1).reverse()) {
+      page.draws.length = 0;
+      await page.event('zoom-in', 'click');
+      assertRadius(radius);
+    }
+  }
+});
+
+test('zoom persists across both pages independently from currency and calendar display', async () => {
+  const page = await openPage('/mint');
+  await page.event('unit-btc', 'click');
+  await page.event('time-days', 'click');
+  await page.event('zoom-out', 'click');
+  assert.equal(page.storage.get(ZOOM_KEY), '720');
+  assert.equal(page.storage.get(TIME_KEY), 'days');
+  assert.equal(page.storage.get(UNIT_KEY), 'BTC');
+  assert.match(page.elements.get('chart-window').textContent, /5 days/);
+  assert.match(page.elements.get('chart')['aria-label'], /Previous and next 720 blocks/);
+  for (const pathname of ['/', '/mint']) {
+    const other = await openPage(pathname, page.storage);
+    other.snapshot.height = 8785;
+    await other.refresh();
+    assert.equal(other.elements.get('unit-btc')['aria-pressed'], 'true');
+    assert.equal(other.elements.get('time-days')['aria-pressed'], 'true');
+    assert.match(other.elements.get('chart-window').textContent, /5 days/);
+    const ticks = other.draws.filter(call => call.canvas === other.elements.get('chart') && call.method === 'fillText' && call.args[2] === 267).slice(-5);
+    assert.deepEqual(ticks.map(call => call.args[0]), [8065, 8425, 8785, 9145, 9505].map(blockDate));
+    other.draws.length = 0;
+    await other.event('time-blocks', 'click');
+    assert.match(other.elements.get('chart-window').textContent, /720 blocks/);
+    assert.equal(other.storage.get(ZOOM_KEY), '720');
+    await other.event('time-days', 'click');
+  }
+});
+
+test('invalid zoom preferences fall back to 432 blocks and blocked storage never disables zoom', async () => {
+  for (const value of ['bad', 'NaN', 'Infinity', '-144', '0', '143', '500', '4465', '432.5', '{}']) {
+    const storage = new Map([[ZOOM_KEY, value]]);
+    const page = await openPage('/', storage);
+    assert.match(page.elements.get('chart-window').textContent, /432 blocks/);
+    assert.equal(storage.get(ZOOM_KEY), value, 'startup does not rewrite malformed storage');
+    assert.equal(page.elements.get('zoom-in').disabled, false);
+    assert.equal(page.elements.get('zoom-out').disabled, false);
+  }
+  const page = await openPage('/', { get() { throw new Error('Storage blocked'); }, set() { throw new Error('Storage blocked'); } });
+  await page.event('zoom-in', 'click');
+  assert.match(page.elements.get('chart-window').textContent, /144 blocks/);
+  assert.equal(page.elements.get('zoom-in').disabled, true);
+  assert.equal(page.elements.get('connection').textContent, 'Live');
+});
+
+test('calendar zoom endpoints label the exact centered day range on both pages', async () => {
+  for (const pathname of ['/', '/mint']) {
+    for (const radius of [144, 4464]) {
+      const page = await openPage(pathname, new Map([[ZOOM_KEY, String(radius)], [TIME_KEY, 'days']]));
+      page.snapshot.height = 6000;
+      page.draws.length = 0;
+      await page.refresh();
+      const ticks = page.draws.filter(call => call.canvas === page.elements.get('chart') && call.method === 'fillText' && call.args[2] === 267);
+      assert.deepEqual(ticks.map(call => call.args[0]), Array.from({ length: 5 }, (_, index) => blockDate(6000 - radius + radius / 2 * index)));
+      assert.equal(ticks[2].args[1], 400);
+      assert.match(page.elements.get('chart-window').textContent, new RegExp(`${radius / 144} day`));
+      assert.equal(page.elements.get('current-block').textContent, blockDate(6000));
+    }
+  }
+});
+
+test('zoom includes future fees and clips delayed draft traces at the selected boundary', async () => {
+  for (const radius of [144, 720, 4464]) {
+    const storage = new Map([[ZOOM_KEY, String(radius)]]);
+    const dashboard = await openPage('/', storage);
+    const first = dashboard.snapshot.contributions[0];
+    dashboard.snapshot.height = 6000;
+    dashboard.snapshot.contributions = [{ ...first, start_block: 6000 + radius - 1, duration: 144, budget_sats: 432000 }];
+    dashboard.draws.length = 0;
+    await dashboard.refresh();
+    let path = [], fees;
+    for (const call of dashboard.draws.filter(call => call.canvas === dashboard.elements.get('chart'))) {
+      if (call.method === 'beginPath') path = [];
+      if (call.method === 'moveTo' || call.method === 'lineTo') path.push(call.args);
+      if (call.method === 'fill' && call.fillStyle?.kind === 'pattern') fees = path;
+    }
+    const baseline = fees[0][1];
+    assert.equal(fees.filter(point => point[1] > baseline).length, 2, 'both final visible future blocks pay fees');
+    const mint = await openPage('/mint', storage);
+    mint.snapshot.height = 6000;
+    mint.elements.get('duration').value = '144';
+    await mint.refresh();
+    const estimate = mint.elements.get('projected-reward').textContent;
+    for (const [delay, visible] of [[radius - 1, true], [radius, false]]) {
+      mint.elements.get('delay').value = String(delay);
+      mint.draws.length = 0;
+      await mint.event('delay', 'input');
+      const draws = mint.draws.filter(call => call.canvas === mint.elements.get('chart'));
+      const index = draws.findIndex(call => call.method === 'stroke' && call.strokeStyle === userColor(1));
+      assert.equal(index >= 0, visible, 'the draft is visible only when a funded block is inside the window');
+      if (visible) {
+        const start = draws.slice(0, index).findLastIndex(call => call.method === 'beginPath');
+        const trace = draws.slice(start + 1, index).filter(call => call.method === 'moveTo' || call.method === 'lineTo');
+        assert.equal(trace.length, 2, 'the last visible funded block follows exactly one zero baseline sample');
+        assert.equal(trace.at(-1).args[0], 752);
+      }
+      assert.equal(mint.elements.get('projected-reward').textContent, estimate, 'clipping never clips the full-duration estimate');
     }
   }
 });
@@ -293,19 +516,19 @@ test('mint chart displays every known future schedule and expiry, with exact own
     if (call.method === 'fill') paths.set(call.fillStyle, path);
   }
   const thickness = (color, block) => {
-    const index = block - (page.snapshot.height - 500);
+    const index = block - (page.snapshot.height - DEFAULT_ZOOM);
     const path = paths.get(color);
-    return path[2002 - index][1] - path[index + 1][1];
+    return path[2 * (2 * DEFAULT_ZOOM + 1) - index][1] - path[index + 1][1];
   };
   const otherHeight = thickness('#a3a3a3', 10);
   assert.ok(otherHeight > 0);
-  for (const block of [11, 60, 111, 510]) assert.equal(thickness('#a3a3a3', block), 0, `no competing commitment is active at ${block}`);
+  for (const block of [11, 60, 111, 442]) assert.equal(thickness('#a3a3a3', block), 0, `no competing commitment is active at ${block}`);
   for (const block of [61, 110]) assert.equal(thickness('#a3a3a3', block), otherHeight, `the scheduled competitor is visible at ${block}`);
   assert.equal(thickness(userColor(1), 10), 0, 'own scheduled contribution has not started at now');
   assert.equal(thickness(userColor(1), 11), otherHeight, 'own concrete schedule begins next block');
   assert.equal(thickness(userColor(1), 60), otherHeight, 'own final funded block remains visible');
   assert.equal(thickness(userColor(1), 61), 0, 'own schedule expires rather than being extrapolated');
-  assert.equal(thickness(userColor(1), 510), 0);
+  assert.equal(thickness(userColor(1), 442), 0);
   assert.equal(page.elements.get('contributions').children.length, 1, 'only the wallet’s own schedule appears in its table');
   const draft = { budget_sats: 1000000, duration: 500, start_block: 11 };
   const estimate = projectedReward(page.snapshot.contributions, draft, first.address, 10);
@@ -332,8 +555,8 @@ test('dashboard includes scheduled contributions in future bands and shows their
     if (call.method === 'fill' && call.fillStyle === userColor(2)) band = path;
   }
   const thickness = block => {
-    const index = block - (page.snapshot.height - 500);
-    return band[2002 - index][1] - band[index + 1][1];
+    const index = block - (page.snapshot.height - DEFAULT_ZOOM);
+    return band[2 * (2 * DEFAULT_ZOOM + 1) - index][1] - band[index + 1][1];
   };
   assert.equal(thickness(144), 0);
   assert.ok(thickness(145) > 0, 'the next-block scheduled start is visible');
@@ -645,8 +868,8 @@ test('dashboard sums each user’s burns and moves their complete band on top wh
   close(added[1].base - added[1].top, 3400 * pixelsPerSat);
   await redraw(page, [...contributions, latest]);
   assert.deepEqual(bands(page), added, 'the latest contribution ID determines user order, not snapshot order');
-  await redraw(page, [{ ...latest, id: 5, user_id: 7, address: 'same-color-other-user' }, ...contributions, latest]);
-  assert.deepEqual(bands(page).map(band => band.color), [userColor(1), userColor(26), userColor(7)], 'distinct users sharing a palette color remain separate bands');
+  await redraw(page, [{ ...latest, id: 5, user_id: 13, address: 'same-color-other-user' }, ...contributions, latest]);
+  assert.deepEqual(bands(page).map(band => band.color), [userColor(1), userColor(26), userColor(13)], 'distinct users sharing a palette color remain separate bands');
 
   const mint = await openPage('/mint');
   mint.snapshot.height = 12;
@@ -711,9 +934,9 @@ test('user colors match across clients, reloads, reordered snapshots, and repeat
   const colors = colorById(page);
   assert.equal(colors.get('#1'), PALETTE[1]);
   assert.equal(colors.get('#2'), PALETTE[2]);
-  assert.equal(colors.get('#6'), PALETTE[0]);
-  assert.equal(colors.get('#7'), PALETTE[1], 'user ID seven wraps around to user ID one');
-  assert.equal(colors.get('#8'), PALETTE[2]);
+  assert.equal(colors.get('#6'), PALETTE[6]);
+  assert.equal(colors.get('#7'), PALETTE[7]);
+  assert.equal(colors.get('#8'), PALETTE[8]);
   assert.equal(colors.get('#9'), PALETTE[1], 'repeat user keeps their color regardless of contribution ID');
   page.snapshot.contributions.unshift({ ...first, id: 10, user_id: 26, address: 'next-user' });
   await page.refresh();
@@ -730,8 +953,8 @@ test('user colors match across clients, reloads, reordered snapshots, and repeat
   assert.equal(page.storage.size, 0);
 });
 
-test('dashboard colors need no storage beyond independent unit and time preferences', async () => {
-  const page = await openPage('/', { get(key) { assert.ok([UNIT_KEY, TIME_KEY].includes(key)); return null; }, set() { assert.fail('Unexpected storage write'); } });
+test('dashboard colors need no storage beyond independent unit, time and zoom preferences', async () => {
+  const page = await openPage('/', { get(key) { assert.ok([UNIT_KEY, TIME_KEY, ZOOM_KEY].includes(key)); return null; }, set() { assert.fail('Unexpected storage write'); } });
   assert.equal(page.elements.get('connection').textContent, 'Live');
   const firstColor = page.elements.get('contributions').children[0].children[0].children[0].children[0].style.background;
   assert.equal(firstColor, userColor(1));
@@ -850,6 +1073,10 @@ test('scheduled delayed drafts compete only across their actual start and expiry
   assert.equal(page.elements.get('delay').disabled, true);
   await page.event('time-days', 'click');
   await page.event('unit-usd', 'click');
+  const estimate = page.elements.get('projected-reward').textContent;
+  await page.event('zoom-out', 'click');
+  await page.event('zoom-in', 'click');
+  assert.equal(page.elements.get('projected-reward').textContent, estimate);
   assert.deepEqual(JSON.parse(storage.get('flame-mint-playground-pending-v1')), request);
   const retry = await openPage('/mint', storage);
   assert.equal(Number(retry.elements.get('delay').value), 4464);
@@ -873,18 +1100,18 @@ test('the dashed draft is limited to its real scheduled interval and disappears 
     }
     return [];
   };
-  for (const [delay, firstBlock, lastBlock] of [[0, 500, 645], [100, 600, 745], [499, 999, 1000]]) {
+  for (const [delay, firstBlock, lastBlock] of [[0, 500, 645], [100, 600, 745], [431, 931, 932]]) {
     page.draws.length = 0;
     page.elements.get('delay').value = String(delay);
     await page.event('delay', 'input');
     const path = strokePath();
     assert.ok(path.length > 0);
     const xs = path.map(point => point[0]);
-    assert.equal(Math.min(...xs), 48 + firstBlock / 1000 * 704, 'only one zero sample immediately precedes the actual start');
-    assert.equal(Math.max(...xs), 48 + lastBlock / 1000 * 704, 'only one zero sample immediately follows the actual end, clipped to the window');
+    assert.equal(Math.min(...xs), 48 + (firstBlock - 68) / 864 * 704, 'only one zero sample immediately precedes the actual start');
+    assert.equal(Math.max(...xs), 48 + (lastBlock - 68) / 864 * 704, 'only one zero sample immediately follows the actual end, clipped to the window');
     assert.equal(path.length, lastBlock - firstBlock + 1);
   }
-  for (const delay of [500, 4464]) {
+  for (const delay of [432, 4464]) {
     page.draws.length = 0;
     page.elements.get('delay').value = String(delay);
     await page.event('delay', 'input');
@@ -997,6 +1224,44 @@ test('a saved reward address must match the address derived from its saved recov
   assert.match(page.elements.get('wallet-status').textContent, /does not match/);
   assert.equal(page.elements.get('submit').disabled, true);
   assert.equal(storage.get('flame-mint-playground-wallet-v1'), saved);
+});
+
+test('the moved wallet panel reveals its recovery phrase only on explicit disclosure and clears it on collapse', async () => {
+  const page = await openPage('/mint');
+  assert.equal(page.elements.get('wallet-panel').hidden, false);
+  assert.equal(page.elements.get('seed-phrase').textContent, '');
+  page.elements.get('seed-details').open = true;
+  await page.event('seed-details', 'toggle');
+  assert.equal(page.elements.get('seed-phrase').textContent, 'a browser only recovery phrase');
+  page.elements.get('seed-details').open = false;
+  await page.event('seed-details', 'toggle');
+  assert.equal(page.elements.get('seed-phrase').textContent, '');
+  assert.equal(page.elements.get('wallet-address').textContent, 'tf1demo-address');
+  assert.equal(page.requests.filter(request => request.url === '/api/contributions').length, 0);
+  assert.ok(page.requests.every(request => request.options.body === undefined), 'moving the wallet does not send its recovery phrase anywhere');
+});
+
+test('the moved wallet retains retry and confirmed reset behavior without silently replacing stored keys', async () => {
+  const walletKey = 'flame-mint-playground-wallet-v1';
+  const storage = new Map([[walletKey, '{broken json']]);
+  let allowReset = false;
+  const page = await openPage('/mint', storage, undefined, undefined, { confirm: () => allowReset });
+  assert.equal(page.elements.get('wallet-panel').hidden, false);
+  assert.equal(page.elements.get('retry-wallet').hidden, false);
+  assert.equal(page.elements.get('reset-wallet').hidden, false);
+  await page.event('retry-wallet', 'click');
+  assert.equal(storage.get(walletKey), '{broken json', 'retry never destroys unreadable saved keys');
+  await page.event('reset-wallet', 'click');
+  assert.equal(storage.get(walletKey), '{broken json', 'cancelled reset preserves the saved wallet');
+  assert.equal(page.elements.get('submit').disabled, true);
+  allowReset = true;
+  await page.event('reset-wallet', 'click');
+  assert.equal(JSON.parse(storage.get(walletKey)).address, 'tf1demo-address');
+  assert.equal(page.elements.get('retry-wallet').hidden, true);
+  assert.equal(page.elements.get('reset-wallet').hidden, true);
+  assert.equal(page.elements.get('submit').disabled, false);
+  assert.equal(page.elements.get('seed-phrase').textContent, '');
+  assert.equal(page.elements.get('wallet-panel').hidden, false);
 });
 
 test('money formatting preserves eight BTC decimals, truncates display values, and keeps small USD rates', () => {

@@ -50,8 +50,9 @@ dd { margin: 0; text-align: right; }
 .form-message:empty { display: none; }
 .form-message.success { color: #176430; }
 .connection.error { color: #a10b0b; }
-.wallet { margin-top: 12px; padding-top: 12px; border-top: 1px solid #ddd; }
 .wallet code { display: block; overflow-wrap: anywhere; margin: 4px 0; font-size: 12px; }
+.palette-preview { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 16px; }
+.palette-preview > span { flex: 0 0 12px; height: 12px; }
 details { margin: 8px 0; }
 summary { cursor: pointer; }
 details p { margin-top: 6px; }

@@ -5,6 +5,8 @@ export const SPARKS = 100000000;
 export const REWARD = 50 * SPARKS;
 export const UNIT_KEY = 'flame-mint-playground-unit-v1';
 export const TIME_KEY = 'flame-mint-playground-time-v1';
+export const ZOOM_KEY = 'flame-mint-playground-zoom-v1';
+export const ZOOM_LEVELS = Array.from({ length: 16 }, (_, index) => 144 + 288 * index);
 export const BLOCKS_PER_DAY = 144;
 export const DURATION_MIN = 144;
 export const DURATION_MAX = 4464;
@@ -61,7 +63,8 @@ export function projectedReward(contributions, draft) {
   return reward;
 }
 
-export const PALETTE = ['#ffd800', '#ffc200', '#ff9c00', '#ff6922', '#ff4242', '#fff000'];
+// Originals plus RGB midpoints, ordered for maximum minimum adjacent OKLab distance, including wrap.
+export const PALETTE = ['#ffd800', '#ff6922', '#ffc200', '#ff4242', '#ff9c00', '#ffe400', '#ff9921', '#fff000', '#ffaf00', '#ff5632', '#ffcd00', '#ff8311'];
 
 export function userColor(userId) {
   return PALETTE[userId % PALETTE.length];
@@ -79,6 +82,7 @@ if (typeof document !== 'undefined') {
   const whole = value => number(Math.trunc(value) || 0);
   let unit = 'sat';
   let timeMode = 'blocks';
+  let zoom = 432;
   try {
     const saved = localStorage.getItem(UNIT_KEY);
     if (['sat', 'BTC', 'USD'].includes(saved)) unit = saved;
@@ -87,6 +91,10 @@ if (typeof document !== 'undefined') {
     const saved = localStorage.getItem(TIME_KEY);
     if (['blocks', 'days'].includes(saved)) timeMode = saved;
   } catch { /* Time selection also works without browser storage. */ }
+  try {
+    const saved = Number(localStorage.getItem(ZOOM_KEY));
+    if (ZOOM_LEVELS.includes(saved)) zoom = saved;
+  } catch { /* Zoom also works without browser storage. */ }
   let btcUsd = null;
   let quoteRequest = false;
   let quoteStatus = 'Loading BTC/USD…';
@@ -118,6 +126,14 @@ if (typeof document !== 'undefined') {
   let chartQueued = false;
   let feeFill = null;
 
+  for (const color of PALETTE) {
+    const swatch = document.createElement('span');
+    swatch.style.background = color;
+    swatch.title = color;
+    swatch.setAttribute('role', 'listitem');
+    swatch.setAttribute('aria-label', color);
+    element('palette-preview').append(swatch);
+  }
   element('empty-table').textContent = minting ? 'No contributions.' : 'No recent contributions.';
   if (minting) {
     document.title = 'Mint';
@@ -127,6 +143,7 @@ if (typeof document !== 'undefined') {
     element('total-rate-label').textContent = 'Effective rate';
     element('total-rate-label').title = 'Your burn plus mining fees paid, divided by your FLM earned';
     element('mint-form').hidden = false;
+    element('wallet-panel').hidden = false;
     element('own-legend').hidden = false;
     element('draft-legend').hidden = false;
     element('fees-legend').hidden = true;
@@ -292,12 +309,14 @@ if (typeof document !== 'undefined') {
     element('chart-rate-unit').textContent = `${label}/FLM`;
     const spokenUnit = unit === 'sat' ? 'satoshis' : unit === 'USD' ? 'US dollars' : 'BTC';
     element('chart').setAttribute('aria-label', minting
-      ? `Burn rate in ${spokenUnit} per block on the left; mint rate in ${spokenUnit} per FLM on the right. Previous and next 500 blocks, shown as ${timeMode === 'days' ? 'calendar dates' : 'block numbers'}. All known contribution schedules included.`
-      : `Burn above zero and mining fees below zero share a ${spokenUnit}-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous and next 500 blocks, shown as ${timeMode === 'days' ? 'calendar dates' : 'block numbers'}. All known contribution schedules included.`);
+      ? `Burn rate in ${spokenUnit} per block on the left; mint rate in ${spokenUnit} per FLM on the right. Previous and next ${zoom} blocks, shown as ${timeMode === 'days' ? 'calendar dates' : 'block numbers'}. All known contribution schedules included.`
+      : `Burn above zero and mining fees below zero share a ${spokenUnit}-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous and next ${zoom} blocks, shown as ${timeMode === 'days' ? 'calendar dates' : 'block numbers'}. All known contribution schedules included.`);
+    element('zoom-in').disabled = zoom === ZOOM_LEVELS[0];
+    element('zoom-out').disabled = zoom === ZOOM_LEVELS[ZOOM_LEVELS.length - 1];
     for (const value of ['blocks', 'days']) element(`time-${value}`).setAttribute('aria-pressed', String(timeMode === value));
     element('current-block-label').textContent = timeMode === 'days' ? 'Date' : 'Block';
     element('current-block').textContent = state ? timeMode === 'days' ? blockDate(state.height) : number(state.height) : '—';
-    element('chart-window').textContent = `±${formatDuration(500, timeMode)}`;
+    element('chart-window').textContent = `±${formatDuration(zoom, timeMode)}`;
     element('duration-min').textContent = formatDuration(DURATION_MIN, timeMode);
     element('duration-max').textContent = formatDuration(DURATION_MAX, timeMode);
     element('delay-min').textContent = formatDuration(0, timeMode);
@@ -356,6 +375,14 @@ if (typeof document !== 'undefined') {
     renderMoney();
   }
 
+  function changeZoom(direction) {
+    const next = ZOOM_LEVELS[ZOOM_LEVELS.indexOf(zoom) + direction];
+    if (next === undefined) return;
+    zoom = next;
+    try { localStorage.setItem(ZOOM_KEY, String(zoom)); } catch { /* Zoom still applies in this page. */ }
+    renderMoney();
+  }
+
   function queueChart() {
     if (chartQueued) return;
     chartQueued = true;
@@ -373,8 +400,8 @@ if (typeof document !== 'undefined') {
     const side = unit === 'sat' ? 48 : unit === 'BTC' ? 94 : 82;
     const margin = { left: side, top: 14, right: side, bottom: 27 };
     const w = width - margin.left - margin.right, h = height - margin.top - margin.bottom;
-    const pastBlocks = 500;
-    const futureBlocks = 500;
+    const pastBlocks = zoom;
+    const futureBlocks = zoom;
     const heightNow = state?.height ?? 0, firstBlock = heightNow - pastBlocks, count = pastBlocks + futureBlocks + 1;
     const colored = !minting;
     const groups = new Map();
@@ -500,6 +527,8 @@ if (typeof document !== 'undefined') {
   element('budget').addEventListener('input', () => updateDraft(true));
   for (const value of ['sat', 'BTC', 'USD']) element(`unit-${value.toLowerCase()}`).addEventListener('click', () => selectUnit(value));
   for (const value of ['blocks', 'days']) element(`time-${value}`).addEventListener('click', () => selectTime(value));
+  element('zoom-in').addEventListener('click', () => changeZoom(-1));
+  element('zoom-out').addEventListener('click', () => changeZoom(1));
   element('duration').addEventListener('input', () => updateDraft(true));
   element('delay').addEventListener('input', () => updateDraft(true));
   element('retry-wallet').addEventListener('click', prepareWallet);

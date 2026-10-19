@@ -40,6 +40,8 @@ Blocks advance once per second while the service is running. Restarting resumes 
 
 The blocks / days switch changes display only and is remembered independently of currency. Days use 144 blocks/day: block 1 begins January 11, 2027, and block 145 begins January 12. Calendar labels use UTC (`Jan 11`, `Mar 13`); durations and delays are shown in days while controls, requests, and storage retain integer blocks. This is an accelerated simulation calendar, not wall-clock scheduling.
 
+Both pages have − / + chart zoom controls. The centered half-window is 144, 432, 720, …, 4,464 blocks (1, 3, 5, …, 31 days). `+` zooms in by 288 blocks on each side; `−` zooms out. The initial window is ±432 blocks. Boundary buttons are disabled, and the selected zoom is remembered independently of time and currency display. Zoom changes only the chart, not contribution settings or estimates.
+
 
 The existing Flame wallet runs in the browser via WebAssembly and uses FlameKD to generate a mnemonic and testnet receiving address (`tf1…`). These are remembered in browser local storage, so subsequent contributions share the same reward destination. **The mnemonic, seed and private keys never go to the service or database.** Request parsing rejects extra fields, including mnemonic/private-key fields. Only the address and contribution parameters are submitted. The server validates the address with FlameKD and stores its canonical lowercase encoding.
 
@@ -90,7 +92,7 @@ URL: `/mint`
 The top counters show only this user's accrued totals: sats burned, FLM earned, and effective cost `(sats burned + mining fees paid) / FLM earned`. They include all of the user's contributions, not only the chart window. Scheduled future spending and the unsubmitted draft are excluded. Effective cost is `—` until rewards are earned; all three numeric values are `—` while the wallet is unavailable, with their labels and units retained.
 
 User sees a chart of the burn rate in satoshis per block, with the equivalent mint rate (sat/FLM) on the right-hand axis.
-- Chart is centered around the current block and shows the previous 500 blocks and next 500 blocks, in block numbers or calendar dates according to the time switch.
+- Chart is centered around the current block, initially ±432 blocks, with its range controlled by zoom and labels shown as block numbers or calendar dates.
 - Other users are grey. Everyone's known schedules are drawn exactly, including future starts and expirations.
 - The user's submitted contributions are drawn on top using their assigned user-ID color, matching the dashboard.
 - The user's draft contribution is a dashed line in the same color; it changes with the sliders. Both legend swatches match. Before the first accepted contribution assigns a user ID, the draft and swatches are neutral grey rather than guessing a future ID.
@@ -113,6 +115,8 @@ Table below shows all user's contributions:
 
 Total line shows total sats burned, total FLM earned, total mining fees paid, average mint rate.
 
+The reward address and recovery controls appear below the contributions table. Both pages end with a row of small squares showing the participant palette in its assigned order.
+
 Blocks are issued every 1 second. Only blocks with active minters distribute 50 FLM; empty-block rewards are permanently lost.
 
 On top - add a button that opens dashboard (`/` url).
@@ -121,13 +125,13 @@ On top - add a button that opens dashboard (`/` url).
 
 URL: `/`
 
-Similar to per-user UI, but visible to everyone. The chart shows ±500 blocks around the current block, including everyone's known future commitments. Contribution summaries show their budgets, durations, and schedules, including future starts. The API and table exclude only contributions with `height - (start_block + duration - 1) > 10,000`; the exact 10,000-block boundary remains included. The table is newest-first. Calendar mode uses the same fixed block window.
+Similar to per-user UI, but visible to everyone. The chart uses the selected symmetric zoom around the current block, including everyone's known future commitments. Contribution summaries show their budgets, durations, and schedules, including future starts. The API and table exclude only contributions with `height - (start_block + duration - 1) > 10,000`; the exact 10,000-block boundary remains included. The table is newest-first. Calendar mode uses the same selected block window.
 
 The top counters and table footer use server-computed lifetime totals, including contributions omitted from the response. The footer's contribution count is also all-time, not just the number of visible rows.
 
 The dashboard chart, "Burn rate and mining fees", shows historical and scheduled burned sats above zero and mining-fee income downward: 1,000 sat per active contribution per block, including overlapping contributions to the same address. Fees use a grey diagonal fill. Both areas share one scale in sat/block on the left; the right-hand scale is the same values divided by 50 FLM (sat/FLM), including negative ticks below zero. The downward direction separates fees from burning, not a loss of income. Both charts mark the current block and distinguish their future portion; `/mint` uses the same axis units without the fee area.
 
-The dashboard always shows contributions colored by user, with no color toggle. All clients use the fixed ordered palette `#ffd800`, `#ffc200`, `#ff9c00`, `#ff6922`, `#ff4242`, `#fff000`, with `palette[user_id % palette.length]`. Thus user 1 uses `#ffc200`, user 6 uses `#ffd800`, and colors repeat every six users. No randomization or browser-local palette is used. Participant colors are opaque; mining fees remain grey and hatched.
+The dashboard always shows contributions colored by user, with no color toggle. The six original colors are retained, with one rounded RGB midpoint between each consecutive pair (including the last/first pair), giving twelve colors. Their fixed order maximizes the weakest adjacent perceptual contrast in OKLab, including the repeating last/first boundary; total adjacent distance breaks ties. The computed order is stored in `PALETTE` in `web/app.js`, not generated at runtime. All clients use `palette[user_id % palette.length]`; colors repeat every twelve users without randomization or browser-local assignment. Participant colors are opaque; mining fees remain grey and hatched.
 
 The dashboard combines each user's contributions into one band. Bands are stacked by each user's latest contribution ID, oldest at the bottom and newest at the top. A new contribution moves that user's entire band upward without changing their color. The table remains newest-first.
 
