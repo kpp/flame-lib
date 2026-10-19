@@ -462,7 +462,7 @@ lines without whitespace.
 Recipient `m/35263'/1'/0'/0/0`, Receiving Address:
 
 ```
-tf1psxy35zgz289wuj33pm05vkl3sr40xp3ecdacw0dmuzu688wufwaf55kjxcgtw9v6tf5mvta3nk93nj8knx8phhrezer3n8999crggcz0p20m
+t1psxy35zgz289wuj33pm05vkl3sr40xp3ecdacw0dmuzu688wufwswqs2mci16nffdydssku2e5knfkchmr8vtr8y0dxvwr0w8j9j8rxw22tsxs3skplgjp
 ```
 
 Inputs:
@@ -504,7 +504,7 @@ d496c2
 Recipient `m/35263'/1'/0'/1/0`, Receiving Address:
 
 ```
-tf1lrkq0dfkh4q83pxp96rp62a4tlnn3ajw9gafvhd2uyg5vv3kmslegyut7k6ymyeygdpr5l4632djpd4a7vlfmt6pcrly3wj2rt2pxcgdelf8q
+t1lrkq0dfkh4q83pxp96rp62a4tlnn3ajw9gafvhd2uyg5vv3kmslsmupuudi1jsfchad5fkfjgs6z8flt4z5myzmtmue7nkh5rs87fzay5xk5zdsspe08qm
 ```
 
 Inputs:

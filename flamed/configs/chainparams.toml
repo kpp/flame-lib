@@ -28,5 +28,5 @@ network = "testnet"
 # of `address` and `predicate` names the holder; an operator writes the
 # address a wallet printed and never handles a wallet-internal value.
 [[genesis]]
-address = "tf1ujp3zt7heh0nqyxnhlzdu2cnc7dnsef8zv6mmamae7pfl6pw0d4j4qnqmpkwqjakn4xs4nsh76tawfq246uvx8tx2wedvegns66vgfq7m0gmy"
+address = "t1ujp3zt7heh0nqyxnhlzdu2cnc7dnsef8zv6mmamae7pfl6pw0d4sm0hkyqi192pxpkrvup9md82dpt8p0a5h6ujq4t4ccvwkv5aj6ej38p45csjqh9wsn6"
 qty_sparks = 100000000000

@@ -72,14 +72,26 @@ test('addresses and ownership', () => {
     const wallet = wasm.Wallet.fromSeed(bytes(clear.seed), 'testnet', 0);
     const first = wallet.nextAddress();
     assert.deepEqual(first.path, { branch: 0, index: 0 });
-    assert.ok(first.address.startsWith('tf1'));
+    assert.ok(first.address.startsWith('t1'));
+    assert.equal(first.address.length, 120);
+    assert.ok(first.address.slice(60).startsWith('i1'));
     assert.equal(wallet.nextIndex(), 1);
     assert.deepEqual(wasm.addressToPredicate(first.address, 'testnet'), first.predicate);
+    assert.deepEqual(wasm.addressToPredicate(first.address.toUpperCase(), 'testnet'), first.predicate);
+    assert.throws(() => wasm.addressToPredicate(first.address.slice(0, 60), 'testnet'), flameError('invalidAddress'));
+    const corrupted = first.address.slice(0, -1) + (first.address.endsWith('q') ? 'p' : 'q');
+    assert.throws(() => wasm.addressToPredicate(corrupted, 'testnet'), flameError('invalidAddress'));
     assert.throws(() => wasm.addressToPredicate(first.address, 'mainnet'), flameError('invalidAddress'));
     assert.deepEqual(wallet.owns(first.predicate, 0), { branch: 0, index: 0 });
     assert.equal(wallet.owns(new Uint8Array(32).fill(1), 5), undefined);
     assert.ok(wallet.receivingKey().startsWith('testrecv1'));
     assert.ok(wallet.viewKey().startsWith('testview1'));
+
+    const mainnet = wasm.Wallet.fromSeed(bytes(clear.seed), 'mainnet', 0).nextAddress();
+    assert.equal(mainnet.address.length, 120);
+    assert.ok(mainnet.address.startsWith('f1'));
+    assert.ok(mainnet.address.slice(60).startsWith('e1'));
+    assert.deepEqual(wasm.addressToPredicate(mainnet.address, 'mainnet'), mainnet.predicate);
 });
 
 test('a transfer from served bytes to signed bytes', () => {

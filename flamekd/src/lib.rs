@@ -51,9 +51,9 @@ pub const HARDENED: u32 = 1 << 31;
 /// Selects the network HRP for textual encoding; key material is network-neutral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
-    /// Mainnet HRPs: `spend`, `view`, `recv`, `f`, and `c`.
+    /// Mainnet HRPs: `spend`, `view`, `recv`, `f`, and `e`.
     Mainnet,
-    /// Testnet HRPs: `testspend`, `testview`, `testrecv`, `tf`, and `tc`.
+    /// Testnet HRPs: `testspend`, `testview`, `testrecv`, `t`, and `i`.
     Testnet,
 }
 
@@ -111,14 +111,15 @@ pub struct RecvKey {
     t: Scalar,
 }
 
-/// Receiving address `(S, V)`, with HRP `f` or `tf`.
+/// Receiving address `(S, V)`, encoded as the tracking address followed by an
+/// encryption public key with HRP `e` or `i`, each with its own checksum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReceivingAddress {
     spending: RistrettoPoint,
     viewing: RistrettoPoint,
 }
 
-/// One clear-payment/tracking address `(S)`, with HRP `c` or `tc`.
+/// One clear-payment/tracking address `(S)`, with HRP `f` or `t`.
 ///
 /// This address does not identify or derive other addresses in the account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,6 +299,41 @@ impl RecvKey {
 }
 
 impl ReceivingAddress {
+    /// Encodes the tracking address followed immediately by the encryption key.
+    /// Both components use the selected network and have independent checksums.
+    pub fn to_bech32(&self, network: Network) -> String {
+        let mut text = self.to_tracking_address().to_bech32(network);
+        let hrp = match network {
+            Network::Mainnet => "e",
+            Network::Testnet => "i",
+        };
+        text.push_str(&encoding::encode(hrp, self.viewing.compress().as_bytes()));
+        text
+    }
+
+    /// Parses both components for the expected network, validating each checksum
+    /// and point. The entire address must be uniformly lowercase or uppercase.
+    pub fn from_bech32(text: &str, network: Network) -> Result<Self, Error> {
+        let (spending_hrp, viewing_hrp) = match network {
+            Network::Mainnet => ("f", "e"),
+            Network::Testnet => ("t", "i"),
+        };
+        if text.len() != 120 {
+            return Err(Error::InvalidLength);
+        }
+        // Check ASCII before splitting at a byte offset, and case across both components.
+        if !text.is_ascii()
+            || (text.bytes().any(|b| b.is_ascii_lowercase())
+                && text.bytes().any(|b| b.is_ascii_uppercase()))
+        {
+            return Err(Error::InvalidEncoding);
+        }
+        let (spending, viewing) = text.split_at(60);
+        let spending = encoding::decode::<32>(spending_hrp, spending)?;
+        let viewing = encoding::decode::<32>(viewing_hrp, viewing)?;
+        Self::from_bytes(&join::<64, 2>([spending, viewing]))
+    }
+
     /// Drops the viewing public key to expose this node's clear-payment address.
     pub fn to_tracking_address(&self) -> TrackingAddress {
         TrackingAddress {
@@ -453,8 +489,21 @@ macro_rules! bech32f {
 bech32f!(SpendKey, "spend", "testspend", 96);
 bech32f!(ViewKey, "view", "testview", 96);
 bech32f!(RecvKey, "recv", "testrecv", 96);
-bech32f!(ReceivingAddress, "f", "tf", 64);
-bech32f!(TrackingAddress, "c", "tc", 32);
+bech32f!(TrackingAddress, "f", "t", 32);
+
+impl fmt::Display for ReceivingAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_bech32(Network::Mainnet))
+    }
+}
+
+impl FromStr for ReceivingAddress {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::from_bech32(text, Network::Mainnet)
+    }
+}
 
 macro_rules! redacted_debug {
     ($($type:ty),+) => { $(

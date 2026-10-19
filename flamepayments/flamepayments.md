@@ -57,8 +57,8 @@ The gap covers addresses issued by another copy of the same wallet.
 
 ## An address and a predicate
 
-An address is flamekd's `ReceivingAddress`, the pair `(S_n, V_n)`, rendered as
-bech32f — `tf1…` on testnet, `f1…` on mainnet.
+An address is flamekd's `ReceivingAddress`, the pair `(S_n, V_n)`, rendered
+according to the [address format](../docs/address.md).
 
 A **predicate** is what actually locks a contract on chain, and here it is
 `Predicate::opaque(S_n.compress())`: the bare public spending key, with no

@@ -87,7 +87,7 @@ pub(crate) fn chainparams<K: AccountKey>(a: &Account<K>) -> ChainParamsFile {
         .address_at(util::RECEIVING, 0)
         .expect("first receiving address")
         .to_bech32(Network::Testnet);
-    assert!(address.starts_with("tf1"), "a testnet address");
+    assert!(address.starts_with("t1"), "a testnet address");
     ChainParamsFile {
         version: 1,
         network: NetworkName::Testnet,

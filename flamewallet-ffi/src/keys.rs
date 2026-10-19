@@ -14,7 +14,7 @@ use crate::error::FlameError;
 use crate::note::{self, ReceivedNote};
 use crate::transfer::{self, Transfer, TransferRequest};
 
-/// Which network addresses are encoded for: `f1…` or `tf1…`.
+/// Which network the address's two bech32f components are encoded for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum Network {
     Mainnet,
@@ -43,7 +43,7 @@ pub struct KeyPath {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct IssuedAddress {
     pub path: KeyPath,
-    /// bech32f: `f1…` on mainnet, `tf1…` on testnet.
+    /// Tracking address followed by the encryption key: `f1…e1…` / `t1…i1…`.
     pub address: String,
     /// The 32-byte compressed point that locks payments to this address.
     pub predicate: Vec<u8>,

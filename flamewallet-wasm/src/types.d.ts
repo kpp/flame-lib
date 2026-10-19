@@ -1,4 +1,4 @@
-/** Which network addresses are encoded for: `f1…` or `tf1…`. */
+/** Which network the address's two bech32f components are encoded for. */
 export type Network = "mainnet" | "testnet";
 
 /**
@@ -16,7 +16,7 @@ export interface KeyPath {
 
 export interface IssuedAddress {
   path: KeyPath;
-  /** bech32f: `f1…` on mainnet, `tf1…` on testnet. */
+  /** Tracking address followed by the encryption key: `f1…e1…` / `t1…i1…`. */
   address: string;
   /** The 32-byte compressed point payments to this address are locked with. */
   predicate: Uint8Array;

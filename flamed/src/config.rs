@@ -109,10 +109,10 @@ params!(LimitsConfig, LimitsSection, BlockLimits, {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkName {
-    /// `tf1…` addresses.
+    /// Receiving addresses composed of `t1…` and `i1…` components.
     #[default]
     Testnet,
-    /// `f1…` addresses.
+    /// Receiving addresses composed of `f1…` and `e1…` components.
     Mainnet,
 }
 
@@ -131,7 +131,7 @@ impl From<NetworkName> for Network {
 pub struct ChainParamsFile {
     /// The Flame protocol version. Only 1 exists.
     pub version: u32,
-    /// The HRP an `address` allocation is read with.
+    /// The network an `address` allocation is read with.
     #[serde(default)]
     pub network: NetworkName,
     /// Storage parameters, where they differ from upstream.

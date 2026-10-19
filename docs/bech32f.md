@@ -28,9 +28,12 @@ The alphabet is ordered by five-bit value, from 0 through 31. The HRP contains
 `1` in the text. No version or type symbol is inserted into the payload:
 the application identifies the expected type through the HRP.
 
-Encode the complete payload in one 8-to-5-bit conversion, reading bytes
-most-significant bit first. Zero-pad only the final five-bit group. Do not
-separately pad tuple elements.
+Encode each Bech32f component's complete payload in one 8-to-5-bit conversion,
+reading bytes most-significant bit first. Zero-pad only the final five-bit
+group. Do not separately pad tuple elements within a component. An application
+may concatenate independently encoded components, as specified for
+[Receiving Addresses](address.md#keys-and-payment-addresses); each then has its
+own HRP and checksum, and the application specifies component boundaries.
 
 ## Checksum
 

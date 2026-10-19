@@ -14,7 +14,9 @@ final class FlameWalletTests: XCTestCase {
         let wallet = try Wallet(seed: seed, network: .testnet, nextIndex: 0)
         let first = try wallet.nextAddress()
         XCTAssertEqual(first.path, KeyPath(branch: 0, index: 0))
-        XCTAssertTrue(first.address.hasPrefix("tf1"))
+        XCTAssertTrue(first.address.hasPrefix("t1"))
+        XCTAssertEqual(first.address.count, 120)
+        XCTAssertTrue(first.address.dropFirst(60).hasPrefix("i1"))
         XCTAssertEqual(wallet.nextIndex(), 1)
 
         let predicate = try addressToPredicate(address: first.address, network: .testnet)

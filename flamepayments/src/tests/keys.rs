@@ -269,7 +269,7 @@ fn pinned_testnet_address() {
 
     assert_eq!(
         address.to_bech32(Network::Testnet),
-        "tf15qsfa4dqsckg4talyc7h5xu26psmyaklrmn3d2ne9dzmkm6aqfvqchl5ngnhyljv2xu0d0a6uf57ju840358vej6pxt7vxff3mywgqgcnpfax"
+        "t15qsfa4dqsckg4talyc7h5xu26psmyaklrmn3d2ne9dzmkm6aqfvq9r7dndi1p30lfx38wflyc5dc76lm4cnfa9c02lrgwen95zvhucvjnrkgusqsf3jfen"
     );
     assert_eq!(
         hex::encode(address.to_bytes()),

@@ -16,7 +16,7 @@
 //!     .derive_child(util::RECEIVING)?
 //!     .derive_child(0)?
 //!     .to_address();
-//! assert!(address.to_bech32(Network::Testnet).starts_with("tf1"));
+//! assert!(address.to_bech32(Network::Testnet).starts_with("t1"));
 //! # Ok::<(), flamekd::Error>(())
 //! ```
 

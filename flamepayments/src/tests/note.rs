@@ -51,7 +51,7 @@ struct Vector {
 /// Payment with a memo: `m/35263'/1'/0'/0/0`.
 const PAYMENT: Vector = Vector {
     branch: util::RECEIVING,
-    address: "tf1psxy35zgz289wuj33pm05vkl3sr40xp3ecdacw0dmuzu688wufwaf55kjxcgtw9v6tf5mvta3nk93nj8knx8phhrezer3n8999crggcz0p20m",
+    address: "t1psxy35zgz289wuj33pm05vkl3sr40xp3ecdacw0dmuzu688wufwswqs2mci16nffdydssku2e5knfkchmr8vtr8y0dxvwr0w8j9j8rxw22tsxs3skplgjp",
     v: "7b4ac2f41156ceb0d35a9631311fe799b2f5c258e36d4f7da7b36d0599ecf804",
     r: "0101010101010101010101010101010101010101010101010101010101010101",
     qty: 40000000000,
@@ -78,7 +78,7 @@ const PAYMENT: Vector = Vector {
 /// Change, no memo: `m/35263'/1'/0'/1/0`.
 const CHANGE: Vector = Vector {
     branch: util::CHANGE,
-    address: "tf1lrkq0dfkh4q83pxp96rp62a4tlnn3ajw9gafvhd2uyg5vv3kmslegyut7k6ymyeygdpr5l4632djpd4a7vlfmt6pcrly3wj2rt2pxcgdelf8q",
+    address: "t1lrkq0dfkh4q83pxp96rp62a4tlnn3ajw9gafvhd2uyg5vv3kmslsmupuudi1jsfchad5fkfjgs6z8flt4z5myzmtmue7nkh5rs87fzay5xk5zdsspe08qm",
     v: "f71608bf3cb3a0dd14548b346ff0895205c884b77cc2759f530a3c08f06af005",
     r: "0202020202020202020202020202020202020202020202020202020202020200",
     qty: 99000000000,

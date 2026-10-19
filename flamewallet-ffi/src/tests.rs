@@ -100,16 +100,55 @@ fn addresses_and_counter() {
     let alice = wallet(&A_SEED);
     let first = alice.next_address().expect("issue");
     assert_eq!(first.path, receiving(0));
-    assert!(first.address.starts_with("tf1"));
+    assert!(first.address.starts_with("t1"));
+    assert_eq!(first.address.len(), 120);
+    assert!(first.address[60..].starts_with("i1"));
+    let parsed = flamekd::ReceivingAddress::from_bech32(&first.address, flamekd::Network::Testnet)
+        .expect("parse issued address");
+    let tracking = parsed
+        .to_tracking_address()
+        .to_bech32(flamekd::Network::Testnet);
+    assert_eq!(&first.address[..60], tracking);
     assert_eq!(alice.next_index(), 1);
     assert_eq!(
         address_to_predicate(first.address.clone(), Network::Testnet).expect("parse"),
         first.predicate
     );
+    assert_eq!(
+        address_to_predicate(first.address.to_uppercase(), Network::Testnet)
+            .expect("uppercase address"),
+        first.predicate
+    );
+    assert!(matches!(
+        address_to_predicate(tracking, Network::Testnet),
+        Err(FlameError::InvalidAddress { .. })
+    ));
+    let mut corrupted = first.address.clone();
+    corrupted.pop();
+    corrupted.push(if first.address.ends_with('q') {
+        'p'
+    } else {
+        'q'
+    });
+    assert!(matches!(
+        address_to_predicate(corrupted, Network::Testnet),
+        Err(FlameError::InvalidAddress { .. })
+    ));
     assert!(matches!(
         address_to_predicate(first.address, Network::Mainnet),
         Err(FlameError::InvalidAddress { .. })
     ));
+
+    let mainnet = wallet_on(&A_SEED, Network::Mainnet)
+        .next_address()
+        .expect("mainnet address");
+    assert_eq!(mainnet.address.len(), 120);
+    assert!(mainnet.address.starts_with("f1"));
+    assert!(mainnet.address[60..].starts_with("e1"));
+    assert_eq!(
+        address_to_predicate(mainnet.address, Network::Mainnet).expect("parse mainnet address"),
+        mainnet.predicate
+    );
 
     // A reopened wallet finds an address issued past its counter only once
     // the counter is restored or the gap covers it.
