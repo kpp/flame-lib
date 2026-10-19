@@ -4,7 +4,24 @@ export const FEE = 1000;
 export const SPARKS = 100000000;
 export const REWARD = 50 * SPARKS;
 export const UNIT_KEY = 'flame-mint-playground-unit-v1';
+export const TIME_KEY = 'flame-mint-playground-time-v1';
+export const BLOCKS_PER_DAY = 144;
+export const DURATION_MIN = 144;
+export const DURATION_MAX = 4464;
+export const DELAY_MAX = 4464;
 const SATS_PER_BTC = 100000000;
+
+export function blockDate(block) {
+  if (block < 0) return '—';
+  const date = new Date(Date.UTC(2027, 0, 11) + Math.floor((block - 1) / BLOCKS_PER_DAY) * 86400000);
+  return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(date);
+}
+
+export function formatDuration(blocks, mode = 'blocks') {
+  const value = mode === 'days' ? blocks / BLOCKS_PER_DAY : blocks;
+  const label = mode === 'days' ? 'day' : 'block';
+  return `${new Intl.NumberFormat('en', { maximumFractionDigits: 3 }).format(value)} ${label}${value === 1 ? '' : 's'}`;
+}
 
 export function formatMoney(sats, unit = 'sat', btcUsd = null, isRate = false, digits = null) {
   if (unit === 'USD' && !(Number.isFinite(btcUsd) && btcUsd > 0)) return '—';
@@ -33,16 +50,12 @@ export function feeAt(contribution, block) {
   return block >= contribution.start_block && block < contribution.start_block + contribution.duration ? FEE : 0;
 }
 
-export function projectedBurn(contribution, block, height, address) {
-  return burnAt(contribution, block > height && contribution.address !== address ? height : block);
-}
-
-export function projectedReward(contributions, draft, address, height = draft.start_block - 1) {
+export function projectedReward(contributions, draft) {
   let reward = 0;
   for (let offset = 0; offset < draft.duration; offset++) {
     const block = draft.start_block + offset;
     const own = burnAt(draft, block);
-    const total = contributions.reduce((sum, contribution) => sum + projectedBurn(contribution, block, height, address), own);
+    const total = contributions.reduce((sum, contribution) => sum + burnAt(contribution, block), own);
     if (total > 0) reward += REWARD * own / total;
   }
   return reward;
@@ -65,10 +78,15 @@ if (typeof document !== 'undefined') {
   const number = (value, digits = 0) => new Intl.NumberFormat('en', { maximumFractionDigits: digits }).format(value);
   const whole = value => number(Math.trunc(value) || 0);
   let unit = 'sat';
+  let timeMode = 'blocks';
   try {
     const saved = localStorage.getItem(UNIT_KEY);
     if (['sat', 'BTC', 'USD'].includes(saved)) unit = saved;
   } catch { /* Unit selection also works without browser storage. */ }
+  try {
+    const saved = localStorage.getItem(TIME_KEY);
+    if (['blocks', 'days'].includes(saved)) timeMode = saved;
+  } catch { /* Time selection also works without browser storage. */ }
   let btcUsd = null;
   let quoteRequest = false;
   let quoteStatus = 'Loading BTC/USD…';
@@ -114,17 +132,19 @@ if (typeof document !== 'undefined') {
     element('fees-legend').hidden = true;
     element('chart-wrap').className = 'canvas-wrap';
     element('chart-title').textContent = 'Burn rate';
-    element('chart-window').textContent = '±500 blocks';
-    element('chart-note').textContent = 'Future: others held at current rate';
     element('others-label').textContent = 'Others';
     element('contributions-title').textContent = 'Your contributions';
     try {
       const saved = JSON.parse(localStorage.getItem(pendingKey) || 'null');
       if (saved) {
-        if (typeof saved.address !== 'string' || typeof saved.request_id !== 'string' || !Number.isSafeInteger(saved.budget_sats) || saved.budget_sats < BUDGET_MIN || saved.budget_sats > BUDGET_MAX || !Number.isInteger(saved.duration) || saved.duration < 100 || saved.duration > 1000 || saved.duration % 50 !== 0) throw new Error('Invalid saved request');
-        pendingRequest = { address: saved.address, budget_sats: saved.budget_sats, duration: saved.duration, request_id: saved.request_id };
+        const legacyDuration = Number.isInteger(saved.duration) && saved.duration >= 100 && saved.duration <= 1000 && saved.duration % 50 === 0;
+        const currentDuration = Number.isInteger(saved.duration) && saved.duration >= DURATION_MIN && saved.duration <= DURATION_MAX;
+        const delay = saved.delay_blocks === undefined ? 0 : saved.delay_blocks;
+        if (typeof saved.address !== 'string' || typeof saved.request_id !== 'string' || !Number.isSafeInteger(saved.budget_sats) || saved.budget_sats < BUDGET_MIN || saved.budget_sats > BUDGET_MAX || !(legacyDuration || currentDuration) || !Number.isInteger(delay) || delay < 0 || delay > DELAY_MAX) throw new Error('Invalid saved request');
+        pendingRequest = { address: saved.address, budget_sats: saved.budget_sats, duration: saved.duration, delay_blocks: delay, request_id: saved.request_id };
         element('budget').value = saved.budget_sats;
         element('duration').value = saved.duration;
+        element('delay').value = delay;
         element('submit-message').textContent = 'Saved request unconfirmed. Retry safely with the same settings.';
       }
     } catch {
@@ -133,7 +153,10 @@ if (typeof document !== 'undefined') {
     }
   }
 
-  const draft = () => ({ budget_sats: pendingRequest?.budget_sats ?? Number(element('budget').value), duration: Number(element('duration').value), start_block: (state?.height ?? 0) + 1 });
+  const draft = () => {
+    const delay = pendingRequest?.delay_blocks ?? Number(element('delay').value);
+    return { budget_sats: pendingRequest?.budget_sats ?? Number(element('budget').value), duration: pendingRequest?.duration ?? Number(element('duration').value), delay_blocks: delay, start_block: (state?.height ?? 0) + 1 + delay };
+  };
   const validDraft = contribution => contribution.budget_sats >= contribution.duration * (FEE + 1);
 
   function updateDraft(resetRequest = false) {
@@ -141,17 +164,20 @@ if (typeof document !== 'undefined') {
     const contribution = draft();
     const valid = validDraft(contribution);
     element('budget-value').textContent = amount(contribution.budget_sats);
-    element('duration-value').textContent = `${number(contribution.duration)} blocks`;
+    element('duration-value').textContent = formatDuration(contribution.duration, timeMode);
+    element('delay-value').textContent = formatDuration(contribution.delay_blocks, timeMode);
     element('budget').setAttribute('aria-valuetext', amount(contribution.budget_sats));
-    element('duration').setAttribute('aria-valuetext', `${contribution.duration} blocks, about ${number(contribution.duration / 60, 1)} minutes`);
+    element('duration').setAttribute('aria-valuetext', `${formatDuration(contribution.duration, timeMode)} (${contribution.duration} blocks)`);
+    element('delay').setAttribute('aria-valuetext', `${formatDuration(contribution.delay_blocks, timeMode)} (${contribution.delay_blocks} blocks)`);
+    element('projection-note').textContent = `Known contribution schedules included. Starts ${timeMode === 'days' ? blockDate(contribution.start_block) : `at block ${number(contribution.start_block)}`}.`;
     element('budget-error').textContent = valid ? '' : `Minimum ${amount(contribution.duration * (FEE + 1))} (${amount(contribution.duration * FEE)} fees + ${amount(1)} burned per block). Increase budget or shorten duration.`;
     const canEstimate = state && wallet && valid;
-    const estimate = canEstimate ? projectedReward(state.contributions, contribution, wallet.address, state.height) : 0;
+    const estimate = canEstimate ? projectedReward(state.contributions, contribution) : 0;
     element('projected-reward').textContent = canEstimate ? whole(estimate / SPARKS) : '—';
     element('projected-fees').textContent = amount(contribution.duration * FEE);
     element('projected-burn').textContent = valid ? amount(contribution.budget_sats - contribution.duration * FEE) : '—';
     element('projected-rate').textContent = estimate ? rateAmount(contribution.budget_sats, estimate) : '—';
-    element('budget').disabled = element('duration').disabled = submitting || !!pendingRequest || brokenPending;
+    element('budget').disabled = element('duration').disabled = element('delay').disabled = submitting || !!pendingRequest || brokenPending;
     element('discard-pending').hidden = !pendingRequest && !brokenPending;
     element('discard-pending').disabled = submitting;
     element('submit').disabled = !valid || !wallet || !state || submitting || brokenPending || Date.now() - lastReceived > 5000;
@@ -211,11 +237,13 @@ if (typeof document !== 'undefined') {
       dot.style.background = userColor(contribution.user_id);
       const title = document.createElement('span');
       title.className = 'contribution-id';
-      title.textContent = minting ? `#${contribution.id} · ${amount(contribution.budget_sats)} / ${contribution.duration} blocks` : `#${contribution.id}`;
+      title.textContent = `#${contribution.id} · ${amount(contribution.budget_sats)} / ${formatDuration(contribution.duration, timeMode)}`;
       heading.append(dot, title);
       const address = document.createElement('p');
       address.className = 'address-label';
-      address.textContent = minting ? `Blocks ${contribution.start_block}–${contribution.start_block + contribution.duration - 1}` : `${contribution.address.slice(0, 13)}…${contribution.address.slice(-7)}`;
+      const end = contribution.start_block + contribution.duration - 1;
+      const schedule = timeMode === 'days' ? `${blockDate(contribution.start_block)}–${blockDate(end)}` : `Blocks ${number(contribution.start_block)}–${number(end)}`;
+      address.textContent = minting ? schedule : `${schedule} · ${contribution.address.slice(0, 13)}…${contribution.address.slice(-7)}`;
       address.title = contribution.address;
       identity.append(heading, address);
       row.append(identity);
@@ -264,8 +292,16 @@ if (typeof document !== 'undefined') {
     element('chart-rate-unit').textContent = `${label}/FLM`;
     const spokenUnit = unit === 'sat' ? 'satoshis' : unit === 'USD' ? 'US dollars' : 'BTC';
     element('chart').setAttribute('aria-label', minting
-      ? `Burn rate in ${spokenUnit} per block on the left; mint rate in ${spokenUnit} per FLM on the right. Previous and next 500 blocks. Future contributions from others remain at their current rate; your contributions follow their schedules.`
-      : `Burn above zero and mining fees below zero share a ${spokenUnit}-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous 1,000 blocks; now is at the right edge.`);
+      ? `Burn rate in ${spokenUnit} per block on the left; mint rate in ${spokenUnit} per FLM on the right. Previous and next 500 blocks, shown as ${timeMode === 'days' ? 'calendar dates' : 'block numbers'}. All known contribution schedules included.`
+      : `Burn above zero and mining fees below zero share a ${spokenUnit}-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous and next 500 blocks, shown as ${timeMode === 'days' ? 'calendar dates' : 'block numbers'}. All known contribution schedules included.`);
+    for (const value of ['blocks', 'days']) element(`time-${value}`).setAttribute('aria-pressed', String(timeMode === value));
+    element('current-block-label').textContent = timeMode === 'days' ? 'Date' : 'Block';
+    element('current-block').textContent = state ? timeMode === 'days' ? blockDate(state.height) : number(state.height) : '—';
+    element('chart-window').textContent = `±${formatDuration(500, timeMode)}`;
+    element('duration-min').textContent = formatDuration(DURATION_MIN, timeMode);
+    element('duration-max').textContent = formatDuration(DURATION_MAX, timeMode);
+    element('delay-min').textContent = formatDuration(0, timeMode);
+    element('delay-max').textContent = formatDuration(DELAY_MAX, timeMode);
     element('budget-min').textContent = amount(BUDGET_MIN);
     element('budget-max').textContent = amount(BUDGET_MAX);
     element('fee-label').textContent = `Fee: ${amount(FEE)}/block`;
@@ -314,6 +350,12 @@ if (typeof document !== 'undefined') {
     renderMoney();
   }
 
+  function selectTime(value) {
+    timeMode = value;
+    try { localStorage.setItem(TIME_KEY, value); } catch { /* Time selection still applies in this page. */ }
+    renderMoney();
+  }
+
   function queueChart() {
     if (chartQueued) return;
     chartQueued = true;
@@ -331,8 +373,8 @@ if (typeof document !== 'undefined') {
     const side = unit === 'sat' ? 48 : unit === 'BTC' ? 94 : 82;
     const margin = { left: side, top: 14, right: side, bottom: 27 };
     const w = width - margin.left - margin.right, h = height - margin.top - margin.bottom;
-    const pastBlocks = minting ? 500 : 1000;
-    const futureBlocks = minting ? 500 : 0;
+    const pastBlocks = 500;
+    const futureBlocks = 500;
     const heightNow = state?.height ?? 0, firstBlock = heightNow - pastBlocks, count = pastBlocks + futureBlocks + 1;
     const colored = !minting;
     const groups = new Map();
@@ -354,7 +396,7 @@ if (typeof document !== 'undefined') {
       groups.set(key, values);
       for (let i = 0; i < count; i++) {
         const block = firstBlock + i;
-        values[i] += minting ? projectedBurn(contribution, block, heightNow, wallet?.address) : burnAt(contribution, block);
+        values[i] += burnAt(contribution, block);
         if (!minting) fees[i] += feeAt(contribution, block);
       }
     }
@@ -411,28 +453,30 @@ if (typeof document !== 'undefined') {
       for (let i = 0; i < count; i++) base[i] += values[i];
     }
     context.globalAlpha = 1;
-    if (minting) {
-      context.fillStyle = '#ffffff30'; context.fillRect(x(pastBlocks), margin.top, w * futureBlocks / (count - 1), h);
-    }
+    context.fillStyle = '#ffffff30'; context.fillRect(x(pastBlocks), margin.top, w * futureBlocks / (count - 1), h);
     if (!minting) {
       context.strokeStyle = '#666';
       context.beginPath(); context.moveTo(x(0), zero); context.lineTo(x(count - 1), zero); context.stroke();
     }
     context.strokeStyle = '#666'; context.setLineDash([3, 4]); context.beginPath(); context.moveTo(x(pastBlocks), margin.top); context.lineTo(x(pastBlocks), margin.top + h); context.stroke(); context.setLineDash([]);
     if (showDraft) {
-      context.beginPath();
-      for (let i = pastBlocks; i < count; i++) {
-        const block = firstBlock + i;
-        if (block > pending.start_block + pending.duration) break;
-        const value = totals[i] + burnAt(pending, block);
-        if (i === pastBlocks) context.moveTo(x(i), y(value)); else context.lineTo(x(i), y(value));
+      const start = Math.max(0, pending.start_block - firstBlock);
+      const end = Math.min(count - 1, pending.start_block + pending.duration - 1 - firstBlock);
+      if (start <= end) {
+        const from = Math.max(0, start - 1), to = Math.min(count - 1, end + 1);
+        context.beginPath();
+        for (let i = from; i <= to; i++) {
+          const value = totals[i] + burnAt(pending, firstBlock + i);
+          if (i === from) context.moveTo(x(i), y(value)); else context.lineTo(x(i), y(value));
+        }
+        context.strokeStyle = ownColor; context.lineWidth = 1.8; context.setLineDash([5, 4]); context.stroke(); context.setLineDash([]);
       }
-      context.strokeStyle = ownColor; context.lineWidth = 1.8; context.setLineDash([5, 4]); context.stroke(); context.setLineDash([]);
     }
     context.fillStyle = '#666'; context.font = '10px -apple-system, sans-serif';
     for (const i of [0, (count - 1) / 4, (count - 1) / 2, 3 * (count - 1) / 4, count - 1]) {
       context.textAlign = i === 0 ? 'left' : i === count - 1 ? 'right' : 'center';
-      context.fillText(firstBlock + i < 0 ? '—' : number(firstBlock + i), x(i), height - 8);
+      const block = firstBlock + i;
+      context.fillText(block < 0 ? '—' : timeMode === 'days' ? blockDate(block) : number(block), x(i), height - 8);
     }
     if (!state) { context.textAlign = 'center'; context.fillText('Loading…', margin.left + w / 2, margin.top + h / 2); }
   }
@@ -445,7 +489,6 @@ if (typeof document !== 'undefined') {
       lastReceived = Date.now();
       element('connection').className = 'connection';
       element('connection').textContent = 'Live';
-      element('current-block').textContent = number(state.height);
       renderMoney();
     } catch (error) {
       element('connection').className = 'connection error';
@@ -456,7 +499,9 @@ if (typeof document !== 'undefined') {
 
   element('budget').addEventListener('input', () => updateDraft(true));
   for (const value of ['sat', 'BTC', 'USD']) element(`unit-${value.toLowerCase()}`).addEventListener('click', () => selectUnit(value));
+  for (const value of ['blocks', 'days']) element(`time-${value}`).addEventListener('click', () => selectTime(value));
   element('duration').addEventListener('input', () => updateDraft(true));
+  element('delay').addEventListener('input', () => updateDraft(true));
   element('retry-wallet').addEventListener('click', prepareWallet);
   element('reset-wallet').addEventListener('click', () => {
     if (!confirm('Forget this saved demo wallet and create a new one? Save its recovery phrase first if it is available. Existing rewards will remain linked to the old address.')) return;
@@ -478,13 +523,13 @@ if (typeof document !== 'undefined') {
     event.preventDefault();
     if (submitting || brokenPending || !wallet || !state || !validDraft(draft()) || Date.now() - lastReceived > 5000) return;
     submitting = true; updateDraft();
-    element('budget').disabled = true; element('duration').disabled = true;
+    element('budget').disabled = element('duration').disabled = element('delay').disabled = true;
     element('submit-message').className = 'form-message';
     element('submit-message').textContent = '';
     try {
       if (!pendingRequest) {
         const contribution = draft();
-        const request = { address: wallet.address, budget_sats: contribution.budget_sats, duration: contribution.duration, request_id: crypto.randomUUID() };
+        const request = { address: wallet.address, budget_sats: contribution.budget_sats, duration: contribution.duration, delay_blocks: contribution.delay_blocks, request_id: crypto.randomUUID() };
         localStorage.setItem(pendingKey, JSON.stringify(request));
         pendingRequest = request;
       }
@@ -492,14 +537,14 @@ if (typeof document !== 'undefined') {
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || `Server returned ${response.status}`);
       element('submit-message').className = 'form-message success';
-      element('submit-message').textContent = `#${result.id} accepted. Starts at block ${result.start_block}.`;
+      element('submit-message').textContent = `#${result.id} accepted. Starts ${timeMode === 'days' ? blockDate(result.start_block) : `at block ${number(result.start_block)}`}.`;
       localStorage.removeItem(pendingKey);
       pendingRequest = null;
     } catch (error) {
       element('submit-message').className = 'form-message';
       element('submit-message').textContent = `${error.message}. Request saved locally; retry safely after reloading.`;
     } finally {
-      submitting = false; element('budget').disabled = false; element('duration').disabled = false; updateDraft();
+      submitting = false; updateDraft();
     }
   });
   new ResizeObserver(queueChart).observe(element('chart'));

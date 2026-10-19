@@ -164,7 +164,7 @@ async fn submit(
     let Json(request) = request.map_err(|error| {
         ApiError(
             error.status(),
-            "Expected JSON containing address, budget_sats, duration and request_id.".into(),
+            "Expected JSON containing address, budget_sats, duration, optional delay_blocks and request_id.".into(),
         )
     })?;
     store
@@ -317,7 +317,7 @@ mod tests {
             .to_recv()
             .to_address()
             .to_bech32(flamekd::Network::Testnet);
-        serde_json::json!({"address": address, "budget_sats": 200000, "duration": 100, "request_id": "test-submission-00001"})
+        serde_json::json!({"address": address, "budget_sats": 400000, "duration": 200, "request_id": "test-submission-00001"})
     }
 
     fn post_request(value: &serde_json::Value) -> Request<Body> {
@@ -402,10 +402,11 @@ mod tests {
                 .await,
             );
         }
-        assert!(pending_states[0]["contributions"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            pending_states[0]["contributions"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(pending_states[0]["contributions"][0]["delay_blocks"], 0);
         assert_eq!(
             pending_states[1]["contributions"].as_array().unwrap().len(),
             1
@@ -469,7 +470,7 @@ mod tests {
             .unwrap()
             .execute(
                 "INSERT INTO blocks(height, burned_sats, fees_sats, reward_sparks)
-                 VALUES (10101, 0, 0, 0)",
+                 VALUES (10201, 0, 0, 0)",
                 [],
             )
             .unwrap();
@@ -485,7 +486,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             states.push(json(response).await);
         }
-        assert_eq!(states[0]["height"], 10_101);
+        assert_eq!(states[0]["height"], 10_201);
         assert!(states[0]["contributions"].as_array().unwrap().is_empty());
         assert_eq!(states[1]["contributions"].as_array().unwrap().len(), 1);
         assert_eq!(states[0]["totals"], states[1]["totals"]);
@@ -493,6 +494,68 @@ mod tests {
         assert_eq!(states[0]["totals"]["burned_sats"], "1000");
         assert_eq!(states[0]["totals"]["fees_sats"], "1000");
         assert_eq!(states[0]["totals"]["reward_sparks"], "5000000000");
+        store.stop().await;
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn schedules_nonstep_duration_and_validates_delay_through_json_api() {
+        let (store, thread) = Store::open(PathBuf::from(":memory:")).unwrap();
+        let app = router(store.clone());
+        let mut value = contribution();
+        value["duration"] = 145.into();
+        value["delay_blocks"] = 4_464.into();
+        let response = app.clone().oneshot(post_request(&value)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first = json(response).await;
+        assert_eq!(first["start_block"], 4_465);
+        store
+            .request(Command::Tick)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.1));
+        let retry = json(app.clone().oneshot(post_request(&value)).await.unwrap()).await;
+        assert_eq!(first, retry);
+        let state = json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/state")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(state["contributions"][0]["delay_blocks"], 4_464);
+        assert_eq!(state["contributions"][0]["duration"], 145);
+        assert_eq!(state["totals"]["burned_sats"], "0");
+        value["delay_blocks"] = 0.into();
+        assert_eq!(
+            app.clone()
+                .oneshot(post_request(&value))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        value["request_id"] = "another-submission-00001".into();
+        for delay in [serde_json::json!(-1), serde_json::json!(4_465)] {
+            value["delay_blocks"] = delay;
+            assert_eq!(
+                app.clone()
+                    .oneshot(post_request(&value))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        value["delay_blocks"] = serde_json::json!(1.5);
+        assert_eq!(
+            app.oneshot(post_request(&value)).await.unwrap().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
         store.stop().await;
         thread.join().unwrap();
     }

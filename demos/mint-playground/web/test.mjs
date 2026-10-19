@@ -4,7 +4,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('./app.js', import.meta.url), 'utf8');
-const { BUDGET_MIN, BUDGET_MAX, burnAt, feeAt, projectedBurn, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, blockDate, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 const plan = (options = {}) => ({ user_id: 1, budget_sats: 300005, duration: 100, start_block: 10, ...options });
 
 test('budget is a native linear slider with the requested endpoints', async () => {
@@ -17,6 +17,34 @@ test('budget is a native linear slider with the requested endpoints', async () =
   assert.equal(attribute('max'), BUDGET_MAX);
   assert.equal(attribute('step'), 100000);
   assert.equal(attribute('value'), 1000000);
+});
+
+test('duration and delay sliders use exact integer block bounds at single-block resolution', async () => {
+  const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
+  assert.equal(BLOCKS_PER_DAY, 144);
+  assert.equal(DURATION_MIN, 144);
+  assert.equal(DURATION_MAX, 4464);
+  assert.equal(DELAY_MAX, 4464);
+  for (const [id, min, max, value] of [['duration', 144, 4464, 500], ['delay', 0, 4464, 0]]) {
+    const slider = html.match(new RegExp(`<input\\b[^>]*\\bid="${id}"[^>]*>`))[0];
+    const attribute = name => Number(slider.match(new RegExp(`\\b${name}="([^"]+)"`))[1]);
+    assert.equal(attribute('min'), min);
+    assert.equal(attribute('max'), max);
+    assert.equal(attribute('step'), 1);
+    assert.equal(attribute('value'), value);
+  }
+});
+
+test('calendar dates start at block one and use exact 144-block UTC days, including leap and year boundaries', () => {
+  assert.equal(blockDate(0), 'Jan 10');
+  for (const block of [1, 2, 143, 144]) assert.equal(blockDate(block), 'Jan 11');
+  assert.equal(blockDate(145), 'Jan 12');
+  assert.equal(blockDate(61 * 144 + 1), 'Mar 13');
+  assert.equal(blockDate(355 * 144), 'Dec 31');
+  assert.equal(blockDate(355 * 144 + 1), 'Jan 1');
+  assert.equal(blockDate(414 * 144 + 1), 'Feb 29');
+  assert.equal(blockDate(415 * 144 + 1), 'Mar 1');
+  assert.equal(blockDate(-1), '—');
 });
 
 test('integer schedule spreads the remainder into the first blocks and conserves sats', () => {
@@ -45,49 +73,54 @@ test('mining fees count concurrent contributions, including the same address, no
 
 test('projection awards all issuance to a sole contribution and halves it with equal competition', () => {
   const draft = plan({ address: 'own', budget_sats: 300000, start_block: 11 });
-  const competing = plan({ address: 'other', budget_sats: 300000 });
+  const competing = plan({ address: 'other', budget_sats: 300000, start_block: 11 });
   assert.equal(projectedReward([], draft, 'own'), 5000 * SPARKS);
   assert.equal(projectedReward([competing], draft, 'own'), 2500 * SPARKS);
 });
 
-test('projection holds other users at their current rate, regardless of their future durations', () => {
+test('projection uses each known competitor’s actual expiry rather than extrapolating its current rate', () => {
   const draft = plan({ address: 'own', budget_sats: 300000, start_block: 11 });
-  const short = plan({ address: 'other', budget_sats: 150000, duration: 50 });
-  const long = plan({ address: 'other', budget_sats: 3000000, duration: 1000 });
-  assert.equal(burnAt(short, 10), burnAt(long, 10));
-  assert.equal(projectedReward([short], draft, 'own'), 2500 * SPARKS);
+  const short = plan({ address: 'other', budget_sats: 150000, duration: 50, start_block: 11 });
+  const long = plan({ address: 'other', budget_sats: 3000000, duration: 1000, start_block: 11 });
+  assert.equal(burnAt(short, 11), burnAt(long, 11));
+  assert.equal(projectedReward([short], draft, 'own'), 3750 * SPARKS);
   assert.equal(projectedReward([long], draft, 'own'), 2500 * SPARKS);
-  assert.equal(projectedBurn(short, 999, 10, 'own'), 2000, 'the latest rate survives the competitor’s actual expiry');
+  assert.equal(burnAt(short, 60), 2000);
+  assert.equal(burnAt(short, 61), 0, 'the last funded block is inclusive');
+  assert.equal(burnAt(short, 999), 0);
 });
 
-test('future other-user schedules and already expired contributions never enter forecasts', () => {
+test('future other-user schedules enter forecasts while expired contributions do not', () => {
   const draft = plan({ address: 'own', budget_sats: 300000, start_block: 11 });
   const expired = plan({ address: 'other', start_block: -90, budget_sats: 300000 });
-  const scheduled = plan({ address: 'other', start_block: 11, budget_sats: 100000000 });
-  assert.equal(projectedReward([expired, scheduled], draft, 'own'), 5000 * SPARKS);
-  assert.equal(projectedBurn(expired, 11, 10, 'own'), 0);
-  assert.equal(projectedBurn(scheduled, 11, 10, 'own'), 0);
-  assert.equal(projectedBurn(scheduled, 11, 10, 'other'), burnAt(scheduled, 11), 'a user’s own scheduled contribution is known');
+  const scheduled = plan({ address: 'other', start_block: 61, duration: 50, budget_sats: 150000 });
+  assert.equal(projectedReward([expired, scheduled], draft, 'own'), 3750 * SPARKS);
+  assert.equal(burnAt(expired, 11), 0);
+  assert.equal(burnAt(scheduled, 60), 0);
+  assert.equal(burnAt(scheduled, 61), 2000);
+  assert.equal(burnAt(scheduled, 110), 2000);
+  assert.equal(burnAt(scheduled, 111), 0);
 });
 
 test('known own contributions reduce the draft’s allocated share and expire on schedule', () => {
   const draft = plan({ address: 'own', budget_sats: 300000, start_block: 11 });
   const existing = plan({ address: 'own', start_block: 11, budget_sats: 150000, duration: 50 });
   assert.equal(projectedReward([existing], draft, 'own'), 3750 * SPARKS);
-  assert.equal(projectedBurn(existing, 60, 10, 'own'), 2000);
-  assert.equal(projectedBurn(existing, 61, 10, 'own'), 0);
+  assert.equal(burnAt(existing, 60), 2000);
+  assert.equal(burnAt(existing, 61), 0);
   const later = { ...existing, start_block: 61 };
   assert.equal(projectedReward([later], draft, 'own'), 3750 * SPARKS, 'known future overlap is included even if it has not begun');
 });
 
-test('the current block snapshot freezes its exact remainder rate for the full draft, not just the chart window', () => {
+test('projections preserve each actual remainder block and account for delayed windows beyond the chart', () => {
   const competing = plan({ address: 'other' });
   const draft = plan({ address: 'own', start_block: 15, duration: 1000, budget_sats: 3000000 });
   const estimate = projectedReward([competing], draft, 'own');
-  assert.equal(projectedBurn(competing, 2000, 14, 'own'), 2001, 'the last current block’s remainder sat is retained');
-  assert.ok(Math.abs(estimate - 1000 * 50 * SPARKS * 2000 / 4001) < 1, 'all 1,000 planned blocks use the same frozen competing burn');
-  assert.equal(projectedBurn(competing, 2000, 15, 'own'), 2000, 'a later snapshot uses its own current remainder rate');
-  assert.equal(projectedBurn(competing, 14, 15, 'own'), 2001, 'historical samples remain factual');
+  assert.equal(burnAt(competing, 2000), 0, 'expired competition is not extrapolated');
+  assert.equal(estimate, (95 * 25 + 905 * 50) * SPARKS, 'only the actual 95 overlapping blocks share rewards');
+  assert.equal(burnAt(competing, 14), 2001, 'historical samples remain factual');
+  const later = { ...draft, start_block: 5000 };
+  assert.equal(projectedReward([competing], later, 'own'), 50000 * SPARKS, 'a delayed draft is evaluated over its full future duration');
 });
 
 test('a contribution finishes on the last inclusive block, not one block later', () => {
@@ -115,9 +148,9 @@ test('every referenced UI element exists once in the page', async () => {
   assert.doesNotMatch(html, /\bcomposition(?:-label)?\b|type="checkbox"/, 'contribution colors have no toggle');
 });
 
-test('linear slider budgets conserve the complete budget at every allowed duration', () => {
+test('linear slider budgets conserve the complete budget at duration boundaries and representative single-block choices', () => {
   for (const budget_sats of [BUDGET_MIN, 200000, 500000, 1000000, 50000000, BUDGET_MAX]) {
-    for (let duration = 100; duration <= 1000; duration += 50) {
+    for (const duration of [DURATION_MIN, DURATION_MIN + 1, 500, 1440, DURATION_MAX - 1, DURATION_MAX]) {
       if (budget_sats < duration * (FEE + 1)) continue;
       const contribution = plan({ budget_sats, duration });
       let total = duration * FEE;
@@ -155,6 +188,7 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
   const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => [id, new Element()]));
   for (const [, id, text] of html.matchAll(/\bid="([^"]+)"[^>]*>([^<]*)</g)) elements.get(id).textContent = text.replaceAll('&nbsp;', '\u00a0');
   elements.get('budget').value = '1000000'; elements.get('duration').value = '500';
+  elements.get('delay').value = '0';
   const requests = [], frames = [], timers = new Map(), abortTimeouts = [];
   let nextTimer = 0;
   const snapshot = { height: 10, totals: { contribution_count: 1, burned_sats: '100000', fees_sats: '1000', reward_sparks: '50000000000' }, contributions: [{ id: 1, user_id: 1, address: 'tf1demo-address', budget_sats: 300000, duration: 100, start_block: 10, burned_sats: '2000', fees_sats: '1000', reward_sparks: '5000000000' }] };
@@ -202,11 +236,9 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
   };
 }
 
-test('dashboard ends 1,000 historical blocks at now while mint centers 500 past and 500 projected blocks', async () => {
+test('both charts center now between 500 past and 500 known future blocks', async () => {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
-  assert.match(html, /<canvas\b[^>]*aria-label="[^"]*Previous 1,000 blocks; now is at the right edge\./);
-  assert.match(html, /id="chart-window">Previous 1,000 blocks</);
-  assert.match(html, /id="chart-note">History only</);
+  assert.match(html, /<canvas\b[^>]*aria-label="[^"]*Previous and next 500 blocks\./);
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
     const minting = pathname === '/mint';
@@ -216,28 +248,24 @@ test('dashboard ends 1,000 historical blocks at now while mint centers 500 past 
     await page.refresh();
     const draws = page.draws.filter(call => call.canvas === page.elements.get('chart'));
     const ticks = draws.filter(call => call.method === 'fillText' && call.args[2] === 267);
-    assert.deepEqual(ticks.map(call => call.args[0]), minting ? ['0', '250', '500', '750', '1,000'] : ['500', '750', '1,000', '1,250', '1,500']);
+    assert.deepEqual(ticks.map(call => call.args[0]), minting ? ['0', '250', '500', '750', '1,000'] : ['1,000', '1,250', '1,500', '1,750', '2,000']);
     assert.deepEqual(ticks.map(call => call.args[1]), [48, 224, 400, 576, 752]);
     const shading = draws.find(call => call.method === 'fillRect' && call.fillStyle === '#ffffff30');
-    if (minting) {
-      assert.equal(shading.args[0], 400, 'future shading begins at the centered current block');
-      assert.equal(shading.args[2], 352, 'future shading ends at the right edge');
-    } else {
-      assert.equal(shading, undefined, 'the public chart has no future region');
-    }
+    assert.equal(shading.args[0], 400, 'future shading begins at the centered current block');
+    assert.equal(shading.args[2], 352, 'future shading ends at the right edge');
     const pathBefore = index => {
       const start = draws.slice(0, index).findLastIndex(call => call.method === 'beginPath');
       return draws.slice(start + 1, index).filter(call => call.method === 'moveTo' || call.method === 'lineTo');
     };
     const nowLine = pathBefore(draws.findLastIndex(call => call.method === 'stroke' && call.strokeStyle === '#666'));
-    assert.deepEqual(nowLine.map(call => call.args), [[minting ? 400 : 752, 14], [minting ? 400 : 752, 248]], 'now marks the center only on the mint page');
+    assert.deepEqual(nowLine.map(call => call.args), [[400, 14], [400, 248]], 'now marks the center of both charts');
     const band = pathBefore(draws.findIndex(call => call.method === 'fill' && call.fillStyle === userColor(1)));
     assert.equal(band.length, 2003, 'a closed band contains 1,001 top and 1,001 bottom samples plus its starting point');
     assert.equal(Math.min(...band.map(call => call.args[0])), 48);
     assert.equal(Math.max(...band.map(call => call.args[0])), 752);
     if (minting) {
-      assert.match(page.elements.get('chart')['aria-label'], /Previous and next 500 blocks\./);
-      assert.match(page.elements.get('chart-note').textContent, /current|rate|Others/i);
+      assert.match(page.elements.get('chart')['aria-label'], /Previous and next 500 blocks[, .]/);
+      assert.match(page.elements.get('chart-note').textContent, /known|scheduled|future/i);
       const draft = pathBefore(draws.findIndex(call => call.method === 'stroke' && call.strokeStyle === userColor(1)));
       assert.equal(draft.length, 501, 'draft sampling stays within the visible future window');
       assert.equal(draft[0].args[0], 400);
@@ -246,12 +274,12 @@ test('dashboard ends 1,000 historical blocks at now while mint centers 500 past 
   }
 });
 
-test('mint chart extends only the current other-user burn and overlays exact own schedules', async () => {
+test('mint chart displays every known future schedule and expiry, with exact own overlays', async () => {
   const page = await openPage('/mint');
   const first = page.snapshot.contributions[0];
   page.snapshot.contributions = [
     { ...first, id: 1, user_id: 2, address: 'other', start_block: -89 },
-    { ...first, id: 2, user_id: 3, address: 'other-future', start_block: 11, budget_sats: 100000000 },
+    { ...first, id: 2, user_id: 3, address: 'other-future', start_block: 61, duration: 50, budget_sats: 150000 },
     { ...first, id: 3, user_id: 4, address: 'other-expired', start_block: -190 },
     { ...first, id: 4, start_block: 11, duration: 50, budget_sats: 150000 },
   ];
@@ -271,9 +299,8 @@ test('mint chart extends only the current other-user burn and overlays exact own
   };
   const otherHeight = thickness('#a3a3a3', 10);
   assert.ok(otherHeight > 0);
-  for (const block of [11, 60, 61, 109, 110, 510]) {
-    assert.equal(thickness('#a3a3a3', block), otherHeight, `other-user burn remains fixed at block ${block}`);
-  }
+  for (const block of [11, 60, 111, 510]) assert.equal(thickness('#a3a3a3', block), 0, `no competing commitment is active at ${block}`);
+  for (const block of [61, 110]) assert.equal(thickness('#a3a3a3', block), otherHeight, `the scheduled competitor is visible at ${block}`);
   assert.equal(thickness(userColor(1), 10), 0, 'own scheduled contribution has not started at now');
   assert.equal(thickness(userColor(1), 11), otherHeight, 'own concrete schedule begins next block');
   assert.equal(thickness(userColor(1), 60), otherHeight, 'own final funded block remains visible');
@@ -284,6 +311,40 @@ test('mint chart extends only the current other-user burn and overlays exact own
   const estimate = projectedReward(page.snapshot.contributions, draft, first.address, 10);
   assert.equal(page.elements.get('projected-reward').textContent, new Intl.NumberFormat('en').format(Math.trunc(estimate / SPARKS)));
   assert.equal(page.elements.get('projected-rate').textContent, `${new Intl.NumberFormat('en').format(Math.trunc(draft.budget_sats * SPARKS / estimate))} sat / FLM`);
+});
+
+test('dashboard includes scheduled contributions in future bands and shows their budgets and date ranges', async () => {
+  const page = await openPage('/');
+  const first = page.snapshot.contributions[0];
+  page.snapshot.height = 144;
+  page.snapshot.contributions = [{ ...first, id: 2, user_id: 2, address: 'scheduled-user', start_block: 145, duration: 144, budget_sats: 432000, burned_sats: '0', fees_sats: '0', reward_sparks: '0' }];
+  page.draws.length = 0;
+  await page.refresh();
+  const row = page.elements.get('contributions').children[0];
+  assert.equal(row.children[1].children[0].textContent, 'Scheduled');
+  assert.match(row.children[0].children[0].children[1].textContent, /432,000 sat \/ 144 blocks/);
+  assert.match(row.children[0].children[1].textContent, /Blocks 145–288/);
+  let path = [];
+  let band;
+  for (const call of page.draws.filter(call => call.canvas === page.elements.get('chart'))) {
+    if (call.method === 'beginPath') path = [];
+    if (call.method === 'moveTo' || call.method === 'lineTo') path.push(call.args);
+    if (call.method === 'fill' && call.fillStyle === userColor(2)) band = path;
+  }
+  const thickness = block => {
+    const index = block - (page.snapshot.height - 500);
+    return band[2002 - index][1] - band[index + 1][1];
+  };
+  assert.equal(thickness(144), 0);
+  assert.ok(thickness(145) > 0, 'the next-block scheduled start is visible');
+  assert.ok(thickness(288) > 0, 'the final funded block is visible');
+  assert.equal(thickness(289), 0, 'the known expiry ends the band');
+  const totals = page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
+  await page.event('time-days', 'click');
+  const dayRow = page.elements.get('contributions').children[0];
+  assert.match(dayRow.children[0].children[0].children[1].textContent, /432,000 sat \/ 1 day$/);
+  assert.match(dayRow.children[0].children[1].textContent, /Jan 12–Jan 12/);
+  assert.deepEqual(page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent), totals, 'calendar display does not alter all-time totals');
 });
 
 test('dashboard burn and patterned downward fees share one sats scale, with mint rates on the right', async () => {
@@ -327,7 +388,7 @@ test('dashboard burn and patterned downward fees share one sats scale, with mint
     negative ||= sats < 0;
   }
   assert.ok(positive && negative, 'both burn and fee regions have paired axis labels');
-  assert.ok(!page.draws.some(call => call.method === 'fillRect' && call.fillStyle === '#ffffff30'), 'the dashboard never shades a future projection');
+  assert.ok(page.draws.some(call => call.method === 'fillRect' && call.fillStyle === '#ffffff30'), 'the dashboard distinguishes its visible future region');
   page.snapshot.contributions.push({ ...page.snapshot.contributions[0], id: 2, budget_sats: 100100 });
   page.draws.length = 0;
   await page.refresh();
@@ -365,7 +426,7 @@ test('dashboard initializes, polls, draws, and renders the actual contribution s
   assert.equal(page.elements.get('current-block').textContent, '10');
   assert.equal(page.elements.get('connection').textContent, 'Live');
   assert.equal(page.elements.get('contributions').children.length, 1);
-  assert.equal(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, '#1', 'public rows do not disclose future budget or duration');
+  assert.match(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, /#1.*300,000 sat.*100 blocks/, 'public rows disclose the known budget and duration');
   assert.equal(page.requests.filter(request => request.url === '/api/state').length, 1);
   assert.equal(page.requests.length, 2, 'state and BTC/USD quote are loaded independently');
   assert.equal(page.storage.size, 0, 'dashboard does not need palette or wallet storage');
@@ -538,7 +599,7 @@ test('dashboard sums each user’s burns and moves their complete band on top wh
     { ...first, id: 2, user_id: 26, address: 'another-user', budget_sats: 430000, start_block: 8 },
     { ...first, id: 3, budget_sats: 760000, start_block: 9 },
   ];
-  const bands = (page, colors = PALETTE, currentX = 752) => {
+  const bands = (page, colors = PALETTE, currentX = 400) => {
     let path = [];
     const result = [];
     for (const call of page.draws.filter(call => call.canvas === page.elements.get('chart'))) {
@@ -669,8 +730,8 @@ test('user colors match across clients, reloads, reordered snapshots, and repeat
   assert.equal(page.storage.size, 0);
 });
 
-test('dashboard colors need no storage beyond the independent unit preference', async () => {
-  const page = await openPage('/', { get(key) { assert.equal(key, UNIT_KEY); return null; }, set() { assert.fail('Unexpected storage write'); } });
+test('dashboard colors need no storage beyond independent unit and time preferences', async () => {
+  const page = await openPage('/', { get(key) { assert.ok([UNIT_KEY, TIME_KEY].includes(key)); return null; }, set() { assert.fail('Unexpected storage write'); } });
   assert.equal(page.elements.get('connection').textContent, 'Live');
   const firstColor = page.elements.get('contributions').children[0].children[0].children[0].children[0].style.background;
   assert.equal(firstColor, userColor(1));
@@ -704,6 +765,179 @@ test('budget slider values are satoshis directly, including its linear midpoint'
   }
 });
 
+test('blocks and days are accessible persisted display modes independent from currency and raw contribution data', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    const before = JSON.stringify(page.snapshot);
+    assert.equal(page.elements.get('time-blocks')['aria-pressed'], 'true');
+    assert.equal(page.elements.get('time-days')['aria-pressed'], 'false');
+    assert.equal(page.storage.has(TIME_KEY), false);
+    page.snapshot.height = 144 * 61 + 1;
+    await page.refresh();
+    page.draws.length = 0;
+    await page.event('time-days', 'click');
+    assert.equal(page.elements.get('time-days')['aria-pressed'], 'true');
+    assert.equal(page.elements.get('time-blocks')['aria-pressed'], 'false');
+    assert.equal(page.storage.get(TIME_KEY), 'days');
+    assert.equal(page.elements.get('current-block').textContent, 'Mar 13');
+    const ticks = page.draws.filter(call => call.canvas === page.elements.get('chart') && call.method === 'fillText' && call.args[2] === 267);
+    assert.equal(ticks.length, 5);
+    assert.equal(ticks[2].args[0], 'Mar 13', 'the center date represents the current block');
+    assert.ok(ticks.every(call => /^[A-Z][a-z]{2} \d{1,2}$/.test(call.args[0])), 'all tick labels use short calendar dates');
+    const dates = ticks.map(call => call.args[0]);
+    await page.event('unit-btc', 'click');
+    assert.equal(page.storage.get(TIME_KEY), 'days');
+    assert.equal(page.storage.get(UNIT_KEY), 'BTC');
+    assert.equal(page.elements.get('time-days')['aria-pressed'], 'true');
+    const reloaded = await openPage(pathname, page.storage);
+    assert.equal(reloaded.elements.get('time-days')['aria-pressed'], 'true');
+    assert.equal(reloaded.elements.get('unit-btc')['aria-pressed'], 'true');
+    assert.deepEqual(page.snapshot.contributions, JSON.parse(before).contributions, 'display changes never alter committed schedules');
+    assert.equal(new Set(dates).size, 5);
+  }
+});
+
+test('invalid or unavailable time preference storage falls back to blocks without breaking either switch', async () => {
+  const storage = new Map([[TIME_KEY, 'invalid']]);
+  const invalid = await openPage('/', storage);
+  assert.equal(invalid.elements.get('time-blocks')['aria-pressed'], 'true');
+  assert.equal(storage.get(TIME_KEY), 'invalid');
+  const page = await openPage('/', { get() { throw new Error('Storage blocked'); }, set() { throw new Error('Storage blocked'); } });
+  await page.event('time-days', 'click');
+  assert.equal(page.elements.get('time-days')['aria-pressed'], 'true');
+  assert.equal(page.elements.get('connection').textContent, 'Live');
+  await page.event('unit-usd', 'click');
+  assert.equal(page.elements.get('time-days')['aria-pressed'], 'true');
+  assert.equal(page.elements.get('total-burned').textContent, '$50.000');
+});
+
+test('day-mode duration and delay show block-derived days while retaining every single-block slider value', async () => {
+  const page = await openPage('/mint');
+  await page.event('time-days', 'click');
+  assert.match(page.elements.get('duration-min').textContent, /^1 day/);
+  assert.match(page.elements.get('duration-max').textContent, /^31 day/);
+  assert.match(page.elements.get('delay-min').textContent, /^0 day/);
+  assert.match(page.elements.get('delay-max').textContent, /^31 day/);
+  page.elements.get('duration').value = '145';
+  await page.event('duration', 'input');
+  page.elements.get('delay').value = '1';
+  await page.event('delay', 'input');
+  assert.equal(page.elements.get('duration-value').textContent, '1.007 days');
+  assert.equal(page.elements.get('delay-value').textContent, '0.007 days');
+  assert.equal(page.elements.get('duration').value, '145');
+  assert.equal(page.elements.get('delay').value, '1');
+  await page.event('contribution-form', 'submit');
+  const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(request.duration, 145);
+  assert.equal(request.delay_blocks, 1);
+  assert.equal(request.budget_sats, 1000000);
+});
+
+test('scheduled delayed drafts compete only across their actual start and expiry and survive retries exactly', async () => {
+  const storage = new Map();
+  const page = await openPage('/mint', storage, async () => { throw new Error('Response lost'); });
+  page.elements.get('duration').value = '144';
+  page.elements.get('delay').value = '4464';
+  await page.event('duration', 'input');
+  await page.event('delay', 'input');
+  page.snapshot.contributions = [plan({ id: 1, address: 'other', start_block: 4475, duration: 144, budget_sats: 1000000 })];
+  await page.refresh();
+  assert.equal(page.elements.get('projected-reward').textContent, '3,600', 'all 144 delayed blocks overlap equal known competition');
+  await page.event('contribution-form', 'submit');
+  const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(request.delay_blocks, 4464);
+  assert.equal(request.duration, 144);
+  assert.equal(page.elements.get('delay').disabled, true);
+  await page.event('time-days', 'click');
+  await page.event('unit-usd', 'click');
+  assert.deepEqual(JSON.parse(storage.get('flame-mint-playground-pending-v1')), request);
+  const retry = await openPage('/mint', storage);
+  assert.equal(Number(retry.elements.get('delay').value), 4464);
+  assert.equal(Number(retry.elements.get('duration').value), 144);
+  assert.equal(retry.elements.get('delay').disabled, true);
+  await retry.event('contribution-form', 'submit');
+  assert.deepEqual(JSON.parse(retry.requests.find(request => request.url === '/api/contributions').options.body), request);
+});
+
+test('the dashed draft is limited to its real scheduled interval and disappears outside the chart', async () => {
+  const page = await openPage('/mint');
+  page.snapshot.height = 500;
+  page.elements.get('duration').value = '144';
+  await page.refresh();
+  const strokePath = () => {
+    let path = [];
+    for (const call of page.draws.filter(call => call.canvas === page.elements.get('chart'))) {
+      if (call.method === 'beginPath') path = [];
+      if (call.method === 'moveTo' || call.method === 'lineTo') path.push(call.args);
+      if (call.method === 'stroke' && call.strokeStyle === userColor(1)) return path;
+    }
+    return [];
+  };
+  for (const [delay, firstBlock, lastBlock] of [[0, 500, 645], [100, 600, 745], [499, 999, 1000]]) {
+    page.draws.length = 0;
+    page.elements.get('delay').value = String(delay);
+    await page.event('delay', 'input');
+    const path = strokePath();
+    assert.ok(path.length > 0);
+    const xs = path.map(point => point[0]);
+    assert.equal(Math.min(...xs), 48 + firstBlock / 1000 * 704, 'only one zero sample immediately precedes the actual start');
+    assert.equal(Math.max(...xs), 48 + lastBlock / 1000 * 704, 'only one zero sample immediately follows the actual end, clipped to the window');
+    assert.equal(path.length, lastBlock - firstBlock + 1);
+  }
+  for (const delay of [500, 4464]) {
+    page.draws.length = 0;
+    page.elements.get('delay').value = String(delay);
+    await page.event('delay', 'input');
+    assert.deepEqual(strokePath(), [], `delay ${delay} starts after the visible future window`);
+    assert.notEqual(page.elements.get('projected-reward').textContent, '—', 'offscreen drafts still have full-duration estimates');
+  }
+});
+
+test('legacy saved requests normalize absent delay to zero without rewriting their identity or historical duration', async () => {
+  const pending = { address: 'tf1demo-address', request_id: 'legacy-request-001', budget_sats: 2000123, duration: 100 };
+  const storage = new Map([['flame-mint-playground-pending-v1', JSON.stringify(pending)]]);
+  const page = await openPage('/mint', storage);
+  assert.equal(page.elements.get('submit').textContent, 'Retry pending');
+  assert.match(page.elements.get('duration-value').textContent, /100 blocks/);
+  assert.equal(page.elements.get('delay').disabled, true);
+  page.elements.get('duration').value = '144';
+  page.elements.get('delay').value = '99';
+  await page.event('contribution-form', 'submit');
+  assert.deepEqual(JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body), { ...pending, delay_blocks: 0 });
+});
+
+test('invalid saved delay or duration blocks new submissions without losing the saved request', async () => {
+  const valid = { address: 'tf1demo-address', request_id: 'saved-request-0001', budget_sats: 10000000, duration: 144, delay_blocks: 0 };
+  for (const change of [{ delay_blocks: -1 }, { delay_blocks: 4465 }, { delay_blocks: 0.5 }, { delay_blocks: '1' }, { duration: 143 }, { duration: 4465 }, { duration: 144.5 }]) {
+    const saved = JSON.stringify({ ...valid, ...change });
+    const storage = new Map([['flame-mint-playground-pending-v1', saved]]);
+    const page = await openPage('/mint', storage);
+    assert.equal(page.elements.get('submit').disabled, true);
+    assert.equal(page.elements.get('delay').disabled, true);
+    assert.match(page.elements.get('submit-message').textContent, /unreadable/);
+    assert.equal(storage.get('flame-mint-playground-pending-v1'), saved);
+  }
+});
+
+test('submitting locks budget, duration and delay until acceptance while display switches remain independent', async () => {
+  let accept;
+  const page = await openPage('/mint', new Map(), () => new Promise(resolve => { accept = resolve; }));
+  page.elements.get('delay').value = '17';
+  await page.event('delay', 'input');
+  const submitting = page.event('contribution-form', 'submit');
+  await page.settle();
+  for (const id of ['budget', 'duration', 'delay', 'submit', 'discard-pending']) assert.equal(page.elements.get(id).disabled, true, id);
+  await page.event('time-days', 'click');
+  await page.event('unit-btc', 'click');
+  const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(request.delay_blocks, 17);
+  assert.equal(request.duration, 500);
+  accept({ id: 2, user_id: 1, start_block: 28 });
+  await submitting;
+  for (const id of ['budget', 'duration', 'delay', 'submit']) assert.equal(page.elements.get(id).disabled, false, id);
+  assert.match(page.elements.get('submit-message').textContent, /accepted/);
+});
+
 test('mint page keeps keys local and persists the exact retry request across a page reload', async () => {
   const storage = new Map();
   const first = await openPage('/mint', storage, async () => { throw new Error('Response lost'); });
@@ -717,9 +951,11 @@ test('mint page keeps keys local and persists the exact retry request across a p
   assert.equal(first.elements.get('seed-phrase').textContent, '');
   await first.event('contribution-form', 'submit');
   const original = JSON.parse(first.requests.find(request => request.url === '/api/contributions').options.body);
-  assert.deepEqual(Object.keys(original).sort(), ['address', 'budget_sats', 'duration', 'request_id']);
+  assert.deepEqual(Object.keys(original).sort(), ['address', 'budget_sats', 'delay_blocks', 'duration', 'request_id']);
+  assert.equal(original.delay_blocks, 0);
   assert.equal(first.elements.get('budget').disabled, true);
   assert.equal(first.elements.get('duration').disabled, true);
+  assert.equal(first.elements.get('delay').disabled, true);
   assert.ok(storage.has('flame-mint-playground-pending-v1'));
   const reloaded = await openPage('/mint', storage);
   assert.equal(reloaded.elements.get('budget').disabled, true);
@@ -728,6 +964,7 @@ test('mint page keeps keys local and persists the exact retry request across a p
   assert.deepEqual(JSON.parse(reloaded.requests.find(request => request.url === '/api/contributions').options.body), original);
   assert.equal(storage.has('flame-mint-playground-pending-v1'), false);
   assert.equal(reloaded.elements.get('budget').disabled, false);
+  assert.equal(reloaded.elements.get('delay').disabled, false);
   assert.match(reloaded.elements.get('submit-message').textContent, /accepted/);
 });
 
@@ -741,7 +978,7 @@ test('pending requests preserve exact non-step budgets after the slider migratio
   // Native range inputs can normalize a non-step value; the saved request stays authoritative.
   page.elements.get('budget').value = '2000000';
   await page.event('contribution-form', 'submit');
-  assert.deepEqual(JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body), pending);
+  assert.deepEqual(JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body), { ...pending, delay_blocks: 0 });
 });
 
 test('a corrupted saved wallet reports a recoverable error instead of silently replacing the identity', async () => {
@@ -1153,7 +1390,7 @@ test('unit changes leave chart data, forecast, requests, and pending idempotence
   const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
   assert.equal(request.budget_sats, 1000000);
   assert.equal(request.duration, 500);
-  assert.deepEqual(Object.keys(request).sort(), ['address', 'budget_sats', 'duration', 'request_id']);
+  assert.deepEqual(Object.keys(request).sort(), ['address', 'budget_sats', 'delay_blocks', 'duration', 'request_id']);
   assert.deepEqual(JSON.parse(storage.get('flame-mint-playground-pending-v1')), request);
   const reloaded = await openPage('/mint', storage);
   assert.equal(reloaded.elements.get('unit-usd')['aria-pressed'], 'true');
