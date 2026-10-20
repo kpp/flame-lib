@@ -1,5 +1,6 @@
 export const BUDGET_MIN = 100000;
 export const BUDGET_MAX = 100000000;
+export const BUDGET_STEP = 100000;
 export const FEE = 1000;
 export const SPARKS = 100000000;
 export const REWARD = 50 * SPARKS;
@@ -13,16 +14,56 @@ export const DURATION_MAX = 4464;
 export const DELAY_MAX = 4464;
 const SATS_PER_BTC = 100000000;
 
+// Typed-value fields next to the sliders. A typed number is parsed leniently
+// (currency signs, unit words and thousands separators are ignored), converted
+// to the slider's native unit (sats or blocks), snapped to the slider's step
+// and clamped to its bounds, so a typed value can never escape the limits the
+// slider itself enforces. `null` means "nothing usable was typed": the caller
+// leaves the slider alone and simply re-renders the current value.
+export function parseInputNumber(text) {
+  const cleaned = String(text ?? '').replace(/[^0-9.]/g, '');
+  if (!cleaned || cleaned === '.') return null;
+  const value = Number(cleaned);
+  return Number.isFinite(value) ? value : null;
+}
+
+export function snapToRange(value, min, max, step = 1) {
+  if (value === null || !Number.isFinite(value)) return null;
+  const snapped = Math.round(value / step) * step;
+  return Math.min(max, Math.max(min, snapped));
+}
+
+export function inputToSats(value, unit = 'sat', btcUsd = null) {
+  if (value === null) return null;
+  if (unit === 'sat') return value;
+  if (unit === 'BTC') return value * SATS_PER_BTC;
+  if (!(Number.isFinite(btcUsd) && btcUsd > 0)) return null;
+  return value / btcUsd * SATS_PER_BTC;
+}
+
+export function inputToBlocks(value, mode = 'blocks') {
+  if (value === null) return null;
+  return mode === 'days' ? value * BLOCKS_PER_DAY : value;
+}
+
 export function blockDate(block) {
   if (block < 0) return '—';
   const date = new Date(Date.UTC(2027, 0, 11) + Math.floor((block - 1) / BLOCKS_PER_DAY) * 86400000);
   return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(date);
 }
 
-export function formatDuration(blocks, mode = 'blocks') {
+export function formatDurationValue(blocks, mode = 'blocks') {
   const value = mode === 'days' ? blocks / BLOCKS_PER_DAY : blocks;
-  const label = mode === 'days' ? 'day' : 'block';
-  return `${new Intl.NumberFormat('en', { maximumFractionDigits: 3 }).format(value)} ${label}${value === 1 ? '' : 's'}`;
+  return new Intl.NumberFormat('en', { maximumFractionDigits: 3 }).format(value);
+}
+
+export function durationUnit(blocks, mode = 'blocks') {
+  const value = mode === 'days' ? blocks / BLOCKS_PER_DAY : blocks;
+  return `${mode === 'days' ? 'day' : 'block'}${value === 1 ? '' : 's'}`;
+}
+
+export function formatDuration(blocks, mode = 'blocks') {
+  return `${formatDurationValue(blocks, mode)} ${durationUnit(blocks, mode)}`;
 }
 
 export function formatMoney(sats, unit = 'sat', btcUsd = null, isRate = false, digits = null) {
@@ -170,19 +211,45 @@ if (typeof document !== 'undefined') {
     }
   }
 
+  // A budget typed to the satoshi is kept exactly; the slider only shows the
+  // nearest step. Dragging the slider clears it.
+  let typedBudget = null;
   const draft = () => {
     const delay = pendingRequest?.delay_blocks ?? Number(element('delay').value);
-    return { budget_sats: pendingRequest?.budget_sats ?? Number(element('budget').value), duration: pendingRequest?.duration ?? Number(element('duration').value), delay_blocks: delay, start_block: (state?.height ?? 0) + 1 + delay };
+    return { budget_sats: pendingRequest?.budget_sats ?? typedBudget ?? Number(element('budget').value), duration: pendingRequest?.duration ?? Number(element('duration').value), delay_blocks: delay, start_block: (state?.height ?? 0) + 1 + delay };
   };
   const validDraft = contribution => contribution.budget_sats >= contribution.duration * (FEE + 1);
+  const typedField = id => element(`${id}-value`);
+  // Keep a field the user is editing untouched: the page re-renders every second.
+  const showTyped = (id, text, unitText) => {
+    element(`${id}-unit`).textContent = unitText;
+    const field = typedField(id);
+    if (typeof document !== 'undefined' && document.activeElement === field) return;
+    field.value = text;
+  };
+  const sliderBounds = { budget: [BUDGET_MIN, BUDGET_MAX, BUDGET_STEP], duration: [DURATION_MIN, DURATION_MAX, 1], delay: [0, DELAY_MAX, 1] };
+  function applyTyped(id) {
+    const slider = element(id);
+    const parsed = parseInputNumber(typedField(id).value);
+    const native = id === 'budget' ? inputToSats(parsed, unit, btcUsd) : inputToBlocks(parsed, timeMode);
+    const next = snapToRange(native, ...sliderBounds[id]);
+    if (next === null || slider.disabled) { updateDraft(); return; }
+    if (id === 'budget') {
+      // Exact satoshis go into the request; the slider just moves to the nearest step.
+      const exact = snapToRange(native, BUDGET_MIN, BUDGET_MAX, 1);
+      typedBudget = exact === next ? null : exact;
+    }
+    slider.value = String(next);
+    updateDraft(true);
+  }
 
   function updateDraft(resetRequest = false) {
     if (resetRequest && !pendingRequest) element('submit-message').textContent = '';
     const contribution = draft();
     const valid = validDraft(contribution);
-    element('budget-value').textContent = amount(contribution.budget_sats);
-    element('duration-value').textContent = formatDuration(contribution.duration, timeMode);
-    element('delay-value').textContent = formatDuration(contribution.delay_blocks, timeMode);
+    showTyped('budget', money(contribution.budget_sats), unit);
+    showTyped('duration', formatDurationValue(contribution.duration, timeMode), durationUnit(contribution.duration, timeMode));
+    showTyped('delay', formatDurationValue(contribution.delay_blocks, timeMode), durationUnit(contribution.delay_blocks, timeMode));
     element('budget').setAttribute('aria-valuetext', amount(contribution.budget_sats));
     element('duration').setAttribute('aria-valuetext', `${formatDuration(contribution.duration, timeMode)} (${contribution.duration} blocks)`);
     element('delay').setAttribute('aria-valuetext', `${formatDuration(contribution.delay_blocks, timeMode)} (${contribution.delay_blocks} blocks)`);
@@ -194,7 +261,8 @@ if (typeof document !== 'undefined') {
     element('projected-fees').textContent = amount(contribution.duration * FEE);
     element('projected-burn').textContent = valid ? amount(contribution.budget_sats - contribution.duration * FEE) : '—';
     element('projected-rate').textContent = estimate ? rateAmount(contribution.budget_sats, estimate) : '—';
-    element('budget').disabled = element('duration').disabled = element('delay').disabled = submitting || !!pendingRequest || brokenPending;
+    const locked = submitting || !!pendingRequest || brokenPending;
+    for (const id of ['budget', 'duration', 'delay']) element(id).disabled = typedField(id).disabled = locked;
     element('discard-pending').hidden = !pendingRequest && !brokenPending;
     element('discard-pending').disabled = submitting;
     element('submit').disabled = !valid || !wallet || !state || submitting || brokenPending || Date.now() - lastReceived > 5000;
@@ -524,13 +592,25 @@ if (typeof document !== 'undefined') {
     } finally { setTimeout(poll, 1000); }
   }
 
-  element('budget').addEventListener('input', () => updateDraft(true));
+  element('budget').addEventListener('input', () => { typedBudget = null; updateDraft(true); });
   for (const value of ['sat', 'BTC', 'USD']) element(`unit-${value.toLowerCase()}`).addEventListener('click', () => selectUnit(value));
   for (const value of ['blocks', 'days']) element(`time-${value}`).addEventListener('click', () => selectTime(value));
   element('zoom-in').addEventListener('click', () => changeZoom(-1));
   element('zoom-out').addEventListener('click', () => changeZoom(1));
   element('duration').addEventListener('input', () => updateDraft(true));
   element('delay').addEventListener('input', () => updateDraft(true));
+  for (const id of ['budget', 'duration', 'delay']) {
+    const field = typedField(id);
+    field.addEventListener('change', () => applyTyped(id));
+    // Enter applies the value instead of submitting the form.
+    field.addEventListener('keydown', event => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      applyTyped(id);
+      field.blur?.();
+    });
+    field.addEventListener('focus', () => field.select?.());
+  }
   element('retry-wallet').addEventListener('click', prepareWallet);
   element('reset-wallet').addEventListener('click', () => {
     if (!confirm('Forget this saved demo wallet and create a new one? Save its recovery phrase first if it is available. Existing rewards will remain linked to the old address.')) return;
@@ -552,7 +632,7 @@ if (typeof document !== 'undefined') {
     event.preventDefault();
     if (submitting || brokenPending || !wallet || !state || !validDraft(draft()) || Date.now() - lastReceived > 5000) return;
     submitting = true; updateDraft();
-    element('budget').disabled = element('duration').disabled = element('delay').disabled = true;
+    for (const id of ['budget', 'duration', 'delay']) element(id).disabled = typedField(id).disabled = true;
     element('submit-message').className = 'form-message';
     element('submit-message').textContent = '';
     try {

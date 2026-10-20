@@ -4,7 +4,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('./app.js', import.meta.url), 'utf8');
-const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, ZOOM_KEY, ZOOM_LEVELS, blockDate, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, ZOOM_KEY, ZOOM_LEVELS, blockDate, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote, BUDGET_STEP, parseInputNumber, snapToRange, inputToSats, inputToBlocks } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 const DEFAULT_ZOOM = 432;
 const plan = (options = {}) => ({ user_id: 1, budget_sats: 300005, duration: 100, start_block: 10, ...options });
 
@@ -983,7 +983,8 @@ test('budget slider values are satoshis directly, including its linear midpoint'
   for (const value of [BUDGET_MIN, 50000000, 50100000, BUDGET_MAX]) {
     page.elements.get('budget').value = String(value);
     await page.event('budget', 'input');
-    assert.equal(page.elements.get('budget-value').textContent, `${new Intl.NumberFormat('en').format(value)} sat`);
+    assert.equal(page.elements.get('budget-value').value, new Intl.NumberFormat('en').format(value));
+    assert.equal(page.elements.get('budget-unit').textContent, 'sat');
     assert.equal(page.elements.get('submit').disabled, value === BUDGET_MIN, 'unfunded fee combinations cannot be submitted');
   }
 });
@@ -1045,8 +1046,10 @@ test('day-mode duration and delay show block-derived days while retaining every 
   await page.event('duration', 'input');
   page.elements.get('delay').value = '1';
   await page.event('delay', 'input');
-  assert.equal(page.elements.get('duration-value').textContent, '1.007 days');
-  assert.equal(page.elements.get('delay-value').textContent, '0.007 days');
+  assert.equal(page.elements.get('duration-value').value, '1.007');
+  assert.equal(page.elements.get('duration-unit').textContent, 'days');
+  assert.equal(page.elements.get('delay-value').value, '0.007');
+  assert.equal(page.elements.get('delay-unit').textContent, 'days');
   assert.equal(page.elements.get('duration').value, '145');
   assert.equal(page.elements.get('delay').value, '1');
   await page.event('contribution-form', 'submit');
@@ -1125,7 +1128,8 @@ test('legacy saved requests normalize absent delay to zero without rewriting the
   const storage = new Map([['flame-mint-playground-pending-v1', JSON.stringify(pending)]]);
   const page = await openPage('/mint', storage);
   assert.equal(page.elements.get('submit').textContent, 'Retry pending');
-  assert.match(page.elements.get('duration-value').textContent, /100 blocks/);
+  assert.equal(page.elements.get('duration-value').value, '100');
+  assert.equal(page.elements.get('duration-unit').textContent, 'blocks');
   assert.equal(page.elements.get('delay').disabled, true);
   page.elements.get('duration').value = '144';
   page.elements.get('delay').value = '99';
@@ -1200,7 +1204,7 @@ test('pending requests preserve exact non-step budgets after the slider migratio
   const storage = new Map([['flame-mint-playground-pending-v1', JSON.stringify(pending)]]);
   const page = await openPage('/mint', storage);
   assert.equal(page.elements.get('budget').disabled, true);
-  assert.equal(page.elements.get('budget-value').textContent, '2,000,123 sat');
+  assert.equal(page.elements.get('budget-value').value, '2,000,123');
   assert.equal(page.elements.get('submit').textContent, 'Retry pending');
   // Native range inputs can normalize a non-step value; the saved request stays authoritative.
   page.elements.get('budget').value = '2000000';
@@ -1394,7 +1398,8 @@ test('mint budget, fees, contribution labels, validation, and projection follow 
   const budgetBefore = page.elements.get('budget').value;
   const projectedBefore = page.elements.get('projected-reward').textContent;
   await page.event('unit-btc', 'click');
-  assert.equal(page.elements.get('budget-value').textContent, '0.01000000 BTC');
+  assert.equal(page.elements.get('budget-value').value, '0.01000000');
+  assert.equal(page.elements.get('budget-unit').textContent, 'BTC');
   assert.equal(page.elements.get('budget')['aria-valuetext'], '0.01000000 BTC');
   assert.equal(page.elements.get('budget-min').textContent, '0.00100000 BTC');
   assert.equal(page.elements.get('budget-max').textContent, '1.00000000 BTC');
@@ -1439,7 +1444,8 @@ test('USD mode reuses the public quote fetched without identity and converts all
     assert.equal(page.elements.get('chart-rate-unit').textContent, '$/FLM');
     assert.equal(page.elements.get('total-rate-label').textContent, pathname === '/' ? 'Current rate' : 'Effective rate');
     if (pathname === '/mint') {
-      assert.equal(page.elements.get('budget-value').textContent, '$500.00');
+      assert.equal(page.elements.get('budget-value').value, '500.00');
+      assert.equal(page.elements.get('budget-unit').textContent, 'USD');
       assert.equal(page.elements.get('projected-fees').textContent, '$250.00');
       assert.equal(page.elements.get('projected-burn').textContent, '$250.00');
       assert.equal(page.elements.get('budget-min').textContent, '$50.00');
@@ -1547,7 +1553,8 @@ test('USD pending and failed quotes show unavailable amounts, never fictitious z
   assert.match(page.elements.get('price-status').textContent, /Loading/i);
   assert.equal(page.elements.get('total-burned').textContent, '$—');
   assert.equal(page.elements.get('total-rate').textContent, '—\u00a0$/FLM');
-  for (const id of ['budget-value', 'projected-fees', 'projected-burn', 'projected-rate']) assert.equal(page.elements.get(id).textContent, '—', id);
+  assert.equal(page.elements.get('budget-value').value, '—');
+  for (const id of ['projected-fees', 'projected-burn', 'projected-rate']) assert.equal(page.elements.get(id).textContent, '—', id);
   assert.deepEqual(rowValues(page), ['—', '50', '—', '—']);
   assert.equal(page.elements.get('total-reward').textContent, '50\u00a0FLM');
   finish({ ok: false, status: 503 });
@@ -1662,4 +1669,131 @@ test('unit changes leave chart data, forecast, requests, and pending idempotence
   await reloaded.event('contribution-form', 'submit');
   assert.deepEqual(JSON.parse(reloaded.requests.find(request => request.url === '/api/contributions').options.body), request);
   assert.equal(storage.has('flame-mint-playground-pending-v1'), false);
+});
+
+test('typed-value helpers parse leniently and snap to slider limits', () => {
+  assert.equal(parseInputNumber('1,000,000 sat'), 1000000);
+  assert.equal(parseInputNumber('$3,665.73'), 3665.73);
+  assert.equal(parseInputNumber('0.01000000 BTC'), 0.01);
+  assert.equal(parseInputNumber('1.007 days'), 1.007);
+  assert.equal(parseInputNumber(''), null);
+  assert.equal(parseInputNumber('abc'), null);
+  assert.equal(parseInputNumber('—'), null);
+  assert.equal(snapToRange(123456, BUDGET_MIN, BUDGET_MAX, BUDGET_STEP), 100000);
+  assert.equal(snapToRange(150000, BUDGET_MIN, BUDGET_MAX, BUDGET_STEP), 200000);
+  assert.equal(snapToRange(1, BUDGET_MIN, BUDGET_MAX, BUDGET_STEP), BUDGET_MIN);
+  assert.equal(snapToRange(1e12, BUDGET_MIN, BUDGET_MAX, BUDGET_STEP), BUDGET_MAX);
+  assert.equal(snapToRange(10, DURATION_MIN, DURATION_MAX), DURATION_MIN);
+  assert.equal(snapToRange(999999, DURATION_MIN, DURATION_MAX), DURATION_MAX);
+  assert.equal(snapToRange(200.4, DURATION_MIN, DURATION_MAX), 200);
+  assert.equal(snapToRange(null, 0, DELAY_MAX), null);
+  assert.equal(inputToSats(5, 'sat'), 5);
+  assert.equal(inputToSats(0.01, 'BTC'), 1000000);
+  assert.equal(inputToSats(500, 'USD', 50000), 1000000);
+  assert.equal(inputToSats(500, 'USD', null), null, 'USD needs a quote');
+  assert.equal(inputToBlocks(2, 'days'), 288);
+  assert.equal(inputToBlocks(300, 'blocks'), 300);
+});
+
+test('a typed budget is kept to the satoshi, the slider shows the nearest step and limits still clamp', async () => {
+  const page = await openPage('/mint');
+  const typed = page.elements.get('budget-value');
+  typed.value = '2,550,000';
+  await page.event('budget-value', 'change');
+  assert.equal(page.elements.get('budget').value, '2600000', 'slider snapped to the 100,000 sat step');
+  assert.equal(typed.value, '2,550,000', 'field keeps the exact amount');
+  assert.equal(page.elements.get('budget-unit').textContent, 'sat', 'unit sits outside the box');
+  assert.equal(page.elements.get('projected-fees').textContent, '500,000 sat');
+  assert.equal(page.elements.get('projected-burn').textContent, '2,050,000 sat', 'estimates use the exact amount');
+  await page.event('contribution-form', 'submit');
+  const sent = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(sent.budget_sats, 2550000, 'the exact amount is submitted');
+  const fresh = await openPage('/mint');
+  const field = fresh.elements.get('budget-value');
+  field.value = '999999999999';
+  await fresh.event('budget-value', 'change');
+  assert.equal(fresh.elements.get('budget').value, String(BUDGET_MAX), 'clamped to the maximum');
+  assert.equal(field.value, '100,000,000');
+  field.value = '5';
+  await fresh.event('budget-value', 'change');
+  assert.equal(fresh.elements.get('budget').value, String(BUDGET_MIN), 'clamped to the minimum');
+  assert.equal(field.value, '100,000');
+  field.value = '123,456';
+  await fresh.event('budget-value', 'change');
+  assert.equal(field.value, '123,456');
+  fresh.elements.get('budget').value = '300000';
+  await fresh.event('budget', 'input');
+  assert.equal(field.value, '300,000', 'dragging the slider replaces the typed amount');
+  field.value = 'garbage';
+  await fresh.event('budget-value', 'change');
+  assert.equal(fresh.elements.get('budget').value, '300000', 'unparseable input leaves the slider alone');
+  assert.equal(field.value, '300,000', 'field is re-rendered from the slider');
+});
+
+test('typing a budget respects the selected currency', async () => {
+  const page = await openPage('/mint', new Map([[UNIT_KEY, 'USD']]));
+  const typed = page.elements.get('budget-value');
+  typed.value = '$500';
+  await page.event('budget-value', 'change');
+  assert.equal(page.elements.get('budget').value, '1000000', '$500 at $50,000/BTC is 1,000,000 sat');
+  assert.equal(typed.value, '500.00');
+  assert.equal(page.elements.get('budget-unit').textContent, 'USD');
+  await page.event('unit-btc', 'click');
+  typed.value = '0.025';
+  await page.event('budget-value', 'change');
+  assert.equal(page.elements.get('budget').value, '2500000');
+  assert.equal(typed.value, '0.02500000');
+  assert.equal(page.elements.get('budget-unit').textContent, 'BTC');
+});
+
+test('typing a duration or delay converts days to blocks and stays inside the slider bounds', async () => {
+  const page = await openPage('/mint', new Map([[TIME_KEY, 'days']]));
+  const duration = page.elements.get('duration-value');
+  duration.value = '2';
+  await page.event('duration-value', 'change');
+  assert.equal(page.elements.get('duration').value, '288', '2 days is 288 blocks');
+  assert.equal(duration.value, '2');
+  assert.equal(page.elements.get('duration-unit').textContent, 'days');
+  duration.value = '100';
+  await page.event('duration-value', 'change');
+  assert.equal(page.elements.get('duration').value, String(DURATION_MAX));
+  duration.value = '0';
+  await page.event('duration-value', 'change');
+  assert.equal(page.elements.get('duration').value, String(DURATION_MIN));
+  await page.event('time-blocks', 'click');
+  const delay = page.elements.get('delay-value');
+  delay.value = '10.6';
+  await page.event('delay-value', 'change');
+  assert.equal(page.elements.get('delay').value, '11', 'blocks are whole numbers');
+  delay.value = '-5';
+  await page.event('delay-value', 'change');
+  assert.equal(page.elements.get('delay').value, '5', 'the sign is ignored and the value stays within bounds');
+});
+
+test('Enter in a typed field applies the value without submitting the form', async () => {
+  const page = await openPage('/mint');
+  const typed = page.elements.get('budget-value');
+  typed.value = '3,000,000';
+  let prevented = false;
+  await typed.handlers.keydown({ key: 'Enter', preventDefault() { prevented = true; } });
+  await page.settle();
+  assert.equal(prevented, true);
+  assert.equal(page.elements.get('budget').value, '3000000');
+  assert.equal(page.requests.some(request => request.url === '/api/contributions'), false, 'no contribution was submitted');
+  await typed.handlers.keydown({ key: 'a', preventDefault() { prevented = 'again'; } });
+  assert.equal(prevented, true, 'other keys are not intercepted');
+});
+
+test('typed fields are locked together with the sliders while a request is pending', async () => {
+  const pending = { address: 'tf1demo-address', request_id: 'old-request-00000002', budget_sats: 2000000, duration: 500 };
+  const page = await openPage('/mint', new Map([['flame-mint-playground-pending-v1', JSON.stringify(pending)]]));
+  for (const id of ['budget', 'duration', 'delay']) {
+    assert.equal(page.elements.get(id).disabled, true, id);
+    assert.equal(page.elements.get(`${id}-value`).disabled, true, `${id}-value`);
+  }
+  const typed = page.elements.get('budget-value');
+  typed.value = '9,000,000';
+  await page.event('budget-value', 'change');
+  assert.equal(Number(page.elements.get('budget').value), 2000000, 'a locked slider does not move');
+  assert.equal(typed.value, '2,000,000');
 });
