@@ -4,9 +4,8 @@ name: flamed image
 # then, from main only, pushes it to GHCR as ghcr.io/runflame/flamed:<full
 # commit hash> and moves `:main` to it. A pull request into main runs the
 # same build and check and pushes nothing: the dry run before merging. Nothing
-# deploys it: the infrastructure playbook, run by hand, resolves `:main` to
-# its commit and runs that commit's tag (infrastructure repo, dev README →
-# flamed).
+# deploys it: the infrastructure playbook is run by hand with the full commit
+# hash of the build to deploy (infrastructure repo, dev README → flamed).
 #
 # The genesis holder is the first receiving address of the BIP-39 mnemonic
 # in the org secret FLAMED_GENESIS_MNEMONIC (no passphrase), passed to the
@@ -74,7 +73,7 @@ jobs:
     env:
       IMAGE: ghcr.io/runflame/flamed
       # The full commit, the same in the tag and in the revision label: the
-      # dev playbook reads the label of `:main` and runs this tag.
+      # dev playbook deploys by this tag and checks it against the label.
       TAG: ${{ github.sha }}
       # BIP-39's all-zero entropy, public everywhere: dry runs only.
       DRY_RUN_MNEMONIC: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
@@ -106,7 +105,6 @@ jobs:
     # What was baked in, for the summary; a dry run must have the test holder.
     - name: Genesis
       id: genesis
-      env:
       run: |
         set -euo pipefail
         hash="$(docker run --rm --entrypoint cat "$IMAGE:$TAG" /etc/flamed/genesis.json | jq -r .genesis_hash)"
@@ -121,7 +119,6 @@ jobs:
     # Starts the image as the host does, waits for the RPC, then for the
     # first minted block on top of this genesis.
     - name: Smoke test
-      env:
       run: |
         set -euo pipefail
         docker run -d --name flamed -p 127.0.0.1:8545:8545 "$IMAGE:$TAG"
@@ -159,5 +156,5 @@ jobs:
           echo
           echo "Genesis \`$GENESIS_HASH\`, the whole supply under \`$GENESIS_HOLDER\`. A genesis hash different from the one dev runs is a new chain: see the infrastructure repo, dev README → flamed."
           echo
-          echo "To deploy the newest main, from \`dev/playground/\` in the infrastructure repo: \`ansible-playbook flamed/deploy.yml --ask-vault-pass\`. This build in particular: add \`-e image_tag=$TAG\`."
+          echo "To deploy this build, from \`dev/playground/\` in the infrastructure repo: \`ansible-playbook flamed/deploy.yml --ask-vault-pass -e image_tag=$TAG\`"
         } >> "$GITHUB_STEP_SUMMARY"

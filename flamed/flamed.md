@@ -185,8 +185,8 @@ restart, and a spend by the recipient — every transaction built by
 `ghcr.io/runflame/flamed:<full commit hash>` from every push to `main` that
 touches flamed or a crate it is built from, moving `:main` along. A pull
 request into `main` runs the same build and smoke test and pushes nothing.
-Nothing deploys the image; a host runs a commit's tag, never `:main`
-itself. The tag and the `org.opencontainers.image.revision` label are the
+Nothing deploys the image; a host is deployed by naming a commit, never
+`:main`. The tag and the `org.opencontainers.image.revision` label are the
 same full hash.
 
 | Path | What |
