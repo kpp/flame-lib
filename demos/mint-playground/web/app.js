@@ -6,8 +6,9 @@ export const SPARKS = 100000000;
 export const REWARD = 50 * SPARKS;
 export const UNIT_KEY = 'flame-mint-playground-unit-v1';
 export const TIME_KEY = 'flame-mint-playground-time-v1';
-export const ZOOM_KEY = 'flame-mint-playground-zoom-v1';
-export const ZOOM_LEVELS = Array.from({ length: 16 }, (_, index) => 144 + 288 * index);
+export const ZOOM_KEY = 'flame-mint-playground-zoom-v2';
+export const ZOOM_MIN = 10;
+export const ZOOM_DEFAULT = 500;
 export const BLOCKS_PER_DAY = 144;
 export const DURATION_MIN = 144;
 export const DURATION_MAX = 4464;
@@ -92,6 +93,26 @@ export function feeAt(contribution, block) {
   return block >= contribution.start_block && block < contribution.start_block + contribution.duration ? FEE : 0;
 }
 
+export function chartBlocks(contributions, firstBlock, lastBlock, heightNow, pending = null) {
+  const count = lastBlock - firstBlock + 1;
+  if (count <= 2001) return Array.from({ length: count }, (_, index) => firstBlock + index);
+  // Rates only change at schedule boundaries; keep both sides so even one-block spikes survive zooming out.
+  const blocks = new Set([firstBlock, lastBlock]);
+  const add = block => { if (block >= firstBlock && block <= lastBlock) blocks.add(block); };
+  add(heightNow);
+  for (const fraction of [.25, .5, .75]) add(firstBlock + (lastBlock - firstBlock) * fraction);
+  const schedule = contribution => {
+    const burn = contribution.budget_sats - contribution.duration * FEE;
+    const remainder = burn % contribution.duration;
+    const boundaries = [contribution.start_block, contribution.start_block + contribution.duration];
+    if (remainder > 0) boundaries.push(contribution.start_block + remainder);
+    for (const block of boundaries) { add(block - 1); add(block); }
+  };
+  contributions.forEach(schedule);
+  if (pending) schedule(pending);
+  return [...blocks].sort((left, right) => left - right);
+}
+
 export function projectedReward(contributions, draft) {
   const start = draft.start_block;
   const end = start + draft.duration;
@@ -148,7 +169,7 @@ if (typeof document !== 'undefined') {
   const whole = value => number(Math.trunc(value) || 0);
   let unit = 'sat';
   let timeMode = 'blocks';
-  let zoom = 432;
+  let zoom = ZOOM_DEFAULT;
   try {
     const saved = localStorage.getItem(UNIT_KEY);
     if (['sat', 'BTC', 'USD'].includes(saved)) unit = saved;
@@ -159,7 +180,7 @@ if (typeof document !== 'undefined') {
   } catch { /* Time selection also works without browser storage. */ }
   try {
     const saved = Number(localStorage.getItem(ZOOM_KEY));
-    if (ZOOM_LEVELS.includes(saved)) zoom = saved;
+    if (Number.isSafeInteger(saved) && saved >= ZOOM_MIN) zoom = saved;
   } catch { /* Zoom also works without browser storage. */ }
   let btcUsd = null;
   let quoteRequest = false;
@@ -359,8 +380,8 @@ if (typeof document !== 'undefined') {
       address.className = 'address-label';
       const end = contribution.start_block + contribution.duration - 1;
       const schedule = timeMode === 'days' ? `${blockDate(contribution.start_block)}–${blockDate(end)}` : `Blocks ${number(contribution.start_block)}–${number(end)}`;
-      address.textContent = minting ? schedule : `${schedule} · ${contribution.address.slice(0, 13)}…${contribution.address.slice(-7)}`;
-      address.title = contribution.address;
+      address.textContent = schedule;
+      address.title = minting ? contribution.address : '';
       identity.append(heading, address);
       row.append(identity);
       const statusCell = document.createElement('td');
@@ -411,8 +432,8 @@ if (typeof document !== 'undefined') {
     element('chart').setAttribute('aria-label', minting
       ? `Burn rate in ${spokenUnit} per block on the left; mint rate in ${spokenUnit} per FLM on the right. Previous and next ${zoom} blocks, shown as ${timeMode === 'days' ? 'calendar dates' : 'block numbers'}. All known contribution schedules included.`
       : `Burn above zero and mining fees below zero share a ${spokenUnit}-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous and next ${zoom} blocks, shown as ${timeMode === 'days' ? 'calendar dates' : 'block numbers'}. All known contribution schedules included.`);
-    element('zoom-in').disabled = zoom === ZOOM_LEVELS[0];
-    element('zoom-out').disabled = zoom === ZOOM_LEVELS[ZOOM_LEVELS.length - 1];
+    element('zoom-in').disabled = zoom === ZOOM_MIN;
+    element('zoom-out').disabled = zoom === Number.MAX_SAFE_INTEGER;
     for (const value of ['blocks', 'days']) element(`time-${value}`).setAttribute('aria-pressed', String(timeMode === value));
     element('current-block-label').textContent = timeMode === 'days' ? 'Date' : 'Block';
     element('current-block').textContent = state ? timeMode === 'days' ? blockDate(state.height) : number(state.height) : '—';
@@ -478,8 +499,8 @@ if (typeof document !== 'undefined') {
   }
 
   function changeZoom(direction) {
-    const next = ZOOM_LEVELS[ZOOM_LEVELS.indexOf(zoom) + direction];
-    if (next === undefined) return;
+    const next = Math.max(ZOOM_MIN, Math.min(Number.MAX_SAFE_INTEGER, direction < 0 ? Math.round(zoom / 2) : zoom * 2));
+    if (next === zoom) return;
     zoom = next;
     try { localStorage.setItem(ZOOM_KEY, String(zoom)); } catch { /* Zoom still applies in this page. */ }
     renderMoney();
@@ -502,13 +523,15 @@ if (typeof document !== 'undefined') {
     const side = unit === 'sat' ? 48 : unit === 'BTC' ? 94 : 82;
     const margin = { left: side, top: 14, right: side, bottom: 27 };
     const w = width - margin.left - margin.right, h = height - margin.top - margin.bottom;
-    const pastBlocks = zoom;
-    const futureBlocks = zoom;
-    const heightNow = state?.height ?? 0, firstBlock = heightNow - pastBlocks, count = pastBlocks + futureBlocks + 1;
+    const heightNow = state?.height ?? 0, firstBlock = heightNow - zoom, lastBlock = heightNow + zoom;
+    const pending = draft();
+    const showDraft = minting && wallet && validDraft(pending);
+    const contributions = state?.contributions || [];
+    const blocks = chartBlocks(contributions, firstBlock, lastBlock, heightNow, showDraft ? pending : null);
+    const count = blocks.length;
     const colored = !minting;
     const groups = new Map();
     const fees = new Float64Array(count);
-    const contributions = state?.contributions || [];
     const ownContribution = contributions.find(contribution => contribution.address === wallet?.address);
     const ownColor = ownContribution ? userColor(ownContribution.user_id) : '#888';
     if (minting) {
@@ -524,7 +547,7 @@ if (typeof document !== 'undefined') {
       if (colored) groups.delete(key);
       groups.set(key, values);
       for (let i = 0; i < count; i++) {
-        const block = firstBlock + i;
+        const block = blocks[i];
         values[i] += burnAt(contribution, block);
         if (!minting) fees[i] += feeAt(contribution, block);
       }
@@ -533,17 +556,20 @@ if (typeof document !== 'undefined') {
     if (ownValues) { groups.delete('own'); groups.set('own', ownValues); }
     const totals = new Float64Array(count);
     for (const values of groups.values()) for (let i = 0; i < count; i++) totals[i] += values[i];
-    const pending = draft();
-    const showDraft = minting && wallet && validDraft(pending);
-    let maximum = 0;
-    for (let i = 0; i < count; i++) maximum = Math.max(maximum, totals[i] + (showDraft ? burnAt(pending, firstBlock + i) : 0));
-    const minimum = minting ? 0 : -Math.max(0, ...fees);
+    let maximum = 0, maximumFees = 0;
+    for (let i = 0; i < count; i++) {
+      maximum = Math.max(maximum, totals[i] + (showDraft ? burnAt(pending, blocks[i]) : 0));
+      maximumFees = Math.max(maximumFees, fees[i]);
+    }
+    const minimum = minting ? 0 : -maximumFees;
     const roughStep = Math.max(1, maximum - minimum) / 5;
     const power = 10 ** Math.floor(Math.log10(roughStep));
     const step = Math.max(1, [1, 2, 5, 10].find(factor => factor * power >= roughStep) * power);
     const high = Math.max(step, Math.ceil(maximum / step) * step);
     const low = Math.floor(minimum / step) * step;
-    const x = i => margin.left + i / (count - 1) * w;
+    const xBlock = block => margin.left + (block - firstBlock) / (lastBlock - firstBlock) * w;
+    const x = i => xBlock(blocks[i]);
+    const nowX = xBlock(heightNow);
     const y = value => margin.top + (high - value) / (high - low) * h;
     const zero = y(0);
     const axisNumber = value => unit !== 'sat' ? money(value) : Math.abs(value) >= 1000000 ? `${number(value / 1000000, 2)}m` : Math.abs(value) >= 1000 ? `${number(value / 1000, 2)}k` : number(value, 2);
@@ -582,30 +608,33 @@ if (typeof document !== 'undefined') {
       for (let i = 0; i < count; i++) base[i] += values[i];
     }
     context.globalAlpha = 1;
-    context.fillStyle = '#ffffff30'; context.fillRect(x(pastBlocks), margin.top, w * futureBlocks / (count - 1), h);
+    context.fillStyle = '#ffffff30'; context.fillRect(nowX, margin.top, w / 2, h);
     if (!minting) {
       context.strokeStyle = '#666';
       context.beginPath(); context.moveTo(x(0), zero); context.lineTo(x(count - 1), zero); context.stroke();
     }
-    context.strokeStyle = '#666'; context.setLineDash([3, 4]); context.beginPath(); context.moveTo(x(pastBlocks), margin.top); context.lineTo(x(pastBlocks), margin.top + h); context.stroke(); context.setLineDash([]);
+    context.strokeStyle = '#666'; context.setLineDash([3, 4]); context.beginPath(); context.moveTo(nowX, margin.top); context.lineTo(nowX, margin.top + h); context.stroke(); context.setLineDash([]);
     if (showDraft) {
-      const start = Math.max(0, pending.start_block - firstBlock);
-      const end = Math.min(count - 1, pending.start_block + pending.duration - 1 - firstBlock);
+      const start = Math.max(firstBlock, pending.start_block);
+      const end = Math.min(lastBlock, pending.start_block + pending.duration - 1);
       if (start <= end) {
-        const from = Math.max(0, start - 1), to = Math.min(count - 1, end + 1);
+        const from = Math.max(firstBlock, start - 1), to = Math.min(lastBlock, end + 1);
+        let started = false;
         context.beginPath();
-        for (let i = from; i <= to; i++) {
-          const value = totals[i] + burnAt(pending, firstBlock + i);
-          if (i === from) context.moveTo(x(i), y(value)); else context.lineTo(x(i), y(value));
+        for (let i = 0; i < count; i++) {
+          if (blocks[i] < from || blocks[i] > to) continue;
+          const value = totals[i] + burnAt(pending, blocks[i]);
+          if (!started) context.moveTo(x(i), y(value)); else context.lineTo(x(i), y(value));
+          started = true;
         }
         context.strokeStyle = ownColor; context.lineWidth = 1.8; context.setLineDash([5, 4]); context.stroke(); context.setLineDash([]);
       }
     }
     context.fillStyle = '#666'; context.font = '10px -apple-system, sans-serif';
-    for (const i of [0, (count - 1) / 4, (count - 1) / 2, 3 * (count - 1) / 4, count - 1]) {
-      context.textAlign = i === 0 ? 'left' : i === count - 1 ? 'right' : 'center';
-      const block = firstBlock + i;
-      context.fillText(block < 0 ? '—' : timeMode === 'days' ? blockDate(block) : number(block), x(i), height - 8);
+    for (const fraction of [0, .25, .5, .75, 1]) {
+      context.textAlign = fraction === 0 ? 'left' : fraction === 1 ? 'right' : 'center';
+      const block = firstBlock + (lastBlock - firstBlock) * fraction;
+      context.fillText(block < 0 ? '—' : timeMode === 'days' ? blockDate(block) : number(block), xBlock(block), height - 8);
     }
     if (!state) { context.textAlign = 'center'; context.fillText('Loading…', margin.left + w / 2, margin.top + h / 2); }
   }

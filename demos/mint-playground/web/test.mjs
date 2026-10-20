@@ -4,8 +4,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('./app.js', import.meta.url), 'utf8');
-const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, ZOOM_KEY, ZOOM_LEVELS, blockDate, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote, BUDGET_STEP, parseInputNumber, snapToRange, inputToSats, inputToBlocks } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
-const DEFAULT_ZOOM = 432;
+const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, ZOOM_KEY, ZOOM_MIN, ZOOM_DEFAULT, chartBlocks, blockDate, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote, BUDGET_STEP, parseInputNumber, snapToRange, inputToSats, inputToBlocks } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const DEFAULT_ZOOM = 500;
 const plan = (options = {}) => ({ user_id: 1, budget_sats: 300005, duration: 100, start_block: 10, ...options });
 
 test('budget is a native linear slider with the requested endpoints', async () => {
@@ -49,9 +49,11 @@ test('calendar dates start at block one and use exact 144-block UTC days, includ
   assert.equal(blockDate(Number.MAX_SAFE_INTEGER), `Block ${new Intl.NumberFormat('en').format(Number.MAX_SAFE_INTEGER)}`, 'far-future manual schedules remain renderable beyond the Date range');
 });
 
-test('zoom levels cover one to thirty-one days in exact two-day increments', () => {
-  assert.equal(ZOOM_KEY, 'flame-mint-playground-zoom-v1');
-  assert.deepEqual(ZOOM_LEVELS, Array.from({ length: 16 }, (_, index) => 144 + 288 * index));
+test('exponential zoom has a ten-block minimum and a fresh five-hundred-block default', () => {
+  assert.equal(ZOOM_KEY, 'flame-mint-playground-zoom-v2');
+  assert.equal(ZOOM_MIN, 10);
+  assert.equal(ZOOM_DEFAULT, DEFAULT_ZOOM);
+  assert.doesNotMatch(source, /ZOOM_LEVELS/);
 });
 
 test('integer schedule spreads the remainder into the first blocks and conserves sats', () => {
@@ -337,9 +339,9 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
   };
 }
 
-test('both charts center now between 432 past and 432 known future blocks by default', async () => {
+test('both charts center now between five hundred past and future blocks by default', async () => {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
-  assert.match(html, /<canvas\b[^>]*aria-label="[^"]*Previous and next 432 blocks\./);
+  assert.match(html, /<canvas\b[^>]*aria-label="[^"]*Previous and next 500 blocks\./);
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
     const minting = pathname === '/mint';
@@ -349,7 +351,7 @@ test('both charts center now between 432 past and 432 known future blocks by def
     await page.refresh();
     const draws = page.draws.filter(call => call.canvas === page.elements.get('chart'));
     const ticks = draws.filter(call => call.method === 'fillText' && call.args[2] === 267);
-    assert.deepEqual(ticks.map(call => call.args[0]), minting ? ['68', '284', '500', '716', '932'] : ['1,068', '1,284', '1,500', '1,716', '1,932']);
+    assert.deepEqual(ticks.map(call => call.args[0]), minting ? ['0', '250', '500', '750', '1,000'] : ['1,000', '1,250', '1,500', '1,750', '2,000']);
     assert.deepEqual(ticks.map(call => call.args[1]), [48, 224, 400, 576, 752]);
     const shading = draws.find(call => call.method === 'fillRect' && call.fillStyle === '#ffffff30');
     assert.equal(shading.args[0], 400, 'future shading begins at the centered current block');
@@ -361,21 +363,21 @@ test('both charts center now between 432 past and 432 known future blocks by def
     const nowLine = pathBefore(draws.findLastIndex(call => call.method === 'stroke' && call.strokeStyle === '#666'));
     assert.deepEqual(nowLine.map(call => call.args), [[400, 14], [400, 248]], 'now marks the center of both charts');
     const band = pathBefore(draws.findIndex(call => call.method === 'fill' && call.fillStyle === userColor(1)));
-    assert.equal(band.length, 1731, 'a closed band contains 865 top and 865 bottom samples plus its starting point');
+    assert.equal(band.length, 2003, 'a closed band contains 1,001 top and 1,001 bottom samples plus its starting point');
     assert.equal(Math.min(...band.map(call => call.args[0])), 48);
     assert.equal(Math.max(...band.map(call => call.args[0])), 752);
     if (minting) {
-      assert.match(page.elements.get('chart')['aria-label'], /Previous and next 432 blocks[, .]/);
+      assert.match(page.elements.get('chart')['aria-label'], /Previous and next 500 blocks[, .]/);
       assert.match(page.elements.get('chart-note').textContent, /known|scheduled|future/i);
       const draft = pathBefore(draws.findIndex(call => call.method === 'stroke' && call.strokeStyle === userColor(1)));
-      assert.equal(draft.length, 433, 'draft sampling stays within the visible future window');
+      assert.equal(draft.length, 501, 'draft sampling stays within the visible future window');
       assert.equal(draft[0].args[0], 400);
       assert.equal(draft.at(-1).args[0], 752);
     }
   }
 });
 
-test('zoom controls traverse every allowed radius and stop at each endpoint without touching accounting', async () => {
+test('zoom controls halve or double whole-block radii without touching accounting', async () => {
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
     page.snapshot.height = 6000;
@@ -388,7 +390,10 @@ test('zoom controls traverse every allowed radius and stop at each endpoint with
     const assertRadius = radius => {
       const draws = page.draws.filter(call => call.canvas === page.elements.get('chart'));
       const ticks = draws.filter(call => call.method === 'fillText' && call.args[2] === 267);
-      assert.deepEqual(ticks.map(call => call.args[0]), Array.from({ length: 5 }, (_, index) => new Intl.NumberFormat('en').format(6000 - radius + radius / 2 * index)));
+      assert.deepEqual(ticks.map(call => call.args[0]), Array.from({ length: 5 }, (_, index) => {
+        const block = Math.round(6000 - radius + radius / 2 * index);
+        return block < 0 ? '—' : new Intl.NumberFormat('en').format(block);
+      }));
       assert.deepEqual(ticks.map(call => call.args[1]), [48, 224, 400, 576, 752]);
       assert.match(page.elements.get('chart-window').textContent, new RegExp(`${new Intl.NumberFormat('en').format(radius)} blocks`));
       assert.match(page.elements.get('chart')['aria-label'], new RegExp(`Previous and next ${radius} blocks`));
@@ -401,12 +406,13 @@ test('zoom controls traverse every allowed radius and stop at each endpoint with
         if (call.method === 'fill' && call.fillStyle === userColor(1)) band = path;
         if (call.method === 'stroke' && call.strokeStyle === '#666') now = path;
       }
-      assert.equal(band.length, 2 * (2 * radius + 1) + 1, 'every block has one top and one base sample');
+      if (radius <= 1000) assert.equal(band.length, 2 * (2 * radius + 1) + 1, 'nearby blocks retain exact per-block samples');
+      else assert.ok(band.length < 50, 'wide charts sample schedule events rather than every block');
       assert.equal(band[1][0], 48);
-      assert.equal(band[2 * radius + 1][0], 752);
+      assert.equal(Math.max(...band.map(point => point[0])), 752);
       assert.deepEqual(now, [[400, 14], [400, 248]], 'now stays centered at every zoom');
-      assert.equal(page.elements.get('zoom-in').disabled, radius === 144);
-      assert.equal(page.elements.get('zoom-out').disabled, radius === 4464);
+      assert.equal(page.elements.get('zoom-in').disabled, radius === ZOOM_MIN);
+      assert.equal(page.elements.get('zoom-out').disabled, radius === Number.MAX_SAFE_INTEGER);
       assert.equal(JSON.stringify(page.snapshot), before);
       assert.equal(stateRequests(page).length, stateCount, 'zoom never fetches another snapshot');
       assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), totals);
@@ -416,23 +422,19 @@ test('zoom controls traverse every allowed radius and stop at each endpoint with
       assert.equal(page.elements.get('delay').value, '0');
     };
     assert.equal(page.storage.has(ZOOM_KEY), false, 'default zoom does not need a storage write');
-    page.draws.length = 0;
+    for (const radius of [250, 125, 63, 32, 16, 10]) {
+      page.draws.length = 0;
+      await page.event('zoom-in', 'click');
+      assertRadius(radius);
+      assert.equal(page.storage.get(ZOOM_KEY), String(radius));
+    }
     await page.event('zoom-in', 'click');
-    assertRadius(144);
-    await page.event('zoom-in', 'click');
-    assert.equal(page.storage.get(ZOOM_KEY), '144', 'an off-limit click cannot leave the allowed sequence');
-    for (const radius of ZOOM_LEVELS.slice(1)) {
+    assert.equal(page.storage.get(ZOOM_KEY), '10', 'an off-limit click cannot shrink below ten blocks');
+    for (const radius of [20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240, 20480]) {
       page.draws.length = 0;
       await page.event('zoom-out', 'click');
       assertRadius(radius);
       assert.equal(page.storage.get(ZOOM_KEY), String(radius));
-    }
-    await page.event('zoom-out', 'click');
-    assert.equal(page.storage.get(ZOOM_KEY), '4464');
-    for (const radius of ZOOM_LEVELS.slice(0, -1).reverse()) {
-      page.draws.length = 0;
-      await page.event('zoom-in', 'click');
-      assertRadius(radius);
     }
   }
 });
@@ -442,55 +444,108 @@ test('zoom persists across both pages independently from currency and calendar d
   await page.event('unit-btc', 'click');
   await page.event('time-days', 'click');
   await page.event('zoom-out', 'click');
-  assert.equal(page.storage.get(ZOOM_KEY), '720');
+  assert.equal(page.storage.get(ZOOM_KEY), '1000');
   assert.equal(page.storage.get(TIME_KEY), 'days');
   assert.equal(page.storage.get(UNIT_KEY), 'BTC');
-  assert.match(page.elements.get('chart-window').textContent, /5 days/);
-  assert.match(page.elements.get('chart')['aria-label'], /Previous and next 720 blocks/);
+  assert.match(page.elements.get('chart-window').textContent, /6\.944 days/);
+  assert.match(page.elements.get('chart')['aria-label'], /Previous and next 1000 blocks/);
   for (const pathname of ['/', '/mint']) {
     const other = await openPage(pathname, page.storage);
     other.snapshot.height = 8785;
     await other.refresh();
     assert.equal(other.elements.get('unit-btc')['aria-pressed'], 'true');
     assert.equal(other.elements.get('time-days')['aria-pressed'], 'true');
-    assert.match(other.elements.get('chart-window').textContent, /5 days/);
+    assert.match(other.elements.get('chart-window').textContent, /6\.944 days/);
     const ticks = other.draws.filter(call => call.canvas === other.elements.get('chart') && call.method === 'fillText' && call.args[2] === 267).slice(-5);
-    assert.deepEqual(ticks.map(call => call.args[0]), [8065, 8425, 8785, 9145, 9505].map(blockDate));
+    assert.deepEqual(ticks.map(call => call.args[0]), [7785, 8285, 8785, 9285, 9785].map(blockDate));
     other.draws.length = 0;
     await other.event('time-blocks', 'click');
-    assert.match(other.elements.get('chart-window').textContent, /720 blocks/);
-    assert.equal(other.storage.get(ZOOM_KEY), '720');
+    assert.match(other.elements.get('chart-window').textContent, /1,000 blocks/);
+    assert.equal(other.storage.get(ZOOM_KEY), '1000');
     await other.event('time-days', 'click');
   }
 });
 
-test('invalid zoom preferences fall back to 432 blocks and blocked storage never disables zoom', async () => {
-  for (const value of ['bad', 'NaN', 'Infinity', '-144', '0', '143', '500', '4465', '432.5', '{}']) {
+test('invalid zoom preferences fall back to five hundred blocks and blocked storage never disables zoom', async () => {
+  for (const value of ['bad', 'NaN', 'Infinity', '-144', '0', '9', '500.5', String(Number.MAX_SAFE_INTEGER + 1), '{}']) {
     const storage = new Map([[ZOOM_KEY, value]]);
     const page = await openPage('/', storage);
-    assert.match(page.elements.get('chart-window').textContent, /432 blocks/);
+    assert.match(page.elements.get('chart-window').textContent, /500 blocks/);
     assert.equal(storage.get(ZOOM_KEY), value, 'startup does not rewrite malformed storage');
     assert.equal(page.elements.get('zoom-in').disabled, false);
     assert.equal(page.elements.get('zoom-out').disabled, false);
   }
   const page = await openPage('/', { get() { throw new Error('Storage blocked'); }, set() { throw new Error('Storage blocked'); } });
   await page.event('zoom-in', 'click');
-  assert.match(page.elements.get('chart-window').textContent, /144 blocks/);
-  assert.equal(page.elements.get('zoom-in').disabled, true);
+  assert.match(page.elements.get('chart-window').textContent, /250 blocks/);
+  assert.equal(page.elements.get('zoom-in').disabled, false);
   assert.equal(page.elements.get('connection').textContent, 'Live');
+  const legacy = new Map([['flame-mint-playground-zoom-v1', '4464']]);
+  const fresh = await openPage('/', legacy);
+  assert.match(fresh.elements.get('chart-window').textContent, /500 blocks/);
+  assert.equal(legacy.get('flame-mint-playground-zoom-v1'), '4464', 'old linear preferences are left untouched');
+  assert.equal(legacy.has(ZOOM_KEY), false);
+});
+
+test('arbitrary safe radii survive reloads and zooming stops only at the numeric precision ceiling', async () => {
+  for (const radius of [10, 11, 143, 500, 4465, 1000000, 1000000000000, Number.MAX_SAFE_INTEGER]) {
+    const page = await openPage('/', new Map([[ZOOM_KEY, String(radius)]]));
+    assert.match(page.elements.get('chart-window').textContent, new RegExp(`${new Intl.NumberFormat('en').format(radius)} blocks`));
+    assert.equal(page.elements.get('zoom-in').disabled, radius === 10);
+    assert.equal(page.elements.get('zoom-out').disabled, radius === Number.MAX_SAFE_INTEGER);
+    const lineCalls = page.draws.filter(call => ['moveTo', 'lineTo'].includes(call.method));
+    assert.ok(lineCalls.length < 10000, 'wide views must not allocate or draw one sample per block');
+    assert.ok(lineCalls.every(call => call.args.every(Number.isFinite)), `all canvas coordinates remain finite at radius ${radius}`);
+    if (radius > 10) {
+      await page.event('zoom-in', 'click');
+      assert.equal(page.storage.get(ZOOM_KEY), String(Math.max(10, Math.round(radius / 2))));
+    }
+  }
+  const page = await openPage('/', new Map([[ZOOM_KEY, String(Math.ceil(Number.MAX_SAFE_INTEGER / 2))]]));
+  await page.event('zoom-out', 'click');
+  assert.equal(page.storage.get(ZOOM_KEY), String(Number.MAX_SAFE_INTEGER));
+  assert.equal(page.elements.get('zoom-out').disabled, true);
+  await page.event('zoom-out', 'click');
+  assert.equal(page.storage.get(ZOOM_KEY), String(Number.MAX_SAFE_INTEGER));
+  await page.event('zoom-in', 'click');
+  assert.equal(page.storage.get(ZOOM_KEY), String(Math.round(Number.MAX_SAFE_INTEGER / 2)));
+  assert.equal(page.elements.get('zoom-out').disabled, false);
+});
+
+test('wide chart samples preserve starts, one-block spikes, remainder changes, and expiries without per-block work', () => {
+  const height = 6000;
+  const spike = plan({ start_block: 6011, duration: 1, budget_sats: FEE + 1 });
+  const remainder = plan({ start_block: 7000, duration: 100, budget_sats: 300005 });
+  const pending = plan({ start_block: 9000, duration: 144, budget_sats: 432001 });
+  const started = performance.now();
+  for (const radius of [1000000, 1000000000000, Number.MAX_SAFE_INTEGER]) {
+    const first = height - radius, last = height + radius;
+    const blocks = chartBlocks([spike, remainder], first, last, height, pending);
+    assert.ok(blocks.length < 40, 'cost follows the number of schedule changes, not the view width');
+    assert.deepEqual(blocks, [...new Set(blocks)].sort((a, b) => a - b));
+    assert.ok(blocks.every(block => Number.isFinite(block) && Number.isInteger(block) && block >= first && block <= last));
+    for (const block of [first, last, height, 6010, 6011, 6012, 6999, 7000, 7004, 7005, 7099, 7100, 8999, 9000, 9143, 9144]) {
+      assert.ok(blocks.includes(block), `essential boundary ${block} survives radius ${radius}`);
+    }
+    assert.deepEqual(blocks.filter(block => feeAt(spike, block) > 0), [6011], 'a one-block fee spike remains represented');
+    assert.equal(burnAt(remainder, 7004), 2001);
+    assert.equal(burnAt(remainder, 7005), 2000);
+  }
+  assert.ok(performance.now() - started < 1000, 'huge views do not freeze the page');
+  assert.deepEqual(chartBlocks([], -10, 10, 0), Array.from({ length: 21 }, (_, i) => i - 10), 'minimum zoom keeps every block and the negative-time blank range');
 });
 
 test('calendar zoom endpoints label the exact centered day range on both pages', async () => {
   for (const pathname of ['/', '/mint']) {
-    for (const radius of [144, 4464]) {
+    for (const radius of [10, 500, 4464, 1000000]) {
       const page = await openPage(pathname, new Map([[ZOOM_KEY, String(radius)], [TIME_KEY, 'days']]));
       page.snapshot.height = 6000;
       page.draws.length = 0;
       await page.refresh();
       const ticks = page.draws.filter(call => call.canvas === page.elements.get('chart') && call.method === 'fillText' && call.args[2] === 267);
-      assert.deepEqual(ticks.map(call => call.args[0]), Array.from({ length: 5 }, (_, index) => blockDate(6000 - radius + radius / 2 * index)));
+      assert.deepEqual(ticks.map(call => call.args[0]), Array.from({ length: 5 }, (_, index) => blockDate(Math.round(6000 - radius + radius / 2 * index))));
       assert.equal(ticks[2].args[1], 400);
-      assert.match(page.elements.get('chart-window').textContent, new RegExp(`${radius / 144} day`));
+      assert.match(page.elements.get('chart-window').textContent, new RegExp(`${new Intl.NumberFormat('en', { maximumFractionDigits: 3 }).format(radius / 144)} days`));
       assert.equal(page.elements.get('current-block').textContent, blockDate(6000));
     }
   }
@@ -693,6 +748,29 @@ test('dashboard initializes, polls, draws, and renders the actual contribution s
   assert.equal(page.requests.filter(request => request.url === '/api/state').length, 1);
   assert.equal(page.requests.length, 2, 'state and BTC/USD quote are loaded independently');
   assert.equal(page.storage.size, 0, 'dashboard does not need palette or wallet storage');
+});
+
+test('dashboard contribution rows show only the schedule, never an address or address tooltip', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    const contribution = page.snapshot.contributions[0];
+    const address = contribution.address;
+    const checkRow = schedule => {
+      const row = page.elements.get('contributions').children[0];
+      const heading = row.children[0].children[0].children[1];
+      const details = row.children[0].children[1];
+      assert.equal(heading.textContent, '#1 · 300,000 sat / 100 blocks');
+      assert.equal(details.textContent, schedule);
+      assert.equal(details.title, pathname === '/mint' ? address : '');
+      assert.equal(page.snapshot.contributions[0].address, address, 'API address data remains available for ownership matching');
+    };
+    checkRow('Blocks 10–109');
+    await page.event('time-days', 'click');
+    const row = page.elements.get('contributions').children[0];
+    assert.equal(row.children[0].children[1].textContent, 'Jan 11–Jan 11');
+    assert.equal(row.children[0].children[1].title, pathname === '/mint' ? address : '');
+    assert.match(row.children[0].children[0].children[1].textContent, /^#1 · 300,000 sat \/ 0\.694 days$/);
+  }
 });
 
 test('dashboard requests recent contributions but uses server all-time totals, even with no visible rows', async () => {
@@ -1164,18 +1242,18 @@ test('the dashed draft is limited to its real scheduled interval and disappears 
     }
     return [];
   };
-  for (const [delay, firstBlock, lastBlock] of [[0, 500, 645], [100, 600, 745], [431, 931, 932]]) {
+  for (const [delay, firstBlock, lastBlock] of [[0, 500, 645], [100, 600, 745], [DEFAULT_ZOOM - 1, 500 + DEFAULT_ZOOM - 1, 500 + DEFAULT_ZOOM]]) {
     page.draws.length = 0;
     page.elements.get('delay').value = String(delay);
     await page.event('delay', 'input');
     const path = strokePath();
     assert.ok(path.length > 0);
     const xs = path.map(point => point[0]);
-    assert.equal(Math.min(...xs), 48 + (firstBlock - 68) / 864 * 704, 'only one zero sample immediately precedes the actual start');
-    assert.equal(Math.max(...xs), 48 + (lastBlock - 68) / 864 * 704, 'only one zero sample immediately follows the actual end, clipped to the window');
+    assert.equal(Math.min(...xs), 48 + (firstBlock - (500 - DEFAULT_ZOOM)) / (2 * DEFAULT_ZOOM) * 704, 'only one zero sample immediately precedes the actual start');
+    assert.equal(Math.max(...xs), 48 + (lastBlock - (500 - DEFAULT_ZOOM)) / (2 * DEFAULT_ZOOM) * 704, 'only one zero sample immediately follows the actual end, clipped to the window');
     assert.equal(path.length, lastBlock - firstBlock + 1);
   }
-  for (const delay of [432, 4464]) {
+  for (const delay of [DEFAULT_ZOOM, 4464]) {
     page.draws.length = 0;
     page.elements.get('delay').value = String(delay);
     await page.event('delay', 'input');
