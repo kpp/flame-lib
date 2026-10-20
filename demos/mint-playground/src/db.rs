@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const FEE_PER_BLOCK: i64 = 1_000;
 pub const BLOCK_REWARD_SPARKS: i64 = 5_000_000_000;
+pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 #[derive(Debug)]
 pub enum Error {
@@ -111,14 +112,14 @@ impl Database {
                  request_id TEXT NOT NULL UNIQUE,
                  user_id INTEGER NOT NULL REFERENCES accounts(id),
                  budget_sats INTEGER NOT NULL CHECK(typeof(budget_sats) = 'integer'
-                     AND budget_sats BETWEEN 2000 AND 100000000),
+                     AND budget_sats BETWEEN 2000 AND 9007199254740991),
                  duration INTEGER NOT NULL CHECK(typeof(duration) = 'integer'
-                     AND duration BETWEEN 100 AND 4464),
+                     AND duration BETWEEN 100 AND 9007199254740991),
                  delay_blocks INTEGER NOT NULL DEFAULT 0 CHECK(typeof(delay_blocks) = 'integer'
-                     AND delay_blocks BETWEEN 0 AND 4464),
+                     AND delay_blocks BETWEEN 0 AND 9007199254740991),
                  start_block INTEGER NOT NULL CHECK(typeof(start_block) = 'integer'
-                     AND start_block >= 1),
-                 CHECK(budget_sats >= duration * 1001)
+                     AND start_block >= 1 AND start_block <= 9007199254740991 - duration),
+                 CHECK(budget_sats / duration >= 1001)
              );
              CREATE TABLE IF NOT EXISTS blocks (
                  height INTEGER PRIMARY KEY CHECK(height >= 1),
@@ -144,12 +145,14 @@ impl Database {
                  ON accruals(contribution_id);
              COMMIT;",
         )?;
-        let has_delay: bool = connection.query_row(
-            "SELECT COUNT(*) > 0 FROM pragma_table_info('contributions') WHERE name = 'delay_blocks'",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_delay {
+        let schema_version: i64 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if schema_version < 1 {
+            let has_delay: bool = connection.query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('contributions') WHERE name = 'delay_blocks'",
+                [],
+                |row| row.get(0),
+            )?;
             // Rebuild only the constrained table, retaining all ledger IDs and references.
             connection.pragma_update(None, "foreign_keys", false)?;
             let transaction =
@@ -160,20 +163,23 @@ impl Database {
                      request_id TEXT NOT NULL UNIQUE,
                      user_id INTEGER NOT NULL REFERENCES accounts(id),
                      budget_sats INTEGER NOT NULL CHECK(typeof(budget_sats) = 'integer'
-                         AND budget_sats BETWEEN 2000 AND 100000000),
+                         AND budget_sats BETWEEN 2000 AND 9007199254740991),
                      duration INTEGER NOT NULL CHECK(typeof(duration) = 'integer'
-                         AND duration BETWEEN 100 AND 4464),
+                         AND duration BETWEEN 100 AND 9007199254740991),
                      delay_blocks INTEGER NOT NULL DEFAULT 0 CHECK(typeof(delay_blocks) = 'integer'
-                         AND delay_blocks BETWEEN 0 AND 4464),
+                         AND delay_blocks BETWEEN 0 AND 9007199254740991),
                      start_block INTEGER NOT NULL CHECK(typeof(start_block) = 'integer'
-                         AND start_block >= 1),
-                     CHECK(budget_sats >= duration * 1001)
-                 );
-                 INSERT INTO contributions_new(id, request_id, user_id, budget_sats, duration, start_block)
-                     SELECT id, request_id, user_id, budget_sats, duration, start_block FROM contributions;
+                         AND start_block >= 1 AND start_block <= 9007199254740991 - duration),
+                     CHECK(budget_sats / duration >= 1001)
+                 );",
+            )?;
+            transaction.execute_batch(&format!(
+                "INSERT INTO contributions_new(id, request_id, user_id, budget_sats, duration, start_block, delay_blocks)
+                     SELECT id, request_id, user_id, budget_sats, duration, start_block, {} FROM contributions;
                  DROP TABLE contributions;
                  ALTER TABLE contributions_new RENAME TO contributions;",
-            )?;
+                if has_delay { "delay_blocks" } else { "0" }
+            ))?;
             if transaction
                 .prepare("PRAGMA foreign_key_check")?
                 .exists([])?
@@ -182,6 +188,7 @@ impl Database {
                     "Database migration found invalid ledger references.".into(),
                 ));
             }
+            transaction.pragma_update(None, "user_version", 1)?;
             transaction.commit()?;
             connection.pragma_update(None, "foreign_keys", true)?;
         }
@@ -244,24 +251,30 @@ impl Database {
                 ))
             };
         }
-        if !(2_000..=100_000_000).contains(&request.budget_sats)
-            || !(144..=4_464).contains(&request.duration)
-            || !(0..=4_464).contains(&request.delay_blocks)
+        if !(2_000..=MAX_SAFE_INTEGER).contains(&request.budget_sats)
+            || !(144..=MAX_SAFE_INTEGER).contains(&request.duration)
+            || !(0..=MAX_SAFE_INTEGER).contains(&request.delay_blocks)
         {
             return Err(Error::Invalid(
                 "Budget, duration or delay is outside the supported range.".into(),
             ));
         }
-        if request.budget_sats < request.duration * (FEE_PER_BLOCK + 1) {
+        if request.budget_sats / request.duration < FEE_PER_BLOCK + 1 {
             return Err(Error::Invalid(
                 "Budget must cover 1,000 sat in fees and at least 1 sat burned per block.".into(),
             ));
         }
-        let start_block = transaction.query_row(
-            "SELECT COALESCE(MAX(height), 0) + 1 + ?1 FROM blocks",
-            [request.delay_blocks],
-            |row| row.get(0),
-        )?;
+        let height: i64 =
+            transaction.query_row("SELECT COALESCE(MAX(height), 0) FROM blocks", [], |row| {
+                row.get(0)
+            })?;
+        let start_block = height
+            .checked_add(1)
+            .and_then(|start| start.checked_add(request.delay_blocks))
+            .filter(|start| *start <= MAX_SAFE_INTEGER - request.duration)
+            .ok_or_else(|| {
+                Error::Invalid("Contribution schedule exceeds the supported block range.".into())
+            })?;
         transaction.execute(
             "INSERT OR IGNORE INTO accounts(address) VALUES (?1)",
             [&request.address],
@@ -477,17 +490,17 @@ mod tests {
         let mut invalid = valid.clone();
         invalid.budget_sats -= 1;
         assert!(matches!(db.submit(invalid), Err(Error::Invalid(_))));
-        for duration in [i64::MIN, 0, 100, 143, 4_465, i64::MAX] {
+        for duration in [i64::MIN, 0, 100, 143, MAX_SAFE_INTEGER + 1, i64::MAX] {
             let mut invalid = valid.clone();
             invalid.duration = duration;
             assert!(matches!(db.submit(invalid), Err(Error::Invalid(_))));
         }
-        for delay in [i64::MIN, -1, 4_465, i64::MAX] {
+        for delay in [i64::MIN, -1, MAX_SAFE_INTEGER + 1, i64::MAX] {
             let mut invalid = valid.clone();
             invalid.delay_blocks = delay;
             assert!(matches!(db.submit(invalid), Err(Error::Invalid(_))));
         }
-        for budget in [1_999, 100_000_001, i64::MAX] {
+        for budget in [1_999, MAX_SAFE_INTEGER + 1, i64::MAX] {
             let mut invalid = valid.clone();
             invalid.budget_sats = budget;
             assert!(matches!(db.submit(invalid), Err(Error::Invalid(_))));
@@ -531,6 +544,76 @@ mod tests {
         assert_eq!(snapshot.contributions[0].duration, 4_464);
         assert_eq!(snapshot.contributions[0].delay_blocks, 4_464);
         assert_eq!(snapshot.totals.burned_sats, "0");
+    }
+
+    #[test]
+    fn manual_values_may_exceed_every_slider_limit() {
+        let mut db = database();
+        let mut contribution = request(1, 1, 100);
+        contribution.budget_sats = 200_000_000;
+        contribution.duration = 5_001;
+        contribution.delay_blocks = 6_001;
+        let submitted = db.submit(contribution.clone()).unwrap();
+        assert_eq!(submitted.start_block, 6_002);
+        assert_eq!(db.submit(contribution).unwrap().id, submitted.id);
+        let snapshot = db.snapshot(false).unwrap();
+        assert_eq!(snapshot.contributions[0].budget_sats, 200_000_000);
+        assert_eq!(snapshot.contributions[0].duration, 5_001);
+        assert_eq!(snapshot.contributions[0].delay_blocks, 6_001);
+    }
+
+    #[test]
+    fn validates_safe_integer_limits_funding_and_schedule_without_overflow() {
+        let mut db = database();
+        let mut contribution = request(1, 1, 100);
+        contribution.budget_sats = MAX_SAFE_INTEGER;
+        contribution.duration = 144;
+        contribution.delay_blocks = MAX_SAFE_INTEGER - 145;
+        let last = db.submit(contribution.clone()).unwrap();
+        assert_eq!(last.start_block + contribution.duration, MAX_SAFE_INTEGER);
+
+        contribution.request_id = "overlong-schedule-0001".into();
+        contribution.delay_blocks += 1;
+        assert!(matches!(
+            db.submit(contribution.clone()),
+            Err(Error::Invalid(_))
+        ));
+        contribution.delay_blocks = 0;
+        contribution.duration = MAX_SAFE_INTEGER;
+        assert!(matches!(
+            db.submit(contribution.clone()),
+            Err(Error::Invalid(_))
+        ));
+
+        contribution.duration = MAX_SAFE_INTEGER / 1_001;
+        let large = db.submit(contribution.clone()).unwrap();
+        assert_eq!(large.start_block, 1);
+        db.tick().unwrap();
+        assert_eq!(db.snapshot(false).unwrap().totals.burned_sats, "2");
+
+        contribution.request_id = "underfunded-large-0001".into();
+        contribution.budget_sats = contribution.duration * 1_001 - 1;
+        assert!(matches!(
+            db.submit(contribution.clone()),
+            Err(Error::Invalid(_))
+        ));
+
+        contribution.budget_sats = MAX_SAFE_INTEGER;
+        contribution.duration = 144;
+        contribution.delay_blocks = MAX_SAFE_INTEGER - 145;
+        assert!(matches!(
+            db.submit(contribution.clone()),
+            Err(Error::Invalid(_))
+        ));
+
+        db.connection
+            .execute_batch("DELETE FROM accruals; DELETE FROM blocks;")
+            .unwrap();
+        db.connection
+            .execute("INSERT INTO blocks VALUES (?1, 0, 0, 0)", [i64::MAX])
+            .unwrap();
+        contribution.delay_blocks = MAX_SAFE_INTEGER;
+        assert!(matches!(db.submit(contribution), Err(Error::Invalid(_))));
     }
 
     #[test]
@@ -927,6 +1010,7 @@ mod tests {
                  );
                  DROP TABLE contributions;
                  ALTER TABLE contributions_legacy RENAME TO contributions;
+                 PRAGMA user_version = 0;
                  COMMIT;
                  PRAGMA foreign_keys = ON;",
                 )
@@ -1016,6 +1100,94 @@ mod tests {
         assert_eq!(snapshot.contributions[1].reward_sparks, "10000000000");
         assert_eq!(snapshot.totals.burned_sats, "2");
         assert_eq!(snapshot.totals.reward_sparks, "10000000000");
+    }
+
+    #[test]
+    fn bounded_schema_migrates_with_ledger_retries_and_delay_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mint.sqlite3");
+        let first = request(1, 1, 100);
+        let mut delayed = request(2, 2, 100);
+        delayed.delay_blocks = 4_464;
+        let snapshot;
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.submit(first.clone()).unwrap();
+            db.submit(delayed.clone()).unwrap();
+            db.tick().unwrap();
+            snapshot = serde_json::to_value(db.snapshot(true).unwrap()).unwrap();
+            db.connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                 BEGIN EXCLUSIVE;
+                 CREATE TABLE contributions_bounded (
+                     id INTEGER PRIMARY KEY,
+                     request_id TEXT NOT NULL UNIQUE,
+                     user_id INTEGER NOT NULL REFERENCES accounts(id),
+                     budget_sats INTEGER NOT NULL CHECK(typeof(budget_sats) = 'integer'
+                         AND budget_sats BETWEEN 2000 AND 100000000),
+                     duration INTEGER NOT NULL CHECK(typeof(duration) = 'integer'
+                         AND duration BETWEEN 100 AND 4464),
+                     delay_blocks INTEGER NOT NULL DEFAULT 0 CHECK(typeof(delay_blocks) = 'integer'
+                         AND delay_blocks BETWEEN 0 AND 4464),
+                     start_block INTEGER NOT NULL CHECK(typeof(start_block) = 'integer'
+                         AND start_block >= 1),
+                     CHECK(budget_sats >= duration * 1001)
+                 );
+                 INSERT INTO contributions_bounded SELECT * FROM contributions;
+                 DROP TABLE contributions;
+                 ALTER TABLE contributions_bounded RENAME TO contributions;
+                 PRAGMA user_version = 0;
+                 COMMIT;
+                 PRAGMA foreign_keys = ON;",
+                )
+                .unwrap();
+        }
+        {
+            let mut db = Database::open(&path).unwrap();
+            assert_eq!(
+                serde_json::to_value(db.snapshot(true).unwrap()).unwrap(),
+                snapshot
+            );
+            assert_eq!(db.submit(first).unwrap().id, 1);
+            assert_eq!(db.submit(delayed).unwrap().start_block, 4_465);
+            assert_eq!(
+                db.rewards()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r.address == address(1))
+                    .unwrap()
+                    .reward_sparks,
+                "5000000000"
+            );
+            let mut large = request(3, 3, 100);
+            large.budget_sats = 200_000_000;
+            large.duration = 5_001;
+            large.delay_blocks = 6_001;
+            let submitted = db.submit(large).unwrap();
+            assert_eq!(
+                (submitted.id, submitted.user_id, submitted.start_block),
+                (3, 3, 6_003)
+            );
+            assert!(!db
+                .connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap());
+            assert!(db
+                .connection
+                .execute("UPDATE contributions SET user_id = 999 WHERE id = 1", [])
+                .is_err());
+            db.tick().unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.snapshot(true).unwrap().height, 2);
+        assert_eq!(db.snapshot(true).unwrap().contributions.len(), 3);
+        assert_eq!(
+            db.snapshot(true).unwrap().totals.reward_sparks,
+            "10000000000"
+        );
     }
 
     #[test]

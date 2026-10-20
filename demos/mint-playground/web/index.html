@@ -19,6 +19,7 @@
 
     <section class="metrics" aria-label="Minting metrics">
       <div><p id="total-burned-label">Burned</p><p class="metric-value" id="total-burned">—&nbsp;sat</p></div>
+      <div><p>Mining fees</p><p class="metric-value" id="total-fees">—&nbsp;sat</p></div>
       <div><p>Earned</p><p class="metric-value" id="total-reward">—&nbsp;FLM</p></div>
       <div><p id="total-rate-label" title="Current block's burn divided by 50 FLM, excluding fees">Current rate</p><p class="metric-value" id="total-rate">—&nbsp;sat/FLM</p></div>
     </section>
@@ -27,8 +28,8 @@
       <div class="section-heading"><h2 id="chart-title">Burn rate and mining fees</h2></div>
       <div class="chart-legend"><span><i class="swatch other"></i><span id="others-label">Burn ↑</span></span><span id="own-legend" hidden><i id="own-swatch" class="swatch own"></i>You</span><span id="draft-legend" hidden><i id="draft-swatch" class="swatch draft"></i>Draft</span><span id="fees-legend"><i class="swatch fees"></i>Mining fees ↓</span></div>
       <div class="chart-units"><span id="chart-burn-unit">sat/block</span><span id="chart-rate-unit">sat/FLM</span></div>
-      <div id="chart-wrap" class="canvas-wrap with-fees"><canvas id="chart" role="img" aria-label="Burn above zero and mining fees below zero share a satoshis-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous and next 432 blocks. All known contribution schedules included."></canvas></div>
-      <div class="chart-footer"><span><span id="current-block-label">Block</span> <strong id="current-block">—</strong> · <span id="chart-window">±432 blocks</span></span><span id="chart-note">Known schedules</span></div>
+      <div id="chart-wrap" class="canvas-wrap with-fees"><canvas id="chart" role="img" aria-label="Burn above zero and mining fees below zero share a satoshis-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous and next 500 blocks. All known contribution schedules included."></canvas></div>
+      <div class="chart-footer"><span><span id="current-block-label">Block</span> <strong id="current-block">—</strong> · <span id="chart-window">±500 blocks</span></span><span id="chart-note">Known schedules</span></div>
     </section>
 
     <section id="mint-form" class="panel mint-panel" hidden aria-labelledby="mint-title">
@@ -51,7 +52,7 @@
         </form>
         <div class="projection">
           <h3>Estimate</h3>
-          <dl><div><dt>Reward (FLM)</dt><dd id="projected-reward">—</dd></div><div><dt>Fees</dt><dd id="projected-fees">—</dd></div><div><dt>Burn</dt><dd id="projected-burn">—</dd></div><div><dt id="projected-rate-label">sat/FLM, incl. fees</dt><dd id="projected-rate">—</dd></div></dl>
+          <dl><div><dt>Reward (FLM)</dt><dd id="projected-reward">—</dd></div><div><dt>Fees</dt><dd id="projected-fees">—</dd></div><div><dt>Burn</dt><dd id="projected-burn">—</dd></div><div><dt id="projected-rate-label">sat/FLM</dt><dd id="projected-rate">—</dd></div></dl>
           <p id="projection-note" class="muted small">Known contribution schedules included. Starts next block.</p>
         </div>
       </div>
@@ -59,7 +60,7 @@
 
     <section class="panel table-panel" aria-labelledby="contributions-title">
       <div class="section-heading"><h2 id="contributions-title">Contributions</h2><a href="/api/rewards" target="_blank" rel="noopener">Rewards JSON</a></div>
-      <div class="table-scroll"><table><thead><tr><th>Contribution</th><th>Status</th><th id="table-burned-label" class="number">Sats burned</th><th class="number">FLM earned</th><th id="table-fees-label" class="number">Mining fees (sat)</th><th class="number"><span id="table-rate-label">sat / FLM</span> <span class="muted">incl. fees</span></th></tr></thead><tbody id="contributions"></tbody><tfoot id="contribution-totals"></tfoot></table></div>
+      <div class="table-scroll"><table><thead><tr><th>Contribution</th><th>Status</th><th id="table-burned-label" class="number">Sats burned</th><th class="number">FLM earned</th><th id="table-fees-label" class="number">Mining fees (sat)</th><th class="number"><span id="table-rate-label">sat / FLM</span></th></tr></thead><tbody id="contributions"></tbody><tfoot id="contribution-totals"></tfoot></table></div>
       <p id="empty-table" class="empty" hidden>No contributions.</p>
     </section>
     <section id="wallet-panel" class="panel wallet" aria-labelledby="wallet-title" hidden><h2 id="wallet-title">Reward address (testnet)</h2><p id="wallet-status" class="muted small">Loading wallet…</p><code id="wallet-address">—</code><details id="seed-details"><summary>Recovery phrase</summary><p class="muted small">Demo only. Anyone with this phrase controls the wallet. Stored in this browser.</p><p id="seed-phrase" class="seed-phrase"></p></details><button id="retry-wallet" type="button" hidden>Retry wallet</button> <button id="reset-wallet" type="button" hidden>Reset wallet</button></section>

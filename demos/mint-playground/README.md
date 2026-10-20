@@ -32,15 +32,15 @@ User chooses:
 - duration: how many blocks to spend it over,
 - delay: how many blocks to wait before starting.
 
-Each contribution starts at `committed_height + 1 + delay_blocks`. Delay defaults to zero (the next block) and ranges from 0 to 4,464 blocks. Duration ranges from 144 to 4,464 blocks; both sliders move one block at a time. Waiting blocks incur no burn, fee, or reward. The total budget includes a fee of 1,000 sat **per contribution, per active block**. The remaining sats are burned across the selected duration: each block burns the integer quotient, and the first remainder blocks burn one extra sat. Thus the complete budget is spent exactly, without fractional sats.
+Each contribution starts at `committed_height + 1 + delay_blocks`. Delay defaults to zero (the next block). Its slider covers 0 to 4,464 blocks; the duration slider covers 144 to 4,464 blocks, both at single-block resolution. Typed values may exceed these slider ranges. Waiting blocks incur no burn, fee, or reward. The total budget includes a fee of 1,000 sat **per contribution, per active block**. The remaining sats are burned across the selected duration: each block burns the integer quotient, and the first remainder blocks burn one extra sat. Thus the complete budget is spent exactly, without fractional sats.
 
-The budget slider runs linearly from 100,000 to 100,000,000 sat, in steps of 100,000. Submission requires `budget >= duration × 1,001`: enough for all fees and at least one burned sat per block. Invalid combinations are explained and cannot be submitted.
+The budget slider runs linearly from 100,000 to 100,000,000 sat, in steps of 100,000. The adjacent text fields accept larger budgets, durations and delays independently of the slider positions; typed budgets retain single-satoshi precision. Dragging a slider replaces only that field's typed value. Currency/time switches and refreshes preserve the underlying sats/blocks. Inputs are bounded by JavaScript's exact integer ceiling, `9,007,199,254,740,991`; the exclusive end block must also fit. Submission requires `budget >= duration × 1,001`: enough for all fees and at least one burned sat per block. Invalid combinations are explained and cannot be submitted. Sliders retain their original limits.
 
 Blocks advance once per second while the service is running. Restarting resumes at the last committed height; downtime does not produce blocks or retroactive rewards. A block with at least one active minter distributes exactly 50 FLM in proportion to each contribution's burned sats, excluding fees. With no active minters, that block's 50 FLM are permanently lost: never accumulated, carried forward, or awarded to later minters. Scheduled contributions that have not started and expired contributions do not count as active. One FLM is 100,000,000 sparks. Allocation uses integer arithmetic: floor each exact share, then assign leftover sparks to largest fractional remainders, breaking ties by contribution ID. Charts and estimates use every known contribution's actual start and expiry, including future scheduled contributions; unknown future submissions are not predicted.
 
 The blocks / days switch changes display only and is remembered independently of currency. Days use 144 blocks/day: block 1 begins January 11, 2027, and block 145 begins January 12. Calendar labels use UTC (`Jan 11`, `Mar 13`); durations and delays are shown in days while controls, requests, and storage retain integer blocks. This is an accelerated simulation calendar, not wall-clock scheduling.
 
-Both pages have − / + chart zoom controls. The centered half-window is 144, 432, 720, …, 4,464 blocks (1, 3, 5, …, 31 days). `+` zooms in by 288 blocks on each side; `−` zooms out. The initial window is ±432 blocks. Boundary buttons are disabled, and the selected zoom is remembered independently of time and currency display. Zoom changes only the chart, not contribution settings or estimates.
+Both pages have − / + chart zoom controls, initially showing ±500 blocks around now. `−` doubles the range on each side; `+` halves it, rounding to whole blocks, down to a minimum of ±10. There is no preset maximum range beyond JavaScript's exact-integer ceiling. Wide views render schedule-change boundaries rather than allocating a sample for every block, retaining short contributions and fee spikes. Zoom is remembered independently of time and currency display; the old fixed-step preference is superseded so the new default takes effect. Zoom changes only the chart, not contribution settings, estimates or the API's existing history-retention window.
 
 
 The existing Flame wallet runs in the browser via WebAssembly and uses FlameKD to generate a mnemonic and testnet receiving address (`t1…i1…`; see [address formatting](../../docs/address.md)). These are remembered in browser local storage, so subsequent contributions share the same reward destination. **The mnemonic, seed and private keys never go to the service or database.** Request parsing rejects extra fields, including mnemonic/private-key fields. Only the address and contribution parameters are submitted. The server validates the address with FlameKD and stores its canonical lowercase encoding.
@@ -62,7 +62,7 @@ The connection holds an exclusive file lock: only one service may own a database
 
 Relationships: an account has many contributions; a contribution and a block each have many accruals. Earned amounts and fees on the contribution table are derived from accruals, not maintained as another mutable copy. Status is derived from the current block and schedule. The account total is deliberately materialized to make later reward export straightforward; it equals the sum of that address's accruals. All money is stored as SQLite signed 64-bit integers, never floats; proportional multiplication uses 128-bit intermediates. Cumulative monetary values in JSON are decimal strings to avoid JavaScript's integer precision limit.
 
-User IDs start at 1 and increment for each new canonical address at its first accepted contribution. Repeat submissions, retries and uppercase spellings reuse the same user ID. IDs persist across service restarts; they are distinct from contribution IDs. The snapshot includes both `user_id` and receiving `address` for every contribution. Existing integer-user-ID databases are migrated without resetting the ledger: old schedules, IDs, allocations, and balances remain intact, with old delays set to zero. Historical durations below the new minimum remain valid records; the older address-keyed schema is not supported.
+User IDs start at 1 and increment for each new canonical address at its first accepted contribution. Repeat submissions, retries and uppercase spellings reuse the same user ID. IDs persist across service restarts; they are distinct from contribution IDs. The snapshot includes both `user_id` and receiving `address` for every contribution. Existing integer-user-ID databases are migrated without resetting the ledger: old schedules, IDs, allocations, balances and retries remain intact, including when lifting the former slider-based SQL limits. Old schemas without delays get zero delays. Historical durations below the new minimum remain valid records; the older address-keyed schema is not supported.
 
 The submission ID is generated in the browser. Repeating an ID with identical canonical address, budget, duration, and delay returns the original contribution and start block without creating another one. Reusing it with different parameters is rejected. Omitted delay means zero, including old saved requests. Matching retries of previously accepted legacy durations remain valid. Because submissions and block ticks share one queue, the delay is applied relative to the committed height observed by the first accepted submission, not by its retries.
 
@@ -89,10 +89,10 @@ Both pages always show the BTC/USD price in a reserved single-line ticker. Coinb
 
 URL: `/mint`
 
-The top counters show only this user's accrued totals: sats burned, FLM earned, and effective cost `(sats burned + mining fees paid) / FLM earned`. They include all of the user's contributions, not only the chart window. Scheduled future spending and the unsubmitted draft are excluded. Effective cost is `—` until rewards are earned; all three numeric values are `—` while the wallet is unavailable, with their labels and units retained.
+The top counters show only this user's accrued totals: sats burned, mining fees paid, FLM earned, and effective rate `sats burned / FLM earned`, excluding fees. They include all of the user's contributions, not only the chart window. Scheduled future spending and the unsubmitted draft are excluded. Effective rate is `—` until rewards are earned; all numeric values are `—` while the wallet is unavailable, with their labels and units retained.
 
 User sees a chart of the burn rate in satoshis per block, with the equivalent mint rate (sat/FLM) on the right-hand axis.
-- Chart is centered around the current block, initially ±432 blocks, with its range controlled by zoom and labels shown as block numbers or calendar dates.
+- Chart is centered around the current block, initially ±500 blocks, with its range controlled by zoom and labels shown as block numbers or calendar dates.
 - Other users are grey. Everyone's known schedules are drawn exactly, including future starts and expirations.
 - The user's submitted contributions are drawn on top using their assigned user-ID color, matching the dashboard.
 - The user's draft contribution is a dashed line in the same color; it changes with the sliders. Both legend swatches match. Before the first accepted contribution assigns a user ID, the draft and swatches are neutral grey rather than guessing a future ID.
@@ -101,19 +101,20 @@ Controls:
 - slider "budget": 100,000 to 100,000,000 satoshis (linear scale, in steps of 100,000).
 - slider "duration": 144 to 4,464 blocks (1 to 31 days), in steps of one block.
 - slider "delay": 0 to 4,464 blocks (0 to 31 days), in steps of one block; default zero.
-- display: projected total amount of flames to be earned over the selected delayed window, total amount of satoshis spent on fees, and resulting average mint rate (sats/FLM) that takes fees into account.
+- Adjacent text fields accept larger values than the sliders, in the selected currency/time units.
+- display: projected total amount of flames to be earned over the selected delayed window, total amount of satoshis spent on fees, burned sats, and resulting average mint rate (burned sats/FLM), excluding fees.
 - button "submit".
 
-For a draft starting at `H + 1 + delay_blocks`, each active block `b` estimates `50 FLM × draft_burn(b) / (sum(existing_burn(b)) + draft_burn(b))`. All existing contributions, including this user's overlapping contributions and other users' scheduled starts/expirations, follow their actual schedules throughout the full duration, even outside the chart window. Only the draft's share is included in its estimate. Later submissions can change the eventual result.
+For a draft starting at `H + 1 + delay_blocks`, each active block `b` estimates `50 FLM × draft_burn(b) / (sum(existing_burn(b)) + draft_burn(b))`. All existing contributions, including this user's overlapping contributions and other users' scheduled starts/expirations, follow their actual schedules throughout the full duration, even outside the chart window. The estimator sums intervals between burn-rate changes instead of iterating over every block, so very long durations do not stall the page. Only the draft's share is included in its estimate. Later submissions can change the eventual result. Dates beyond the calendar's representable range display a block number instead.
 
 Table below shows all user's contributions: 
 - their status (scheduled, active, finished),
 - amount of sats burned, 
 - amount of FLM earned,
 - total mining fees paid,
-- average sats/FLM rate - per each contribution.
+- average burned sats/FLM rate, excluding fees, per contribution.
 
-Total line shows total sats burned, total FLM earned, total mining fees paid, average mint rate.
+Total line shows total sats burned, total FLM earned, total mining fees paid, and average burned sats/FLM, excluding fees. The dashboard table uses the same rate definition.
 
 The reward address and recovery controls appear below the contributions table. Both pages end with a row of small squares showing the participant palette in its assigned order.
 
@@ -135,8 +136,9 @@ The dashboard always shows contributions colored by user, with no color toggle. 
 
 The dashboard combines each user's contributions into one band. Bands are stacked by each user's latest contribution ID, oldest at the bottom and newest at the top. A new contribution moves that user's entire band upward without changing their color. The table remains newest-first.
 
-On very top show three big digits: 
+On very top show four totals/rates:
 - total satoshis burned from the beginning,
+- total mining fees paid from the beginning,
 - and total flames distributed,
 - current mint rate: this block's burned sats divided by 50 FLM, excluding fees; `—` when no contributions burn this block. This is not the lifetime average.
 

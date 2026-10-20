@@ -6,8 +6,9 @@ export const SPARKS = 100000000;
 export const REWARD = 50 * SPARKS;
 export const UNIT_KEY = 'flame-mint-playground-unit-v1';
 export const TIME_KEY = 'flame-mint-playground-time-v1';
-export const ZOOM_KEY = 'flame-mint-playground-zoom-v1';
-export const ZOOM_LEVELS = Array.from({ length: 16 }, (_, index) => 144 + 288 * index);
+export const ZOOM_KEY = 'flame-mint-playground-zoom-v2';
+export const ZOOM_MIN = 10;
+export const ZOOM_DEFAULT = 500;
 export const BLOCKS_PER_DAY = 144;
 export const DURATION_MIN = 144;
 export const DURATION_MAX = 4464;
@@ -16,10 +17,8 @@ const SATS_PER_BTC = 100000000;
 
 // Typed-value fields next to the sliders. A typed number is parsed leniently
 // (currency signs, unit words and thousands separators are ignored), converted
-// to the slider's native unit (sats or blocks), snapped to the slider's step
-// and clamped to its bounds, so a typed value can never escape the limits the
-// slider itself enforces. `null` means "nothing usable was typed": the caller
-// leaves the slider alone and simply re-renders the current value.
+// to whole sats or blocks independently of the slider's range. The slider
+// only displays the nearest available step. `null` means nothing usable was typed.
 export function parseInputNumber(text) {
   const cleaned = String(text ?? '').replace(/[^0-9.]/g, '');
   if (!cleaned || cleaned === '.') return null;
@@ -49,6 +48,7 @@ export function inputToBlocks(value, mode = 'blocks') {
 export function blockDate(block) {
   if (block < 0) return '—';
   const date = new Date(Date.UTC(2027, 0, 11) + Math.floor((block - 1) / BLOCKS_PER_DAY) * 86400000);
+  if (Number.isNaN(date.getTime())) return `Block ${new Intl.NumberFormat('en').format(block)}`;
   return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(date);
 }
 
@@ -68,7 +68,7 @@ export function formatDuration(blocks, mode = 'blocks') {
 
 export function formatMoney(sats, unit = 'sat', btcUsd = null, isRate = false, digits = null) {
   if (unit === 'USD' && !(Number.isFinite(btcUsd) && btcUsd > 0)) return '—';
-  const value = unit === 'BTC' ? sats / SATS_PER_BTC : unit === 'USD' ? sats / SATS_PER_BTC * btcUsd : sats;
+  const value = unit === 'BTC' ? sats / SATS_PER_BTC : unit === 'USD' ? sats * (btcUsd / SATS_PER_BTC) : sats;
   const minimumFractionDigits = digits ?? (unit === 'BTC' ? 8 : unit === 'USD' ? 2 : 0);
   return new Intl.NumberFormat('en', { minimumFractionDigits, maximumFractionDigits: unit === 'USD' && isRate ? 6 : minimumFractionDigits, roundingMode: 'trunc' }).format(value);
 }
@@ -93,13 +93,59 @@ export function feeAt(contribution, block) {
   return block >= contribution.start_block && block < contribution.start_block + contribution.duration ? FEE : 0;
 }
 
+export function chartBlocks(contributions, firstBlock, lastBlock, heightNow, pending = null) {
+  const count = lastBlock - firstBlock + 1;
+  if (count <= 2001) return Array.from({ length: count }, (_, index) => firstBlock + index);
+  // Rates only change at schedule boundaries; keep both sides so even one-block spikes survive zooming out.
+  const blocks = new Set([firstBlock, lastBlock]);
+  const add = block => { if (block >= firstBlock && block <= lastBlock) blocks.add(block); };
+  add(heightNow);
+  for (const fraction of [.25, .5, .75]) add(firstBlock + (lastBlock - firstBlock) * fraction);
+  const schedule = contribution => {
+    const burn = contribution.budget_sats - contribution.duration * FEE;
+    const remainder = burn % contribution.duration;
+    const boundaries = [contribution.start_block, contribution.start_block + contribution.duration];
+    if (remainder > 0) boundaries.push(contribution.start_block + remainder);
+    for (const block of boundaries) { add(block - 1); add(block); }
+  };
+  contributions.forEach(schedule);
+  if (pending) schedule(pending);
+  return [...blocks].sort((left, right) => left - right);
+}
+
 export function projectedReward(contributions, draft) {
+  const start = draft.start_block;
+  const end = start + draft.duration;
+  const events = new Map();
+  const add = (block, change, own) => {
+    block = Math.max(start, Math.min(end, block));
+    const event = events.get(block) ?? { total: 0n, own: 0n };
+    event.total += change;
+    if (own) event.own += change;
+    events.set(block, event);
+  };
+  const schedule = (contribution, own = false) => {
+    const duration = BigInt(contribution.duration);
+    const burn = BigInt(contribution.budget_sats) - duration * BigInt(FEE);
+    const rate = burn / duration;
+    const remainder = Number(burn % duration);
+    add(contribution.start_block, rate + (remainder > 0 ? 1n : 0n), own);
+    if (remainder > 0) add(contribution.start_block + remainder, -1n, own);
+    add(contribution.start_block + contribution.duration, -rate, own);
+  };
+  schedule(draft, true);
+  contributions.forEach(contribution => schedule(contribution));
+
+  // Burn rates only change at schedule boundaries; keep sums exact before computing shares.
   let reward = 0;
-  for (let offset = 0; offset < draft.duration; offset++) {
-    const block = draft.start_block + offset;
-    const own = burnAt(draft, block);
-    const total = contributions.reduce((sum, contribution) => sum + burnAt(contribution, block), own);
-    if (total > 0) reward += REWARD * own / total;
+  let previous = start;
+  let total = 0n;
+  let own = 0n;
+  for (const [block, event] of [...events].sort(([left], [right]) => left - right)) {
+    if (total > 0n) reward += REWARD * Number(own) / Number(total) * (block - previous);
+    total += event.total;
+    own += event.own;
+    previous = block;
   }
   return reward;
 }
@@ -123,7 +169,7 @@ if (typeof document !== 'undefined') {
   const whole = value => number(Math.trunc(value) || 0);
   let unit = 'sat';
   let timeMode = 'blocks';
-  let zoom = 432;
+  let zoom = ZOOM_DEFAULT;
   try {
     const saved = localStorage.getItem(UNIT_KEY);
     if (['sat', 'BTC', 'USD'].includes(saved)) unit = saved;
@@ -134,7 +180,7 @@ if (typeof document !== 'undefined') {
   } catch { /* Time selection also works without browser storage. */ }
   try {
     const saved = Number(localStorage.getItem(ZOOM_KEY));
-    if (ZOOM_LEVELS.includes(saved)) zoom = saved;
+    if (Number.isSafeInteger(saved) && saved >= ZOOM_MIN) zoom = saved;
   } catch { /* Zoom also works without browser storage. */ }
   let btcUsd = null;
   let quoteRequest = false;
@@ -182,7 +228,7 @@ if (typeof document !== 'undefined') {
     element('navigation').href = '/';
     element('navigation').textContent = 'Dashboard';
     element('total-rate-label').textContent = 'Effective rate';
-    element('total-rate-label').title = 'Your burn plus mining fees paid, divided by your FLM earned';
+    element('total-rate-label').title = 'Your burned coins divided by your FLM earned, excluding mining fees';
     element('mint-form').hidden = false;
     element('wallet-panel').hidden = false;
     element('own-legend').hidden = false;
@@ -196,13 +242,13 @@ if (typeof document !== 'undefined') {
       const saved = JSON.parse(localStorage.getItem(pendingKey) || 'null');
       if (saved) {
         const legacyDuration = Number.isInteger(saved.duration) && saved.duration >= 100 && saved.duration <= 1000 && saved.duration % 50 === 0;
-        const currentDuration = Number.isInteger(saved.duration) && saved.duration >= DURATION_MIN && saved.duration <= DURATION_MAX;
+        const currentDuration = Number.isSafeInteger(saved.duration) && saved.duration >= DURATION_MIN;
         const delay = saved.delay_blocks === undefined ? 0 : saved.delay_blocks;
-        if (typeof saved.address !== 'string' || typeof saved.request_id !== 'string' || !Number.isSafeInteger(saved.budget_sats) || saved.budget_sats < BUDGET_MIN || saved.budget_sats > BUDGET_MAX || !(legacyDuration || currentDuration) || !Number.isInteger(delay) || delay < 0 || delay > DELAY_MAX) throw new Error('Invalid saved request');
+        if (typeof saved.address !== 'string' || typeof saved.request_id !== 'string' || !Number.isSafeInteger(saved.budget_sats) || saved.budget_sats < BUDGET_MIN || !(legacyDuration || currentDuration) || !Number.isSafeInteger(delay) || delay < 0) throw new Error('Invalid saved request');
         pendingRequest = { address: saved.address, budget_sats: saved.budget_sats, duration: saved.duration, delay_blocks: delay, request_id: saved.request_id };
-        element('budget').value = saved.budget_sats;
-        element('duration').value = saved.duration;
-        element('delay').value = delay;
+        element('budget').value = String(snapToRange(saved.budget_sats, BUDGET_MIN, BUDGET_MAX, BUDGET_STEP));
+        element('duration').value = String(snapToRange(saved.duration, DURATION_MIN, DURATION_MAX));
+        element('delay').value = String(snapToRange(delay, 0, DELAY_MAX));
         element('submit-message').textContent = 'Saved request unconfirmed. Retry safely with the same settings.';
       }
     } catch {
@@ -211,14 +257,20 @@ if (typeof document !== 'undefined') {
     }
   }
 
-  // A budget typed to the satoshi is kept exactly; the slider only shows the
-  // nearest step. Dragging the slider clears it.
-  let typedBudget = null;
-  const draft = () => {
-    const delay = pendingRequest?.delay_blocks ?? Number(element('delay').value);
-    return { budget_sats: pendingRequest?.budget_sats ?? typedBudget ?? Number(element('budget').value), duration: pendingRequest?.duration ?? Number(element('duration').value), delay_blocks: delay, start_block: (state?.height ?? 0) + 1 + delay };
+  // Exact typed values are independent of the clamped slider positions.
+  const typedValues = {
+    budget: pendingRequest?.budget_sats ?? null,
+    duration: pendingRequest ? Math.max(DURATION_MIN, pendingRequest.duration) : null,
+    delay: pendingRequest?.delay_blocks ?? null,
   };
-  const validDraft = contribution => contribution.budget_sats >= contribution.duration * (FEE + 1);
+  const draft = () => {
+    const delay = pendingRequest?.delay_blocks ?? typedValues.delay ?? Number(element('delay').value);
+    return { budget_sats: pendingRequest?.budget_sats ?? typedValues.budget ?? Number(element('budget').value), duration: pendingRequest?.duration ?? typedValues.duration ?? Number(element('duration').value), delay_blocks: delay, start_block: (state?.height ?? 0) + 1 + delay };
+  };
+  const validDraft = contribution => [contribution.budget_sats, contribution.duration, contribution.delay_blocks, contribution.start_block].every(Number.isSafeInteger)
+    && contribution.budget_sats >= BUDGET_MIN && contribution.duration >= (pendingRequest ? 100 : DURATION_MIN) && contribution.delay_blocks >= 0
+    && contribution.start_block <= Number.MAX_SAFE_INTEGER - contribution.duration
+    && contribution.budget_sats >= contribution.duration * (FEE + 1);
   const typedField = id => element(`${id}-value`);
   // Keep a field the user is editing untouched: the page re-renders every second.
   const showTyped = (id, text, unitText) => {
@@ -232,14 +284,10 @@ if (typeof document !== 'undefined') {
     const slider = element(id);
     const parsed = parseInputNumber(typedField(id).value);
     const native = id === 'budget' ? inputToSats(parsed, unit, btcUsd) : inputToBlocks(parsed, timeMode);
-    const next = snapToRange(native, ...sliderBounds[id]);
-    if (next === null || slider.disabled) { updateDraft(); return; }
-    if (id === 'budget') {
-      // Exact satoshis go into the request; the slider just moves to the nearest step.
-      const exact = snapToRange(native, BUDGET_MIN, BUDGET_MAX, 1);
-      typedBudget = exact === next ? null : exact;
-    }
-    slider.value = String(next);
+    const exact = snapToRange(native, sliderBounds[id][0], Number.MAX_SAFE_INTEGER);
+    if (exact === null || slider.disabled) { updateDraft(); return; }
+    typedValues[id] = exact;
+    slider.value = String(snapToRange(exact, ...sliderBounds[id]));
     updateDraft(true);
   }
 
@@ -250,17 +298,21 @@ if (typeof document !== 'undefined') {
     showTyped('budget', money(contribution.budget_sats), unit);
     showTyped('duration', formatDurationValue(contribution.duration, timeMode), durationUnit(contribution.duration, timeMode));
     showTyped('delay', formatDurationValue(contribution.delay_blocks, timeMode), durationUnit(contribution.delay_blocks, timeMode));
-    element('budget').setAttribute('aria-valuetext', amount(contribution.budget_sats));
-    element('duration').setAttribute('aria-valuetext', `${formatDuration(contribution.duration, timeMode)} (${contribution.duration} blocks)`);
-    element('delay').setAttribute('aria-valuetext', `${formatDuration(contribution.delay_blocks, timeMode)} (${contribution.delay_blocks} blocks)`);
+    element('budget').setAttribute('aria-valuetext', amount(Number(element('budget').value)));
+    for (const id of ['duration', 'delay']) {
+      const blocks = Number(element(id).value);
+      element(id).setAttribute('aria-valuetext', `${formatDuration(blocks, timeMode)} (${blocks} blocks)`);
+    }
     element('projection-note').textContent = `Known contribution schedules included. Starts ${timeMode === 'days' ? blockDate(contribution.start_block) : `at block ${number(contribution.start_block)}`}.`;
-    element('budget-error').textContent = valid ? '' : `Minimum ${amount(contribution.duration * (FEE + 1))} (${amount(contribution.duration * FEE)} fees + ${amount(1)} burned per block). Increase budget or shorten duration.`;
+    element('budget-error').textContent = valid ? '' : contribution.budget_sats < contribution.duration * (FEE + 1)
+      ? `Minimum ${amount(contribution.duration * (FEE + 1))} (${amount(contribution.duration * FEE)} fees + ${amount(1)} burned per block). Increase budget or shorten duration.`
+      : 'Values and the end block must not exceed 9,007,199,254,740,991.';
     const canEstimate = state && wallet && valid;
     const estimate = canEstimate ? projectedReward(state.contributions, contribution) : 0;
     element('projected-reward').textContent = canEstimate ? whole(estimate / SPARKS) : '—';
     element('projected-fees').textContent = amount(contribution.duration * FEE);
     element('projected-burn').textContent = valid ? amount(contribution.budget_sats - contribution.duration * FEE) : '—';
-    element('projected-rate').textContent = estimate ? rateAmount(contribution.budget_sats, estimate) : '—';
+    element('projected-rate').textContent = estimate ? rateAmount(contribution.budget_sats - contribution.duration * FEE, estimate) : '—';
     const locked = submitting || !!pendingRequest || brokenPending;
     for (const id of ['budget', 'duration', 'delay']) element(id).disabled = typedField(id).disabled = locked;
     element('discard-pending').hidden = !pendingRequest && !brokenPending;
@@ -328,8 +380,8 @@ if (typeof document !== 'undefined') {
       address.className = 'address-label';
       const end = contribution.start_block + contribution.duration - 1;
       const schedule = timeMode === 'days' ? `${blockDate(contribution.start_block)}–${blockDate(end)}` : `Blocks ${number(contribution.start_block)}–${number(end)}`;
-      address.textContent = minting ? schedule : `${schedule} · ${contribution.address.slice(0, 13)}…${contribution.address.slice(-7)}`;
-      address.title = contribution.address;
+      address.textContent = schedule;
+      address.title = minting ? contribution.address : '';
       identity.append(heading, address);
       row.append(identity);
       const statusCell = document.createElement('td');
@@ -340,7 +392,7 @@ if (typeof document !== 'undefined') {
       statusCell.append(status);
       row.append(statusCell);
       const burn = Number(contribution.burned_sats), fee = Number(contribution.fees_sats), reward = Number(contribution.reward_sparks);
-      for (const value of [money(burn), whole(reward / SPARKS), money(fee), rate(burn + fee, reward)]) {
+      for (const value of [money(burn), whole(reward / SPARKS), money(fee), rate(burn, reward)]) {
         const cell = document.createElement('td'); cell.className = 'number'; cell.textContent = value; row.append(cell);
       }
       burned += burn; fees += fee; rewards += reward;
@@ -355,14 +407,15 @@ if (typeof document !== 'undefined') {
     }
     const totalRow = document.createElement('tr');
     const count = minting ? contributions.length : state.totals.contribution_count;
-    for (const [index, value] of [minting ? 'Total' : 'All-time total', `${count} contributions`, money(burned), whole(rewards / SPARKS), money(fees), rate(burned + fees, rewards)].entries()) {
+    for (const [index, value] of [minting ? 'Total' : 'All-time total', `${count} contributions`, money(burned), whole(rewards / SPARKS), money(fees), rate(burned, rewards)].entries()) {
       const cell = document.createElement('td'); if (index > 1) cell.className = 'number'; cell.textContent = value; totalRow.append(cell);
     }
     element('contribution-totals').replaceChildren(totalRow);
     if (minting) {
       element('total-burned').textContent = metricAmount(wallet ? burned : null);
+      element('total-fees').textContent = metricAmount(wallet ? fees : null);
       element('total-reward').textContent = metricReward(wallet ? rewards : null);
-      element('total-rate').textContent = metricRate(burned + fees, wallet ? rewards : 0);
+      element('total-rate').textContent = metricRate(burned, wallet ? rewards : 0);
     }
   }
 
@@ -379,8 +432,8 @@ if (typeof document !== 'undefined') {
     element('chart').setAttribute('aria-label', minting
       ? `Burn rate in ${spokenUnit} per block on the left; mint rate in ${spokenUnit} per FLM on the right. Previous and next ${zoom} blocks, shown as ${timeMode === 'days' ? 'calendar dates' : 'block numbers'}. All known contribution schedules included.`
       : `Burn above zero and mining fees below zero share a ${spokenUnit}-per-block scale on the left. Right-hand values are divided by 50 FLM. Previous and next ${zoom} blocks, shown as ${timeMode === 'days' ? 'calendar dates' : 'block numbers'}. All known contribution schedules included.`);
-    element('zoom-in').disabled = zoom === ZOOM_LEVELS[0];
-    element('zoom-out').disabled = zoom === ZOOM_LEVELS[ZOOM_LEVELS.length - 1];
+    element('zoom-in').disabled = zoom === ZOOM_MIN;
+    element('zoom-out').disabled = zoom === Number.MAX_SAFE_INTEGER;
     for (const value of ['blocks', 'days']) element(`time-${value}`).setAttribute('aria-pressed', String(timeMode === value));
     element('current-block-label').textContent = timeMode === 'days' ? 'Date' : 'Block';
     element('current-block').textContent = state ? timeMode === 'days' ? blockDate(state.height) : number(state.height) : '—';
@@ -392,17 +445,19 @@ if (typeof document !== 'undefined') {
     element('budget-min').textContent = amount(BUDGET_MIN);
     element('budget-max').textContent = amount(BUDGET_MAX);
     element('fee-label').textContent = `Fee: ${amount(FEE)}/block`;
-    element('projected-rate-label').textContent = `${label}/FLM, incl. fees`;
+    element('projected-rate-label').textContent = `${label}/FLM`;
     if (state) {
       renderTable();
       if (!minting) {
         element('total-burned').textContent = metricAmount(Number(state.totals.burned_sats));
+        element('total-fees').textContent = metricAmount(Number(state.totals.fees_sats));
         element('total-reward').textContent = metricReward(Number(state.totals.reward_sparks));
         const currentBurn = state.contributions.reduce((sum, contribution) => sum + burnAt(contribution, state.height), 0);
         element('total-rate').textContent = metricRate(currentBurn, currentBurn ? REWARD : 0);
       }
     } else {
       element('total-burned').textContent = metricAmount(null);
+      element('total-fees').textContent = metricAmount(null);
       element('total-reward').textContent = metricReward(null);
       element('total-rate').textContent = metricRate(0, 0);
     }
@@ -444,8 +499,8 @@ if (typeof document !== 'undefined') {
   }
 
   function changeZoom(direction) {
-    const next = ZOOM_LEVELS[ZOOM_LEVELS.indexOf(zoom) + direction];
-    if (next === undefined) return;
+    const next = Math.max(ZOOM_MIN, Math.min(Number.MAX_SAFE_INTEGER, direction < 0 ? Math.round(zoom / 2) : zoom * 2));
+    if (next === zoom) return;
     zoom = next;
     try { localStorage.setItem(ZOOM_KEY, String(zoom)); } catch { /* Zoom still applies in this page. */ }
     renderMoney();
@@ -468,13 +523,15 @@ if (typeof document !== 'undefined') {
     const side = unit === 'sat' ? 48 : unit === 'BTC' ? 94 : 82;
     const margin = { left: side, top: 14, right: side, bottom: 27 };
     const w = width - margin.left - margin.right, h = height - margin.top - margin.bottom;
-    const pastBlocks = zoom;
-    const futureBlocks = zoom;
-    const heightNow = state?.height ?? 0, firstBlock = heightNow - pastBlocks, count = pastBlocks + futureBlocks + 1;
+    const heightNow = state?.height ?? 0, firstBlock = heightNow - zoom, lastBlock = heightNow + zoom;
+    const pending = draft();
+    const showDraft = minting && wallet && validDraft(pending);
+    const contributions = state?.contributions || [];
+    const blocks = chartBlocks(contributions, firstBlock, lastBlock, heightNow, showDraft ? pending : null);
+    const count = blocks.length;
     const colored = !minting;
     const groups = new Map();
     const fees = new Float64Array(count);
-    const contributions = state?.contributions || [];
     const ownContribution = contributions.find(contribution => contribution.address === wallet?.address);
     const ownColor = ownContribution ? userColor(ownContribution.user_id) : '#888';
     if (minting) {
@@ -490,7 +547,7 @@ if (typeof document !== 'undefined') {
       if (colored) groups.delete(key);
       groups.set(key, values);
       for (let i = 0; i < count; i++) {
-        const block = firstBlock + i;
+        const block = blocks[i];
         values[i] += burnAt(contribution, block);
         if (!minting) fees[i] += feeAt(contribution, block);
       }
@@ -499,17 +556,20 @@ if (typeof document !== 'undefined') {
     if (ownValues) { groups.delete('own'); groups.set('own', ownValues); }
     const totals = new Float64Array(count);
     for (const values of groups.values()) for (let i = 0; i < count; i++) totals[i] += values[i];
-    const pending = draft();
-    const showDraft = minting && wallet && validDraft(pending);
-    let maximum = 0;
-    for (let i = 0; i < count; i++) maximum = Math.max(maximum, totals[i] + (showDraft ? burnAt(pending, firstBlock + i) : 0));
-    const minimum = minting ? 0 : -Math.max(0, ...fees);
+    let maximum = 0, maximumFees = 0;
+    for (let i = 0; i < count; i++) {
+      maximum = Math.max(maximum, totals[i] + (showDraft ? burnAt(pending, blocks[i]) : 0));
+      maximumFees = Math.max(maximumFees, fees[i]);
+    }
+    const minimum = minting ? 0 : -maximumFees;
     const roughStep = Math.max(1, maximum - minimum) / 5;
     const power = 10 ** Math.floor(Math.log10(roughStep));
     const step = Math.max(1, [1, 2, 5, 10].find(factor => factor * power >= roughStep) * power);
     const high = Math.max(step, Math.ceil(maximum / step) * step);
     const low = Math.floor(minimum / step) * step;
-    const x = i => margin.left + i / (count - 1) * w;
+    const xBlock = block => margin.left + (block - firstBlock) / (lastBlock - firstBlock) * w;
+    const x = i => xBlock(blocks[i]);
+    const nowX = xBlock(heightNow);
     const y = value => margin.top + (high - value) / (high - low) * h;
     const zero = y(0);
     const axisNumber = value => unit !== 'sat' ? money(value) : Math.abs(value) >= 1000000 ? `${number(value / 1000000, 2)}m` : Math.abs(value) >= 1000 ? `${number(value / 1000, 2)}k` : number(value, 2);
@@ -548,30 +608,33 @@ if (typeof document !== 'undefined') {
       for (let i = 0; i < count; i++) base[i] += values[i];
     }
     context.globalAlpha = 1;
-    context.fillStyle = '#ffffff30'; context.fillRect(x(pastBlocks), margin.top, w * futureBlocks / (count - 1), h);
+    context.fillStyle = '#ffffff30'; context.fillRect(nowX, margin.top, w / 2, h);
     if (!minting) {
       context.strokeStyle = '#666';
       context.beginPath(); context.moveTo(x(0), zero); context.lineTo(x(count - 1), zero); context.stroke();
     }
-    context.strokeStyle = '#666'; context.setLineDash([3, 4]); context.beginPath(); context.moveTo(x(pastBlocks), margin.top); context.lineTo(x(pastBlocks), margin.top + h); context.stroke(); context.setLineDash([]);
+    context.strokeStyle = '#666'; context.setLineDash([3, 4]); context.beginPath(); context.moveTo(nowX, margin.top); context.lineTo(nowX, margin.top + h); context.stroke(); context.setLineDash([]);
     if (showDraft) {
-      const start = Math.max(0, pending.start_block - firstBlock);
-      const end = Math.min(count - 1, pending.start_block + pending.duration - 1 - firstBlock);
+      const start = Math.max(firstBlock, pending.start_block);
+      const end = Math.min(lastBlock, pending.start_block + pending.duration - 1);
       if (start <= end) {
-        const from = Math.max(0, start - 1), to = Math.min(count - 1, end + 1);
+        const from = Math.max(firstBlock, start - 1), to = Math.min(lastBlock, end + 1);
+        let started = false;
         context.beginPath();
-        for (let i = from; i <= to; i++) {
-          const value = totals[i] + burnAt(pending, firstBlock + i);
-          if (i === from) context.moveTo(x(i), y(value)); else context.lineTo(x(i), y(value));
+        for (let i = 0; i < count; i++) {
+          if (blocks[i] < from || blocks[i] > to) continue;
+          const value = totals[i] + burnAt(pending, blocks[i]);
+          if (!started) context.moveTo(x(i), y(value)); else context.lineTo(x(i), y(value));
+          started = true;
         }
         context.strokeStyle = ownColor; context.lineWidth = 1.8; context.setLineDash([5, 4]); context.stroke(); context.setLineDash([]);
       }
     }
     context.fillStyle = '#666'; context.font = '10px -apple-system, sans-serif';
-    for (const i of [0, (count - 1) / 4, (count - 1) / 2, 3 * (count - 1) / 4, count - 1]) {
-      context.textAlign = i === 0 ? 'left' : i === count - 1 ? 'right' : 'center';
-      const block = firstBlock + i;
-      context.fillText(block < 0 ? '—' : timeMode === 'days' ? blockDate(block) : number(block), x(i), height - 8);
+    for (const fraction of [0, .25, .5, .75, 1]) {
+      context.textAlign = fraction === 0 ? 'left' : fraction === 1 ? 'right' : 'center';
+      const block = firstBlock + (lastBlock - firstBlock) * fraction;
+      context.fillText(block < 0 ? '—' : timeMode === 'days' ? blockDate(block) : number(block), xBlock(block), height - 8);
     }
     if (!state) { context.textAlign = 'center'; context.fillText('Loading…', margin.left + w / 2, margin.top + h / 2); }
   }
@@ -592,14 +655,12 @@ if (typeof document !== 'undefined') {
     } finally { setTimeout(poll, 1000); }
   }
 
-  element('budget').addEventListener('input', () => { typedBudget = null; updateDraft(true); });
   for (const value of ['sat', 'BTC', 'USD']) element(`unit-${value.toLowerCase()}`).addEventListener('click', () => selectUnit(value));
   for (const value of ['blocks', 'days']) element(`time-${value}`).addEventListener('click', () => selectTime(value));
   element('zoom-in').addEventListener('click', () => changeZoom(-1));
   element('zoom-out').addEventListener('click', () => changeZoom(1));
-  element('duration').addEventListener('input', () => updateDraft(true));
-  element('delay').addEventListener('input', () => updateDraft(true));
   for (const id of ['budget', 'duration', 'delay']) {
+    element(id).addEventListener('input', () => { typedValues[id] = null; updateDraft(true); });
     const field = typedField(id);
     field.addEventListener('change', () => applyTyped(id));
     // Enter applies the value instead of submitting the form.

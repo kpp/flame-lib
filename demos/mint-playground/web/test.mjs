@@ -4,8 +4,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('./app.js', import.meta.url), 'utf8');
-const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, ZOOM_KEY, ZOOM_LEVELS, blockDate, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote, BUDGET_STEP, parseInputNumber, snapToRange, inputToSats, inputToBlocks } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
-const DEFAULT_ZOOM = 432;
+const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, ZOOM_KEY, ZOOM_MIN, ZOOM_DEFAULT, chartBlocks, blockDate, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote, BUDGET_STEP, parseInputNumber, snapToRange, inputToSats, inputToBlocks } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const DEFAULT_ZOOM = 500;
 const plan = (options = {}) => ({ user_id: 1, budget_sats: 300005, duration: 100, start_block: 10, ...options });
 
 test('budget is a native linear slider with the requested endpoints', async () => {
@@ -46,11 +46,14 @@ test('calendar dates start at block one and use exact 144-block UTC days, includ
   assert.equal(blockDate(414 * 144 + 1), 'Feb 29');
   assert.equal(blockDate(415 * 144 + 1), 'Mar 1');
   assert.equal(blockDate(-1), '—');
+  assert.equal(blockDate(Number.MAX_SAFE_INTEGER), `Block ${new Intl.NumberFormat('en').format(Number.MAX_SAFE_INTEGER)}`, 'far-future manual schedules remain renderable beyond the Date range');
 });
 
-test('zoom levels cover one to thirty-one days in exact two-day increments', () => {
-  assert.equal(ZOOM_KEY, 'flame-mint-playground-zoom-v1');
-  assert.deepEqual(ZOOM_LEVELS, Array.from({ length: 16 }, (_, index) => 144 + 288 * index));
+test('exponential zoom has a ten-block minimum and a fresh five-hundred-block default', () => {
+  assert.equal(ZOOM_KEY, 'flame-mint-playground-zoom-v2');
+  assert.equal(ZOOM_MIN, 10);
+  assert.equal(ZOOM_DEFAULT, DEFAULT_ZOOM);
+  assert.doesNotMatch(source, /ZOOM_LEVELS/);
 });
 
 test('integer schedule spreads the remainder into the first blocks and conserves sats', () => {
@@ -127,6 +130,44 @@ test('projections preserve each actual remainder block and account for delayed w
   assert.equal(burnAt(competing, 14), 2001, 'historical samples remain factual');
   const later = { ...draft, start_block: 5000 };
   assert.equal(projectedReward([competing], later, 'own'), 50000 * SPARKS, 'a delayed draft is evaluated over its full future duration');
+});
+
+test('event-based forecasts match a per-block reference across randomized starts, expiries, overlaps, and integer remainders', () => {
+  let seed = 74219;
+  const random = limit => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed % limit; };
+  const schedule = () => {
+    const duration = random(100) + 1;
+    return plan({ duration, start_block: random(150), budget_sats: duration * (FEE + 1) + random(100000) });
+  };
+  for (let sample = 0; sample < 300; sample++) {
+    const draft = schedule();
+    const contributions = Array.from({ length: random(8) }, schedule);
+    let expected = 0;
+    for (let block = draft.start_block; block < draft.start_block + draft.duration; block++) {
+      const own = burnAt(draft, block);
+      const total = contributions.reduce((sum, contribution) => sum + burnAt(contribution, block), own);
+      expected += 50 * SPARKS * own / total;
+    }
+    const actual = projectedReward(contributions, draft);
+    assert.ok(Math.abs(actual - expected) <= Math.max(1, expected) * 1e-12, `schedule ${sample}: ${actual} differs from ${expected}`);
+  }
+});
+
+test('trillion-block forecasts scale with schedule events rather than the number of blocks', () => {
+  const duration = 1000000000000;
+  const draft = plan({ duration, start_block: 1000000000000, budget_sats: duration * (FEE + 1) });
+  const start = performance.now();
+  assert.equal(projectedReward([], draft), duration * 50 * SPARKS);
+  assert.equal(projectedReward([{ ...draft }], draft), duration * 25 * SPARKS);
+  assert.ok(performance.now() - start < 1000, 'forecasting a large manual duration must not freeze the page');
+});
+
+test('large burn-rate events cancel exactly before tiny competitors and lone draft blocks', () => {
+  const draft = plan({ duration: 4, start_block: 11, budget_sats: 4 * (FEE + 1) });
+  const large = plan({ duration: 1, start_block: 11, budget_sats: Number.MAX_SAFE_INTEGER });
+  const tiny = plan({ duration: 1, start_block: 12, budget_sats: FEE + 1 });
+  const expected = 50 * SPARKS * (1 / (Number.MAX_SAFE_INTEGER - FEE + 1) + 0.5 + 2);
+  assert.equal(projectedReward([large, tiny], draft), expected);
 });
 
 test('a contribution finishes on the last inclusive block, not one block later', () => {
@@ -298,9 +339,9 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
   };
 }
 
-test('both charts center now between 432 past and 432 known future blocks by default', async () => {
+test('both charts center now between five hundred past and future blocks by default', async () => {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
-  assert.match(html, /<canvas\b[^>]*aria-label="[^"]*Previous and next 432 blocks\./);
+  assert.match(html, /<canvas\b[^>]*aria-label="[^"]*Previous and next 500 blocks\./);
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
     const minting = pathname === '/mint';
@@ -310,7 +351,7 @@ test('both charts center now between 432 past and 432 known future blocks by def
     await page.refresh();
     const draws = page.draws.filter(call => call.canvas === page.elements.get('chart'));
     const ticks = draws.filter(call => call.method === 'fillText' && call.args[2] === 267);
-    assert.deepEqual(ticks.map(call => call.args[0]), minting ? ['68', '284', '500', '716', '932'] : ['1,068', '1,284', '1,500', '1,716', '1,932']);
+    assert.deepEqual(ticks.map(call => call.args[0]), minting ? ['0', '250', '500', '750', '1,000'] : ['1,000', '1,250', '1,500', '1,750', '2,000']);
     assert.deepEqual(ticks.map(call => call.args[1]), [48, 224, 400, 576, 752]);
     const shading = draws.find(call => call.method === 'fillRect' && call.fillStyle === '#ffffff30');
     assert.equal(shading.args[0], 400, 'future shading begins at the centered current block');
@@ -322,21 +363,21 @@ test('both charts center now between 432 past and 432 known future blocks by def
     const nowLine = pathBefore(draws.findLastIndex(call => call.method === 'stroke' && call.strokeStyle === '#666'));
     assert.deepEqual(nowLine.map(call => call.args), [[400, 14], [400, 248]], 'now marks the center of both charts');
     const band = pathBefore(draws.findIndex(call => call.method === 'fill' && call.fillStyle === userColor(1)));
-    assert.equal(band.length, 1731, 'a closed band contains 865 top and 865 bottom samples plus its starting point');
+    assert.equal(band.length, 2003, 'a closed band contains 1,001 top and 1,001 bottom samples plus its starting point');
     assert.equal(Math.min(...band.map(call => call.args[0])), 48);
     assert.equal(Math.max(...band.map(call => call.args[0])), 752);
     if (minting) {
-      assert.match(page.elements.get('chart')['aria-label'], /Previous and next 432 blocks[, .]/);
+      assert.match(page.elements.get('chart')['aria-label'], /Previous and next 500 blocks[, .]/);
       assert.match(page.elements.get('chart-note').textContent, /known|scheduled|future/i);
       const draft = pathBefore(draws.findIndex(call => call.method === 'stroke' && call.strokeStyle === userColor(1)));
-      assert.equal(draft.length, 433, 'draft sampling stays within the visible future window');
+      assert.equal(draft.length, 501, 'draft sampling stays within the visible future window');
       assert.equal(draft[0].args[0], 400);
       assert.equal(draft.at(-1).args[0], 752);
     }
   }
 });
 
-test('zoom controls traverse every allowed radius and stop at each endpoint without touching accounting', async () => {
+test('zoom controls halve or double whole-block radii without touching accounting', async () => {
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
     page.snapshot.height = 6000;
@@ -349,7 +390,10 @@ test('zoom controls traverse every allowed radius and stop at each endpoint with
     const assertRadius = radius => {
       const draws = page.draws.filter(call => call.canvas === page.elements.get('chart'));
       const ticks = draws.filter(call => call.method === 'fillText' && call.args[2] === 267);
-      assert.deepEqual(ticks.map(call => call.args[0]), Array.from({ length: 5 }, (_, index) => new Intl.NumberFormat('en').format(6000 - radius + radius / 2 * index)));
+      assert.deepEqual(ticks.map(call => call.args[0]), Array.from({ length: 5 }, (_, index) => {
+        const block = Math.round(6000 - radius + radius / 2 * index);
+        return block < 0 ? '—' : new Intl.NumberFormat('en').format(block);
+      }));
       assert.deepEqual(ticks.map(call => call.args[1]), [48, 224, 400, 576, 752]);
       assert.match(page.elements.get('chart-window').textContent, new RegExp(`${new Intl.NumberFormat('en').format(radius)} blocks`));
       assert.match(page.elements.get('chart')['aria-label'], new RegExp(`Previous and next ${radius} blocks`));
@@ -362,12 +406,13 @@ test('zoom controls traverse every allowed radius and stop at each endpoint with
         if (call.method === 'fill' && call.fillStyle === userColor(1)) band = path;
         if (call.method === 'stroke' && call.strokeStyle === '#666') now = path;
       }
-      assert.equal(band.length, 2 * (2 * radius + 1) + 1, 'every block has one top and one base sample');
+      if (radius <= 1000) assert.equal(band.length, 2 * (2 * radius + 1) + 1, 'nearby blocks retain exact per-block samples');
+      else assert.ok(band.length < 50, 'wide charts sample schedule events rather than every block');
       assert.equal(band[1][0], 48);
-      assert.equal(band[2 * radius + 1][0], 752);
+      assert.equal(Math.max(...band.map(point => point[0])), 752);
       assert.deepEqual(now, [[400, 14], [400, 248]], 'now stays centered at every zoom');
-      assert.equal(page.elements.get('zoom-in').disabled, radius === 144);
-      assert.equal(page.elements.get('zoom-out').disabled, radius === 4464);
+      assert.equal(page.elements.get('zoom-in').disabled, radius === ZOOM_MIN);
+      assert.equal(page.elements.get('zoom-out').disabled, radius === Number.MAX_SAFE_INTEGER);
       assert.equal(JSON.stringify(page.snapshot), before);
       assert.equal(stateRequests(page).length, stateCount, 'zoom never fetches another snapshot');
       assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), totals);
@@ -377,23 +422,19 @@ test('zoom controls traverse every allowed radius and stop at each endpoint with
       assert.equal(page.elements.get('delay').value, '0');
     };
     assert.equal(page.storage.has(ZOOM_KEY), false, 'default zoom does not need a storage write');
-    page.draws.length = 0;
+    for (const radius of [250, 125, 63, 32, 16, 10]) {
+      page.draws.length = 0;
+      await page.event('zoom-in', 'click');
+      assertRadius(radius);
+      assert.equal(page.storage.get(ZOOM_KEY), String(radius));
+    }
     await page.event('zoom-in', 'click');
-    assertRadius(144);
-    await page.event('zoom-in', 'click');
-    assert.equal(page.storage.get(ZOOM_KEY), '144', 'an off-limit click cannot leave the allowed sequence');
-    for (const radius of ZOOM_LEVELS.slice(1)) {
+    assert.equal(page.storage.get(ZOOM_KEY), '10', 'an off-limit click cannot shrink below ten blocks');
+    for (const radius of [20, 40, 80, 160, 320, 640, 1280, 2560, 5120, 10240, 20480]) {
       page.draws.length = 0;
       await page.event('zoom-out', 'click');
       assertRadius(radius);
       assert.equal(page.storage.get(ZOOM_KEY), String(radius));
-    }
-    await page.event('zoom-out', 'click');
-    assert.equal(page.storage.get(ZOOM_KEY), '4464');
-    for (const radius of ZOOM_LEVELS.slice(0, -1).reverse()) {
-      page.draws.length = 0;
-      await page.event('zoom-in', 'click');
-      assertRadius(radius);
     }
   }
 });
@@ -403,55 +444,108 @@ test('zoom persists across both pages independently from currency and calendar d
   await page.event('unit-btc', 'click');
   await page.event('time-days', 'click');
   await page.event('zoom-out', 'click');
-  assert.equal(page.storage.get(ZOOM_KEY), '720');
+  assert.equal(page.storage.get(ZOOM_KEY), '1000');
   assert.equal(page.storage.get(TIME_KEY), 'days');
   assert.equal(page.storage.get(UNIT_KEY), 'BTC');
-  assert.match(page.elements.get('chart-window').textContent, /5 days/);
-  assert.match(page.elements.get('chart')['aria-label'], /Previous and next 720 blocks/);
+  assert.match(page.elements.get('chart-window').textContent, /6\.944 days/);
+  assert.match(page.elements.get('chart')['aria-label'], /Previous and next 1000 blocks/);
   for (const pathname of ['/', '/mint']) {
     const other = await openPage(pathname, page.storage);
     other.snapshot.height = 8785;
     await other.refresh();
     assert.equal(other.elements.get('unit-btc')['aria-pressed'], 'true');
     assert.equal(other.elements.get('time-days')['aria-pressed'], 'true');
-    assert.match(other.elements.get('chart-window').textContent, /5 days/);
+    assert.match(other.elements.get('chart-window').textContent, /6\.944 days/);
     const ticks = other.draws.filter(call => call.canvas === other.elements.get('chart') && call.method === 'fillText' && call.args[2] === 267).slice(-5);
-    assert.deepEqual(ticks.map(call => call.args[0]), [8065, 8425, 8785, 9145, 9505].map(blockDate));
+    assert.deepEqual(ticks.map(call => call.args[0]), [7785, 8285, 8785, 9285, 9785].map(blockDate));
     other.draws.length = 0;
     await other.event('time-blocks', 'click');
-    assert.match(other.elements.get('chart-window').textContent, /720 blocks/);
-    assert.equal(other.storage.get(ZOOM_KEY), '720');
+    assert.match(other.elements.get('chart-window').textContent, /1,000 blocks/);
+    assert.equal(other.storage.get(ZOOM_KEY), '1000');
     await other.event('time-days', 'click');
   }
 });
 
-test('invalid zoom preferences fall back to 432 blocks and blocked storage never disables zoom', async () => {
-  for (const value of ['bad', 'NaN', 'Infinity', '-144', '0', '143', '500', '4465', '432.5', '{}']) {
+test('invalid zoom preferences fall back to five hundred blocks and blocked storage never disables zoom', async () => {
+  for (const value of ['bad', 'NaN', 'Infinity', '-144', '0', '9', '500.5', String(Number.MAX_SAFE_INTEGER + 1), '{}']) {
     const storage = new Map([[ZOOM_KEY, value]]);
     const page = await openPage('/', storage);
-    assert.match(page.elements.get('chart-window').textContent, /432 blocks/);
+    assert.match(page.elements.get('chart-window').textContent, /500 blocks/);
     assert.equal(storage.get(ZOOM_KEY), value, 'startup does not rewrite malformed storage');
     assert.equal(page.elements.get('zoom-in').disabled, false);
     assert.equal(page.elements.get('zoom-out').disabled, false);
   }
   const page = await openPage('/', { get() { throw new Error('Storage blocked'); }, set() { throw new Error('Storage blocked'); } });
   await page.event('zoom-in', 'click');
-  assert.match(page.elements.get('chart-window').textContent, /144 blocks/);
-  assert.equal(page.elements.get('zoom-in').disabled, true);
+  assert.match(page.elements.get('chart-window').textContent, /250 blocks/);
+  assert.equal(page.elements.get('zoom-in').disabled, false);
   assert.equal(page.elements.get('connection').textContent, 'Live');
+  const legacy = new Map([['flame-mint-playground-zoom-v1', '4464']]);
+  const fresh = await openPage('/', legacy);
+  assert.match(fresh.elements.get('chart-window').textContent, /500 blocks/);
+  assert.equal(legacy.get('flame-mint-playground-zoom-v1'), '4464', 'old linear preferences are left untouched');
+  assert.equal(legacy.has(ZOOM_KEY), false);
+});
+
+test('arbitrary safe radii survive reloads and zooming stops only at the numeric precision ceiling', async () => {
+  for (const radius of [10, 11, 143, 500, 4465, 1000000, 1000000000000, Number.MAX_SAFE_INTEGER]) {
+    const page = await openPage('/', new Map([[ZOOM_KEY, String(radius)]]));
+    assert.match(page.elements.get('chart-window').textContent, new RegExp(`${new Intl.NumberFormat('en').format(radius)} blocks`));
+    assert.equal(page.elements.get('zoom-in').disabled, radius === 10);
+    assert.equal(page.elements.get('zoom-out').disabled, radius === Number.MAX_SAFE_INTEGER);
+    const lineCalls = page.draws.filter(call => ['moveTo', 'lineTo'].includes(call.method));
+    assert.ok(lineCalls.length < 10000, 'wide views must not allocate or draw one sample per block');
+    assert.ok(lineCalls.every(call => call.args.every(Number.isFinite)), `all canvas coordinates remain finite at radius ${radius}`);
+    if (radius > 10) {
+      await page.event('zoom-in', 'click');
+      assert.equal(page.storage.get(ZOOM_KEY), String(Math.max(10, Math.round(radius / 2))));
+    }
+  }
+  const page = await openPage('/', new Map([[ZOOM_KEY, String(Math.ceil(Number.MAX_SAFE_INTEGER / 2))]]));
+  await page.event('zoom-out', 'click');
+  assert.equal(page.storage.get(ZOOM_KEY), String(Number.MAX_SAFE_INTEGER));
+  assert.equal(page.elements.get('zoom-out').disabled, true);
+  await page.event('zoom-out', 'click');
+  assert.equal(page.storage.get(ZOOM_KEY), String(Number.MAX_SAFE_INTEGER));
+  await page.event('zoom-in', 'click');
+  assert.equal(page.storage.get(ZOOM_KEY), String(Math.round(Number.MAX_SAFE_INTEGER / 2)));
+  assert.equal(page.elements.get('zoom-out').disabled, false);
+});
+
+test('wide chart samples preserve starts, one-block spikes, remainder changes, and expiries without per-block work', () => {
+  const height = 6000;
+  const spike = plan({ start_block: 6011, duration: 1, budget_sats: FEE + 1 });
+  const remainder = plan({ start_block: 7000, duration: 100, budget_sats: 300005 });
+  const pending = plan({ start_block: 9000, duration: 144, budget_sats: 432001 });
+  const started = performance.now();
+  for (const radius of [1000000, 1000000000000, Number.MAX_SAFE_INTEGER]) {
+    const first = height - radius, last = height + radius;
+    const blocks = chartBlocks([spike, remainder], first, last, height, pending);
+    assert.ok(blocks.length < 40, 'cost follows the number of schedule changes, not the view width');
+    assert.deepEqual(blocks, [...new Set(blocks)].sort((a, b) => a - b));
+    assert.ok(blocks.every(block => Number.isFinite(block) && Number.isInteger(block) && block >= first && block <= last));
+    for (const block of [first, last, height, 6010, 6011, 6012, 6999, 7000, 7004, 7005, 7099, 7100, 8999, 9000, 9143, 9144]) {
+      assert.ok(blocks.includes(block), `essential boundary ${block} survives radius ${radius}`);
+    }
+    assert.deepEqual(blocks.filter(block => feeAt(spike, block) > 0), [6011], 'a one-block fee spike remains represented');
+    assert.equal(burnAt(remainder, 7004), 2001);
+    assert.equal(burnAt(remainder, 7005), 2000);
+  }
+  assert.ok(performance.now() - started < 1000, 'huge views do not freeze the page');
+  assert.deepEqual(chartBlocks([], -10, 10, 0), Array.from({ length: 21 }, (_, i) => i - 10), 'minimum zoom keeps every block and the negative-time blank range');
 });
 
 test('calendar zoom endpoints label the exact centered day range on both pages', async () => {
   for (const pathname of ['/', '/mint']) {
-    for (const radius of [144, 4464]) {
+    for (const radius of [10, 500, 4464, 1000000]) {
       const page = await openPage(pathname, new Map([[ZOOM_KEY, String(radius)], [TIME_KEY, 'days']]));
       page.snapshot.height = 6000;
       page.draws.length = 0;
       await page.refresh();
       const ticks = page.draws.filter(call => call.canvas === page.elements.get('chart') && call.method === 'fillText' && call.args[2] === 267);
-      assert.deepEqual(ticks.map(call => call.args[0]), Array.from({ length: 5 }, (_, index) => blockDate(6000 - radius + radius / 2 * index)));
+      assert.deepEqual(ticks.map(call => call.args[0]), Array.from({ length: 5 }, (_, index) => blockDate(Math.round(6000 - radius + radius / 2 * index))));
       assert.equal(ticks[2].args[1], 400);
-      assert.match(page.elements.get('chart-window').textContent, new RegExp(`${radius / 144} day`));
+      assert.match(page.elements.get('chart-window').textContent, new RegExp(`${new Intl.NumberFormat('en', { maximumFractionDigits: 3 }).format(radius / 144)} days`));
       assert.equal(page.elements.get('current-block').textContent, blockDate(6000));
     }
   }
@@ -533,7 +627,7 @@ test('mint chart displays every known future schedule and expiry, with exact own
   const draft = { budget_sats: 1000000, duration: 500, start_block: 11 };
   const estimate = projectedReward(page.snapshot.contributions, draft, first.address, 10);
   assert.equal(page.elements.get('projected-reward').textContent, new Intl.NumberFormat('en').format(Math.trunc(estimate / SPARKS)));
-  assert.equal(page.elements.get('projected-rate').textContent, `${new Intl.NumberFormat('en').format(Math.trunc(draft.budget_sats * SPARKS / estimate))} sat / FLM`);
+  assert.equal(page.elements.get('projected-rate').textContent, `${new Intl.NumberFormat('en').format(Math.trunc((draft.budget_sats - draft.duration * FEE) * SPARKS / estimate))} sat / FLM`);
 });
 
 test('dashboard includes scheduled contributions in future bands and shows their budgets and date ranges', async () => {
@@ -644,6 +738,7 @@ test('dashboard burn and patterned downward fees share one sats scale, with mint
 test('dashboard initializes, polls, draws, and renders the actual contribution snapshot', async () => {
   const page = await openPage('/');
   assert.equal(page.elements.get('total-burned').textContent, '100,000\u00a0sat');
+  assert.equal(page.elements.get('total-fees').textContent, '1,000\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '500\u00a0FLM');
   assert.equal(page.elements.get('total-rate').textContent, '40\u00a0sat/FLM');
   assert.equal(page.elements.get('current-block').textContent, '10');
@@ -655,14 +750,38 @@ test('dashboard initializes, polls, draws, and renders the actual contribution s
   assert.equal(page.storage.size, 0, 'dashboard does not need palette or wallet storage');
 });
 
+test('dashboard contribution rows show only the schedule, never an address or address tooltip', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    const contribution = page.snapshot.contributions[0];
+    const address = contribution.address;
+    const checkRow = schedule => {
+      const row = page.elements.get('contributions').children[0];
+      const heading = row.children[0].children[0].children[1];
+      const details = row.children[0].children[1];
+      assert.equal(heading.textContent, '#1 · 300,000 sat / 100 blocks');
+      assert.equal(details.textContent, schedule);
+      assert.equal(details.title, pathname === '/mint' ? address : '');
+      assert.equal(page.snapshot.contributions[0].address, address, 'API address data remains available for ownership matching');
+    };
+    checkRow('Blocks 10–109');
+    await page.event('time-days', 'click');
+    const row = page.elements.get('contributions').children[0];
+    assert.equal(row.children[0].children[1].textContent, 'Jan 11–Jan 11');
+    assert.equal(row.children[0].children[1].title, pathname === '/mint' ? address : '');
+    assert.match(row.children[0].children[0].children[1].textContent, /^#1 · 300,000 sat \/ 0\.694 days$/);
+  }
+});
+
 test('dashboard requests recent contributions but uses server all-time totals, even with no visible rows', async () => {
   const page = await openPage('/');
   page.snapshot.totals = { contribution_count: 42, burned_sats: '9876543', fees_sats: '1234567', reward_sparks: '123456789999' };
   await page.refresh();
   const footer = () => page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
   assert.equal(page.elements.get('contributions').children.length, 1, 'only the returned recent row is displayed');
-  assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '8,999']);
+  assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '7,999']);
   assert.equal(page.elements.get('total-burned').textContent, '9,876,543\u00a0sat');
+  assert.equal(page.elements.get('total-fees').textContent, '1,234,567\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '1,234\u00a0FLM');
   page.snapshot.contributions = [];
   page.draws.length = 0;
@@ -671,7 +790,7 @@ test('dashboard requests recent contributions but uses server all-time totals, e
   assert.equal(page.elements.get('empty-table').hidden, false);
   assert.equal(page.elements.get('empty-table').textContent, 'No recent contributions.');
   assert.ok(!page.draws.some(call => call.method === 'fill' && PALETTE.includes(call.fillStyle)), 'omitted contributions create no chart bands');
-  assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '8,999']);
+  assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '7,999']);
   assert.ok(page.requests.filter(request => request.url.startsWith('/api/state')).every(request => request.url === '/api/state'), 'dashboard never requests full history');
 });
 
@@ -685,8 +804,9 @@ test('mint requests full history and retains personal totals for contributions f
   assert.equal(page.elements.get('contributions').children[0].children[1].children[0].textContent, 'Finished');
   assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '1\u00a0FLM');
-  assert.equal(page.elements.get('total-rate').textContent, '1,500\u00a0sat/FLM');
-  assert.deepEqual(page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent), ['Total', '1 contributions', '2,000', '1', '1,000', '1,500']);
+  assert.equal(page.elements.get('total-fees').textContent, '1,000\u00a0sat');
+  assert.equal(page.elements.get('total-rate').textContent, '1,000\u00a0sat/FLM');
+  assert.deepEqual(page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent), ['Total', '1 contributions', '2,000', '1', '1,000', '1,000']);
 });
 
 test('FLM and sat/FLM displays truncate fractions without changing rewards or projection calculations', async () => {
@@ -700,16 +820,17 @@ test('FLM and sat/FLM displays truncate fractions without changing rewards or pr
     await page.refresh();
     const row = page.elements.get('contributions').children[0].children.map(cell => cell.textContent);
     const footer = page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
-    assert.deepEqual(row.slice(2), ['1,000', '1', '999', '999']);
-    assert.deepEqual(footer.slice(2), ['1,000', '1', '999', '999']);
+    assert.deepEqual(row.slice(2), ['1,000', '1', '999', '500']);
+    assert.deepEqual(footer.slice(2), ['1,000', '1', '999', '500']);
     assert.equal(page.elements.get('total-reward').textContent, '1\u00a0FLM');
-    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/mint' ? '999' : '40'}\u00a0sat/FLM`);
+    assert.equal(page.elements.get('total-fees').textContent, '999\u00a0sat');
+    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/mint' ? '500' : '40'}\u00a0sat/FLM`);
     if (pathname === '/mint') {
       const draft = { budget_sats: 1000000, duration: 500, start_block: page.snapshot.height + 1 };
       const estimate = projectedReward(page.snapshot.contributions, draft, 'tf1demo-address');
       assert.notEqual(estimate / SPARKS, Math.trunc(estimate / SPARKS));
       assert.equal(page.elements.get('projected-reward').textContent, new Intl.NumberFormat('en').format(Math.trunc(estimate / SPARKS)));
-      assert.equal(page.elements.get('projected-rate').textContent, `${Math.trunc(draft.budget_sats * SPARKS / estimate)} sat / FLM`);
+      assert.equal(page.elements.get('projected-rate').textContent, `${Math.trunc((draft.budget_sats - draft.duration * FEE) * SPARKS / estimate)} sat / FLM`);
     }
     assert.equal(JSON.stringify(page.snapshot), before, 'display formatting never changes stored or received quantities');
     contribution.burned_sats = '7'; contribution.fees_sats = '0'; contribution.reward_sparks = '7000000';
@@ -731,7 +852,7 @@ test('mint-rate chart ticks truncate fractional rates, leaving the satoshi scale
   assert.equal(right.args[0], '0', '0.02 sat/FLM truncates only in the displayed axis label');
 });
 
-test('mint totals show only accrued wallet burns and rewards, with mining fees included in effective cost', async () => {
+test('mint totals separate accrued mining fees and calculate effective rate from burns alone', async () => {
   const page = await openPage('/mint');
   const first = page.snapshot.contributions[0];
   page.snapshot.height = 250;
@@ -742,18 +863,33 @@ test('mint totals show only accrued wallet burns and rewards, with mining fees i
     { ...first, id: 5, user_id: 2, address: 'another-user', burned_sats: '999999', fees_sats: '999999', reward_sparks: '999999999999' },
   ];
   await page.refresh();
-  const totals = () => ['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent);
-  assert.deepEqual(totals(), ['122,345\u00a0sat', '133\u00a0FLM', '1,795\u00a0sat/FLM']);
+  const totals = () => ['total-burned', 'total-fees', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent);
+  assert.deepEqual(totals(), ['122,345\u00a0sat', '117,000\u00a0sat', '133\u00a0FLM', '917\u00a0sat/FLM']);
   assert.equal(page.elements.get('total-rate-label').textContent, 'Effective rate');
-  assert.match(page.elements.get('total-rate-label').title, /mining fees/);
+  assert.match(page.elements.get('total-rate-label').title, /excluding.*fees/i);
   const table = page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
-  assert.deepEqual(table.slice(2), ['122,345', '133', '117,000', '1,795'], 'header and table truncate only displayed reward and cost');
+  assert.deepEqual(table.slice(2), ['122,345', '133', '117,000', '917'], 'header and table truncate only displayed reward and burn-only rate');
   assert.deepEqual(page.elements.get('contributions').children.map(row => row.children[1].children[0].textContent), ['Scheduled', 'Active', 'Finished']);
   page.elements.get('budget').value = String(BUDGET_MAX);
   await page.event('budget', 'input');
   page.elements.get('duration').value = '1000';
   await page.event('duration', 'input');
-  assert.deepEqual(totals(), ['122,345\u00a0sat', '133\u00a0FLM', '1,795\u00a0sat/FLM'], 'draft budgets and projected rewards never change the accrued header');
+  assert.deepEqual(totals(), ['122,345\u00a0sat', '117,000\u00a0sat', '133\u00a0FLM', '917\u00a0sat/FLM'], 'draft budgets and projected rewards never change the accrued header');
+});
+
+test('changing accrued fees changes fee displays but never burn-based mint rates or draft estimates', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    const rates = () => [page.elements.get('total-rate').textContent, rowValues(page).at(-1), footerValues(page).at(-1), page.elements.get('projected-rate').textContent];
+    const before = rates();
+    page.snapshot.totals.fees_sats = '999999';
+    page.snapshot.contributions[0].fees_sats = '999999';
+    await page.refresh();
+    assert.equal(page.elements.get('total-fees').textContent, '999,999\u00a0sat');
+    assert.equal(rowValues(page)[2], '999,999');
+    assert.equal(footerValues(page)[2], '999,999');
+    assert.deepEqual(rates(), before, `${pathname}: fees must not be counted as burned coins`);
+  }
 });
 
 test('mint effective cost is undefined before any FLM is earned, and a ready unregistered wallet has zero totals', async () => {
@@ -761,11 +897,13 @@ test('mint effective cost is undefined before any FLM is earned, and a ready unr
   page.snapshot.contributions[0].reward_sparks = '0';
   await page.refresh();
   assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
+  assert.equal(page.elements.get('total-fees').textContent, '1,000\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '0\u00a0FLM');
   assert.equal(page.elements.get('total-rate').textContent, '—\u00a0sat/FLM');
   page.snapshot.contributions[0].address = 'another-user';
   await page.refresh();
   assert.equal(page.elements.get('total-burned').textContent, '0\u00a0sat');
+  assert.equal(page.elements.get('total-fees').textContent, '0\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '0\u00a0FLM');
   assert.equal(page.elements.get('total-rate').textContent, '—\u00a0sat/FLM');
 });
@@ -773,11 +911,11 @@ test('mint effective cost is undefined before any FLM is earned, and a ready unr
 test('an unavailable wallet never substitutes global totals on the mint page', async () => {
   const storage = new Map([['flame-mint-playground-wallet-v1', '{broken json']]);
   const page = await openPage('/mint', storage);
-  assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
+  assert.deepEqual(['total-burned', 'total-fees', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
   assert.equal(page.elements.get('projected-reward').textContent, '—', 'an unknown identity cannot distinguish its own future schedules');
   assert.equal(page.elements.get('projected-rate').textContent, '—');
   await page.refresh();
-  assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
+  assert.deepEqual(['total-burned', 'total-fees', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
   assert.equal(page.elements.get('contributions').children.length, 0);
 });
 
@@ -786,12 +924,13 @@ test('a wallet arriving after the first poll fills personal totals without waiti
   const walletReady = new Promise(resolve => { finishWallet = resolve; });
   const page = await openPage('/mint', new Map(), undefined, walletReady);
   assert.equal(page.elements.get('connection').textContent, 'Live', 'the snapshot arrived while wallet initialization is pending');
-  assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
+  assert.deepEqual(['total-burned', 'total-fees', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
   finishWallet();
   await page.settle();
   assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '50\u00a0FLM');
-  assert.equal(page.elements.get('total-rate').textContent, '60\u00a0sat/FLM');
+  assert.equal(page.elements.get('total-fees').textContent, '1,000\u00a0sat');
+  assert.equal(page.elements.get('total-rate').textContent, '40\u00a0sat/FLM');
   assert.equal(page.requests.filter(request => request.url === '/api/state?full_history=true').length, 1, 'wallet completion reuses the current full-history snapshot');
 });
 
@@ -1103,18 +1242,18 @@ test('the dashed draft is limited to its real scheduled interval and disappears 
     }
     return [];
   };
-  for (const [delay, firstBlock, lastBlock] of [[0, 500, 645], [100, 600, 745], [431, 931, 932]]) {
+  for (const [delay, firstBlock, lastBlock] of [[0, 500, 645], [100, 600, 745], [DEFAULT_ZOOM - 1, 500 + DEFAULT_ZOOM - 1, 500 + DEFAULT_ZOOM]]) {
     page.draws.length = 0;
     page.elements.get('delay').value = String(delay);
     await page.event('delay', 'input');
     const path = strokePath();
     assert.ok(path.length > 0);
     const xs = path.map(point => point[0]);
-    assert.equal(Math.min(...xs), 48 + (firstBlock - 68) / 864 * 704, 'only one zero sample immediately precedes the actual start');
-    assert.equal(Math.max(...xs), 48 + (lastBlock - 68) / 864 * 704, 'only one zero sample immediately follows the actual end, clipped to the window');
+    assert.equal(Math.min(...xs), 48 + (firstBlock - (500 - DEFAULT_ZOOM)) / (2 * DEFAULT_ZOOM) * 704, 'only one zero sample immediately precedes the actual start');
+    assert.equal(Math.max(...xs), 48 + (lastBlock - (500 - DEFAULT_ZOOM)) / (2 * DEFAULT_ZOOM) * 704, 'only one zero sample immediately follows the actual end, clipped to the window');
     assert.equal(path.length, lastBlock - firstBlock + 1);
   }
-  for (const delay of [432, 4464]) {
+  for (const delay of [DEFAULT_ZOOM, 4464]) {
     page.draws.length = 0;
     page.elements.get('delay').value = String(delay);
     await page.event('delay', 'input');
@@ -1139,7 +1278,7 @@ test('legacy saved requests normalize absent delay to zero without rewriting the
 
 test('invalid saved delay or duration blocks new submissions without losing the saved request', async () => {
   const valid = { address: 'tf1demo-address', request_id: 'saved-request-0001', budget_sats: 10000000, duration: 144, delay_blocks: 0 };
-  for (const change of [{ delay_blocks: -1 }, { delay_blocks: 4465 }, { delay_blocks: 0.5 }, { delay_blocks: '1' }, { duration: 143 }, { duration: 4465 }, { duration: 144.5 }]) {
+  for (const change of [{ delay_blocks: -1 }, { delay_blocks: Number.MAX_SAFE_INTEGER + 1 }, { delay_blocks: 0.5 }, { delay_blocks: '1' }, { duration: 143 }, { duration: Number.MAX_SAFE_INTEGER + 1 }, { duration: 144.5 }]) {
     const saved = JSON.stringify({ ...valid, ...change });
     const storage = new Map([['flame-mint-playground-pending-v1', saved]]);
     const page = await openPage('/mint', storage);
@@ -1157,7 +1296,7 @@ test('submitting locks budget, duration and delay until acceptance while display
   await page.event('delay', 'input');
   const submitting = page.event('contribution-form', 'submit');
   await page.settle();
-  for (const id of ['budget', 'duration', 'delay', 'submit', 'discard-pending']) assert.equal(page.elements.get(id).disabled, true, id);
+  for (const id of ['budget', 'budget-value', 'duration', 'duration-value', 'delay', 'delay-value', 'submit', 'discard-pending']) assert.equal(page.elements.get(id).disabled, true, id);
   await page.event('time-days', 'click');
   await page.event('unit-btc', 'click');
   const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
@@ -1165,7 +1304,7 @@ test('submitting locks budget, duration and delay until acceptance while display
   assert.equal(request.duration, 500);
   accept({ id: 2, user_id: 1, start_block: 28 });
   await submitting;
-  for (const id of ['budget', 'duration', 'delay', 'submit']) assert.equal(page.elements.get(id).disabled, false, id);
+  for (const id of ['budget', 'budget-value', 'duration', 'duration-value', 'delay', 'delay-value', 'submit']) assert.equal(page.elements.get(id).disabled, false, id);
   assert.match(page.elements.get('submit-message').textContent, /accepted/);
 });
 
@@ -1306,6 +1445,8 @@ test('both pages offer an accessible three-state unit selection while always sho
   assert.doesNotMatch(quoteRow, /\bhidden\b/);
   assert.match(quoteRow, />Loading BTC\/USD…<\/p>/);
   assert.match(html, /<div><p>Earned<\/p><p[^>]*id="total-reward">—&nbsp;FLM<\/p><\/div>/);
+  assert.match(html, /<div><p>Mining fees<\/p><p[^>]*id="total-fees">—&nbsp;sat<\/p><\/div>/);
+  assert.doesNotMatch(html.match(/id="(?:table-rate-label|projected-rate-label)"[^>]*>[^<]*/g).join(''), /incl\. fees/);
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
     for (const [unit, selected] of [['sat', true], ['btc', false], ['usd', false]]) {
@@ -1331,12 +1472,13 @@ test('unit switches reuse the preloaded BTC/USD quote and preserve its refresh t
     const row = page.elements.get('price-status').textContent;
     const quoteTimer = [...page.timers].find(([, timer]) => timer.delay === 60000)[0];
     for (const [unit, amount, rate] of [
-      ['usd', pathname === '/' ? '$50.000' : '$1.000', pathname === '/' ? '0.02\u00a0$/FLM' : '0.03\u00a0$/FLM'],
-      ['btc', pathname === '/' ? '0.00100000\u00a0btc' : '0.00002000\u00a0btc', pathname === '/' ? '0.00000040\u00a0BTC/FLM' : '0.00000060\u00a0BTC/FLM'],
-      ['sat', pathname === '/' ? '100,000\u00a0sat' : '2,000\u00a0sat', pathname === '/' ? '40\u00a0sat/FLM' : '60\u00a0sat/FLM'],
+      ['usd', pathname === '/' ? '$50.000' : '$1.000', '0.02\u00a0$/FLM'],
+      ['btc', pathname === '/' ? '0.00100000\u00a0btc' : '0.00002000\u00a0btc', '0.00000040\u00a0BTC/FLM'],
+      ['sat', pathname === '/' ? '100,000\u00a0sat' : '2,000\u00a0sat', '40\u00a0sat/FLM'],
     ]) {
       await page.event(`unit-${unit}`, 'click');
       assert.equal(page.elements.get('total-burned').textContent, amount);
+      assert.equal(page.elements.get('total-fees').textContent, unit === 'usd' ? '$0.500' : unit === 'btc' ? '0.00001000\u00a0btc' : '1,000\u00a0sat');
       assert.equal(page.elements.get('total-reward').textContent, pathname === '/' ? '500\u00a0FLM' : '50\u00a0FLM');
       assert.equal(page.elements.get('total-rate').textContent, rate);
       assert.equal(page.elements.get('total-burned-label').textContent, 'Burned');
@@ -1376,9 +1518,10 @@ test('BTC mode converts totals, tables, and rates on both pages without touching
     const rewardBefore = page.elements.get('total-reward').textContent;
     await page.event('unit-btc', 'click');
     assert.equal(page.elements.get('total-burned').textContent, `${pathname === '/' ? '0.00100000' : '0.00002000'}\u00a0btc`);
-    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/' ? '0.00000040' : '0.00000060'}\u00a0BTC/FLM`);
-    assert.deepEqual(rowValues(page), ['0.00002000', '50', '0.00001000', '0.00000060']);
-    assert.deepEqual(footerValues(page), pathname === '/' ? ['0.00100000', '500', '0.00001000', '0.00000202'] : ['0.00002000', '50', '0.00001000', '0.00000060']);
+    assert.equal(page.elements.get('total-fees').textContent, '0.00001000\u00a0btc');
+    assert.equal(page.elements.get('total-rate').textContent, '0.00000040\u00a0BTC/FLM');
+    assert.deepEqual(rowValues(page), ['0.00002000', '50', '0.00001000', '0.00000040']);
+    assert.deepEqual(footerValues(page), pathname === '/' ? ['0.00100000', '500', '0.00001000', '0.00000200'] : ['0.00002000', '50', '0.00001000', '0.00000040']);
     assert.equal(page.elements.get('total-reward').textContent, rewardBefore);
     assert.equal(page.elements.get('total-burned-label').textContent, 'Burned');
     assert.equal(page.elements.get('total-rate-label').textContent, pathname === '/' ? 'Current rate' : 'Effective rate');
@@ -1409,7 +1552,7 @@ test('mint budget, fees, contribution labels, validation, and projection follow 
   assert.match(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, /0\.00300000 BTC/);
   const draft = { budget_sats: 1000000, duration: 500, start_block: 11 };
   const estimate = projectedReward(page.snapshot.contributions, draft, 'tf1demo-address', 10);
-  assert.equal(page.elements.get('projected-rate').textContent, `${formatMoney(draft.budget_sats * SPARKS / estimate, 'BTC', null, true)} BTC / FLM`);
+  assert.equal(page.elements.get('projected-rate').textContent, `${formatMoney((draft.budget_sats - draft.duration * FEE) * SPARKS / estimate, 'BTC', null, true)} BTC / FLM`);
   assert.equal(page.elements.get('projected-reward').textContent, projectedBefore);
   assert.equal(page.elements.get('budget').value, budgetBefore);
   page.elements.get('budget').value = String(BUDGET_MIN);
@@ -1437,9 +1580,10 @@ test('USD mode reuses the public quote fetched without identity and converts all
     assert.equal(page.elements.get('price-status').hidden, false);
     assert.match(page.elements.get('price-status').textContent, /50,000|50000/);
     assert.equal(page.elements.get('total-burned').textContent, pathname === '/' ? '$50.000' : '$1.000');
-    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/' ? '0.02' : '0.03'}\u00a0$/FLM`);
-    assert.deepEqual(rowValues(page), ['1.00', '50', '0.50', '0.03']);
-    assert.deepEqual(footerValues(page), pathname === '/' ? ['50.00', '500', '0.50', '0.101'] : ['1.00', '50', '0.50', '0.03']);
+    assert.equal(page.elements.get('total-fees').textContent, '$0.500');
+    assert.equal(page.elements.get('total-rate').textContent, '0.02\u00a0$/FLM');
+    assert.deepEqual(rowValues(page), ['1.00', '50', '0.50', '0.02']);
+    assert.deepEqual(footerValues(page), pathname === '/' ? ['50.00', '500', '0.50', '0.10'] : ['1.00', '50', '0.50', '0.02']);
     assert.equal(page.elements.get('chart-burn-unit').textContent, '$/block');
     assert.equal(page.elements.get('chart-rate-unit').textContent, '$/FLM');
     assert.equal(page.elements.get('total-rate-label').textContent, pathname === '/' ? 'Current rate' : 'Effective rate');
@@ -1507,6 +1651,7 @@ test('unknown wallet totals and undefined rates keep their labels and selected u
     await page.event(`unit-${unit}`, 'click');
     await page.refresh();
     assert.equal(page.elements.get('total-burned').textContent, amount);
+    assert.equal(page.elements.get('total-fees').textContent, amount);
     assert.equal(page.elements.get('total-reward').textContent, '—\u00a0FLM');
     assert.equal(page.elements.get('total-rate').textContent, `—\u00a0${rateUnit}/FLM`);
   }
@@ -1518,6 +1663,7 @@ test('unknown wallet totals and undefined rates keep their labels and selected u
     for (const [unit, amount, rateUnit] of [['sat', '0\u00a0sat', 'sat'], ['btc', '0.00000000\u00a0btc', 'BTC'], ['usd', '$0.000', '$']]) {
       await ready.event(`unit-${unit}`, 'click');
       assert.equal(ready.elements.get('total-burned').textContent, amount);
+      assert.equal(ready.elements.get('total-fees').textContent, amount);
       assert.equal(ready.elements.get('total-reward').textContent, '0\u00a0FLM');
       assert.equal(ready.elements.get('total-rate').textContent, `—\u00a0${rateUnit}/FLM`);
     }
@@ -1552,6 +1698,7 @@ test('USD pending and failed quotes show unavailable amounts, never fictitious z
   await page.event('unit-usd', 'click');
   assert.match(page.elements.get('price-status').textContent, /Loading/i);
   assert.equal(page.elements.get('total-burned').textContent, '$—');
+  assert.equal(page.elements.get('total-fees').textContent, '$—');
   assert.equal(page.elements.get('total-rate').textContent, '—\u00a0$/FLM');
   assert.equal(page.elements.get('budget-value').value, '—');
   for (const id of ['projected-fees', 'projected-burn', 'projected-rate']) assert.equal(page.elements.get(id).textContent, '—', id);
@@ -1561,6 +1708,7 @@ test('USD pending and failed quotes show unavailable amounts, never fictitious z
   await page.settle();
   assert.match(page.elements.get('price-status').textContent, /unavailable|503/i);
   assert.equal(page.elements.get('total-burned').textContent, '$—');
+  assert.equal(page.elements.get('total-fees').textContent, '$—');
   assert.equal(page.elements.get('connection').textContent, 'Live');
   await page.event('unit-btc', 'click');
   assert.equal(page.elements.get('total-burned').textContent, '0.00002000\u00a0btc');
@@ -1671,7 +1819,7 @@ test('unit changes leave chart data, forecast, requests, and pending idempotence
   assert.equal(storage.has('flame-mint-playground-pending-v1'), false);
 });
 
-test('typed-value helpers parse leniently and snap to slider limits', () => {
+test('typed-value helpers parse native units while slider presentation snaps to its own limits', () => {
   assert.equal(parseInputNumber('1,000,000 sat'), 1000000);
   assert.equal(parseInputNumber('$3,665.73'), 3665.73);
   assert.equal(parseInputNumber('0.01000000 BTC'), 0.01);
@@ -1695,7 +1843,7 @@ test('typed-value helpers parse leniently and snap to slider limits', () => {
   assert.equal(inputToBlocks(300, 'blocks'), 300);
 });
 
-test('a typed budget is kept to the satoshi, the slider shows the nearest step and limits still clamp', async () => {
+test('a typed budget stays exact beyond the slider maximum while the slider remains bounded', async () => {
   const page = await openPage('/mint');
   const typed = page.elements.get('budget-value');
   typed.value = '2,550,000';
@@ -1712,8 +1860,12 @@ test('a typed budget is kept to the satoshi, the slider shows the nearest step a
   const field = fresh.elements.get('budget-value');
   field.value = '999999999999';
   await fresh.event('budget-value', 'change');
-  assert.equal(fresh.elements.get('budget').value, String(BUDGET_MAX), 'clamped to the maximum');
-  assert.equal(field.value, '100,000,000');
+  assert.equal(fresh.elements.get('budget').value, String(BUDGET_MAX), 'only the slider is clamped to its maximum');
+  assert.equal(field.value, '999,999,999,999');
+  assert.equal(fresh.elements.get('projected-burn').textContent, '999,999,499,999 sat');
+  field.value = '9999999999999999999999999';
+  await fresh.event('budget-value', 'change');
+  assert.equal(field.value, new Intl.NumberFormat('en').format(Number.MAX_SAFE_INTEGER), 'the precision ceiling is independent of the slider maximum');
   field.value = '5';
   await fresh.event('budget-value', 'change');
   assert.equal(fresh.elements.get('budget').value, String(BUDGET_MIN), 'clamped to the minimum');
@@ -1746,7 +1898,7 @@ test('typing a budget respects the selected currency', async () => {
   assert.equal(page.elements.get('budget-unit').textContent, 'BTC');
 });
 
-test('typing a duration or delay converts days to blocks and stays inside the slider bounds', async () => {
+test('typed durations and delays convert days to blocks beyond the slider bounds and retain their minimums', async () => {
   const page = await openPage('/mint', new Map([[TIME_KEY, 'days']]));
   const duration = page.elements.get('duration-value');
   duration.value = '2';
@@ -1757,6 +1909,10 @@ test('typing a duration or delay converts days to blocks and stays inside the sl
   duration.value = '100';
   await page.event('duration-value', 'change');
   assert.equal(page.elements.get('duration').value, String(DURATION_MAX));
+  assert.equal(duration.value, '100', 'a typed duration is not limited to the 31-day slider');
+  await page.event('time-blocks', 'click');
+  assert.equal(duration.value, '14,400');
+  await page.event('time-days', 'click');
   duration.value = '0';
   await page.event('duration-value', 'change');
   assert.equal(page.elements.get('duration').value, String(DURATION_MIN));
@@ -1768,6 +1924,102 @@ test('typing a duration or delay converts days to blocks and stays inside the sl
   delay.value = '-5';
   await page.event('delay-value', 'change');
   assert.equal(page.elements.get('delay').value, '5', 'the sign is ignored and the value stays within bounds');
+  delay.value = '10000';
+  await page.event('delay-value', 'change');
+  assert.equal(page.elements.get('delay').value, String(DELAY_MAX));
+  assert.equal(delay.value, '10,000', 'delays can exceed the visible slider range');
+});
+
+test('larger typed values survive polls and display changes, and each slider replaces only its own field', async () => {
+  const page = await openPage('/mint');
+  for (const [id, value] of [['budget', '1000000000123'], ['duration', '12345'], ['delay', '67890']]) {
+    page.elements.get(`${id}-value`).value = value;
+    await page.event(`${id}-value`, 'change');
+  }
+  const check = () => {
+    assert.equal(page.elements.get('budget-value').value, '1,000,000,000,123');
+    assert.equal(page.elements.get('duration-value').value, '12,345');
+    assert.equal(page.elements.get('delay-value').value, '67,890');
+    assert.equal(page.elements.get('budget').value, String(BUDGET_MAX));
+    assert.equal(page.elements.get('duration').value, String(DURATION_MAX));
+    assert.equal(page.elements.get('delay').value, String(DELAY_MAX));
+  };
+  check();
+  await page.refresh();
+  await page.event('unit-btc', 'click');
+  assert.equal(page.elements.get('budget-value').value, '10,000.00000123');
+  await page.event('unit-sat', 'click');
+  await page.event('time-days', 'click');
+  await page.event('time-blocks', 'click');
+  await page.event('zoom-out', 'click');
+  await page.event('zoom-in', 'click');
+  check();
+  page.elements.get('duration').value = '500';
+  await page.event('duration', 'input');
+  assert.equal(page.elements.get('duration-value').value, '500');
+  assert.equal(page.elements.get('budget-value').value, '1,000,000,000,123');
+  assert.equal(page.elements.get('delay-value').value, '67,890');
+  page.elements.get('budget').value = '2000000';
+  await page.event('budget', 'input');
+  assert.equal(page.elements.get('budget-value').value, '2,000,000');
+  assert.equal(page.elements.get('delay-value').value, '67,890');
+  page.elements.get('delay').value = '7';
+  await page.event('delay', 'input');
+  assert.equal(page.elements.get('delay-value').value, '7');
+  assert.equal(page.elements.get('duration-value').value, '500');
+});
+
+test('large manual requests persist exact values and retry unchanged despite clamped locked sliders', async () => {
+  const storage = new Map();
+  const page = await openPage('/mint', storage, async () => { throw new Error('Response lost'); });
+  const values = { budget: 1000000000123, duration: 12345, delay: 67890 };
+  for (const [id, value] of Object.entries(values)) {
+    page.elements.get(`${id}-value`).value = String(value);
+    await page.event(`${id}-value`, 'change');
+  }
+  await page.event('contribution-form', 'submit');
+  const sent = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(sent.budget_sats, values.budget);
+  assert.equal(sent.duration, values.duration);
+  assert.equal(sent.delay_blocks, values.delay);
+  const retry = await openPage('/mint', storage);
+  for (const [id, value] of Object.entries(values)) {
+    assert.equal(retry.elements.get(id).disabled, true);
+    assert.equal(retry.elements.get(`${id}-value`).disabled, true);
+    assert.equal(retry.elements.get(`${id}-value`).value, new Intl.NumberFormat('en').format(value));
+    retry.elements.get(id).value = '1';
+  }
+  await retry.event('time-days', 'click');
+  await retry.event('unit-btc', 'click');
+  await retry.event('contribution-form', 'submit');
+  assert.deepEqual(JSON.parse(retry.requests.find(request => request.url === '/api/contributions').options.body), sent);
+  await retry.event('unit-sat', 'click');
+  await retry.event('time-blocks', 'click');
+  for (const [id, value] of Object.entries(values)) {
+    assert.equal(retry.elements.get(`${id}-value`).disabled, false);
+    assert.equal(retry.elements.get(`${id}-value`).value, new Intl.NumberFormat('en').format(value), 'successful retry preserves the full accepted amount for the next draft');
+  }
+});
+
+test('manual schedules must fund every block and keep their exclusive end within safe integer precision', async () => {
+  const page = await openPage('/mint');
+  page.elements.get('duration-value').value = '10000';
+  await page.event('duration-value', 'change');
+  assert.equal(page.elements.get('submit').disabled, true, 'manual durations still need enough funds for burn and mining fees');
+  page.elements.get('budget-value').value = '10010000';
+  await page.event('budget-value', 'change');
+  assert.equal(page.elements.get('submit').disabled, false);
+  page.elements.get('duration-value').value = '144';
+  await page.event('duration-value', 'change');
+  const safeDelay = Number.MAX_SAFE_INTEGER - page.snapshot.height - 1 - 144;
+  page.elements.get('delay-value').value = String(safeDelay);
+  await page.event('delay-value', 'change');
+  assert.equal(page.elements.get('submit').disabled, false, 'an exclusive end exactly at MAX_SAFE_INTEGER is valid');
+  page.elements.get('delay-value').value = String(safeDelay + 1);
+  await page.event('delay-value', 'change');
+  assert.equal(page.elements.get('submit').disabled, true, 'an overflowing exclusive end cannot be submitted');
+  await page.event('contribution-form', 'submit');
+  assert.equal(page.requests.some(request => request.url === '/api/contributions'), false);
 });
 
 test('Enter in a typed field applies the value without submitting the form', async () => {
