@@ -35,13 +35,13 @@
       <div class="section-heading"><h2 id="mint-title">Contribution</h2><span id="fee-label" class="muted">Fee: 1,000 sat/block</span></div>
       <div class="mint-grid">
         <form id="contribution-form">
-          <div class="slider-heading"><label for="budget">Budget, incl. fees</label><output id="budget-value" for="budget"></output></div>
+          <div class="slider-heading"><label for="budget">Budget, incl. fees</label><span class="value-field"><input id="budget-value" class="value-input" type="text" inputmode="decimal" autocomplete="off" aria-label="Budget, typed value"><span id="budget-unit" class="value-unit"></span></span></div>
           <input id="budget" type="range" min="100000" max="100000000" step="100000" value="1000000">
           <div class="range-labels"><span id="budget-min">100,000 sat</span><span id="budget-max">100,000,000 sat</span></div>
-          <div class="slider-heading duration-heading"><label for="duration">Duration</label><output id="duration-value" for="duration"></output></div>
+          <div class="slider-heading duration-heading"><label for="duration">Duration</label><span class="value-field"><input id="duration-value" class="value-input" type="text" inputmode="decimal" autocomplete="off" aria-label="Duration, typed value"><span id="duration-unit" class="value-unit"></span></span></div>
           <input id="duration" type="range" min="144" max="4464" step="1" value="500">
           <div class="range-labels"><span id="duration-min">144 blocks</span><span id="duration-max">4,464 blocks</span></div>
-          <div class="slider-heading duration-heading"><label for="delay">Start delay</label><output id="delay-value" for="delay"></output></div>
+          <div class="slider-heading duration-heading"><label for="delay">Start delay</label><span class="value-field"><input id="delay-value" class="value-input" type="text" inputmode="decimal" autocomplete="off" aria-label="Start delay, typed value"><span id="delay-unit" class="value-unit"></span></span></div>
           <input id="delay" type="range" min="0" max="4464" step="1" value="0">
           <div class="range-labels"><span id="delay-min">0 blocks</span><span id="delay-max">4,464 blocks</span></div>
           <p id="budget-error" class="form-message" role="status"></p>
