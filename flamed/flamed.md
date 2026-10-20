@@ -34,7 +34,9 @@ are not in it:
   never parsed ([Confidential payments](../docs/payments.md#the-node)).
 
 All three live in memory and are rebuilt by replaying `blocks.bin`. The only
-durable state this node has is that file and `genesis.json`.
+durable state this node has is that file and `genesis.json`. Block times are
+not its own: they belong to the core indexer, which keeps them in its own
+directory ([Times](#times)).
 
 ## The three files
 
@@ -69,9 +71,10 @@ not the limits. Comparing whole `chainparams.toml` files is what makes a
 network agree.
 
 **`flamed.toml`** is one node's local policy: where its data lives, where to
-listen, how often to mint, and the fee it will not go below. None of it is
-consensus — the block header carries no timestamp, and a fee floor is an
-opinion about what is worth relaying.
+listen, how often to mint, the fee it will not go below, and where the mock
+core indexer keeps its table (`indexer_dir`, `<data_dir>/indexer` by
+default). None of it is consensus — the block header carries no timestamp,
+and a fee floor is an opinion about what is worth relaying.
 
 `blocks.bin` sits beside them in the data directory: one record per block, a
 `u64` little-endian length then the block's canonical bytes. A torn trailing
@@ -130,6 +133,52 @@ site. That is what lets an explorer, a monitor or a WASM client speak these
 methods without the VM behind them. The crate defines them once with
 `#[rpc(server, client)]`, so the node's server and every consumer's client
 are generated from the same declaration and cannot drift.
+
+## Times
+
+A Flame header has no time field, and none is planned: a block's time is the
+time of the Bitcoin block its `core_block_hash` names. A transaction has
+three times, each vouched for by someone different.
+
+| Field | Where | Who vouches for it |
+|---|---|---|
+| `time` | `BlockSummary`, and `ScanEntry` for the creating block | the core indexer |
+| `block_time` | `TransactionResult` | the core indexer, through the block |
+| `locktime` | `TransactionSummary`, `PendingTransaction` | the sender: signed, never checked |
+| `received_at` | `PendingTransaction`, `TransactionResult` | this node's clock |
+
+All are Unix seconds. `time` and `block_time` are absent for genesis and for a
+block the indexer does not know. `received_at` is absent on a confirmed
+transaction this node never held pending, and after a restart, because the
+mempool is not durable and neither are its times.
+
+**The core indexer** is the `CoreIndexer` trait in `src/indexer.rs`: `anchor`
+names the core block to commit in the next header and its time, and
+`time_of` gives back the time of a core block already anchored to. The
+minter calls `anchor`; `Node::open` calls `time_of` for every archived block
+while replaying, which is how a restarted node gets back the times it had.
+The node holds the times only in its block index.
+
+`MockIndexer` is the only implementation, and it has no Bitcoin behind it.
+It anchors height `h` to `core_block_hash(h)`, the same devnet rule as
+before, so existing archives replay unchanged. The time is this machine's
+clock when the indexer first saw that height. Each one is appended to
+`<indexer_dir>/core-times.txt` (`<hex hash> <unix seconds>` per line) and
+synced before `anchor` returns, so any time a block was shown with can be
+given back. A torn last line is dropped; any other bad line stops the node
+from starting. If the table is lost, the node still opens and serves every
+block, without times, and prints how many it could not time.
+
+A real indexer replaces it through `Node::open_with` and the node stays the
+same. Several Flame blocks then anchor to one Bitcoin block and share its
+time, which the hash-keyed lookup already allows.
+
+**`locktime`** is documented as Bitcoin's: below `500_000_000` a height,
+otherwise Unix seconds before which the transaction is invalid, and `0`
+for no lock: include as soon as possible. Nothing enforces it yet, and the
+node shows it as signed. A wallet that wants a signing time on record can
+set it to the current Unix time, which is already reached and so does not
+delay the transaction; it is the sender's claim, covered by the TxID.
 
 ## A recorded session
 
@@ -235,6 +284,9 @@ Stated plainly, because each of these is a real limit and not a detail:
   an `Input`, so nothing the node believes unspent can have been spent
   behind its back. Closing the gap needs an upstream change — `connect`
   returning the logs it already has.
+- **Block times are only as good as the indexer.** The mock's times are
+  this machine's clock and can be lost with its directory. Nothing about
+  them is consensus until a real indexer authenticates the core block.
 - **The mempool does not survive a restart**, and neither do the indexes —
   they are rebuilt by replaying every block from genesis. Replay decodes the
   whole archive into memory before connecting any of it, so the node is

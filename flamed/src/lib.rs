@@ -19,6 +19,7 @@ pub mod cells;
 pub mod config;
 pub mod genesis;
 pub mod index;
+pub mod indexer;
 mod inspect;
 #[cfg(any(test, feature = "devnet"))]
 pub mod minter;
@@ -28,6 +29,7 @@ pub mod store;
 pub mod utxos;
 
 pub use config::{ChainParamsFile, GenesisFile, NodeConfig};
+pub use indexer::{CoreBlock, CoreError, CoreIndexer, MockIndexer};
 pub use node::{Node, NodeError, ProofStatus, SharedNode, TipInfo, TxStatus};
 pub use rpc::{serve, FlamedRpc};
 pub use store::BlockStore;

@@ -112,6 +112,7 @@ fn an_unspent_scan_entry_omits_its_spend() {
         txid: TxId([0x44; 32]),
         predicate: PredicatePoint([0x55; 32]),
         bytes: ContractEnvelope(vec![0xde, 0xad]),
+        time: None,
         note: None,
         spent: None,
     };
@@ -121,6 +122,7 @@ fn an_unspent_scan_entry_omits_its_spend() {
     };
     let json = serde_json::to_value(&result).expect("serialize");
     assert!(json["outputs"][0].get("spent").is_none());
+    assert!(json["outputs"][0].get("time").is_none());
 
     let spent = ScanEntry {
         spent: Some(SpentAt {
@@ -143,11 +145,13 @@ fn a_scan_entry_carries_its_note_as_base64_or_omits_it() {
         txid: TxId([0x44; 32]),
         predicate: PredicatePoint([0x55; 32]),
         bytes: ContractEnvelope(vec![0xde, 0xad]),
+        time: Some(1_760_000_000),
         note: Some(NoteEnvelope(vec![0x01, 0x02, 0x03, 0xff])),
         spent: None,
     };
     let json = serde_json::to_value(&entry).expect("serialize");
     assert_eq!(json["note"], "AQID/w==");
+    assert_eq!(json["time"], 1_760_000_000);
     assert_eq!(
         serde_json::from_value::<ScanEntry>(json).expect("deserialize"),
         entry
@@ -190,6 +194,7 @@ fn a_block_preserves_execution_categories_links_and_exact_fees() {
                     available_storage_units: 8192,
                 },
             },
+            time: Some(1_760_000_000),
             transactions: 1,
             internal: 1,
             failed: 1,
@@ -206,6 +211,7 @@ fn a_block_preserves_execution_categories_links_and_exact_fees() {
             inputs: 0,
             outputs: 1,
             messages: 0,
+            locktime: 0,
         }],
     };
     let json = serde_json::to_value(&result).unwrap();
@@ -223,6 +229,7 @@ fn a_block_preserves_execution_categories_links_and_exact_fees() {
                         "available_storage_units": 8192
                     }
                 },
+                "time": 1_760_000_000,
                 "transactions": 1, "internal": 1, "failed": 1, "size_bytes": 1234
             },
             "executions": [{
@@ -232,7 +239,7 @@ fn a_block_preserves_execution_categories_links_and_exact_fees() {
                     "actor": "88".repeat(32), "error": "actor not found"
                 },
                 "fee_sparks": "18446744073709551615", "inputs": 0, "outputs": 1,
-                "messages": 0
+                "messages": 0, "locktime": 0
             }]
         })
     );
@@ -277,10 +284,11 @@ fn execution_data_is_nested_and_requires_each_variants_fields() {
             inputs: 0,
             outputs: 0,
             messages: 0,
+            locktime: 1_760_000_000,
         };
         let expected = json!({
             "id": "66".repeat(32), "fee_sparks": "0", "inputs": 0,
-            "outputs": 0, "messages": 0, "execution": fields
+            "outputs": 0, "messages": 0, "locktime": 1_760_000_000, "execution": fields
         });
         assert_eq!(serde_json::to_value(&summary).unwrap(), expected);
         assert_eq!(
