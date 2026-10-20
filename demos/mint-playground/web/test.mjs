@@ -46,6 +46,7 @@ test('calendar dates start at block one and use exact 144-block UTC days, includ
   assert.equal(blockDate(414 * 144 + 1), 'Feb 29');
   assert.equal(blockDate(415 * 144 + 1), 'Mar 1');
   assert.equal(blockDate(-1), '—');
+  assert.equal(blockDate(Number.MAX_SAFE_INTEGER), `Block ${new Intl.NumberFormat('en').format(Number.MAX_SAFE_INTEGER)}`, 'far-future manual schedules remain renderable beyond the Date range');
 });
 
 test('zoom levels cover one to thirty-one days in exact two-day increments', () => {
@@ -127,6 +128,44 @@ test('projections preserve each actual remainder block and account for delayed w
   assert.equal(burnAt(competing, 14), 2001, 'historical samples remain factual');
   const later = { ...draft, start_block: 5000 };
   assert.equal(projectedReward([competing], later, 'own'), 50000 * SPARKS, 'a delayed draft is evaluated over its full future duration');
+});
+
+test('event-based forecasts match a per-block reference across randomized starts, expiries, overlaps, and integer remainders', () => {
+  let seed = 74219;
+  const random = limit => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed % limit; };
+  const schedule = () => {
+    const duration = random(100) + 1;
+    return plan({ duration, start_block: random(150), budget_sats: duration * (FEE + 1) + random(100000) });
+  };
+  for (let sample = 0; sample < 300; sample++) {
+    const draft = schedule();
+    const contributions = Array.from({ length: random(8) }, schedule);
+    let expected = 0;
+    for (let block = draft.start_block; block < draft.start_block + draft.duration; block++) {
+      const own = burnAt(draft, block);
+      const total = contributions.reduce((sum, contribution) => sum + burnAt(contribution, block), own);
+      expected += 50 * SPARKS * own / total;
+    }
+    const actual = projectedReward(contributions, draft);
+    assert.ok(Math.abs(actual - expected) <= Math.max(1, expected) * 1e-12, `schedule ${sample}: ${actual} differs from ${expected}`);
+  }
+});
+
+test('trillion-block forecasts scale with schedule events rather than the number of blocks', () => {
+  const duration = 1000000000000;
+  const draft = plan({ duration, start_block: 1000000000000, budget_sats: duration * (FEE + 1) });
+  const start = performance.now();
+  assert.equal(projectedReward([], draft), duration * 50 * SPARKS);
+  assert.equal(projectedReward([{ ...draft }], draft), duration * 25 * SPARKS);
+  assert.ok(performance.now() - start < 1000, 'forecasting a large manual duration must not freeze the page');
+});
+
+test('large burn-rate events cancel exactly before tiny competitors and lone draft blocks', () => {
+  const draft = plan({ duration: 4, start_block: 11, budget_sats: 4 * (FEE + 1) });
+  const large = plan({ duration: 1, start_block: 11, budget_sats: Number.MAX_SAFE_INTEGER });
+  const tiny = plan({ duration: 1, start_block: 12, budget_sats: FEE + 1 });
+  const expected = 50 * SPARKS * (1 / (Number.MAX_SAFE_INTEGER - FEE + 1) + 0.5 + 2);
+  assert.equal(projectedReward([large, tiny], draft), expected);
 });
 
 test('a contribution finishes on the last inclusive block, not one block later', () => {
@@ -533,7 +572,7 @@ test('mint chart displays every known future schedule and expiry, with exact own
   const draft = { budget_sats: 1000000, duration: 500, start_block: 11 };
   const estimate = projectedReward(page.snapshot.contributions, draft, first.address, 10);
   assert.equal(page.elements.get('projected-reward').textContent, new Intl.NumberFormat('en').format(Math.trunc(estimate / SPARKS)));
-  assert.equal(page.elements.get('projected-rate').textContent, `${new Intl.NumberFormat('en').format(Math.trunc(draft.budget_sats * SPARKS / estimate))} sat / FLM`);
+  assert.equal(page.elements.get('projected-rate').textContent, `${new Intl.NumberFormat('en').format(Math.trunc((draft.budget_sats - draft.duration * FEE) * SPARKS / estimate))} sat / FLM`);
 });
 
 test('dashboard includes scheduled contributions in future bands and shows their budgets and date ranges', async () => {
@@ -644,6 +683,7 @@ test('dashboard burn and patterned downward fees share one sats scale, with mint
 test('dashboard initializes, polls, draws, and renders the actual contribution snapshot', async () => {
   const page = await openPage('/');
   assert.equal(page.elements.get('total-burned').textContent, '100,000\u00a0sat');
+  assert.equal(page.elements.get('total-fees').textContent, '1,000\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '500\u00a0FLM');
   assert.equal(page.elements.get('total-rate').textContent, '40\u00a0sat/FLM');
   assert.equal(page.elements.get('current-block').textContent, '10');
@@ -661,8 +701,9 @@ test('dashboard requests recent contributions but uses server all-time totals, e
   await page.refresh();
   const footer = () => page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
   assert.equal(page.elements.get('contributions').children.length, 1, 'only the returned recent row is displayed');
-  assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '8,999']);
+  assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '7,999']);
   assert.equal(page.elements.get('total-burned').textContent, '9,876,543\u00a0sat');
+  assert.equal(page.elements.get('total-fees').textContent, '1,234,567\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '1,234\u00a0FLM');
   page.snapshot.contributions = [];
   page.draws.length = 0;
@@ -671,7 +712,7 @@ test('dashboard requests recent contributions but uses server all-time totals, e
   assert.equal(page.elements.get('empty-table').hidden, false);
   assert.equal(page.elements.get('empty-table').textContent, 'No recent contributions.');
   assert.ok(!page.draws.some(call => call.method === 'fill' && PALETTE.includes(call.fillStyle)), 'omitted contributions create no chart bands');
-  assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '8,999']);
+  assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '7,999']);
   assert.ok(page.requests.filter(request => request.url.startsWith('/api/state')).every(request => request.url === '/api/state'), 'dashboard never requests full history');
 });
 
@@ -685,8 +726,9 @@ test('mint requests full history and retains personal totals for contributions f
   assert.equal(page.elements.get('contributions').children[0].children[1].children[0].textContent, 'Finished');
   assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '1\u00a0FLM');
-  assert.equal(page.elements.get('total-rate').textContent, '1,500\u00a0sat/FLM');
-  assert.deepEqual(page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent), ['Total', '1 contributions', '2,000', '1', '1,000', '1,500']);
+  assert.equal(page.elements.get('total-fees').textContent, '1,000\u00a0sat');
+  assert.equal(page.elements.get('total-rate').textContent, '1,000\u00a0sat/FLM');
+  assert.deepEqual(page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent), ['Total', '1 contributions', '2,000', '1', '1,000', '1,000']);
 });
 
 test('FLM and sat/FLM displays truncate fractions without changing rewards or projection calculations', async () => {
@@ -700,16 +742,17 @@ test('FLM and sat/FLM displays truncate fractions without changing rewards or pr
     await page.refresh();
     const row = page.elements.get('contributions').children[0].children.map(cell => cell.textContent);
     const footer = page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
-    assert.deepEqual(row.slice(2), ['1,000', '1', '999', '999']);
-    assert.deepEqual(footer.slice(2), ['1,000', '1', '999', '999']);
+    assert.deepEqual(row.slice(2), ['1,000', '1', '999', '500']);
+    assert.deepEqual(footer.slice(2), ['1,000', '1', '999', '500']);
     assert.equal(page.elements.get('total-reward').textContent, '1\u00a0FLM');
-    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/mint' ? '999' : '40'}\u00a0sat/FLM`);
+    assert.equal(page.elements.get('total-fees').textContent, '999\u00a0sat');
+    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/mint' ? '500' : '40'}\u00a0sat/FLM`);
     if (pathname === '/mint') {
       const draft = { budget_sats: 1000000, duration: 500, start_block: page.snapshot.height + 1 };
       const estimate = projectedReward(page.snapshot.contributions, draft, 'tf1demo-address');
       assert.notEqual(estimate / SPARKS, Math.trunc(estimate / SPARKS));
       assert.equal(page.elements.get('projected-reward').textContent, new Intl.NumberFormat('en').format(Math.trunc(estimate / SPARKS)));
-      assert.equal(page.elements.get('projected-rate').textContent, `${Math.trunc(draft.budget_sats * SPARKS / estimate)} sat / FLM`);
+      assert.equal(page.elements.get('projected-rate').textContent, `${Math.trunc((draft.budget_sats - draft.duration * FEE) * SPARKS / estimate)} sat / FLM`);
     }
     assert.equal(JSON.stringify(page.snapshot), before, 'display formatting never changes stored or received quantities');
     contribution.burned_sats = '7'; contribution.fees_sats = '0'; contribution.reward_sparks = '7000000';
@@ -731,7 +774,7 @@ test('mint-rate chart ticks truncate fractional rates, leaving the satoshi scale
   assert.equal(right.args[0], '0', '0.02 sat/FLM truncates only in the displayed axis label');
 });
 
-test('mint totals show only accrued wallet burns and rewards, with mining fees included in effective cost', async () => {
+test('mint totals separate accrued mining fees and calculate effective rate from burns alone', async () => {
   const page = await openPage('/mint');
   const first = page.snapshot.contributions[0];
   page.snapshot.height = 250;
@@ -742,18 +785,33 @@ test('mint totals show only accrued wallet burns and rewards, with mining fees i
     { ...first, id: 5, user_id: 2, address: 'another-user', burned_sats: '999999', fees_sats: '999999', reward_sparks: '999999999999' },
   ];
   await page.refresh();
-  const totals = () => ['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent);
-  assert.deepEqual(totals(), ['122,345\u00a0sat', '133\u00a0FLM', '1,795\u00a0sat/FLM']);
+  const totals = () => ['total-burned', 'total-fees', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent);
+  assert.deepEqual(totals(), ['122,345\u00a0sat', '117,000\u00a0sat', '133\u00a0FLM', '917\u00a0sat/FLM']);
   assert.equal(page.elements.get('total-rate-label').textContent, 'Effective rate');
-  assert.match(page.elements.get('total-rate-label').title, /mining fees/);
+  assert.match(page.elements.get('total-rate-label').title, /excluding.*fees/i);
   const table = page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
-  assert.deepEqual(table.slice(2), ['122,345', '133', '117,000', '1,795'], 'header and table truncate only displayed reward and cost');
+  assert.deepEqual(table.slice(2), ['122,345', '133', '117,000', '917'], 'header and table truncate only displayed reward and burn-only rate');
   assert.deepEqual(page.elements.get('contributions').children.map(row => row.children[1].children[0].textContent), ['Scheduled', 'Active', 'Finished']);
   page.elements.get('budget').value = String(BUDGET_MAX);
   await page.event('budget', 'input');
   page.elements.get('duration').value = '1000';
   await page.event('duration', 'input');
-  assert.deepEqual(totals(), ['122,345\u00a0sat', '133\u00a0FLM', '1,795\u00a0sat/FLM'], 'draft budgets and projected rewards never change the accrued header');
+  assert.deepEqual(totals(), ['122,345\u00a0sat', '117,000\u00a0sat', '133\u00a0FLM', '917\u00a0sat/FLM'], 'draft budgets and projected rewards never change the accrued header');
+});
+
+test('changing accrued fees changes fee displays but never burn-based mint rates or draft estimates', async () => {
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    const rates = () => [page.elements.get('total-rate').textContent, rowValues(page).at(-1), footerValues(page).at(-1), page.elements.get('projected-rate').textContent];
+    const before = rates();
+    page.snapshot.totals.fees_sats = '999999';
+    page.snapshot.contributions[0].fees_sats = '999999';
+    await page.refresh();
+    assert.equal(page.elements.get('total-fees').textContent, '999,999\u00a0sat');
+    assert.equal(rowValues(page)[2], '999,999');
+    assert.equal(footerValues(page)[2], '999,999');
+    assert.deepEqual(rates(), before, `${pathname}: fees must not be counted as burned coins`);
+  }
 });
 
 test('mint effective cost is undefined before any FLM is earned, and a ready unregistered wallet has zero totals', async () => {
@@ -761,11 +819,13 @@ test('mint effective cost is undefined before any FLM is earned, and a ready unr
   page.snapshot.contributions[0].reward_sparks = '0';
   await page.refresh();
   assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
+  assert.equal(page.elements.get('total-fees').textContent, '1,000\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '0\u00a0FLM');
   assert.equal(page.elements.get('total-rate').textContent, '—\u00a0sat/FLM');
   page.snapshot.contributions[0].address = 'another-user';
   await page.refresh();
   assert.equal(page.elements.get('total-burned').textContent, '0\u00a0sat');
+  assert.equal(page.elements.get('total-fees').textContent, '0\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '0\u00a0FLM');
   assert.equal(page.elements.get('total-rate').textContent, '—\u00a0sat/FLM');
 });
@@ -773,11 +833,11 @@ test('mint effective cost is undefined before any FLM is earned, and a ready unr
 test('an unavailable wallet never substitutes global totals on the mint page', async () => {
   const storage = new Map([['flame-mint-playground-wallet-v1', '{broken json']]);
   const page = await openPage('/mint', storage);
-  assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
+  assert.deepEqual(['total-burned', 'total-fees', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
   assert.equal(page.elements.get('projected-reward').textContent, '—', 'an unknown identity cannot distinguish its own future schedules');
   assert.equal(page.elements.get('projected-rate').textContent, '—');
   await page.refresh();
-  assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
+  assert.deepEqual(['total-burned', 'total-fees', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
   assert.equal(page.elements.get('contributions').children.length, 0);
 });
 
@@ -786,12 +846,13 @@ test('a wallet arriving after the first poll fills personal totals without waiti
   const walletReady = new Promise(resolve => { finishWallet = resolve; });
   const page = await openPage('/mint', new Map(), undefined, walletReady);
   assert.equal(page.elements.get('connection').textContent, 'Live', 'the snapshot arrived while wallet initialization is pending');
-  assert.deepEqual(['total-burned', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
+  assert.deepEqual(['total-burned', 'total-fees', 'total-reward', 'total-rate'].map(id => page.elements.get(id).textContent), ['—\u00a0sat', '—\u00a0sat', '—\u00a0FLM', '—\u00a0sat/FLM']);
   finishWallet();
   await page.settle();
   assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '50\u00a0FLM');
-  assert.equal(page.elements.get('total-rate').textContent, '60\u00a0sat/FLM');
+  assert.equal(page.elements.get('total-fees').textContent, '1,000\u00a0sat');
+  assert.equal(page.elements.get('total-rate').textContent, '40\u00a0sat/FLM');
   assert.equal(page.requests.filter(request => request.url === '/api/state?full_history=true').length, 1, 'wallet completion reuses the current full-history snapshot');
 });
 
@@ -1139,7 +1200,7 @@ test('legacy saved requests normalize absent delay to zero without rewriting the
 
 test('invalid saved delay or duration blocks new submissions without losing the saved request', async () => {
   const valid = { address: 'tf1demo-address', request_id: 'saved-request-0001', budget_sats: 10000000, duration: 144, delay_blocks: 0 };
-  for (const change of [{ delay_blocks: -1 }, { delay_blocks: 4465 }, { delay_blocks: 0.5 }, { delay_blocks: '1' }, { duration: 143 }, { duration: 4465 }, { duration: 144.5 }]) {
+  for (const change of [{ delay_blocks: -1 }, { delay_blocks: Number.MAX_SAFE_INTEGER + 1 }, { delay_blocks: 0.5 }, { delay_blocks: '1' }, { duration: 143 }, { duration: Number.MAX_SAFE_INTEGER + 1 }, { duration: 144.5 }]) {
     const saved = JSON.stringify({ ...valid, ...change });
     const storage = new Map([['flame-mint-playground-pending-v1', saved]]);
     const page = await openPage('/mint', storage);
@@ -1157,7 +1218,7 @@ test('submitting locks budget, duration and delay until acceptance while display
   await page.event('delay', 'input');
   const submitting = page.event('contribution-form', 'submit');
   await page.settle();
-  for (const id of ['budget', 'duration', 'delay', 'submit', 'discard-pending']) assert.equal(page.elements.get(id).disabled, true, id);
+  for (const id of ['budget', 'budget-value', 'duration', 'duration-value', 'delay', 'delay-value', 'submit', 'discard-pending']) assert.equal(page.elements.get(id).disabled, true, id);
   await page.event('time-days', 'click');
   await page.event('unit-btc', 'click');
   const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
@@ -1165,7 +1226,7 @@ test('submitting locks budget, duration and delay until acceptance while display
   assert.equal(request.duration, 500);
   accept({ id: 2, user_id: 1, start_block: 28 });
   await submitting;
-  for (const id of ['budget', 'duration', 'delay', 'submit']) assert.equal(page.elements.get(id).disabled, false, id);
+  for (const id of ['budget', 'budget-value', 'duration', 'duration-value', 'delay', 'delay-value', 'submit']) assert.equal(page.elements.get(id).disabled, false, id);
   assert.match(page.elements.get('submit-message').textContent, /accepted/);
 });
 
@@ -1306,6 +1367,8 @@ test('both pages offer an accessible three-state unit selection while always sho
   assert.doesNotMatch(quoteRow, /\bhidden\b/);
   assert.match(quoteRow, />Loading BTC\/USD…<\/p>/);
   assert.match(html, /<div><p>Earned<\/p><p[^>]*id="total-reward">—&nbsp;FLM<\/p><\/div>/);
+  assert.match(html, /<div><p>Mining fees<\/p><p[^>]*id="total-fees">—&nbsp;sat<\/p><\/div>/);
+  assert.doesNotMatch(html.match(/id="(?:table-rate-label|projected-rate-label)"[^>]*>[^<]*/g).join(''), /incl\. fees/);
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
     for (const [unit, selected] of [['sat', true], ['btc', false], ['usd', false]]) {
@@ -1331,12 +1394,13 @@ test('unit switches reuse the preloaded BTC/USD quote and preserve its refresh t
     const row = page.elements.get('price-status').textContent;
     const quoteTimer = [...page.timers].find(([, timer]) => timer.delay === 60000)[0];
     for (const [unit, amount, rate] of [
-      ['usd', pathname === '/' ? '$50.000' : '$1.000', pathname === '/' ? '0.02\u00a0$/FLM' : '0.03\u00a0$/FLM'],
-      ['btc', pathname === '/' ? '0.00100000\u00a0btc' : '0.00002000\u00a0btc', pathname === '/' ? '0.00000040\u00a0BTC/FLM' : '0.00000060\u00a0BTC/FLM'],
-      ['sat', pathname === '/' ? '100,000\u00a0sat' : '2,000\u00a0sat', pathname === '/' ? '40\u00a0sat/FLM' : '60\u00a0sat/FLM'],
+      ['usd', pathname === '/' ? '$50.000' : '$1.000', '0.02\u00a0$/FLM'],
+      ['btc', pathname === '/' ? '0.00100000\u00a0btc' : '0.00002000\u00a0btc', '0.00000040\u00a0BTC/FLM'],
+      ['sat', pathname === '/' ? '100,000\u00a0sat' : '2,000\u00a0sat', '40\u00a0sat/FLM'],
     ]) {
       await page.event(`unit-${unit}`, 'click');
       assert.equal(page.elements.get('total-burned').textContent, amount);
+      assert.equal(page.elements.get('total-fees').textContent, unit === 'usd' ? '$0.500' : unit === 'btc' ? '0.00001000\u00a0btc' : '1,000\u00a0sat');
       assert.equal(page.elements.get('total-reward').textContent, pathname === '/' ? '500\u00a0FLM' : '50\u00a0FLM');
       assert.equal(page.elements.get('total-rate').textContent, rate);
       assert.equal(page.elements.get('total-burned-label').textContent, 'Burned');
@@ -1376,9 +1440,10 @@ test('BTC mode converts totals, tables, and rates on both pages without touching
     const rewardBefore = page.elements.get('total-reward').textContent;
     await page.event('unit-btc', 'click');
     assert.equal(page.elements.get('total-burned').textContent, `${pathname === '/' ? '0.00100000' : '0.00002000'}\u00a0btc`);
-    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/' ? '0.00000040' : '0.00000060'}\u00a0BTC/FLM`);
-    assert.deepEqual(rowValues(page), ['0.00002000', '50', '0.00001000', '0.00000060']);
-    assert.deepEqual(footerValues(page), pathname === '/' ? ['0.00100000', '500', '0.00001000', '0.00000202'] : ['0.00002000', '50', '0.00001000', '0.00000060']);
+    assert.equal(page.elements.get('total-fees').textContent, '0.00001000\u00a0btc');
+    assert.equal(page.elements.get('total-rate').textContent, '0.00000040\u00a0BTC/FLM');
+    assert.deepEqual(rowValues(page), ['0.00002000', '50', '0.00001000', '0.00000040']);
+    assert.deepEqual(footerValues(page), pathname === '/' ? ['0.00100000', '500', '0.00001000', '0.00000200'] : ['0.00002000', '50', '0.00001000', '0.00000040']);
     assert.equal(page.elements.get('total-reward').textContent, rewardBefore);
     assert.equal(page.elements.get('total-burned-label').textContent, 'Burned');
     assert.equal(page.elements.get('total-rate-label').textContent, pathname === '/' ? 'Current rate' : 'Effective rate');
@@ -1409,7 +1474,7 @@ test('mint budget, fees, contribution labels, validation, and projection follow 
   assert.match(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, /0\.00300000 BTC/);
   const draft = { budget_sats: 1000000, duration: 500, start_block: 11 };
   const estimate = projectedReward(page.snapshot.contributions, draft, 'tf1demo-address', 10);
-  assert.equal(page.elements.get('projected-rate').textContent, `${formatMoney(draft.budget_sats * SPARKS / estimate, 'BTC', null, true)} BTC / FLM`);
+  assert.equal(page.elements.get('projected-rate').textContent, `${formatMoney((draft.budget_sats - draft.duration * FEE) * SPARKS / estimate, 'BTC', null, true)} BTC / FLM`);
   assert.equal(page.elements.get('projected-reward').textContent, projectedBefore);
   assert.equal(page.elements.get('budget').value, budgetBefore);
   page.elements.get('budget').value = String(BUDGET_MIN);
@@ -1437,9 +1502,10 @@ test('USD mode reuses the public quote fetched without identity and converts all
     assert.equal(page.elements.get('price-status').hidden, false);
     assert.match(page.elements.get('price-status').textContent, /50,000|50000/);
     assert.equal(page.elements.get('total-burned').textContent, pathname === '/' ? '$50.000' : '$1.000');
-    assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/' ? '0.02' : '0.03'}\u00a0$/FLM`);
-    assert.deepEqual(rowValues(page), ['1.00', '50', '0.50', '0.03']);
-    assert.deepEqual(footerValues(page), pathname === '/' ? ['50.00', '500', '0.50', '0.101'] : ['1.00', '50', '0.50', '0.03']);
+    assert.equal(page.elements.get('total-fees').textContent, '$0.500');
+    assert.equal(page.elements.get('total-rate').textContent, '0.02\u00a0$/FLM');
+    assert.deepEqual(rowValues(page), ['1.00', '50', '0.50', '0.02']);
+    assert.deepEqual(footerValues(page), pathname === '/' ? ['50.00', '500', '0.50', '0.10'] : ['1.00', '50', '0.50', '0.02']);
     assert.equal(page.elements.get('chart-burn-unit').textContent, '$/block');
     assert.equal(page.elements.get('chart-rate-unit').textContent, '$/FLM');
     assert.equal(page.elements.get('total-rate-label').textContent, pathname === '/' ? 'Current rate' : 'Effective rate');
@@ -1507,6 +1573,7 @@ test('unknown wallet totals and undefined rates keep their labels and selected u
     await page.event(`unit-${unit}`, 'click');
     await page.refresh();
     assert.equal(page.elements.get('total-burned').textContent, amount);
+    assert.equal(page.elements.get('total-fees').textContent, amount);
     assert.equal(page.elements.get('total-reward').textContent, '—\u00a0FLM');
     assert.equal(page.elements.get('total-rate').textContent, `—\u00a0${rateUnit}/FLM`);
   }
@@ -1518,6 +1585,7 @@ test('unknown wallet totals and undefined rates keep their labels and selected u
     for (const [unit, amount, rateUnit] of [['sat', '0\u00a0sat', 'sat'], ['btc', '0.00000000\u00a0btc', 'BTC'], ['usd', '$0.000', '$']]) {
       await ready.event(`unit-${unit}`, 'click');
       assert.equal(ready.elements.get('total-burned').textContent, amount);
+      assert.equal(ready.elements.get('total-fees').textContent, amount);
       assert.equal(ready.elements.get('total-reward').textContent, '0\u00a0FLM');
       assert.equal(ready.elements.get('total-rate').textContent, `—\u00a0${rateUnit}/FLM`);
     }
@@ -1552,6 +1620,7 @@ test('USD pending and failed quotes show unavailable amounts, never fictitious z
   await page.event('unit-usd', 'click');
   assert.match(page.elements.get('price-status').textContent, /Loading/i);
   assert.equal(page.elements.get('total-burned').textContent, '$—');
+  assert.equal(page.elements.get('total-fees').textContent, '$—');
   assert.equal(page.elements.get('total-rate').textContent, '—\u00a0$/FLM');
   assert.equal(page.elements.get('budget-value').value, '—');
   for (const id of ['projected-fees', 'projected-burn', 'projected-rate']) assert.equal(page.elements.get(id).textContent, '—', id);
@@ -1561,6 +1630,7 @@ test('USD pending and failed quotes show unavailable amounts, never fictitious z
   await page.settle();
   assert.match(page.elements.get('price-status').textContent, /unavailable|503/i);
   assert.equal(page.elements.get('total-burned').textContent, '$—');
+  assert.equal(page.elements.get('total-fees').textContent, '$—');
   assert.equal(page.elements.get('connection').textContent, 'Live');
   await page.event('unit-btc', 'click');
   assert.equal(page.elements.get('total-burned').textContent, '0.00002000\u00a0btc');
@@ -1671,7 +1741,7 @@ test('unit changes leave chart data, forecast, requests, and pending idempotence
   assert.equal(storage.has('flame-mint-playground-pending-v1'), false);
 });
 
-test('typed-value helpers parse leniently and snap to slider limits', () => {
+test('typed-value helpers parse native units while slider presentation snaps to its own limits', () => {
   assert.equal(parseInputNumber('1,000,000 sat'), 1000000);
   assert.equal(parseInputNumber('$3,665.73'), 3665.73);
   assert.equal(parseInputNumber('0.01000000 BTC'), 0.01);
@@ -1695,7 +1765,7 @@ test('typed-value helpers parse leniently and snap to slider limits', () => {
   assert.equal(inputToBlocks(300, 'blocks'), 300);
 });
 
-test('a typed budget is kept to the satoshi, the slider shows the nearest step and limits still clamp', async () => {
+test('a typed budget stays exact beyond the slider maximum while the slider remains bounded', async () => {
   const page = await openPage('/mint');
   const typed = page.elements.get('budget-value');
   typed.value = '2,550,000';
@@ -1712,8 +1782,12 @@ test('a typed budget is kept to the satoshi, the slider shows the nearest step a
   const field = fresh.elements.get('budget-value');
   field.value = '999999999999';
   await fresh.event('budget-value', 'change');
-  assert.equal(fresh.elements.get('budget').value, String(BUDGET_MAX), 'clamped to the maximum');
-  assert.equal(field.value, '100,000,000');
+  assert.equal(fresh.elements.get('budget').value, String(BUDGET_MAX), 'only the slider is clamped to its maximum');
+  assert.equal(field.value, '999,999,999,999');
+  assert.equal(fresh.elements.get('projected-burn').textContent, '999,999,499,999 sat');
+  field.value = '9999999999999999999999999';
+  await fresh.event('budget-value', 'change');
+  assert.equal(field.value, new Intl.NumberFormat('en').format(Number.MAX_SAFE_INTEGER), 'the precision ceiling is independent of the slider maximum');
   field.value = '5';
   await fresh.event('budget-value', 'change');
   assert.equal(fresh.elements.get('budget').value, String(BUDGET_MIN), 'clamped to the minimum');
@@ -1746,7 +1820,7 @@ test('typing a budget respects the selected currency', async () => {
   assert.equal(page.elements.get('budget-unit').textContent, 'BTC');
 });
 
-test('typing a duration or delay converts days to blocks and stays inside the slider bounds', async () => {
+test('typed durations and delays convert days to blocks beyond the slider bounds and retain their minimums', async () => {
   const page = await openPage('/mint', new Map([[TIME_KEY, 'days']]));
   const duration = page.elements.get('duration-value');
   duration.value = '2';
@@ -1757,6 +1831,10 @@ test('typing a duration or delay converts days to blocks and stays inside the sl
   duration.value = '100';
   await page.event('duration-value', 'change');
   assert.equal(page.elements.get('duration').value, String(DURATION_MAX));
+  assert.equal(duration.value, '100', 'a typed duration is not limited to the 31-day slider');
+  await page.event('time-blocks', 'click');
+  assert.equal(duration.value, '14,400');
+  await page.event('time-days', 'click');
   duration.value = '0';
   await page.event('duration-value', 'change');
   assert.equal(page.elements.get('duration').value, String(DURATION_MIN));
@@ -1768,6 +1846,102 @@ test('typing a duration or delay converts days to blocks and stays inside the sl
   delay.value = '-5';
   await page.event('delay-value', 'change');
   assert.equal(page.elements.get('delay').value, '5', 'the sign is ignored and the value stays within bounds');
+  delay.value = '10000';
+  await page.event('delay-value', 'change');
+  assert.equal(page.elements.get('delay').value, String(DELAY_MAX));
+  assert.equal(delay.value, '10,000', 'delays can exceed the visible slider range');
+});
+
+test('larger typed values survive polls and display changes, and each slider replaces only its own field', async () => {
+  const page = await openPage('/mint');
+  for (const [id, value] of [['budget', '1000000000123'], ['duration', '12345'], ['delay', '67890']]) {
+    page.elements.get(`${id}-value`).value = value;
+    await page.event(`${id}-value`, 'change');
+  }
+  const check = () => {
+    assert.equal(page.elements.get('budget-value').value, '1,000,000,000,123');
+    assert.equal(page.elements.get('duration-value').value, '12,345');
+    assert.equal(page.elements.get('delay-value').value, '67,890');
+    assert.equal(page.elements.get('budget').value, String(BUDGET_MAX));
+    assert.equal(page.elements.get('duration').value, String(DURATION_MAX));
+    assert.equal(page.elements.get('delay').value, String(DELAY_MAX));
+  };
+  check();
+  await page.refresh();
+  await page.event('unit-btc', 'click');
+  assert.equal(page.elements.get('budget-value').value, '10,000.00000123');
+  await page.event('unit-sat', 'click');
+  await page.event('time-days', 'click');
+  await page.event('time-blocks', 'click');
+  await page.event('zoom-out', 'click');
+  await page.event('zoom-in', 'click');
+  check();
+  page.elements.get('duration').value = '500';
+  await page.event('duration', 'input');
+  assert.equal(page.elements.get('duration-value').value, '500');
+  assert.equal(page.elements.get('budget-value').value, '1,000,000,000,123');
+  assert.equal(page.elements.get('delay-value').value, '67,890');
+  page.elements.get('budget').value = '2000000';
+  await page.event('budget', 'input');
+  assert.equal(page.elements.get('budget-value').value, '2,000,000');
+  assert.equal(page.elements.get('delay-value').value, '67,890');
+  page.elements.get('delay').value = '7';
+  await page.event('delay', 'input');
+  assert.equal(page.elements.get('delay-value').value, '7');
+  assert.equal(page.elements.get('duration-value').value, '500');
+});
+
+test('large manual requests persist exact values and retry unchanged despite clamped locked sliders', async () => {
+  const storage = new Map();
+  const page = await openPage('/mint', storage, async () => { throw new Error('Response lost'); });
+  const values = { budget: 1000000000123, duration: 12345, delay: 67890 };
+  for (const [id, value] of Object.entries(values)) {
+    page.elements.get(`${id}-value`).value = String(value);
+    await page.event(`${id}-value`, 'change');
+  }
+  await page.event('contribution-form', 'submit');
+  const sent = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(sent.budget_sats, values.budget);
+  assert.equal(sent.duration, values.duration);
+  assert.equal(sent.delay_blocks, values.delay);
+  const retry = await openPage('/mint', storage);
+  for (const [id, value] of Object.entries(values)) {
+    assert.equal(retry.elements.get(id).disabled, true);
+    assert.equal(retry.elements.get(`${id}-value`).disabled, true);
+    assert.equal(retry.elements.get(`${id}-value`).value, new Intl.NumberFormat('en').format(value));
+    retry.elements.get(id).value = '1';
+  }
+  await retry.event('time-days', 'click');
+  await retry.event('unit-btc', 'click');
+  await retry.event('contribution-form', 'submit');
+  assert.deepEqual(JSON.parse(retry.requests.find(request => request.url === '/api/contributions').options.body), sent);
+  await retry.event('unit-sat', 'click');
+  await retry.event('time-blocks', 'click');
+  for (const [id, value] of Object.entries(values)) {
+    assert.equal(retry.elements.get(`${id}-value`).disabled, false);
+    assert.equal(retry.elements.get(`${id}-value`).value, new Intl.NumberFormat('en').format(value), 'successful retry preserves the full accepted amount for the next draft');
+  }
+});
+
+test('manual schedules must fund every block and keep their exclusive end within safe integer precision', async () => {
+  const page = await openPage('/mint');
+  page.elements.get('duration-value').value = '10000';
+  await page.event('duration-value', 'change');
+  assert.equal(page.elements.get('submit').disabled, true, 'manual durations still need enough funds for burn and mining fees');
+  page.elements.get('budget-value').value = '10010000';
+  await page.event('budget-value', 'change');
+  assert.equal(page.elements.get('submit').disabled, false);
+  page.elements.get('duration-value').value = '144';
+  await page.event('duration-value', 'change');
+  const safeDelay = Number.MAX_SAFE_INTEGER - page.snapshot.height - 1 - 144;
+  page.elements.get('delay-value').value = String(safeDelay);
+  await page.event('delay-value', 'change');
+  assert.equal(page.elements.get('submit').disabled, false, 'an exclusive end exactly at MAX_SAFE_INTEGER is valid');
+  page.elements.get('delay-value').value = String(safeDelay + 1);
+  await page.event('delay-value', 'change');
+  assert.equal(page.elements.get('submit').disabled, true, 'an overflowing exclusive end cannot be submitted');
+  await page.event('contribution-form', 'submit');
+  assert.equal(page.requests.some(request => request.url === '/api/contributions'), false);
 });
 
 test('Enter in a typed field applies the value without submitting the form', async () => {

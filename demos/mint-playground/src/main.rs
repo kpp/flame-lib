@@ -569,7 +569,10 @@ mod tests {
             StatusCode::CONFLICT
         );
         value["request_id"] = "another-submission-00001".into();
-        for delay in [serde_json::json!(-1), serde_json::json!(4_465)] {
+        for delay in [
+            serde_json::json!(-1),
+            serde_json::json!(db::MAX_SAFE_INTEGER + 1),
+        ] {
             value["delay_blocks"] = delay;
             assert_eq!(
                 app.clone()
@@ -585,6 +588,29 @@ mod tests {
             app.oneshot(post_request(&value)).await.unwrap().status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
+        store.stop().await;
+        thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_manual_values_above_slider_limits_through_json_api() {
+        let (store, thread) = Store::open(PathBuf::from(":memory:")).unwrap();
+        let app = router(store.clone());
+        let mut value = contribution();
+        value["budget_sats"] = 200_000_000.into();
+        value["duration"] = 5_001.into();
+        value["delay_blocks"] = 6_001.into();
+        let response = app.clone().oneshot(post_request(&value)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json(response).await["start_block"], 6_002);
+        value["request_id"] = "unsafe-manual-number-0001".into();
+        for field in ["budget_sats", "duration", "delay_blocks"] {
+            let previous = value[field].clone();
+            value[field] = (db::MAX_SAFE_INTEGER + 1).into();
+            let response = app.clone().oneshot(post_request(&value)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            value[field] = previous;
+        }
         store.stop().await;
         thread.join().unwrap();
     }
