@@ -1,4 +1,5 @@
-//! Contracts by id, by spend, and by predicate.
+//! Contracts by id, by spend, and by predicate, and each predicate's
+//! history.
 
 use std::collections::BTreeMap;
 
@@ -9,6 +10,8 @@ use flamevm::{ContractID, TxID};
 pub struct OutputRecord {
     /// The height that created it.
     pub height: u64,
+    /// Its transaction's place among its block's executions.
+    pub index: u32,
     /// The transaction that created it.
     pub txid: TxID,
     /// The compressed point of the predicate that locks it.
@@ -26,8 +29,27 @@ pub struct OutputRecord {
 pub struct SpendRecord {
     /// The height that spent it.
     pub height: u64,
+    /// Its transaction's place among its block's executions.
+    pub index: u32,
     /// The transaction that spent it.
     pub txid: TxID,
+}
+
+/// Where an execution stands in the chain: its height, then its place
+/// among that block's executions. Chain order is the order of these.
+pub type Position = (u64, u32);
+
+/// One transaction that created or spent contracts under one predicate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Touch {
+    /// Where the transaction stands.
+    pub position: Position,
+    /// The transaction.
+    pub txid: TxID,
+    /// What it created under the predicate, in log order.
+    pub created: Vec<ContractID>,
+    /// What it spent from under the predicate, in log order.
+    pub spent: Vec<ContractID>,
 }
 
 /// Every contract the node has ever seen, spent or not.
@@ -36,6 +58,7 @@ pub struct OutputIndex {
     outputs: BTreeMap<ContractID, OutputRecord>,
     spent: BTreeMap<ContractID, SpendRecord>,
     by_predicate: BTreeMap<[u8; 32], Vec<ContractID>>,
+    history: BTreeMap<[u8; 32], Vec<Touch>>,
 }
 
 impl OutputIndex {
@@ -50,14 +73,48 @@ impl OutputIndex {
     /// commits its predicate, so a repeat is the same contract twice.
     pub fn insert(&mut self, id: ContractID, record: OutputRecord) {
         let predicate = record.predicate;
+        let position = (record.height, record.index);
+        let txid = record.txid;
         if self.outputs.insert(id, record).is_none() {
             self.by_predicate.entry(predicate).or_default().push(id);
+            self.touch(predicate, position, txid).created.push(id);
         }
     }
 
-    /// Records a spend.
+    /// Records a spend. A contract this index never saw created has no
+    /// predicate to file the spend under, so it is in no history.
     pub fn spend(&mut self, id: ContractID, record: SpendRecord) {
+        let position = (record.height, record.index);
+        let txid = record.txid;
         self.spent.insert(id, record);
+        if let Some(predicate) = self.outputs.get(&id).map(|output| output.predicate) {
+            self.touch(predicate, position, txid).spent.push(id);
+        }
+    }
+
+    /// The entry for one transaction in one predicate's history, made on
+    /// its first contract. Blocks connect in order and a block's
+    /// executions are recorded in order, so a new one always goes last.
+    fn touch(&mut self, predicate: [u8; 32], position: Position, txid: TxID) -> &mut Touch {
+        let history = self.history.entry(predicate).or_default();
+        if history.last().is_none_or(|last| last.position != position) {
+            debug_assert!(history.last().is_none_or(|last| last.position < position));
+            history.push(Touch {
+                position,
+                txid,
+                created: Vec::new(),
+                spent: Vec::new(),
+            });
+        }
+        history.last_mut().expect("just pushed")
+    }
+
+    /// Every transaction that touched one predicate, in chain order.
+    pub fn history(&self, predicate: &[u8; 32]) -> &[Touch] {
+        self.history
+            .get(predicate)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     /// One contract.

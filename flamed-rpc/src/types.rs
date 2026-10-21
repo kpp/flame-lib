@@ -267,6 +267,80 @@ pub struct UnspentResult {
     pub outputs: Vec<UnspentEntry>,
 }
 
+/// One contract a history entry created or spent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryContract {
+    /// The contract's id.
+    pub id: ContractId,
+    /// The predicate that locks it: which of the asked addresses it is.
+    pub predicate: PredicatePoint,
+    /// Its bytes, as published.
+    pub bytes: ContractEnvelope,
+    /// The `Data` entry right after it in its creating log, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<NoteEnvelope>,
+}
+
+/// One transaction that created or spent a contract of the asked addresses.
+///
+/// An entry never changes once the transaction has confirmed: it says what
+/// happened, not what is true now. `unspent` says what is true now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// The transaction, or all zeros for the genesis allocation.
+    pub txid: TxId,
+    /// Its height. Absent while pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u64>,
+    /// Its block's time, in Unix seconds; see [`BlockSummary::time`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<u64>,
+    /// When this node admitted it, in Unix seconds; see
+    /// [`TransactionResult::received_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<u64>,
+    /// Its fee in sparks, as an exact decimal string.
+    pub fee_sparks: String,
+    /// Contracts it created for the asked addresses: by address, then in
+    /// log order.
+    pub created: Vec<HistoryContract>,
+    /// Contracts of the asked addresses it spent, each with the bytes and
+    /// note it was created with: by address, then in log order.
+    pub spent: Vec<HistoryContract>,
+}
+
+/// A page of history, and the cursors around it.
+///
+/// A cursor is a readable string for debugging, not a format: pass it back
+/// as it came, and expect it to change without notice.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryResult {
+    /// The tip this page was answered at.
+    pub tip: TipResult,
+    /// The predicate each address resolved to, in the order asked.
+    pub predicates: Vec<PredicatePoint>,
+    /// Confirmed entries: newest first on a first or older page, oldest
+    /// first on a newer page.
+    pub entries: Vec<HistoryEntry>,
+    /// On a first or older page, where older entries continue. Null when
+    /// there are none, and always on a newer page.
+    pub older: Option<String>,
+    /// On a first or newer page, where to read what comes after this page.
+    /// Null on an older page.
+    pub newer: Option<String>,
+    /// On a newer page: whether entries past `newer` already exist, so it
+    /// is worth asking again right away. False on other pages.
+    pub has_newer: bool,
+    /// With `with_pending`, on a first or newer page: the mempool's
+    /// transactions that touch the asked addresses, in admission order,
+    /// without a height or time. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Vec<HistoryEntry>>,
+    /// Whether `pending` was cut at [`MAX_PAGE_SIZE`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_truncated: bool,
+}
+
 /// Execution category and its data.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -695,6 +769,9 @@ pub struct BlocksResult {
 
 /// Maximum entries in a `blocks`, `transactions`, or `pending_transactions` response.
 pub const MAX_PAGE_SIZE: u32 = 100;
+
+/// The most addresses one `history` call may name.
+pub const MAX_HISTORY_ADDRESSES: usize = 256;
 
 /// The most predicates one `scan` may name.
 ///

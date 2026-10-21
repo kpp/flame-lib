@@ -14,9 +14,9 @@ use jsonrpsee::proc_macros::rpc;
 
 use crate::types::{
     ActorId, ActorQueryResult, ActorResult, BlockId, BlockResult, BlockTxEnvelope, BlocksResult,
-    ContractId, ContractResult, PendingTransactionsResult, PredicatePoint, ProofResult, ScanResult,
-    TipResult, TransactionResult, TransactionsResult, TxId, TxStatusResult, UnspentResult,
-    ValueEnvelope,
+    ContractId, ContractResult, HistoryResult, PendingTransactionsResult, PredicatePoint,
+    ProofResult, ScanResult, TipResult, TransactionResult, TransactionsResult, TxId,
+    TxStatusResult, UnspentResult, ValueEnvelope,
 };
 
 /// The `flamed` JSON-RPC 2.0 API. Parameters are positional, in the order
@@ -118,4 +118,26 @@ pub trait FlamedApi {
         address: String,
         with_pending: Option<bool>,
     ) -> RpcResult<UnspentResult>;
+
+    /// What happened to a wallet's addresses, a page at a time, with a
+    /// cursor at each end of what has been read (`HistoryResult`).
+    ///
+    /// Without `cursor`, the newest entries; with an `older` cursor, the
+    /// entries before it; with a `newer` one, the entries after it, oldest
+    /// first. Every page needs the same `addresses`, up to
+    /// `MAX_HISTORY_ADDRESSES`. `limit` is 1..=`MAX_PAGE_SIZE`.
+    /// `with_pending` (default false) adds the mempool to a first or newer
+    /// page.
+    /// `STALE_BLOCK` if the block a cursor stands on is no longer in the
+    /// chain: start again without one. `INVALID_ADDRESS` for an address,
+    /// invalid params for a cursor that does not read or was made for other
+    /// addresses.
+    #[method(name = "history")]
+    async fn history(
+        &self,
+        addresses: Vec<String>,
+        cursor: Option<String>,
+        limit: u32,
+        with_pending: Option<bool>,
+    ) -> RpcResult<HistoryResult>;
 }

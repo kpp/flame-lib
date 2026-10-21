@@ -3,8 +3,9 @@
 //! on.
 
 use crate::types::{
-    BlockId, ContractEnvelope, ContractId, NoteEnvelope, PredicatePoint, ProofBytes, ProofResult,
-    ScanEntry, ScanResult, SpentAt, TipResult, TxId, TxStatusResult, UnspentEntry, UnspentResult,
+    BlockId, ContractEnvelope, ContractId, HistoryContract, HistoryEntry, HistoryResult,
+    NoteEnvelope, PredicatePoint, ProofBytes, ProofResult, ScanEntry, ScanResult, SpentAt,
+    TipResult, TxId, TxStatusResult, UnspentEntry, UnspentResult,
 };
 
 #[test]
@@ -356,4 +357,64 @@ fn execution_data_is_nested_and_requires_each_variants_fields() {
             );
         }
     }
+}
+
+#[test]
+fn a_history_page_omits_what_does_not_apply() {
+    let contract = HistoryContract {
+        id: ContractId([0x33; 32]),
+        predicate: PredicatePoint([0x55; 32]),
+        bytes: ContractEnvelope(vec![0xde, 0xad]),
+        note: None,
+    };
+    let confirmed = HistoryEntry {
+        txid: TxId([0x44; 32]),
+        height: Some(1),
+        time: Some(1_800_000_000),
+        received_at: None,
+        fee_sparks: "1000".into(),
+        created: vec![contract.clone()],
+        spent: vec![],
+    };
+    let result = HistoryResult {
+        tip: TipResult {
+            hash: BlockId([0x11; 32]),
+            height: 1,
+            contract_root: [0x22; 32],
+        },
+        predicates: vec![PredicatePoint([0x55; 32])],
+        entries: vec![confirmed.clone()],
+        older: None,
+        newer: Some("newer:1:end:11:22".into()),
+        has_newer: false,
+        pending: None,
+        pending_truncated: false,
+    };
+    let json = serde_json::to_value(&result).expect("serialize");
+    assert!(json["older"].is_null());
+    assert_eq!(json["newer"], "newer:1:end:11:22");
+    assert!(json.get("pending").is_none());
+    assert!(json.get("pending_truncated").is_none());
+    assert!(json["entries"][0].get("received_at").is_none());
+    assert!(json["entries"][0]["created"][0].get("note").is_none());
+    assert_eq!(json["entries"][0]["spent"], serde_json::json!([]));
+    assert_eq!(
+        serde_json::from_value::<HistoryResult>(json).expect("deserialize"),
+        result
+    );
+
+    let with_pending = HistoryResult {
+        pending: Some(vec![HistoryEntry {
+            height: None,
+            time: None,
+            received_at: Some(1_800_000_100),
+            ..confirmed
+        }]),
+        pending_truncated: true,
+        ..result
+    };
+    let json = serde_json::to_value(&with_pending).expect("serialize");
+    assert_eq!(json["pending_truncated"], true);
+    assert!(json["pending"][0].get("height").is_none());
+    assert_eq!(json["pending"][0]["received_at"], 1_800_000_100);
 }

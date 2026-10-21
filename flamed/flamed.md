@@ -103,6 +103,7 @@ lowercase hex strings; blobs are standard base64.
 | `tx_status` | `txid` | `unknown`, `mempool`, or `confirmed` with where |
 | `scan` | `predicates`, `since_height` | every contract created under those predicates since that height, each with its note |
 | `unspent` | `address`, `with_pending?` | every unspent contract locked to a receiving or tracking address, with its note, block time and a proof at the tip; with `with_pending`, mempool spends are removed and pending outputs are added with `received_at` instead of a height, time or proof |
+| `history` | `addresses`, `cursor?`, `limit`, `with_pending?` | the transactions that created or spent contracts of up to 256 addresses, a page at a time from either end; see [History](#history) |
 
 Server-defined error codes, in the JSON-RPC 2.0 server range: `-32001`
 `NOT_FOUND`, `-32002` `MEMPOOL_REJECTED`, `-32003` `LIMIT_EXCEEDED`,
@@ -142,6 +143,47 @@ site. That is what lets an explorer, a monitor or a WASM client speak these
 methods without the VM behind them. The crate defines them once with
 `#[rpc(server, client)]`, so the node's server and every consumer's client
 are generated from the same declaration and cannot drift.
+
+## History
+
+`history` is the log of a wallet: every transaction that created a contract
+for one of its addresses or spent one, with those contracts' bytes and notes.
+The node cannot see amounts; the wallet opens the notes. A spent contract
+comes with the note it was created with, so a wallet restored from its seed
+can price a spend before it has paged back to the receipt. An entry never
+changes once confirmed: it says what happened, and `unspent` says what is
+true now. A transaction that touched several of the addresses, like a
+payment that sends change to another address, is one entry. The genesis
+allocation is an entry at height 0 with an all-zero txid and no fee.
+
+A wallet holds two cursors around what it has read, and the range only
+grows:
+
+| Call | Reads | Returns |
+|---|---|---|
+| no `cursor` | the newest entries, newest first | `older`, and `newer` at the tip |
+| `older` cursor | the entries before it, newest first | the next `older`, null at the beginning |
+| `newer` cursor | the entries after it, oldest first | the next `newer`, and `has_newer` when the page was cut short |
+
+`with_pending` adds the mempool's transactions for these addresses to a first
+or newer page, as `pending`: a fresh snapshot each time, never part of the
+paging, capped at 100 (`pending_truncated`). A pending transaction that
+confirms arrives once, through the newer cursor.
+
+A cursor is a position, never an offset: `older:12:3:<block>:<addresses>` is
+the 4th execution of block 12. The chain only grows, so the entries on either
+side of a position are the same however many blocks come after. The cursor
+also names the block at that height and fingerprints the addresses: a cursor
+on a block the chain no longer has is `STALE_BLOCK`, and the wallet starts
+again without one; a cursor asked with other addresses, or one this node did
+not write, is invalid params. The format is for reading in a debugger and is
+promised to no one: pass a cursor back as it came, and expect it to change
+with any release.
+
+Each address's history is a list in chain order, kept in RAM and rebuilt
+by replay like the rest of the index. A page is a binary search into each
+list and a merge, so its cost is the page and the number of addresses, not
+the length of the history.
 
 ## Times
 

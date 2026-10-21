@@ -18,6 +18,7 @@
 pub mod cells;
 pub mod config;
 pub mod genesis;
+pub mod history;
 pub mod index;
 pub mod indexer;
 mod inspect;

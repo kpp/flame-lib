@@ -23,10 +23,11 @@ use flamechain::{
 use flamed_rpc::{
     ActorCode, ActorId, ActorQueryResult, ActorResult, ActorStateEnvelope, BlockHeader, BlockId,
     BlockResult, BlockSummary, BlockTxEnvelope, BlocksResult, ContractEnvelope, ContractId,
-    ExecutionData, NoteEnvelope, PendingTransaction, PendingTransactionsResult, PredicatePoint,
-    ProofBytes, ScanEntry, SpentAt, StateCommitment, TipResult, TransactionResult,
-    TransactionSummary, TransactionsResult, TxId, UnspentEntry, UnspentResult, ValueEnvelope,
-    MAX_PAGE_SIZE, MAX_QUERY_BYTES, MAX_QUERY_GAS,
+    ExecutionData, HistoryContract, HistoryEntry, HistoryResult, NoteEnvelope, PendingTransaction,
+    PendingTransactionsResult, PredicatePoint, ProofBytes, ScanEntry, SpentAt, StateCommitment,
+    TipResult, TransactionResult, TransactionSummary, TransactionsResult, TxId, UnspentEntry,
+    UnspentResult, ValueEnvelope, MAX_HISTORY_ADDRESSES, MAX_PAGE_SIZE, MAX_QUERY_BYTES,
+    MAX_QUERY_GAS,
 };
 use flamekd::{Network, ReceivingAddress, TrackingAddress};
 use flamevm::{
@@ -37,7 +38,8 @@ use flamevm::{
 use crate::cells::{contract_bytes, log_bytes, proof_bytes};
 use crate::config::{GenesisFile, NodeConfig};
 use crate::genesis::{self, GenesisError};
-use crate::index::{OutputIndex, OutputRecord, SpendRecord, TxIndex, TxRecord};
+use crate::history::{self, Cursor, Direction, END_OF_BLOCK};
+use crate::index::{OutputIndex, OutputRecord, Position, SpendRecord, Touch, TxIndex, TxRecord};
 use crate::indexer::{unix_now, CoreError, CoreIndexer, MockIndexer};
 use crate::inspect;
 use crate::store::{BlockStore, StoreError};
@@ -183,6 +185,7 @@ impl Node {
                 *id,
                 OutputRecord {
                     height: 0,
+                    index: 0,
                     txid: GENESIS_TXID,
                     predicate: contract.predicate.to_point().to_bytes(),
                     contract: record.bytes.0.clone(),
@@ -605,6 +608,213 @@ impl Node {
         })
     }
 
+    /// A page of what happened to a set of addresses; the RPC method
+    /// `history` says what each argument and field means.
+    pub fn history(
+        &self,
+        addresses: &[String],
+        cursor: Option<&str>,
+        limit: u32,
+        with_pending: bool,
+    ) -> Result<HistoryResult, NodeError> {
+        let limit = page_limit(limit)?;
+        if addresses.is_empty() || addresses.len() > MAX_HISTORY_ADDRESSES {
+            return Err(NodeError::Limit {
+                got: addresses.len(),
+                max: MAX_HISTORY_ADDRESSES,
+            });
+        }
+        let listed = addresses
+            .iter()
+            .map(|address| address_predicate(address, self.network))
+            .collect::<Result<Vec<_>, _>>()?;
+        let predicates: BTreeSet<[u8; 32]> = listed.iter().copied().collect();
+        let set = history::address_set(&predicates);
+        let cursor = cursor.map(|text| self.read_cursor(text, set)).transpose()?;
+        let direction = cursor.map_or(Direction::Older, |cursor| cursor.direction);
+
+        let (touches, more) = history::page(
+            predicates
+                .iter()
+                .map(|predicate| self.outputs.history(predicate)),
+            direction,
+            cursor.map(|cursor| cursor.position),
+            limit,
+        );
+        let entries = touches
+            .iter()
+            .map(|touch| self.history_entry(touch))
+            .collect();
+
+        let tip = self.tip();
+        let at = |direction, position: Position| Cursor {
+            direction,
+            position,
+            block: self.block_id(position.0),
+            set,
+        };
+        let last = touches.last().map(|touch| touch.position);
+        // Everything up to the tip has been read once a page reaches it.
+        let at_tip = at(Direction::Newer, (tip.height, END_OF_BLOCK)).to_string();
+        let (older, newer, has_newer) = match (direction, cursor) {
+            (Direction::Older, first) => (
+                last.filter(|_| more)
+                    .map(|position| at(Direction::Older, position).to_string()),
+                first.is_none().then_some(at_tip),
+                false,
+            ),
+            (Direction::Newer, _) => match last.filter(|_| more) {
+                Some(position) => (None, Some(at(Direction::Newer, position).to_string()), true),
+                None => (None, Some(at_tip), false),
+            },
+        };
+
+        let (pending, pending_truncated) = match (with_pending, direction, cursor) {
+            (true, Direction::Newer, _) | (true, _, None) => {
+                let (pending, truncated) = self.pending_history(&predicates)?;
+                (Some(pending), truncated)
+            }
+            _ => (None, false),
+        };
+
+        Ok(HistoryResult {
+            tip: TipResult {
+                hash: BlockId(tip.hash.into_bytes()),
+                height: tip.height,
+                contract_root: tip.contract_root,
+            },
+            predicates: listed.into_iter().map(PredicatePoint).collect(),
+            entries,
+            older,
+            newer,
+            has_newer,
+            pending,
+            pending_truncated,
+        })
+    }
+
+    /// A cursor this node wrote, for these addresses, on a block still in
+    /// the chain.
+    fn read_cursor(&self, text: &str, set: [u8; 8]) -> Result<Cursor, NodeError> {
+        let cursor = Cursor::parse(text)
+            .ok_or_else(|| NodeError::Cursor(format!("{text:?} is not a history cursor")))?;
+        if cursor.set != set {
+            return Err(NodeError::Cursor(
+                "the cursor was made for other addresses".into(),
+            ));
+        }
+        let height = cursor.position.0;
+        if self.txindex.block(height).map(|block| block.id.0) != Some(cursor.block) {
+            return Err(NodeError::StaleCursor { height });
+        }
+        Ok(cursor)
+    }
+
+    /// The id of the block at a height this node has.
+    fn block_id(&self, height: u64) -> [u8; 32] {
+        self.txindex
+            .block(height)
+            .map(|block| block.id.0)
+            .expect("a position or the tip names a block this node has")
+    }
+
+    /// One confirmed transaction in a history.
+    fn history_entry(&self, touch: &Touch) -> HistoryEntry {
+        let record = self.txindex.get(&touch.txid);
+        let (height, _) = touch.position;
+        HistoryEntry {
+            txid: TxId(touch.txid.0),
+            height: Some(height),
+            time: self.block_time(height),
+            received_at: record.and_then(|record| record.received_at),
+            // The genesis allocation is in no block's executions, and
+            // paid no fee.
+            fee_sparks: record
+                .map_or_else(|| "0".into(), |record| record.summary.fee_sparks.clone()),
+            created: touch
+                .created
+                .iter()
+                .filter_map(|id| self.history_contract(id))
+                .collect(),
+            spent: touch
+                .spent
+                .iter()
+                .filter_map(|id| self.history_contract(id))
+                .collect(),
+        }
+    }
+
+    /// A contract as a history shows it, as it was created.
+    fn history_contract(&self, id: &ContractID) -> Option<HistoryContract> {
+        let output = self.outputs.get(id)?;
+        Some(HistoryContract {
+            id: ContractId(*id),
+            predicate: PredicatePoint(output.predicate),
+            bytes: ContractEnvelope(output.contract.clone()),
+            note: output.note.clone().map(NoteEnvelope),
+        })
+    }
+
+    /// The pending transactions that touch `predicates`, in admission
+    /// order, and whether the list was cut at `MAX_PAGE_SIZE`.
+    ///
+    /// A pending transaction can spend what an earlier pending one created,
+    /// so the contracts the pool creates for these addresses are kept as
+    /// they go by.
+    fn pending_history(
+        &self,
+        predicates: &BTreeSet<[u8; 32]>,
+    ) -> Result<(Vec<HistoryEntry>, bool), NodeError> {
+        let mut created_here = BTreeMap::new();
+        let mut entries = Vec::new();
+        for entry in self.mempool.entries() {
+            let log = entry.log().entries();
+            let (mut created, mut spent, mut fee) = (Vec::new(), Vec::new(), 0u128);
+            for (index, effect) in log.iter().enumerate() {
+                match effect {
+                    TxEntry::Input(id) => {
+                        let ours = created_here.remove(id).or_else(|| {
+                            self.history_contract(id)
+                                .filter(|contract| predicates.contains(&contract.predicate.0))
+                        });
+                        spent.extend(ours);
+                    }
+                    TxEntry::Output(contract) => {
+                        let predicate = contract.predicate.to_point().to_bytes();
+                        if predicates.contains(&predicate) {
+                            let ours = HistoryContract {
+                                id: ContractId(contract.id()),
+                                predicate: PredicatePoint(predicate),
+                                bytes: ContractEnvelope(contract_bytes(contract)?),
+                                note: note_after(log, index).map(NoteEnvelope),
+                            };
+                            created_here.insert(contract.id(), ours.clone());
+                            created.push(ours);
+                        }
+                    }
+                    TxEntry::Fee(q) => fee += u128::from(*q),
+                    _ => {}
+                }
+            }
+            if created.is_empty() && spent.is_empty() {
+                continue;
+            }
+            if entries.len() == MAX_PAGE_SIZE as usize {
+                return Ok((entries, true));
+            }
+            entries.push(HistoryEntry {
+                txid: TxId(entry.txid().0),
+                height: None,
+                time: None,
+                received_at: self.received.get(&entry.txid().0).copied(),
+                fee_sparks: fee.to_string(),
+                created,
+                spent,
+            });
+        }
+        Ok((entries, false))
+    }
+
     /// The time of the block at `height`, if the indexer knew it.
     pub fn block_time(&self, height: u64) -> Option<u64> {
         self.txindex.block(height).and_then(|block| block.time)
@@ -943,6 +1153,9 @@ fn connect_block(
     // 2. Nothing is recorded before the chain has accepted the block.
     let applied = chain.connect_with_observer(block, |record, log, error| {
         let txid = record.txid;
+        // Its place among the block's executions, the order `staged`, and
+        // so `TxIndex::at_height`, keeps.
+        let position = staged.len() as u32;
 
         let mut changes = Vec::new();
         let mut received = None;
@@ -974,6 +1187,7 @@ fn connect_block(
                         id,
                         OutputRecord {
                             height,
+                            index: position,
                             txid,
                             predicate: contract.predicate.to_point().to_bytes(),
                             contract: contract_bytes(contract)?,
@@ -1041,12 +1255,19 @@ fn connect_block(
     //    refund contract under the sender's refund predicate. That
     //    contract is real and in the accumulator, and this node can serve
     //    both a proof and a record for it.
-    for (txid, record, changes) in staged {
+    for (index, (txid, record, changes)) in staged.into_iter().enumerate() {
         for change in changes {
             match change {
                 UtxoEffect::Input(id) => {
                     utxos.remove(&id);
-                    outputs.spend(id, SpendRecord { height, txid });
+                    outputs.spend(
+                        id,
+                        SpendRecord {
+                            height,
+                            index: index as u32,
+                            txid,
+                        },
+                    );
                 }
                 UtxoEffect::Output(id, output) => {
                     utxos.insert_transient(id);
@@ -1168,6 +1389,13 @@ pub enum NodeError {
     /// Query execution gas must be positive and fit the node's bound.
     #[error("actor query gas must be 1..={MAX_QUERY_GAS}, got {0}")]
     QueryGasLimit(u64),
+    /// A history cursor's block is no longer in the chain.
+    #[error("the block at height {height} that the cursor stands on is no longer in the chain")]
+    StaleCursor { height: u64 },
+    /// A history cursor this node did not write, or wrote for other
+    /// addresses.
+    #[error("invalid cursor: {0}")]
+    Cursor(String),
     /// A lookup's pinned block is no longer the current tip.
     #[error("the expected query block is not the current tip")]
     StaleBlock,

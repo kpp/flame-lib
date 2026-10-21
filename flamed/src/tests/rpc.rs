@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flamed_rpc::{
-    codes, BlockTxEnvelope, ClientError, ContractId, FlamedApiClient, HttpClientBuilder,
+    codes, BlockTxEnvelope, ClientError, ContractId, ErrorCode, FlamedApiClient, HttpClientBuilder,
     PredicatePoint, ProofResult, TxId, TxStatusResult, MAX_SCAN_PREDICATES,
 };
 use flamekd::util::{CHANGE, RECEIVING};
@@ -219,6 +219,22 @@ async fn every_method_over_http() {
     assert_eq!(unspent.outputs[0].id, ContractId(fixture.b_id));
     assert!(unspent.outputs[0].proof.is_some());
 
+    // history, by the same address: the payment that created it, and a
+    // newer cursor that reads nothing new yet.
+    let history = client
+        .history(vec![b_address.clone()], None, 10, None)
+        .await
+        .expect("history");
+    assert_eq!(history.entries.len(), 1);
+    assert_eq!(history.entries[0].created[0].id, ContractId(fixture.b_id));
+    assert_eq!(history.older, None);
+    let head = history.newer.expect("a newer cursor");
+    let nothing_new = client
+        .history(vec![b_address.clone()], Some(head), 10, None)
+        .await
+        .expect("history");
+    assert!(nothing_new.entries.is_empty());
+
     // The note crossed HTTP with the contract, and it opens: this is all B
     // needs to spend what A sent.
     let b = account(&SEED_B);
@@ -276,6 +292,15 @@ async fn every_method_over_http() {
                 .unwrap_err()
         ),
         codes::INVALID_ADDRESS
+    );
+    assert_eq!(
+        code_of(
+            client
+                .history(vec![b_address.clone()], Some("older:0:0".into()), 10, None)
+                .await
+                .unwrap_err()
+        ),
+        ErrorCode::InvalidParams.code()
     );
 
     // A transaction the node does accept shows up as `Mempool`.
