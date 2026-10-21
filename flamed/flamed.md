@@ -80,6 +80,12 @@ and a fee floor is an opinion about what is worth relaying.
 `u64` little-endian length then the block's canonical bytes. A torn trailing
 record means the process died mid-append; the node refuses to start and
 names the byte offset, and truncating the file there is the recovery.
+SIGINT and SIGTERM do not cause one: the node stops minting at the next
+tick boundary, finishes a block already under way, answers the RPC calls in
+flight, and exits once nothing holds the node. A second signal skips the
+wait for RPC clients but still waits for the archive: it takes the node
+lock, which no append is ever outside of, and exits holding it. Only
+SIGKILL can tear a record.
 
 ## The RPC
 
@@ -227,11 +233,50 @@ that recorded session: two accounts from fixed seeds, a payment, a sweep, a
 restart, and a spend by the recipient — every transaction built by
 `flamepayments`, submitted to the node, and confirmed.
 
+## The image
+
+`flamed/Dockerfile` builds one devnet node as an image, and CI
+(`.github/workflows/flamed-image.yml`) pushes it to GHCR as
+`ghcr.io/runflame/flamed:<full commit hash>` from every push to `main` that
+touches flamed or a crate it is built from, moving `:main` along. A pull
+request into `main` runs the same build and smoke test and pushes nothing.
+Nothing deploys the image; a host is deployed by naming a commit, never
+`:main`. The tag and the `org.opencontainers.image.revision` label are the
+same full hash.
+
+| Path | What |
+|---|---|
+| `/etc/flamed/flamed.toml` | [`configs/flamed.image.toml`](configs/flamed.image.toml): RPC on `0.0.0.0:8545`, data in `/var/lib/flamed` |
+| `/etc/flamed/chainparams.toml` | `configs/chainparams.toml` with the genesis holder replaced |
+| `/etc/flamed/genesis.json` | derived from it at build time |
+| `/var/lib/flamed` | the volume: `blocks.bin`, nothing else |
+
+The genesis holder is the first receiving address of a BIP-39 mnemonic with
+no passphrase, the address a wallet restored from that phrase shows first.
+The build reads the phrase from the build secret `genesis_mnemonic`, turns
+it into that address with `flamed address`, and keeps nothing else of it: no
+layer of either stage holds the phrase. CI passes the org secret
+`FLAMED_GENESIS_MNEMONIC` on `main` and fails without it; a dry run uses
+BIP-39's public all-zero phrase (`abandon` ×11, `about`) and checks the
+address it gets.
+
+The same mnemonic and the same `chainparams.toml` give the same genesis, so
+consecutive images are normally one chain. A run summary names the genesis
+hash; an image whose hash differs from the running one is a new chain, and
+it will not start on the old `blocks.bin`.
+
+Stopping the container is a kill: `flamed` installs no signal handler, and
+as PID 1 it is not killed by SIGTERM or SIGINT, so a stop ends in SIGKILL.
+A kill mid-append leaves a torn record, the node refuses to start naming
+the byte offset, and truncating `blocks.bin` there is the recovery. The
+RPC has no authentication and no rate limit: publish it on loopback and put
+a proxy in front.
+
 ## The devnet feature
 
 Everything that exists only because minting and consensus are not designed
 yet is behind `devnet`: the genesis allocations and the interval minter.
-Without it, `flamed` has no `genesis` subcommand, contains no `Minter`, and
+Without it, `flamed` has no `genesis` or `address` subcommand, contains no `Minter`, and
 refuses a `genesis.json` that has any allocation, naming the feature in the
 refusal.
 
