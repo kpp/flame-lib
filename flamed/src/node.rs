@@ -557,6 +557,8 @@ impl Node {
                                 bytes: ContractEnvelope(contract_bytes(contract)?),
                                 note: note_after(entries, index).map(NoteEnvelope),
                                 height: None,
+                                time: None,
+                                received_at: self.received.get(&entry.txid().0).copied(),
                                 proof: None,
                             });
                         }
@@ -580,6 +582,8 @@ impl Node {
                 bytes: ContractEnvelope(record.contract.clone()),
                 note: record.note.clone().map(NoteEnvelope),
                 height: Some(record.height),
+                time: self.block_time(record.height),
+                received_at: None,
                 proof: Some(ProofBytes(proof_bytes(proof))),
             });
         }

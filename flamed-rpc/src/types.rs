@@ -240,6 +240,15 @@ pub struct UnspentEntry {
     /// The height that created it. Absent while its transaction is pending.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<u64>,
+    /// The creating block's time, in Unix seconds; see [`BlockSummary::time`].
+    /// Absent while pending, or when the indexer has no time for the block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<u64>,
+    /// While pending: when this node admitted its transaction, in Unix
+    /// seconds. Absent once confirmed, or when the node has restarted since
+    /// admitting it; see [`PendingTransaction::received_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<u64>,
     /// A membership proof valid against `tip`. Absent while its transaction
     /// is pending: a contract the chain has not inserted has nothing to prove.
     #[serde(skip_serializing_if = "Option::is_none")]

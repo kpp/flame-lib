@@ -35,6 +35,8 @@ fn unspent_follows_an_address_through_the_mempool_and_into_a_block() {
     let entry = &held.outputs[0];
     assert_eq!(entry.id.0, genesis_id);
     assert_eq!(entry.height, Some(0));
+    // Genesis anchors to no core block, so it has no time.
+    assert_eq!(entry.time, None);
     let proof = crate::cells::proof_from_bytes(&entry.proof.as_ref().expect("a proof").0)
         .expect("a served proof decodes");
     assert!(node.verify_proof(&genesis_id, &proof));
@@ -62,6 +64,7 @@ fn unspent_follows_an_address_through_the_mempool_and_into_a_block() {
     let to_change = output(&a, CHANGE, 0, GENESIS_SPARKS - payment - FEE);
     let (packaged, contracts) = signed_transfer(vec![input], &[to_b, to_change], FEE, &mut rng);
     let b_id = paying(&contracts, &b, RECEIVING, 0).id();
+    let since = crate::indexer::unix_now();
     let txid = node.submit(&submitted(&packaged)).expect("A's payment");
 
     // Confirmed only: nothing has changed yet.
@@ -89,6 +92,9 @@ fn unspent_follows_an_address_through_the_mempool_and_into_a_block() {
     assert_eq!(pending.id.0, b_id);
     assert_eq!(pending.txid.0, txid.0);
     assert_eq!(pending.height, None);
+    assert_eq!(pending.time, None);
+    let received = pending.received_at.expect("an admission time");
+    assert!((since..=crate::indexer::unix_now()).contains(&received));
     assert_eq!(pending.proof, None);
     let contract = crate::cells::contract_from_bytes(&pending.bytes.0).expect("decode");
     let note = open_note(
@@ -109,6 +115,9 @@ fn unspent_follows_an_address_through_the_mempool_and_into_a_block() {
         let entry = &confirmed.outputs[0];
         assert_eq!(entry.id.0, b_id);
         assert_eq!(entry.height, Some(1));
+        assert_eq!(entry.time, node.block_time(1));
+        assert!(entry.time.is_some());
+        assert_eq!(entry.received_at, None);
         let proof = crate::cells::proof_from_bytes(&entry.proof.as_ref().expect("a proof").0)
             .expect("a served proof decodes");
         assert!(node.verify_proof(&b_id, &proof));
