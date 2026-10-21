@@ -11,6 +11,7 @@ mod contract;
 mod node;
 mod rpc;
 mod transactions;
+mod unspent;
 
 use std::path::Path;
 

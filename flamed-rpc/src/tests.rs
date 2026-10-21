@@ -4,7 +4,7 @@
 
 use crate::types::{
     BlockId, ContractEnvelope, ContractId, NoteEnvelope, PredicatePoint, ProofBytes, ProofResult,
-    ScanEntry, ScanResult, SpentAt, TipResult, TxId, TxStatusResult,
+    ScanEntry, ScanResult, SpentAt, TipResult, TxId, TxStatusResult, UnspentEntry, UnspentResult,
 };
 
 #[test]
@@ -133,6 +133,44 @@ fn an_unspent_scan_entry_omits_its_spend() {
         serde_json::from_str(&serde_json::to_string(&spent).expect("serialize"))
             .expect("deserialize");
     assert_eq!(round_tripped, spent);
+}
+
+#[test]
+fn a_pending_unspent_entry_omits_its_height_and_proof() {
+    let confirmed = UnspentEntry {
+        id: ContractId([0x33; 32]),
+        txid: TxId([0x44; 32]),
+        bytes: ContractEnvelope(vec![0xde, 0xad]),
+        note: None,
+        height: Some(1),
+        proof: Some(ProofBytes(vec![0x01, 0x02])),
+    };
+    let result = UnspentResult {
+        tip: TipResult {
+            hash: BlockId([0x11; 32]),
+            height: 1,
+            contract_root: [0x22; 32],
+        },
+        predicate: PredicatePoint([0x55; 32]),
+        outputs: vec![
+            confirmed.clone(),
+            UnspentEntry {
+                height: None,
+                proof: None,
+                ..confirmed
+            },
+        ],
+    };
+    let json = serde_json::to_value(&result).expect("serialize");
+    assert_eq!(json["outputs"][0]["height"], 1);
+    assert_eq!(json["outputs"][0]["proof"], "AQI=");
+    assert!(json["outputs"][1].get("height").is_none());
+    assert!(json["outputs"][1].get("proof").is_none());
+    assert!(json["outputs"][1].get("note").is_none());
+    assert_eq!(
+        serde_json::from_value::<UnspentResult>(json).expect("deserialize"),
+        result
+    );
 }
 
 #[test]

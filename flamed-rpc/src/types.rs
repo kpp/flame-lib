@@ -221,6 +221,40 @@ pub struct ScanResult {
     pub outputs: Vec<ScanEntry>,
 }
 
+/// One contract an address can spend.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnspentEntry {
+    /// The contract's id.
+    pub id: ContractId,
+    /// The transaction that created it.
+    pub txid: TxId,
+    /// Its bytes, as published.
+    pub bytes: ContractEnvelope,
+    /// The `Data` entry right after it in its log, if any. Absent when none
+    /// followed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<NoteEnvelope>,
+    /// The height that created it. Absent while its transaction is pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u64>,
+    /// A membership proof valid against `tip`. Absent while its transaction
+    /// is pending: a contract the chain has not inserted has nothing to prove.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<ProofBytes>,
+}
+
+/// What one address can spend, and the tip it was answered at.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnspentResult {
+    /// The tip every proof is valid against.
+    pub tip: TipResult,
+    /// The predicate the address resolved to.
+    pub predicate: PredicatePoint,
+    /// Confirmed contracts in creation order, then pending ones in mempool
+    /// admission order.
+    pub outputs: Vec<UnspentEntry>,
+}
+
 /// Execution category and its data.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -660,4 +694,8 @@ pub mod codes {
     pub const STALE_BLOCK: i32 = -32005;
     /// Actor query execution failed, including gas exhaustion or a write attempt.
     pub const QUERY_FAILED: i32 = -32006;
+    /// An address did not decode, or is for another network. Not `-32007`:
+    /// jsonrpsee answers oversized requests with that, and reserves
+    /// `-32005..=-32011` for its own server errors.
+    pub const INVALID_ADDRESS: i32 = -32012;
 }
