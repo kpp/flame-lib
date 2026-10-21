@@ -77,6 +77,12 @@ opinion about what is worth relaying.
 `u64` little-endian length then the block's canonical bytes. A torn trailing
 record means the process died mid-append; the node refuses to start and
 names the byte offset, and truncating the file there is the recovery.
+SIGINT and SIGTERM do not cause one: the node stops minting at the next
+tick boundary, finishes a block already under way, answers the RPC calls in
+flight, and exits once nothing holds the node. A second signal skips the
+wait for RPC clients but still waits for the archive: it takes the node
+lock, which no append is ever outside of, and exits holding it. Only
+SIGKILL can tear a record.
 
 ## The RPC
 
