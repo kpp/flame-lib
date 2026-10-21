@@ -35,6 +35,15 @@ enum Command {
         #[arg(long, default_value = "./genesis.json")]
         out: PathBuf,
     },
+    /// Prints the first receiving address of the wallet whose BIP-39
+    /// mnemonic is read from stdin, with no passphrase: the address a
+    /// wallet restored from that mnemonic shows first. Devnet builds only.
+    #[cfg(feature = "devnet")]
+    Address {
+        /// The network definition whose `network` the address is for.
+        #[arg(long)]
+        chainparams: PathBuf,
+    },
     /// Opens a chain and serves it.
     Run {
         /// This node's policy file.
@@ -67,6 +76,11 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
+        #[cfg(feature = "devnet")]
+        Command::Address { chainparams } => {
+            println!("{}", first_address(&chainparams)?);
+            Ok(())
+        }
         // Built by hand rather than with `#[tokio::main]`, because
         // `flamed genesis` is synchronous and must not need a runtime.
         Command::Run { config } => tokio::runtime::Builder::new_multi_thread()
@@ -74,6 +88,31 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error>> {
             .build()?
             .block_on(run(config)),
     }
+}
+
+/// `m/35263'/network'/0'/0/0` of the mnemonic on stdin, in bech32f. The
+/// phrase is a secret: it is never echoed, not even in an error, since a
+/// parse error can name the word it stopped at.
+#[cfg(feature = "devnet")]
+fn first_address(chainparams: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read;
+
+    use flamekd::{util, Mnemonic, Network};
+    use flamepayments::SpendAccount;
+    use zeroize::Zeroizing;
+
+    let network: Network = flamed::config::ChainParamsFile::load(chainparams)?
+        .network
+        .into();
+    let mut phrase = Zeroizing::new(String::new());
+    std::io::stdin().read_to_string(&mut phrase)?;
+    let mnemonic =
+        Mnemonic::parse(phrase.trim()).map_err(|_| "stdin is not a valid BIP-39 mnemonic")?;
+    let seed = Zeroizing::new(mnemonic.to_seed(""));
+    let address = SpendAccount::from_seed(&seed, network, 0)?
+        .address_at(util::RECEIVING, 0)?
+        .to_bech32(network);
+    Ok(address)
 }
 
 async fn run(config: PathBuf) -> Result<(), Box<dyn std::error::Error>> {

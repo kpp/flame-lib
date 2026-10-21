@@ -1,0 +1,11 @@
+# One node's local policy inside the image (flamed/Dockerfile). The genesis
+# is part of the image; the volume at data_dir holds only blocks.bin. Keep
+# the three paths: the volume, the baked genesis and the published port
+# depend on them.
+data_dir = "/var/lib/flamed"
+genesis = "/etc/flamed/genesis.json"
+rpc_bind = "0.0.0.0:8545"
+block_interval_secs = 15
+# Zero on purpose, even with a public dev RPC: only the reverse proxy's
+# per-IP limit bounds free-transaction spam.
+minimum_fee = 0
