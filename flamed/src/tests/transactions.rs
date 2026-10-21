@@ -13,7 +13,23 @@ use jsonrpsee::{core::client::ClientT, rpc_params};
 use tempfile::TempDir;
 
 use super::*;
+use crate::indexer::unix_now;
 use crate::NodeError;
+
+/// The page with every admission time checked against `since` and then
+/// zeroed, so the rest compares exactly.
+fn unstamped(pending: &[PendingTransaction], since: u64) -> Vec<PendingTransaction> {
+    pending
+        .iter()
+        .map(|tx| {
+            assert!((since..=unix_now()).contains(&tx.received_at));
+            PendingTransaction {
+                received_at: 0,
+                ..tx.clone()
+            }
+        })
+        .collect()
+}
 
 #[tokio::test]
 async fn pending_transactions_are_bounded_and_disappear_after_confirmation() {
@@ -45,6 +61,7 @@ async fn pending_transactions_are_bounded_and_disappear_after_confirmation() {
     assert!(empty.transactions.is_empty());
     assert_eq!(empty.total, 0);
 
+    let since = unix_now();
     let id = client
         .submit_tx(BlockTxEnvelope(submitted(&transfer)))
         .await
@@ -54,6 +71,8 @@ async fn pending_transactions_are_bounded_and_disappear_after_confirmation() {
         block_tx: BlockTxEnvelope(submitted(&transfer)),
         fee_sparks: FEE.to_string(),
         witness_bytes: transfer.witness_size().unwrap() as u64,
+        received_at: 0,
+        locktime: 0,
     }];
     for index in 0..MAX_PAGE_SIZE {
         let tx = ScriptBuilder::new()
@@ -72,11 +91,16 @@ async fn pending_transactions_are_bounded_and_disappear_after_confirmation() {
             block_tx: BlockTxEnvelope(submitted(&tx)),
             fee_sparks: "0".into(),
             witness_bytes: tx.witness_size().unwrap() as u64,
+            received_at: 0,
+            locktime: 0,
         });
     }
     for limit in [1, 2, MAX_PAGE_SIZE] {
         let pending = client.pending_transactions(limit).await.unwrap();
-        assert_eq!(pending.transactions, expected[..limit as usize]);
+        assert_eq!(
+            unstamped(&pending.transactions, since),
+            expected[..limit as usize]
+        );
         assert_eq!(pending.total, expected.len() as u64);
     }
     assert!(client
@@ -85,10 +109,12 @@ async fn pending_transactions_are_bounded_and_disappear_after_confirmation() {
         .unwrap()
         .transactions
         .is_empty());
-    let json: serde_json::Value = client
+    let mut json: serde_json::Value = client
         .request("pending_transactions", rpc_params![1])
         .await
         .unwrap();
+    assert!(json["transactions"][0]["received_at"].as_u64().unwrap() >= since);
+    json["transactions"][0]["received_at"] = 0.into();
     assert_eq!(
         json,
         serde_json::json!({
@@ -284,9 +310,23 @@ fn transaction_details_preserve_effects_and_location_after_replay() {
         .iter()
         .any(|e| matches!(e, RpcTxEntry::Output { .. })));
     drop(node);
+    // The block times come back from the core indexer. The admission times
+    // were this node's memory, and a replay has none of it.
     let node = Node::open(&genesis, &cfg).unwrap();
     for detail in details {
-        assert_eq!(node.transaction(detail.summary.id, true).unwrap(), detail);
+        assert!(detail.block_time.is_some());
+        assert_eq!(
+            detail.received_at.is_some(),
+            detail.summary.execution == ExecutionData::External
+        );
+        let replayed = TransactionResult {
+            received_at: None,
+            ..detail
+        };
+        assert_eq!(
+            node.transaction(replayed.summary.id, true).unwrap(),
+            replayed
+        );
     }
 }
 

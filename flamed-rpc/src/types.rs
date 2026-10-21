@@ -203,6 +203,9 @@ pub struct ScanEntry {
     pub predicate: PredicatePoint,
     /// Its bytes, as published.
     pub bytes: ContractEnvelope,
+    /// The creating block's time, in Unix seconds; see [`BlockSummary::time`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<u64>,
     /// The `Data` entry right after it in its log, if any: the note a
     /// confidential output's recipient opens. Absent when none followed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,6 +298,10 @@ pub struct TransactionSummary {
     pub outputs: u32,
     /// Number of outgoing asynchronous messages.
     pub messages: u32,
+    /// The header's `locktime`, as signed: `0` for no lock, otherwise a
+    /// height or Unix time as in Bitcoin. The chain does not check it yet.
+    /// Zero for internal executions.
+    pub locktime: u32,
 }
 
 /// A public execution effect.
@@ -550,6 +557,13 @@ pub struct TransactionResult {
     pub height: u64,
     /// Containing block identifier.
     pub block: BlockId,
+    /// The containing block's time, in Unix seconds; see [`BlockSummary::time`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_time: Option<u64>,
+    /// When this node admitted it to its mempool, in Unix seconds. Absent
+    /// when this node never held it pending, or has restarted since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<u64>,
     /// Canonical public effect log as a base64 CellEnvelope.
     #[serde(with = "crate::codec::base64")]
     pub log: Vec<u8>,
@@ -579,6 +593,10 @@ pub struct PendingTransaction {
     pub fee_sparks: String,
     /// Witness size counted by the mempool, in bytes.
     pub witness_bytes: u64,
+    /// When this node admitted it, in Unix seconds.
+    pub received_at: u64,
+    /// The header's `locktime`, as signed; see [`TransactionSummary::locktime`].
+    pub locktime: u32,
 }
 
 /// A bounded view of the current mempool, in admission order.
@@ -632,6 +650,11 @@ pub struct BlockSummary {
     pub id: BlockId,
     /// Complete consensus header.
     pub header: BlockHeader,
+    /// The time of the core block the header anchors to, in Unix seconds,
+    /// as the node's core indexer reports it. Absent for genesis and for a
+    /// core block the indexer does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<u64>,
     /// External transaction count.
     pub transactions: u32,
     /// Internal execution count, including failures.

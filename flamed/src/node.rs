@@ -6,6 +6,10 @@
 //! three, so this node keeps them: `UtxoSet` for the proofs, `TxIndex` and
 //! `OutputIndex` for the history. All three are rebuilt by replaying
 //! `blocks.bin`, which is the only durable state there is.
+//!
+//! Times come from outside. A block's time is its core block's, which the
+//! core indexer reports and remembers; a transaction's admission time is
+//! this node's clock, kept in memory only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -29,12 +33,12 @@ use flamevm::{
     ActorID, Cell, CellDecode, CellEncode, CellEnvelope, CellError, CellID, CellReader, ContractID,
     Predicate, TxEntry, TxID, VMError, Value,
 };
-use sha2::{Digest, Sha256};
 
 use crate::cells::{contract_bytes, log_bytes, proof_bytes};
 use crate::config::{GenesisFile, NodeConfig};
 use crate::genesis::{self, GenesisError};
 use crate::index::{OutputIndex, OutputRecord, SpendRecord, TxIndex, TxRecord};
+use crate::indexer::{unix_now, CoreError, CoreIndexer, MockIndexer};
 use crate::inspect;
 use crate::store::{BlockStore, StoreError};
 use crate::utxos::UtxoSet;
@@ -63,17 +67,7 @@ impl CellReader for QueryDecode<'_> {
     }
 }
 
-/// This devnet's stand-in for a core-chain identity.
-///
-/// `check_header` does not constrain `core_block_hash` and the header
-/// carries no timestamp, so a devnet needs some rule; height is the only
-/// thing a second node could independently agree on.
-pub fn core_block_hash(height: u64) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"flame.devnet.core");
-    digest.update(height.to_le_bytes());
-    digest.finalize().into()
-}
+pub use crate::indexer::core_block_hash;
 
 /// An archival node.
 pub struct Node {
@@ -85,6 +79,14 @@ pub struct Node {
     txindex: TxIndex,
     outputs: OutputIndex,
     store: BlockStore,
+    // Read again only by the minter; a build without one asks it only
+    // while opening.
+    #[cfg_attr(not(any(test, feature = "devnet")), allow(dead_code))]
+    indexer: Box<dyn CoreIndexer>,
+    /// When each pending transaction was first admitted, by txid. A
+    /// transaction that leaves the pool by confirming takes its time into
+    /// `TxIndex`; one that leaves any other way takes it nowhere.
+    received: BTreeMap<[u8; 32], u64>,
 }
 
 // Every call into the node runs on the blocking pool behind a
@@ -139,9 +141,19 @@ pub enum TxStatus {
 }
 
 impl Node {
-    /// Opens a node: rebuilds the genesis, replays the archive, and starts
-    /// with an empty mempool.
+    /// Opens a node over the mock core indexer in `cfg.indexer_dir()`.
     pub fn open(genesis: &GenesisFile, cfg: &NodeConfig) -> Result<Node, NodeError> {
+        let indexer = MockIndexer::open(&cfg.indexer_dir())?;
+        Self::open_with(genesis, cfg, Box::new(indexer))
+    }
+
+    /// Opens a node: rebuilds the genesis, replays the archive with each
+    /// block's time from `indexer`, and starts with an empty mempool.
+    pub fn open_with(
+        genesis: &GenesisFile,
+        cfg: &NodeConfig,
+        indexer: Box<dyn CoreIndexer>,
+    ) -> Result<Node, NodeError> {
         fs::create_dir_all(&cfg.data_dir)?;
         let params = genesis.chain.params();
 
@@ -163,7 +175,7 @@ impl Node {
         let mut outputs = OutputIndex::new();
         let mut txindex = TxIndex::new();
 
-        txindex.insert_block(block_summary(chain.header(), 0, 0, 0, 0));
+        txindex.insert_block(block_summary(chain.header(), None, 0, 0, 0, 0));
 
         for ((id, contract), record) in allocations.iter().zip(&genesis.contracts) {
             utxos.insert_transient(*id);
@@ -183,11 +195,15 @@ impl Node {
         }
 
         let mut store = BlockStore::open(&cfg.blocks_path())?;
+        let mut untimed = 0usize;
         // An archived block was validated when it was appended, so one that
         // will not decode or connect now means the archive is wrong, not
-        // that this block is skippable.
+        // that this block is skippable. A block the indexer has no time for
+        // is still the same block; it is shown without one.
         for block in store.replay(params)? {
             let height = block.header.height;
+            let time = indexer.time_of(&block.header.core_block_hash)?;
+            untimed += usize::from(time.is_none());
             connect_block(
                 &mut chain,
                 &mut utxos,
@@ -195,11 +211,16 @@ impl Node {
                 &mut outputs,
                 None,
                 &block,
+                time,
             )
             .map_err(|source| NodeError::Replay {
                 height,
                 source: Box::new(source),
             })?;
+        }
+
+        if untimed != 0 {
+            eprintln!("flamed: the core indexer has no time for {untimed} archived block(s)");
         }
 
         let mempool = Mempool::new(&chain, mempool_policy(params, cfg.minimum_fee));
@@ -213,15 +234,22 @@ impl Node {
             txindex,
             outputs,
             store,
+            indexer,
+            received: BTreeMap::new(),
         })
     }
 
     /// Offers a transaction to the mempool.
+    ///
+    /// The admission time is kept from the first admission: a transaction
+    /// the minter takes out and puts back is the same pending transaction.
     pub fn submit(&mut self, block_tx_bytes: &[u8]) -> Result<TxID, NodeError> {
         let block_tx =
             BlockTx::from_bytes_bounded(block_tx_bytes, self.params.version, self.params.limits)
                 .map_err(NodeError::Decode)?;
-        Ok(self.mempool.admit(block_tx)?.txid())
+        let txid = self.mempool.admit(block_tx)?.txid();
+        self.received.entry(txid.0).or_insert_with(unix_now);
+        Ok(txid)
     }
 
     /// The current tip.
@@ -404,6 +432,8 @@ impl Node {
             summary: record.summary.clone(),
             height: record.height,
             block: BlockId(record.block.into_bytes()),
+            block_time: self.block_time(record.height),
+            received_at: record.received_at,
             log: record.log.clone(),
             effects: if decode_effects {
                 Some(inspect::effects(&record.log)?)
@@ -438,6 +468,12 @@ impl Node {
                         block_tx: BlockTxEnvelope(entry.transaction().to_bytes()?),
                         fee_sparks: entry.fee().to_string(),
                         witness_bytes: entry.witness_bytes() as u64,
+                        received_at: self
+                            .received
+                            .get(&entry.txid().0)
+                            .copied()
+                            .unwrap_or_default(),
+                        locktime: entry.transaction().tx.header.locktime,
                     })
                 })
                 .collect::<Result<_, CellError>>()?,
@@ -478,6 +514,7 @@ impl Node {
                     txid: TxId(record.txid.0),
                     predicate: PredicatePoint(record.predicate),
                     bytes: ContractEnvelope(record.contract.clone()),
+                    time: self.block_time(record.height),
                     note: record.note.clone().map(NoteEnvelope),
                     spent: self.outputs.spend_of(id).map(|spend| SpentAt {
                         height: spend.height,
@@ -564,6 +601,11 @@ impl Node {
         })
     }
 
+    /// The time of the block at `height`, if the indexer knew it.
+    pub fn block_time(&self, height: u64) -> Option<u64> {
+        self.txindex.block(height).and_then(|block| block.time)
+    }
+
     /// Whether a proof really proves membership at this tip.
     ///
     /// A `Transient` proof never does: it is a promise that a block is about
@@ -599,6 +641,12 @@ impl Node {
     /// two places it is unusual are called out where they happen.
     #[cfg(any(test, feature = "devnet"))]
     pub fn mint_block(&mut self) -> Result<BlockHash, NodeError> {
+        // 0. Ask the indexer first: if it cannot answer, nothing has been
+        //    touched yet and the next tick tries again.
+        let height = self.chain.height().saturating_add(1);
+        let anchor = self.indexer.anchor(height)?;
+        let core = anchor.hash;
+
         // 1. Write every candidate down before draining the pool. `BlockTx`
         //    is not `Clone` and `build_block` consumes what it is given, so
         //    bytes are the only form that survives a retry — and a candidate
@@ -611,8 +659,6 @@ impl Node {
             .map_err(NodeError::Cell)?;
         let _ = self.mempool.take_all();
 
-        let height = self.chain.height().saturating_add(1);
-        let core = core_block_hash(height);
         // The pool is already drained, so an error here would take every
         // candidate with it — and the minter treats a failed build as
         // recoverable and keeps ticking. Put them all back first.
@@ -649,11 +695,13 @@ impl Node {
             &mut self.outputs,
             Some(&mut self.mempool),
             &block,
+            Some(anchor.time),
         )
         .map_err(|source| NodeError::Archive {
             height,
             source: Box::new(source),
         })?;
+        self.settle_received();
 
         dropped += rebase.dropped;
         println!(
@@ -662,6 +710,21 @@ impl Node {
             block.transactions.len()
         );
         Ok(hash)
+    }
+
+    /// Hands each confirmed transaction its admission time, and forgets the
+    /// times of transactions that left the pool without confirming.
+    #[cfg(any(test, feature = "devnet"))]
+    fn settle_received(&mut self) {
+        let pending: BTreeSet<[u8; 32]> =
+            self.mempool.entries().map(|entry| entry.txid().0).collect();
+        for (txid, time) in std::mem::take(&mut self.received) {
+            if pending.contains(&txid) {
+                self.received.insert(txid, time);
+            } else {
+                self.txindex.set_received(&TxID(txid), time);
+            }
+        }
     }
 
     /// Builds the largest prefix of `candidates` that fits in a block.
@@ -853,7 +916,7 @@ fn build_chain(
 ///
 /// One function for minting and for replay, so an archived chain and a live
 /// one cannot drift apart. `mempool` is `None` during replay, where no pool
-/// exists yet.
+/// exists yet. `time` is the core block's, as the indexer reported it.
 fn connect_block(
     chain: &mut Blockchain,
     utxos: &mut UtxoSet,
@@ -861,6 +924,7 @@ fn connect_block(
     outputs: &mut OutputIndex,
     mempool: Option<&mut Mempool>,
     block: &Block,
+    time: Option<u64>,
 ) -> Result<(BlockHash, RebaseReport), NodeError> {
     // 1. `connect` reports only `ExecutionRecord { kind, txid }`, so the
     //    effects are read through an observer during block validation.
@@ -889,6 +953,10 @@ fn connect_block(
         //    entry after it when that entry is `Data`: the output's note,
         //    kept byte for byte and never parsed here.
         let entries = log.entries();
+        let locktime = match entries.first() {
+            Some(TxEntry::Header(header)) => header.locktime,
+            _ => 0,
+        };
         for (index, entry) in entries.iter().enumerate() {
             match entry {
                 TxEntry::Input(id) => {
@@ -943,6 +1011,7 @@ fn connect_block(
             inputs,
             outputs: output_count,
             messages: sends,
+            locktime,
         };
 
         // 4. The log itself, for anyone who asks what this transaction did.
@@ -953,6 +1022,7 @@ fn connect_block(
                 block: block_id,
                 log: log_bytes(log)?,
                 summary,
+                received_at: None,
             },
             changes,
         ));
@@ -996,6 +1066,7 @@ fn connect_block(
 
     txindex.insert_block(block_summary(
         &block.header,
+        time,
         block.transactions.len() as u32,
         internal,
         failed,
@@ -1036,6 +1107,7 @@ enum UtxoEffect {
 
 fn block_summary(
     header: &flamechain::BlockHeader,
+    time: Option<u64>,
     transactions: u32,
     internal: u32,
     failed: u32,
@@ -1056,6 +1128,7 @@ fn block_summary(
                 available_storage_units: header.state.available_storage_units,
             },
         },
+        time,
         transactions,
         internal,
         failed,
@@ -1151,6 +1224,9 @@ pub enum NodeError {
     /// The archive.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The core indexer.
+    #[error("core indexer: {0}")]
+    Indexer(#[from] CoreError),
     /// The filesystem.
     #[error(transparent)]
     Io(#[from] std::io::Error),

@@ -277,6 +277,11 @@ pub struct NodeConfig {
     /// The fee this node's mempool will not go below.
     #[serde(default)]
     pub minimum_fee: u64,
+    /// Where the mock core indexer keeps its table;
+    /// `<data_dir>/indexer` by default. Kept apart from `blocks.bin` on
+    /// purpose: it stands in for a separate service.
+    #[serde(default)]
+    pub indexer_dir: Option<PathBuf>,
 }
 
 fn default_block_interval_secs() -> u64 {
@@ -303,6 +308,13 @@ impl NodeConfig {
         self.genesis
             .clone()
             .unwrap_or_else(|| self.data_dir.join("genesis.json"))
+    }
+
+    /// Where the mock core indexer keeps its table.
+    pub fn indexer_dir(&self) -> PathBuf {
+        self.indexer_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("indexer"))
     }
 
     /// Where this node archives blocks.

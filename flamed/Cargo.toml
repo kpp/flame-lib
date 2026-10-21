@@ -30,7 +30,8 @@ thiserror = "2"
 # `net` is named explicitly. `jsonrpsee-server` enables it anyway, so the
 # build would work without it today, but the IO driver this crate's own
 # runtime turns on must not depend on another crate's feature list.
-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
 toml = "0.8"
 zeroize = { version = "1", optional = true }
 

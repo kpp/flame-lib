@@ -10,6 +10,7 @@ mod block;
 mod contract;
 mod node;
 mod rpc;
+mod times;
 mod transactions;
 mod unspent;
 
@@ -115,6 +116,7 @@ pub(crate) fn devnet<K: AccountKey>(dir: &Path, a: &Account<K>) -> (GenesisFile,
         rpc_bind: "127.0.0.1:0".parse().expect("a literal socket address"),
         block_interval_secs: 15,
         minimum_fee: 0,
+        indexer_dir: None,
     };
     (genesis, cfg)
 }
