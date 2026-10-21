@@ -17,12 +17,13 @@ pub use api::{FlamedApiClient, FlamedApiServer};
 pub use types::{
     codes, ActorCode, ActorId, ActorQueryResult, ActorResult, ActorStateEnvelope, ActorTarget,
     BlockHeader, BlockId, BlockResult, BlockSummary, BlockTxEnvelope, BlocksResult, CellId,
-    ContractEnvelope, ContractId, ContractResult, DictEntry, ExecutionData, InstructionView,
-    NoteEnvelope, PendingTransaction, PendingTransactionsResult, PredicatePoint, ProofBytes,
-    ProofResult, ScanEntry, ScanResult, SpentAt, StateCommitment, TipResult, TransactionResult,
-    TransactionSummary, TransactionsResult, TxEntry, TxId, TxStatusResult, TxValue, UnspentEntry,
-    UnspentResult, ValueCell, ValueEnvelope, MAX_PAGE_SIZE, MAX_PROOF_IDS, MAX_QUERY_BYTES,
-    MAX_QUERY_GAS, MAX_SCAN_PREDICATES,
+    ContractEnvelope, ContractId, ContractResult, DictEntry, ExecutionData, HistoryContract,
+    HistoryEntry, HistoryResult, InstructionView, NoteEnvelope, PendingTransaction,
+    PendingTransactionsResult, PredicatePoint, ProofBytes, ProofResult, ScanEntry, ScanResult,
+    SpentAt, StateCommitment, TipResult, TransactionResult, TransactionSummary, TransactionsResult,
+    TxEntry, TxId, TxStatusResult, TxValue, UnspentEntry, UnspentResult, ValueCell, ValueEnvelope,
+    MAX_HISTORY_ADDRESSES, MAX_PAGE_SIZE, MAX_PROOF_IDS, MAX_QUERY_BYTES, MAX_QUERY_GAS,
+    MAX_SCAN_PREDICATES,
 };
 
 /// Required on any `impl FlamedApiServer`.

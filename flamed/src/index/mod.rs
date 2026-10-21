@@ -8,5 +8,5 @@
 pub mod outputindex;
 pub mod txindex;
 
-pub use outputindex::{OutputIndex, OutputRecord, SpendRecord};
+pub use outputindex::{OutputIndex, OutputRecord, Position, SpendRecord, Touch};
 pub use txindex::{TxIndex, TxRecord};

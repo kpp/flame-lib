@@ -8,6 +8,7 @@
 mod actor;
 mod block;
 mod contract;
+mod history;
 mod node;
 mod rpc;
 mod times;
