@@ -8,6 +8,25 @@ pub const FEE_PER_BLOCK: i64 = 1_000;
 pub const BLOCK_REWARD_SPARKS: i64 = 5_000_000_000;
 pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    Independent,
+    Service,
+    Delegating,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Independent => "independent",
+            Self::Service => "service",
+            Self::Delegating => "delegating",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Invalid(String),
@@ -41,6 +60,12 @@ pub struct ContributionRequest {
     #[serde(default)]
     pub delay_blocks: i64,
     pub request_id: String,
+    #[serde(default)]
+    pub mode: Mode,
+    // Old clients may replay this field, but new contributions cannot specify a rate.
+    #[serde(default, deserialize_with = "legacy_commission")]
+    pub commission_bps: Option<i64>,
+    pub service_user_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +73,21 @@ pub struct Submitted {
     pub id: i64,
     pub user_id: i64,
     pub start_block: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MinterRequest {
+    pub address: String,
+    pub name: Option<String>,
+    pub service_commission_bps: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Minter {
+    pub user_id: i64,
+    pub name: String,
+    pub service_commission_bps: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,6 +110,47 @@ pub struct Contribution {
     pub burned_sats: String,
     pub fees_sats: String,
     pub reward_sparks: String,
+    pub user_name: String,
+    pub minter_id: i64,
+    pub minter_name: String,
+    pub mode: String,
+    pub commission_bps: i64,
+    pub service_user_id: Option<i64>,
+    pub commission_sparks: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Schedule {
+    pub id: i64,
+    pub user_id: i64,
+    pub budget_sats: i64,
+    pub duration: i64,
+    pub start_block: i64,
+    pub mode: String,
+    pub commission_bps: i64,
+    pub service_user_id: Option<i64>,
+    pub minter_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Service {
+    pub user_id: i64,
+    pub name: String,
+    pub commission_bps: i64,
+    pub active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MinterSummary {
+    pub user_id: i64,
+    pub address: String,
+    pub name: String,
+    pub mode: String,
+    pub commission_bps: i64,
+    pub burned_sats: String,
+    pub fees_sats: String,
+    pub reward_sparks: String,
+    pub contribution_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,8 +158,12 @@ pub struct Snapshot {
     pub height: i64,
     pub totals: Totals,
     pub contributions: Vec<Contribution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chart_contributions: Option<Vec<Schedule>>,
     pub fee_per_block: i64,
     pub block_reward_sparks: i64,
+    pub services: Vec<Service>,
+    pub minters: Vec<MinterSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,9 +176,81 @@ pub struct Database {
     connection: Connection,
 }
 
+pub fn reset(
+    path: &Path,
+    output: &mut impl std::io::Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = path.canonicalize()?;
+    if !path.is_file() {
+        return Err(std::io::Error::other("Reset requires an existing database file.").into());
+    }
+    let connection =
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    connection.busy_timeout(Duration::ZERO)?;
+    let tables: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type='table'
+             AND name IN ('accounts', 'contributions', 'blocks', 'accruals')",
+        [],
+        |row| row.get(0),
+    )?;
+    if tables != 4 {
+        return Err(std::io::Error::other("Reset requires a mint-playground database.").into());
+    }
+    connection.execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;")?;
+    let (backup_path, backup_file) = loop {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let mut name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("Database has no filename."))?
+            .to_os_string();
+        name.push(format!(".backup-{nanos}"));
+        let backup_path = path.with_file_name(name);
+        if backup_path
+            .to_str()
+            .is_none_or(|path| path.contains(['\r', '\n']))
+        {
+            return Err(
+                std::io::Error::other("Backup path must be valid single-line UTF-8.").into(),
+            );
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&backup_path) {
+            Ok(file) => break (backup_path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    connection.execute("VACUUM INTO ?1", [backup_path.to_str().unwrap()])?;
+    backup_file.sync_all()?;
+    #[cfg(unix)]
+    std::fs::File::open(backup_path.parent().unwrap())?.sync_all()?;
+    writeln!(output, "{}", backup_path.display())?;
+    output.flush()?;
+
+    // Keep the same exclusive owner from backup through migrations and the atomic reset.
+    let mut database = Database::from_connection(connection)?;
+    let transaction = database
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    transaction.execute_batch("DELETE FROM accruals; DELETE FROM contributions; DELETE FROM blocks; DELETE FROM accounts;")?;
+    transaction.commit()?;
+    Ok(())
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, Error> {
-        let mut connection = Connection::open(path)?;
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    fn from_connection(mut connection: Connection) -> Result<Self, Error> {
         // A second owner would run a second minting clock against the same ledger.
         connection.busy_timeout(Duration::ZERO)?;
         // Stored durations also accept historical 100-block records; submit enforces new limits.
@@ -104,6 +261,7 @@ impl Database {
              CREATE TABLE IF NOT EXISTS accounts (
                  id INTEGER PRIMARY KEY,
                  address TEXT NOT NULL UNIQUE,
+                 name TEXT,
                  reward_sparks INTEGER NOT NULL DEFAULT 0
                      CHECK(typeof(reward_sparks) = 'integer' AND reward_sparks >= 0)
              );
@@ -192,15 +350,215 @@ impl Database {
             transaction.commit()?;
             connection.pragma_update(None, "foreign_keys", true)?;
         }
+        let has_name: bool = connection.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('accounts') WHERE name = 'name'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_name {
+            connection.execute_batch("ALTER TABLE accounts ADD COLUMN name TEXT;")?;
+        }
+        if schema_version < 2 {
+            connection.pragma_update(None, "foreign_keys", false)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            let has_service: bool = transaction.query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('accounts') WHERE name = 'service_commission_bps'", [], |row| row.get(0)
+            )?;
+            if !has_service {
+                transaction.execute_batch("ALTER TABLE accounts ADD COLUMN service_commission_bps INTEGER
+                     CHECK(service_commission_bps IS NULL OR (typeof(service_commission_bps) = 'integer'
+                         AND service_commission_bps BETWEEN 0 AND 10000));")?;
+            }
+            transaction.execute_batch(
+                "CREATE TABLE contributions_v2 (
+                     id INTEGER PRIMARY KEY,
+                     request_id TEXT NOT NULL UNIQUE,
+                     user_id INTEGER NOT NULL REFERENCES accounts(id),
+                     budget_sats INTEGER NOT NULL CHECK(typeof(budget_sats) = 'integer'
+                         AND budget_sats BETWEEN 2000 AND 9007199254740991),
+                     duration INTEGER NOT NULL CHECK(typeof(duration) = 'integer'
+                         AND duration BETWEEN 100 AND 9007199254740991),
+                     delay_blocks INTEGER NOT NULL DEFAULT 0 CHECK(typeof(delay_blocks) = 'integer'
+                         AND delay_blocks BETWEEN 0 AND 9007199254740991),
+                     start_block INTEGER NOT NULL CHECK(typeof(start_block) = 'integer'
+                         AND start_block >= 1 AND start_block <= 9007199254740991 - duration),
+                     mode TEXT NOT NULL DEFAULT 'independent' CHECK(mode IN ('independent', 'service', 'delegating')),
+                     commission_bps INTEGER NOT NULL DEFAULT 0 CHECK(typeof(commission_bps) = 'integer'
+                         AND commission_bps BETWEEN 0 AND 10000),
+                     service_user_id INTEGER REFERENCES accounts(id),
+                     CHECK((mode = 'independent' AND commission_bps = 0 AND service_user_id IS NULL)
+                         OR (mode = 'service' AND service_user_id IS NULL)
+                         OR (mode = 'delegating' AND service_user_id IS NOT NULL)),
+                     CHECK(budget_sats / duration >= CASE WHEN mode = 'delegating' THEN 1 ELSE 1001 END)
+                 );
+                 INSERT INTO contributions_v2(id, request_id, user_id, budget_sats, duration, start_block, delay_blocks)
+                     SELECT id, request_id, user_id, budget_sats, duration, start_block, delay_blocks FROM contributions;
+                 CREATE TABLE blocks_v2 (
+                     height INTEGER PRIMARY KEY CHECK(height >= 1),
+                     burned_sats INTEGER NOT NULL CHECK(typeof(burned_sats) = 'integer' AND burned_sats >= 0),
+                     fees_sats INTEGER NOT NULL CHECK(typeof(fees_sats) = 'integer' AND fees_sats >= 0),
+                     reward_sparks INTEGER NOT NULL CHECK(typeof(reward_sparks) = 'integer'
+                         AND reward_sparks IN (0, 5000000000) AND (reward_sparks = 0 OR burned_sats > 0))
+                 );
+                 INSERT INTO blocks_v2 SELECT * FROM blocks;
+                 CREATE TABLE accruals_v2 (
+                     height INTEGER NOT NULL REFERENCES blocks(height),
+                     contribution_id INTEGER NOT NULL REFERENCES contributions(id),
+                     burned_sats INTEGER NOT NULL CHECK(typeof(burned_sats) = 'integer' AND burned_sats > 0),
+                     fees_sats INTEGER NOT NULL CHECK(fees_sats IN (0, 1000)),
+                     reward_sparks INTEGER NOT NULL CHECK(typeof(reward_sparks) = 'integer' AND reward_sparks >= 0),
+                     commission_sparks INTEGER NOT NULL DEFAULT 0 CHECK(typeof(commission_sparks) = 'integer'
+                         AND commission_sparks BETWEEN 0 AND reward_sparks),
+                     PRIMARY KEY(height, contribution_id)
+                 );
+                 INSERT INTO accruals_v2(height, contribution_id, burned_sats, fees_sats, reward_sparks)
+                     SELECT height, contribution_id, burned_sats, fees_sats, reward_sparks FROM accruals;
+                 DROP TABLE accruals;
+                 DROP TABLE contributions;
+                 DROP TABLE blocks;
+                 ALTER TABLE contributions_v2 RENAME TO contributions;
+                 ALTER TABLE blocks_v2 RENAME TO blocks;
+                 ALTER TABLE accruals_v2 RENAME TO accruals;
+                 CREATE INDEX accruals_by_contribution ON accruals(contribution_id);",
+            )?;
+            if transaction
+                .prepare("PRAGMA foreign_key_check")?
+                .exists([])?
+            {
+                return Err(Error::Invalid(
+                    "Database migration found invalid ledger references.".into(),
+                ));
+            }
+            transaction.pragma_update(None, "user_version", 2)?;
+            transaction.commit()?;
+            connection.pragma_update(None, "foreign_keys", true)?;
+        }
+        if schema_version < 3 {
+            connection.pragma_update(None, "foreign_keys", false)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            transaction.execute_batch(
+                "CREATE TABLE contributions_v3 (
+                     id INTEGER PRIMARY KEY,
+                     request_id TEXT NOT NULL UNIQUE,
+                     user_id INTEGER NOT NULL REFERENCES accounts(id),
+                     budget_sats INTEGER NOT NULL CHECK(typeof(budget_sats) = 'integer'
+                         AND budget_sats BETWEEN 2000 AND 9007199254740991),
+                     duration INTEGER NOT NULL CHECK(typeof(duration) = 'integer'
+                         AND duration BETWEEN 100 AND 9007199254740991),
+                     delay_blocks INTEGER NOT NULL DEFAULT 0 CHECK(typeof(delay_blocks) = 'integer'
+                         AND delay_blocks BETWEEN 0 AND 9007199254740991),
+                     start_block INTEGER NOT NULL CHECK(typeof(start_block) = 'integer'
+                         AND start_block >= 1 AND start_block <= 9007199254740991 - duration),
+                     mode TEXT NOT NULL DEFAULT 'independent' CHECK(mode IN ('independent', 'service', 'delegating')),
+                     service_user_id INTEGER REFERENCES accounts(id),
+                     CHECK((mode IN ('independent', 'service') AND service_user_id IS NULL)
+                         OR (mode = 'delegating' AND service_user_id IS NOT NULL)),
+                     CHECK(budget_sats / duration >= CASE WHEN mode = 'delegating' THEN 1 ELSE 1001 END)
+                 );
+                 INSERT INTO contributions_v3(id, request_id, user_id, budget_sats, duration, start_block, delay_blocks, mode, service_user_id)
+                     SELECT id, request_id, user_id, budget_sats, duration, start_block, delay_blocks, mode, service_user_id FROM contributions;
+                 DROP TABLE contributions;
+                 ALTER TABLE contributions_v3 RENAME TO contributions;",
+            )?;
+            reprice_commissions(&transaction, None)?;
+            if transaction
+                .prepare("PRAGMA foreign_key_check")?
+                .exists([])?
+            {
+                return Err(Error::Invalid(
+                    "Database migration found invalid ledger references.".into(),
+                ));
+            }
+            transaction.pragma_update(None, "user_version", 3)?;
+            transaction.commit()?;
+            connection.pragma_update(None, "foreign_keys", true)?;
+        }
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS contributions_by_user ON contributions(user_id);",
+        )?;
         Ok(Self { connection })
     }
 
+    pub fn minter(&mut self, request: MinterRequest) -> Result<Minter, Error> {
+        let address = canonical_address(&request.address)?;
+        if request
+            .service_commission_bps
+            .is_some_and(|rate| !(0..=10_000).contains(&rate))
+        {
+            return Err(Error::Invalid(
+                "Service commission must be between 0 and 10,000 basis points.".into(),
+            ));
+        }
+        let name = request
+            .name
+            .map(|name| {
+                let trimmed = name.trim();
+                if !(1..=64).contains(&trimmed.chars().count())
+                    || name.chars().any(char::is_control)
+                {
+                    return Err(Error::Invalid(
+                        "Name must contain 1–64 characters with no control characters.".into(),
+                    ));
+                }
+                Ok(trimmed.to_owned())
+            })
+            .transpose()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO accounts(address) VALUES (?1)",
+            [&address],
+        )?;
+        if let Some(name) = name {
+            transaction.execute(
+                "UPDATE accounts SET name = ?1 WHERE address = ?2",
+                params![name, address],
+            )?;
+        }
+        if let Some(rate) = request.service_commission_bps {
+            let (user_id, previous): (i64, Option<i64>) = transaction.query_row(
+                "SELECT id, service_commission_bps FROM accounts WHERE address = ?1",
+                [&address],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if previous != Some(rate) {
+                transaction.execute(
+                    "UPDATE accounts SET service_commission_bps = ?1 WHERE id = ?2",
+                    params![rate, user_id],
+                )?;
+                reprice_commissions(&transaction, Some(user_id))?;
+            }
+        }
+        let minter = transaction.query_row(
+            "SELECT id, COALESCE(name, 'Minter ' || id), service_commission_bps FROM accounts WHERE address = ?1",
+            [&address],
+            |row| {
+                Ok(Minter {
+                    user_id: row.get(0)?,
+                    name: row.get(1)?,
+                    service_commission_bps: row.get(2)?,
+                })
+            },
+        )?;
+        transaction.commit()?;
+        Ok(minter)
+    }
+
     pub fn submit(&mut self, mut request: ContributionRequest) -> Result<Submitted, Error> {
-        request.address = ReceivingAddress::from_bech32(&request.address, Network::Testnet)
-            .map_err(|_| {
-                Error::Invalid("A valid testnet Flame receiving address is required.".into())
-            })?
-            .to_bech32(Network::Testnet);
+        request.address = canonical_address(&request.address)?;
+        if (request.mode != Mode::Delegating && request.service_user_id.is_some())
+            || (request.mode == Mode::Delegating
+                && !request
+                    .service_user_id
+                    .is_some_and(|id| (1..=MAX_SAFE_INTEGER).contains(&id)))
+        {
+            return Err(Error::Invalid(
+                "Invalid mode, commission or service selection.".into(),
+            ));
+        }
         if !(16..=64).contains(&request.request_id.len())
             || !request
                 .request_id
@@ -217,7 +575,8 @@ impl Database {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous = transaction
             .query_row(
-                "SELECT c.id, c.start_block, u.address, c.budget_sats, c.duration, c.user_id, c.delay_blocks
+                "SELECT c.id, c.start_block, u.address, c.budget_sats, c.duration, c.user_id, c.delay_blocks,
+                        c.mode, c.service_user_id
              FROM contributions c JOIN accounts u ON u.id = c.user_id WHERE c.request_id = ?1",
                 [&request.request_id],
                 |row| {
@@ -229,16 +588,30 @@ impl Database {
                         row.get::<_, i64>(4)?,
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((id, start_block, address, budget, duration, user_id, delay_blocks)) = previous
+        if let Some((
+            id,
+            start_block,
+            address,
+            budget,
+            duration,
+            user_id,
+            delay_blocks,
+            mode,
+            service_user_id,
+        )) = previous
         {
             return if address == request.address
                 && budget == request.budget_sats
                 && duration == request.duration
                 && delay_blocks == request.delay_blocks
+                && mode == request.mode.as_str()
+                && service_user_id == request.service_user_id
             {
                 Ok(Submitted {
                     id,
@@ -251,6 +624,11 @@ impl Database {
                 ))
             };
         }
+        if request.commission_bps.is_some() {
+            return Err(Error::Invalid(
+                "Commission belongs to the service identity; update it via /api/minter.".into(),
+            ));
+        }
         if !(2_000..=MAX_SAFE_INTEGER).contains(&request.budget_sats)
             || !(144..=MAX_SAFE_INTEGER).contains(&request.duration)
             || !(0..=MAX_SAFE_INTEGER).contains(&request.delay_blocks)
@@ -259,9 +637,14 @@ impl Database {
                 "Budget, duration or delay is outside the supported range.".into(),
             ));
         }
-        if request.budget_sats / request.duration < FEE_PER_BLOCK + 1 {
+        let fee = if request.mode == Mode::Delegating {
+            0
+        } else {
+            FEE_PER_BLOCK
+        };
+        if request.budget_sats / request.duration < fee + 1 {
             return Err(Error::Invalid(
-                "Budget must cover 1,000 sat in fees and at least 1 sat burned per block.".into(),
+                "Budget must cover mining fees and at least 1 sat burned per block.".into(),
             ));
         }
         let height: i64 =
@@ -275,6 +658,15 @@ impl Database {
             .ok_or_else(|| {
                 Error::Invalid("Contribution schedule exceeds the supported block range.".into())
             })?;
+        if request.mode == Mode::Delegating {
+            let offered: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1 AND service_commission_bps IS NOT NULL)",
+                [request.service_user_id], |row| row.get(0),
+            )?;
+            if !offered {
+                return Err(Error::Invalid("Select an existing minting service.".into()));
+            }
+        }
         transaction.execute(
             "INSERT OR IGNORE INTO accounts(address) VALUES (?1)",
             [&request.address],
@@ -284,16 +676,25 @@ impl Database {
             [&request.address],
             |row| row.get(0),
         )?;
+        if request.mode == Mode::Service {
+            transaction.execute(
+                "UPDATE accounts SET service_commission_bps = COALESCE(service_commission_bps, 200) WHERE id = ?1",
+                [user_id],
+            )?;
+        }
         transaction.execute(
-            "INSERT INTO contributions(request_id, user_id, budget_sats, duration, start_block, delay_blocks)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO contributions(request_id, user_id, budget_sats, duration, start_block, delay_blocks,
+                 mode, service_user_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 request.request_id,
                 user_id,
                 request.budget_sats,
                 request.duration,
                 start_block,
-                request.delay_blocks
+                request.delay_blocks,
+                request.mode.as_str(),
+                request.service_user_id,
             ],
         )?;
         let id = transaction.last_insert_rowid();
@@ -316,19 +717,32 @@ impl Database {
         )?;
         let mut active = {
             let mut statement = transaction.prepare(
-                "SELECT id, user_id, budget_sats, duration, start_block FROM contributions
-                 WHERE start_block <= ?1 AND start_block + duration > ?1 ORDER BY id",
+                "SELECT c.id, c.user_id, c.budget_sats, c.duration, c.start_block, c.mode,
+                        COALESCE(m.service_commission_bps, 0), c.service_user_id
+                 FROM contributions c LEFT JOIN accounts m ON m.id = c.service_user_id
+                 WHERE c.start_block <= ?1 AND c.start_block + c.duration > ?1 ORDER BY c.id",
             )?;
             let active = statement
                 .query_map([height], |row| {
                     let budget: i64 = row.get(2)?;
                     let duration: i64 = row.get(3)?;
                     let offset = height - row.get::<_, i64>(4)?;
-                    let net = budget - duration * FEE_PER_BLOCK;
+                    let mode: String = row.get(5)?;
+                    let fee = if mode == "delegating" {
+                        0
+                    } else {
+                        FEE_PER_BLOCK
+                    };
+                    let net = budget - duration * fee;
                     Ok(Accrual {
                         id: row.get(0)?,
                         user_id: row.get(1)?,
                         burn: net / duration + i64::from(offset < net % duration),
+                        fee,
+                        service: mode == "service",
+                        commission_bps: row.get(6)?,
+                        service_user_id: row.get(7)?,
+                        eligible: true,
                         reward: 0,
                         remainder: 0,
                     })
@@ -336,23 +750,40 @@ impl Database {
                 .collect::<Result<Vec<_>, _>>()?;
             active
         };
+        let services: std::collections::HashSet<_> = active
+            .iter()
+            .filter(|item| item.service)
+            .map(|item| item.user_id)
+            .collect();
+        for item in &mut active {
+            item.eligible = item.service_user_id.is_none_or(|id| services.contains(&id));
+        }
         let total_burn: i128 = active.iter().map(|item| i128::from(item.burn)).sum();
-        let total_fees = (active.len() as i128) * i128::from(FEE_PER_BLOCK);
-        // Empty-block issuance is permanently lost, never carried into a later block.
-        let reward = if total_burn == 0 {
+        let eligible_burn: i128 = active
+            .iter()
+            .filter(|item| item.eligible)
+            .map(|item| i128::from(item.burn))
+            .sum();
+        let total_fees: i128 = active.iter().map(|item| i128::from(item.fee)).sum();
+        // With no eligible minting, issuance is permanently lost rather than carried forward.
+        let reward = if eligible_burn == 0 {
             0
         } else {
             BLOCK_REWARD_SPARKS
         };
         if reward > 0 {
-            for item in &mut active {
+            for item in active.iter_mut().filter(|item| item.eligible) {
                 let numerator = i128::from(item.burn) * i128::from(reward);
-                item.reward = (numerator / total_burn) as i64;
-                item.remainder = numerator % total_burn;
+                item.reward = (numerator / eligible_burn) as i64;
+                item.remainder = numerator % eligible_burn;
             }
             let remaining = reward - active.iter().map(|item| item.reward).sum::<i64>();
             active.sort_unstable_by(|a, b| b.remainder.cmp(&a.remainder).then(a.id.cmp(&b.id)));
-            for item in active.iter_mut().take(remaining as usize) {
+            for item in active
+                .iter_mut()
+                .filter(|item| item.eligible)
+                .take(remaining as usize)
+            {
                 item.reward += 1;
             }
         }
@@ -365,16 +796,27 @@ impl Database {
             params![height, amount(total_burn)?, amount(total_fees)?, reward],
         )?;
         for item in active {
+            let commission = if item.service_user_id.is_some() {
+                (i128::from(item.reward) * i128::from(item.commission_bps) / 10_000) as i64
+            } else {
+                0
+            };
             transaction.execute(
-                "INSERT INTO accruals(height, contribution_id, burned_sats, fees_sats, reward_sparks)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![height, item.id, item.burn, FEE_PER_BLOCK, item.reward],
+                "INSERT INTO accruals(height, contribution_id, burned_sats, fees_sats, reward_sparks, commission_sparks)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![height, item.id, item.burn, item.fee, item.reward, commission],
             )?;
             // SQLite may promote an overflowing addition to REAL; the account CHECK rejects it.
             transaction.execute(
                 "UPDATE accounts SET reward_sparks = reward_sparks + ?1 WHERE id = ?2",
-                params![item.reward, item.user_id],
+                params![item.reward - commission, item.user_id],
             )?;
+            if commission > 0 {
+                transaction.execute(
+                    "UPDATE accounts SET reward_sparks = reward_sparks + ?1 WHERE id = ?2",
+                    params![commission, item.service_user_id],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -401,14 +843,18 @@ impl Database {
         let mut statement = self.connection.prepare(
             "SELECT c.id, u.address, c.budget_sats, c.duration, c.start_block,
                  COALESCE(SUM(a.burned_sats), 0), COALESCE(SUM(a.fees_sats), 0),
-                 COALESCE(SUM(a.reward_sparks), 0), c.user_id, c.delay_blocks
-             FROM contributions c JOIN accounts u ON u.id = c.user_id
+                 COALESCE(SUM(a.reward_sparks - a.commission_sparks), 0), c.user_id, c.delay_blocks,
+                 COALESCE(u.name, 'Minter ' || u.id), m.id, COALESCE(m.name, 'Minter ' || m.id),
+                 c.mode, CASE WHEN c.mode = 'independent' THEN 0 ELSE COALESCE(m.service_commission_bps, 0) END,
+                 c.service_user_id, COALESCE(SUM(a.commission_sparks), 0)
+             FROM (SELECT * FROM contributions ORDER BY id DESC LIMIT ?1) c
+             JOIN accounts u ON u.id = c.user_id
+             JOIN accounts m ON m.id = COALESCE(c.service_user_id, c.user_id)
              LEFT JOIN accruals a ON a.contribution_id = c.id
-             WHERE ?1 OR c.start_block + c.duration - 1 >= ?2
              GROUP BY c.id ORDER BY c.id DESC",
         )?;
         let contributions = statement
-            .query_map(params![full_history, height - 10_000], |row| {
+            .query_map([if full_history { -1 } else { 200 }], |row| {
                 Ok(Contribution {
                     id: row.get(0)?,
                     user_id: row.get(8)?,
@@ -420,6 +866,82 @@ impl Database {
                     burned_sats: row.get::<_, i64>(5)?.to_string(),
                     fees_sats: row.get::<_, i64>(6)?.to_string(),
                     reward_sparks: row.get::<_, i64>(7)?.to_string(),
+                    user_name: row.get(10)?,
+                    minter_id: row.get(11)?,
+                    minter_name: row.get(12)?,
+                    mode: row.get(13)?,
+                    commission_bps: row.get(14)?,
+                    service_user_id: row.get(15)?,
+                    commission_sparks: row.get::<_, i64>(16)?.to_string(),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        let chart_contributions = if full_history {
+            None
+        } else {
+            let mut statement = self.connection.prepare(
+                "SELECT c.id, c.user_id, c.budget_sats, c.duration, c.start_block,
+                        c.mode, CASE WHEN c.mode = 'independent' THEN 0 ELSE COALESCE(m.service_commission_bps, 0) END,
+                        c.service_user_id, m.id
+                 FROM contributions c JOIN accounts m ON m.id = COALESCE(c.service_user_id, c.user_id)
+                 ORDER BY c.id DESC",
+            )?;
+            let schedules = statement
+                .query_map([], |row| {
+                    Ok(Schedule {
+                        id: row.get(0)?,
+                        user_id: row.get(1)?,
+                        budget_sats: row.get(2)?,
+                        duration: row.get(3)?,
+                        start_block: row.get(4)?,
+                        mode: row.get(5)?,
+                        commission_bps: row.get(6)?,
+                        service_user_id: row.get(7)?,
+                        minter_id: row.get(8)?,
+                    })
+                })?
+                .collect::<Result<_, _>>()?;
+            Some(schedules)
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT u.id, COALESCE(u.name, 'Minter ' || u.id), u.service_commission_bps,
+                 EXISTS(SELECT 1 FROM contributions c WHERE c.user_id = u.id AND c.mode = 'service'
+                     AND c.start_block <= ?1 AND c.start_block + c.duration > ?1)
+             FROM accounts u WHERE u.service_commission_bps IS NOT NULL ORDER BY u.id",
+        )?;
+        let services = statement
+            .query_map([height], |row| {
+                Ok(Service {
+                    user_id: row.get(0)?,
+                    name: row.get(1)?,
+                    commission_bps: row.get(2)?,
+                    active: row.get(3)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        let mut statement = self.connection.prepare(
+            "SELECT u.id, u.address, COALESCE(u.name, 'Minter ' || u.id), latest.mode,
+                    CASE WHEN latest.mode = 'independent' THEN 0 ELSE COALESCE(m.service_commission_bps, 0) END,
+                    COALESCE(SUM(a.burned_sats), 0), COALESCE(SUM(a.fees_sats), 0), u.reward_sparks,
+                    COUNT(DISTINCT c.id)
+             FROM accounts u JOIN contributions c ON c.user_id = u.id
+             JOIN contributions latest ON latest.id = (SELECT MAX(id) FROM contributions WHERE user_id = u.id)
+             JOIN accounts m ON m.id = COALESCE(latest.service_user_id, latest.user_id)
+             LEFT JOIN accruals a ON a.contribution_id = c.id
+             GROUP BY u.id ORDER BY u.id",
+        )?;
+        let minters = statement
+            .query_map([], |row| {
+                Ok(MinterSummary {
+                    user_id: row.get(0)?,
+                    address: row.get(1)?,
+                    name: row.get(2)?,
+                    mode: row.get(3)?,
+                    commission_bps: row.get(4)?,
+                    burned_sats: row.get::<_, i64>(5)?.to_string(),
+                    fees_sats: row.get::<_, i64>(6)?.to_string(),
+                    reward_sparks: row.get::<_, i64>(7)?.to_string(),
+                    contribution_count: row.get(8)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -427,8 +949,11 @@ impl Database {
             height,
             totals,
             contributions,
+            chart_contributions,
             fee_per_block: FEE_PER_BLOCK,
             block_reward_sparks: BLOCK_REWARD_SPARKS,
+            services,
+            minters,
         })
     }
 
@@ -448,10 +973,86 @@ impl Database {
     }
 }
 
+fn canonical_address(address: &str) -> Result<String, Error> {
+    ReceivingAddress::from_bech32(address, Network::Testnet)
+        .map(|address| address.to_bech32(Network::Testnet))
+        .map_err(|_| Error::Invalid("A valid testnet Flame receiving address is required.".into()))
+}
+
+fn legacy_commission<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
+    // Preserve old null-valued retries while marking the obsolete field as present.
+    Option::<i64>::deserialize(deserializer).map(|value| Some(value.unwrap_or(0)))
+}
+
+fn reprice_commissions(connection: &Connection, service_user_id: Option<i64>) -> Result<(), Error> {
+    let mut deltas = std::collections::BTreeMap::<i64, i128>::new();
+    let mut statement = connection.prepare(
+        "SELECT a.reward_sparks, a.commission_sparks, c.user_id, c.service_user_id, u.service_commission_bps
+         FROM accruals a JOIN contributions c ON c.id = a.contribution_id
+         JOIN accounts u ON u.id = c.service_user_id
+         WHERE ?1 IS NULL OR c.service_user_id = ?1",
+    )?;
+    let mut rows = statement.query([service_user_id])?;
+    while let Some(row) = rows.next()? {
+        let gross = i128::from(row.get::<_, i64>(0)?);
+        let previous = i128::from(row.get::<_, i64>(1)?);
+        let owner = row.get::<_, i64>(2)?;
+        let service = row.get::<_, i64>(3)?;
+        let rate = i128::from(row.get::<_, i64>(4)?);
+        let delta = gross * rate / 10_000 - previous;
+        *deltas.entry(owner).or_default() -= delta;
+        *deltas.entry(service).or_default() += delta;
+    }
+    let mut balances = Vec::new();
+    for (user_id, delta) in deltas.into_iter().filter(|(_, delta)| *delta != 0) {
+        let current: i64 = connection.query_row(
+            "SELECT reward_sparks FROM accounts WHERE id = ?1",
+            [user_id],
+            |row| row.get(0),
+        )?;
+        let balance = i128::from(current) + delta;
+        let balance = i64::try_from(balance)
+            .ok()
+            .filter(|balance| *balance >= 0)
+            .ok_or_else(|| {
+                Error::Invalid(
+                    "Reward accounting capacity exceeded; commission update was not applied."
+                        .into(),
+                )
+            })?;
+        balances.push((user_id, balance));
+    }
+    // Split multiplication so even cached i64 amounts never overflow SQL integer arithmetic.
+    connection.execute(
+        "UPDATE accruals SET commission_sparks = (
+             SELECT accruals.reward_sparks / 10000 * u.service_commission_bps
+                  + accruals.reward_sparks % 10000 * u.service_commission_bps / 10000
+             FROM contributions c JOIN accounts u ON u.id = c.service_user_id
+             WHERE c.id = accruals.contribution_id)
+         WHERE contribution_id IN (SELECT id FROM contributions WHERE service_user_id IS NOT NULL
+             AND (?1 IS NULL OR service_user_id = ?1))",
+        [service_user_id],
+    )?;
+    for (user_id, balance) in balances {
+        connection.execute(
+            "UPDATE accounts SET reward_sparks = ?1 WHERE id = ?2",
+            params![balance, user_id],
+        )?;
+    }
+    Ok(())
+}
+
 struct Accrual {
     id: i64,
     user_id: i64,
     burn: i64,
+    fee: i64,
+    service: bool,
+    commission_bps: i64,
+    service_user_id: Option<i64>,
+    eligible: bool,
     reward: i64,
     remainder: i128,
 }
@@ -476,11 +1077,1017 @@ mod tests {
             duration: 200,
             delay_blocks: 0,
             request_id: format!("submission-{nonce:016}"),
+            mode: Mode::Independent,
+            commission_bps: None,
+            service_user_id: None,
         }
     }
 
     fn database() -> Database {
         Database::open(Path::new(":memory:")).unwrap()
+    }
+
+    struct ResetOutput<'a> {
+        source: std::fs::File,
+        original: &'a [u8],
+        bytes: Vec<u8>,
+        fail_write: bool,
+        fail_flush: bool,
+        flushed: bool,
+    }
+
+    impl std::io::Write for ResetOutput<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                return Err(std::io::Error::other("Output unavailable"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let mut original = Vec::new();
+            std::io::Seek::rewind(&mut self.source)?;
+            std::io::Read::read_to_end(&mut self.source, &mut original)?;
+            assert_eq!(original, self.original);
+            let path = std::path::PathBuf::from(std::str::from_utf8(&self.bytes).unwrap().trim());
+            assert!(path.is_absolute());
+            let backup =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            assert_eq!(
+                backup
+                    .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+            assert_eq!(
+                backup
+                    .query_row("SELECT COUNT(*) FROM contributions", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                backup
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            self.flushed = true;
+            if self.fail_flush {
+                return Err(std::io::Error::other("Output flush failed"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reset_flushes_a_complete_backup_before_migration_or_deletion_and_aborts_on_output_errors() {
+        for (fail_write, fail_flush) in [(false, false), (true, false), (false, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("mint.sqlite3");
+            {
+                let mut db = Database::open(&path).unwrap();
+                db.submit(request(1, 1, 100)).unwrap();
+                db.tick().unwrap();
+                db.connection.execute_batch("ALTER TABLE contributions ADD COLUMN commission_bps INTEGER DEFAULT 0; PRAGMA user_version=2;").unwrap();
+            }
+            let original = std::fs::read(&path).unwrap();
+            let mut output = ResetOutput {
+                source: std::fs::File::open(&path).unwrap(),
+                original: &original,
+                bytes: Vec::new(),
+                fail_write,
+                fail_flush,
+                flushed: false,
+            };
+            let result = reset(&path, &mut output);
+            if fail_write || fail_flush {
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            } else {
+                result.unwrap();
+                assert!(output.flushed);
+                let mut db = Database::open(&path).unwrap();
+                let state = db.snapshot(true).unwrap();
+                assert_eq!(state.height, 0);
+                assert_eq!(state.totals.contribution_count, 0);
+                assert!(state.services.is_empty());
+                assert!(state.minters.is_empty());
+                assert!(db.rewards().unwrap().is_empty());
+                let submitted = db.submit(request(2, 2, 100)).unwrap();
+                assert_eq!(
+                    (submitted.id, submitted.user_id, submitted.start_block),
+                    (1, 1, 1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reset_backups_are_unique_private_and_previous_backups_remain_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mint's data.sqlite3");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.submit(request(1, 1, 100)).unwrap();
+            db.tick().unwrap();
+        }
+        let mut first = Vec::new();
+        reset(&path, &mut first).unwrap();
+        let first = std::path::PathBuf::from(String::from_utf8(first).unwrap().trim());
+        let original_backup = std::fs::read(&first).unwrap();
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.submit(request(2, 2, 100)).unwrap();
+            db.tick().unwrap();
+        }
+        let mut second = Vec::new();
+        reset(&path, &mut second).unwrap();
+        let second = std::path::PathBuf::from(String::from_utf8(second).unwrap().trim());
+        assert_ne!(first, second);
+        assert!(second.is_file());
+        assert_eq!(std::fs::read(&first).unwrap(), original_backup);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn reset_refuses_a_running_owner_without_a_backup_or_any_data_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mint.sqlite3");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.submit(request(1, 1, 100)).unwrap();
+            db.tick().unwrap();
+        }
+        let original = std::fs::read(&path).unwrap();
+        let db = Database::open(&path).unwrap();
+        let mut output = Vec::new();
+        assert!(reset(&path, &mut output).is_err());
+        assert!(output.is_empty());
+        assert_eq!(db.snapshot(true).unwrap().height, 1);
+        drop(db);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn reset_refuses_missing_corrupt_empty_foreign_and_multiline_database_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.sqlite3");
+        let mut output = Vec::new();
+        assert!(reset(&missing, &mut output).is_err());
+        assert!(!missing.exists());
+        for (name, bytes) in [
+            ("corrupt.sqlite3", b"not sqlite".as_slice()),
+            ("empty.sqlite3", b"".as_slice()),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            assert!(reset(&path, &mut output).is_err());
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        let foreign = directory.path().join("foreign.sqlite3");
+        Connection::open(&foreign)
+            .unwrap()
+            .execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let foreign_bytes = std::fs::read(&foreign).unwrap();
+        assert!(reset(&foreign, &mut output).is_err());
+        assert_eq!(std::fs::read(&foreign).unwrap(), foreign_bytes);
+        let multiline = directory.path().join("mint\n.sqlite3");
+        drop(Database::open(&multiline).unwrap());
+        let multiline_bytes = std::fs::read(&multiline).unwrap();
+        assert!(reset(&multiline, &mut output).is_err());
+        assert_eq!(std::fs::read(&multiline).unwrap(), multiline_bytes);
+        assert!(output.is_empty());
+        assert!(!std::fs::read_dir(directory.path())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".backup-")));
+    }
+
+    fn minter_request(seed: u8, name: Option<&str>) -> MinterRequest {
+        MinterRequest {
+            address: address(seed),
+            name: name.map(str::to_owned),
+            service_commission_bps: None,
+        }
+    }
+
+    fn service_request(seed: u8, nonce: u8) -> ContributionRequest {
+        let mut value = request(seed, nonce, 100);
+        value.mode = Mode::Service;
+        value.duration = 144;
+        value.budget_sats = 144 * 1_020;
+        value
+    }
+
+    fn set_commission(db: &mut Database, seed: u8, rate: i64) -> Result<Minter, Error> {
+        let mut profile = minter_request(seed, None);
+        profile.service_commission_bps = Some(rate);
+        db.minter(profile)
+    }
+
+    fn delegated_request(seed: u8, nonce: u8, service: i64) -> ContributionRequest {
+        let mut value = request(seed, nonce, 100);
+        value.mode = Mode::Delegating;
+        value.service_user_id = Some(service);
+        value.duration = 144;
+        value.budget_sats = 144 * 20;
+        value
+    }
+
+    #[test]
+    fn delegation_shares_fees_and_credits_exact_net_rewards_and_commissions() {
+        let mut db = database();
+        let service = db.submit(service_request(1, 1)).unwrap();
+        db.minter(minter_request(1, Some("Service"))).unwrap();
+        let delegated = db.submit(delegated_request(2, 2, service.user_id)).unwrap();
+        db.tick().unwrap();
+        let state = db.snapshot(false).unwrap();
+        assert_eq!(state.totals.burned_sats, "40");
+        assert_eq!(state.totals.fees_sats, "1000");
+        assert_eq!(state.totals.reward_sparks, "5000000000");
+        let contribution = &state.contributions[0];
+        assert_eq!(contribution.id, delegated.id);
+        assert_eq!(contribution.mode, "delegating");
+        assert_eq!(contribution.fees_sats, "0");
+        assert_eq!(contribution.burned_sats, "20");
+        assert_eq!(contribution.reward_sparks, "2450000000");
+        assert_eq!(contribution.commission_sparks, "50000000");
+        assert_eq!(contribution.commission_bps, 200);
+        assert_eq!(contribution.minter_id, service.user_id);
+        assert_eq!(contribution.minter_name, "Service");
+        assert_eq!(state.minters[0].reward_sparks, "2550000000");
+        assert_eq!(state.minters[0].burned_sats, "20");
+        assert_eq!(state.minters[0].fees_sats, "1000");
+        assert_eq!(state.minters[1].reward_sparks, "2450000000");
+        assert_eq!(
+            state
+                .minters
+                .iter()
+                .map(|m| m.reward_sparks.parse::<i64>().unwrap())
+                .sum::<i64>(),
+            BLOCK_REWARD_SPARKS
+        );
+        assert_eq!(state.services[0].commission_bps, 200);
+        assert!(state.services[0].active);
+        let ledger: (i64, i64) = db
+            .connection
+            .query_row(
+                "SELECT SUM(reward_sparks), SUM(commission_sparks) FROM accruals",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ledger, (BLOCK_REWARD_SPARKS, 50_000_000));
+        let schedule = &state.chart_contributions.unwrap()[0];
+        assert_eq!(
+            (
+                schedule.mode.as_str(),
+                schedule.minter_id,
+                schedule.commission_bps
+            ),
+            ("delegating", service.user_id, 200)
+        );
+    }
+
+    #[test]
+    fn inactive_service_loses_delegated_burn_without_fees_or_rewards_and_can_resume() {
+        let mut db = database();
+        let mut first = service_request(1, 1);
+        first.delay_blocks = 2;
+        let service = db.submit(first).unwrap();
+        let mut delegated = delegated_request(2, 2, service.user_id);
+        delegated.duration = 300;
+        delegated.budget_sats = 6_000;
+        let delegate_id = db.submit(delegated.clone()).unwrap().id;
+        for height in 1..=300 {
+            db.tick().unwrap();
+            let eligible = (3..147).contains(&height) || (150..294).contains(&height);
+            let ledger: (i64,i64,i64) = db.connection.query_row(
+                "SELECT fees_sats,reward_sparks,commission_sparks FROM accruals WHERE height=?1 AND contribution_id=?2",
+                params![height,delegate_id],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+            ).unwrap();
+            assert_eq!(
+                ledger,
+                if eligible {
+                    (0, 2_500_000_000, 50_000_000)
+                } else {
+                    (0, 0, 0)
+                }
+            );
+            if height == 147 {
+                let inactive = db.snapshot(false).unwrap();
+                assert!(!inactive.services[0].active);
+                let mut resumed = service_request(1, 3);
+                resumed.delay_blocks = 2;
+                assert_eq!(db.submit(resumed).unwrap().start_block, 150);
+                assert_eq!(db.submit(delegated.clone()).unwrap().id, delegate_id);
+            }
+        }
+        let state = db.snapshot(true).unwrap();
+        assert_eq!(state.totals.burned_sats, "11760");
+        assert_eq!(state.totals.fees_sats, "288000");
+        assert_eq!(
+            state.totals.reward_sparks,
+            (288 * BLOCK_REWARD_SPARKS).to_string()
+        );
+        assert_eq!(state.services[0].commission_bps, 200);
+        assert!(!state.services[0].active);
+        assert_eq!(
+            state
+                .contributions
+                .iter()
+                .find(|c| c.id == delegate_id)
+                .unwrap()
+                .commission_bps,
+            200
+        );
+        assert_eq!(db.submit(delegated).unwrap().id, delegate_id);
+        let future = delegated_request(3, 4, service.user_id);
+        assert_eq!(db.submit(future).unwrap().start_block, 301);
+        db.tick().unwrap();
+        let lost = db
+            .connection
+            .query_row(
+                "SELECT burned_sats,fees_sats,reward_sparks FROM blocks WHERE height=301",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(lost, (20, 0, 0));
+    }
+
+    #[test]
+    fn service_identity_rate_applies_to_all_contributions_and_old_quotes_only_work_on_retries() {
+        let mut db = database();
+        let original_service = service_request(1, 1);
+        let service = db.submit(original_service.clone()).unwrap();
+        let mut delegated = delegated_request(2, 2, service.user_id);
+        let accepted = db.submit(delegated.clone()).unwrap();
+        set_commission(&mut db, 1, 500).unwrap();
+        let mut changed = service_request(1, 3);
+        changed.delay_blocks = 1000;
+        db.submit(changed).unwrap();
+        assert_eq!(db.submit(original_service).unwrap().id, service.id);
+        assert_eq!(db.snapshot(false).unwrap().services[0].commission_bps, 500);
+        assert_eq!(db.submit(delegated.clone()).unwrap().id, accepted.id);
+        delegated.commission_bps = Some(200);
+        assert_eq!(db.submit(delegated.clone()).unwrap().id, accepted.id);
+        delegated.commission_bps = Some(500);
+        assert_eq!(db.submit(delegated.clone()).unwrap().id, accepted.id);
+        delegated.request_id = "new-delegation-0001".into();
+        delegated.commission_bps = Some(200);
+        assert!(matches!(
+            db.submit(delegated.clone()),
+            Err(Error::Invalid(_))
+        ));
+        delegated.commission_bps = None;
+        let new = db.submit(delegated).unwrap();
+        assert_eq!(
+            db.snapshot(false)
+                .unwrap()
+                .contributions
+                .iter()
+                .find(|c| c.id == new.id)
+                .unwrap()
+                .commission_bps,
+            500
+        );
+        for mut invalid in [
+            request(3, 4, 100),
+            service_request(3, 5),
+            delegated_request(3, 6, 999),
+        ] {
+            if invalid.mode == Mode::Independent {
+                invalid.commission_bps = Some(0);
+            }
+            if invalid.mode == Mode::Service {
+                invalid.service_user_id = Some(service.user_id);
+            }
+            assert!(matches!(db.submit(invalid), Err(Error::Invalid(_))));
+        }
+        for rate in [-1, 10_001, i64::MAX] {
+            assert!(matches!(
+                set_commission(&mut db, 3, rate),
+                Err(Error::Invalid(_))
+            ));
+            let mut invalid = service_request(3, 7);
+            invalid.commission_bps = Some(rate);
+            assert!(matches!(db.submit(invalid.clone()), Err(Error::Invalid(_))));
+            invalid.mode = Mode::Delegating;
+            invalid.service_user_id = Some(service.user_id);
+            assert!(matches!(db.submit(invalid), Err(Error::Invalid(_))));
+        }
+        let mut chain = delegated_request(3, 8, accepted.user_id);
+        assert!(matches!(db.submit(chain.clone()), Err(Error::Invalid(_))));
+        chain.service_user_id = None;
+        assert!(matches!(db.submit(chain), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn identity_rate_reprices_finished_active_and_future_delegations_without_changing_issuance() {
+        let mut db = database();
+        let first = set_commission(&mut db, 1, 200).unwrap();
+        assert_eq!(first.service_commission_bps, Some(200));
+        assert!(!db.snapshot(false).unwrap().services[0].active);
+        set_commission(&mut db, 2, 1_000).unwrap();
+        let service = db.submit(service_request(1, 1)).unwrap();
+        let other = db.submit(service_request(2, 2)).unwrap();
+        let finished = db.submit(delegated_request(3, 3, service.user_id)).unwrap();
+        let mut active = delegated_request(4, 4, service.user_id);
+        active.duration = 288;
+        active.budget_sats = 5_760;
+        let active = db.submit(active).unwrap();
+        let mut future = delegated_request(3, 5, service.user_id);
+        future.delay_blocks = 200;
+        let future = db.submit(future).unwrap();
+        db.submit(delegated_request(5, 6, other.user_id)).unwrap();
+        for _ in 0..145 {
+            db.tick().unwrap();
+        }
+        let totals = serde_json::to_value(db.snapshot(true).unwrap().totals).unwrap();
+        set_commission(&mut db, 1, 5_000).unwrap();
+        let state = db.snapshot(false).unwrap();
+        assert_eq!(serde_json::to_value(&state.totals).unwrap(), totals);
+        for id in [service.id, finished.id, active.id, future.id] {
+            assert_eq!(
+                state
+                    .contributions
+                    .iter()
+                    .find(|c| c.id == id)
+                    .unwrap()
+                    .commission_bps,
+                5_000
+            );
+        }
+        assert_eq!(state.minters[0].reward_sparks, "288000000000");
+        assert_eq!(state.minters[1].reward_sparks, "158400000000");
+        assert_eq!(state.minters[2].reward_sparks, "72000000000");
+        assert_eq!(state.minters[3].reward_sparks, "72000000000");
+        assert_eq!(state.minters[4].reward_sparks, "129600000000");
+        assert_eq!(
+            state
+                .minters
+                .iter()
+                .map(|m| m.reward_sparks.parse::<i64>().unwrap())
+                .sum::<i64>(),
+            144 * BLOCK_REWARD_SPARKS
+        );
+        assert!(state
+            .chart_contributions
+            .unwrap()
+            .iter()
+            .filter(|c| c.minter_id == service.user_id)
+            .all(|c| c.commission_bps == 5_000));
+        let loaded = db.minter(minter_request(1, None)).unwrap();
+        assert_eq!(loaded.service_commission_bps, Some(5_000));
+        assert_eq!(
+            db.minter(minter_request(1, Some("Renamed")))
+                .unwrap()
+                .service_commission_bps,
+            Some(5_000)
+        );
+        set_commission(&mut db, 1, 0).unwrap();
+        let zero = db.snapshot(true).unwrap();
+        assert_eq!(zero.minters[0].reward_sparks, "144000000000");
+        assert_eq!(zero.minters[2].reward_sparks, "144000000000");
+        set_commission(&mut db, 1, 10_000).unwrap();
+        let full = db.snapshot(true).unwrap();
+        assert_eq!(full.minters[0].reward_sparks, "432000000000");
+        assert_eq!(full.minters[2].reward_sparks, "0");
+        assert_eq!(full.minters[3].reward_sparks, "0");
+        assert_eq!(serde_json::to_value(&full.totals).unwrap(), totals);
+        db.submit(service_request(1, 7)).unwrap();
+        db.tick().unwrap();
+        let latest = db.snapshot(true).unwrap();
+        assert_eq!(latest.services[0].commission_bps, 10_000);
+        assert_eq!(latest.minters[0].reward_sparks, "437000000000");
+    }
+
+    #[test]
+    fn repricing_rounds_each_accrual_separately_and_self_delegation_has_no_balance_delta() {
+        let mut db = database();
+        let service = db.submit(service_request(1, 1)).unwrap();
+        let delegated = db.submit(delegated_request(2, 2, service.user_id)).unwrap();
+        db.submit(request(3, 3, 100)).unwrap();
+        for _ in 0..10 {
+            db.tick().unwrap();
+        }
+        let gross = db
+            .connection
+            .prepare("SELECT reward_sparks FROM accruals WHERE contribution_id=?1 ORDER BY height")
+            .unwrap()
+            .query_map([delegated.id], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let expected: i64 = gross
+            .iter()
+            .map(|v| (i128::from(*v) * 333 / 10_000) as i64)
+            .sum();
+        assert_ne!(
+            expected,
+            (i128::from(gross.iter().sum::<i64>()) * 333 / 10_000) as i64
+        );
+        set_commission(&mut db, 1, 333).unwrap();
+        let state = db.snapshot(true).unwrap();
+        let contribution = state
+            .contributions
+            .iter()
+            .find(|c| c.id == delegated.id)
+            .unwrap();
+        assert_eq!(contribution.commission_sparks, expected.to_string());
+        assert_eq!(
+            contribution.reward_sparks,
+            (gross.iter().sum::<i64>() - expected).to_string()
+        );
+
+        let mut db = database();
+        let service = db.submit(service_request(1, 1)).unwrap();
+        db.submit(delegated_request(1, 2, service.user_id)).unwrap();
+        db.tick().unwrap();
+        for rate in [0, 10_000, 333] {
+            set_commission(&mut db, 1, rate).unwrap();
+            assert_eq!(
+                db.rewards().unwrap()[0].reward_sparks,
+                BLOCK_REWARD_SPARKS.to_string()
+            );
+        }
+        db.connection
+            .execute(
+                "UPDATE accounts SET reward_sparks=?1 WHERE id=?2",
+                params![i64::MAX, service.user_id],
+            )
+            .unwrap();
+        set_commission(&mut db, 1, 10_000).unwrap();
+        assert_eq!(db.rewards().unwrap()[0].reward_sparks, i64::MAX.to_string());
+    }
+
+    #[test]
+    fn identity_repricing_overflow_or_underflow_rolls_back_name_rate_cache_and_balances() {
+        let mut db = database();
+        let service = db.submit(service_request(1, 1)).unwrap();
+        db.submit(delegated_request(2, 2, service.user_id)).unwrap();
+        db.tick().unwrap();
+        for (balance, rate) in [(i64::MAX - 1, 10_000), (0, 0)] {
+            db.connection
+                .execute(
+                    "UPDATE accounts SET reward_sparks=?1 WHERE id=?2",
+                    params![balance, service.user_id],
+                )
+                .unwrap();
+            let before = serde_json::to_value(db.snapshot(true).unwrap()).unwrap();
+            let mut profile = minter_request(1, Some("Must roll back"));
+            profile.service_commission_bps = Some(rate);
+            assert!(matches!(db.minter(profile), Err(Error::Invalid(_))));
+            assert_eq!(
+                serde_json::to_value(db.snapshot(true).unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(
+                db.minter(minter_request(1, None))
+                    .unwrap()
+                    .service_commission_bps,
+                Some(200)
+            );
+        }
+    }
+
+    #[test]
+    fn version_two_quotes_migrate_to_current_identity_rate_preserving_gross_ledger_and_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mint.sqlite3");
+        let original_service = service_request(1, 1);
+        let first = delegated_request(2, 2, 1);
+        let second = delegated_request(3, 3, 1);
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.submit(original_service.clone()).unwrap();
+            db.submit(first.clone()).unwrap();
+            db.submit(second.clone()).unwrap();
+            db.tick().unwrap();
+            db.connection.execute_batch(
+                "ALTER TABLE contributions ADD COLUMN commission_bps INTEGER NOT NULL DEFAULT 0;
+                 UPDATE contributions SET commission_bps = CASE id WHEN 1 THEN 200 WHEN 2 THEN 0 ELSE 10000 END;
+                 UPDATE accruals SET commission_sparks = CASE contribution_id WHEN 3 THEN reward_sparks ELSE 0 END;
+                 UPDATE accounts SET reward_sparks =
+                     COALESCE((SELECT SUM(a.reward_sparks-a.commission_sparks) FROM accruals a JOIN contributions c
+                         ON c.id=a.contribution_id WHERE c.user_id=accounts.id),0)
+                     + COALESCE((SELECT SUM(a.commission_sparks) FROM accruals a JOIN contributions c
+                         ON c.id=a.contribution_id WHERE c.service_user_id=accounts.id),0);
+                 UPDATE accounts SET service_commission_bps=500 WHERE id=1;
+                 PRAGMA user_version=2;",
+            ).unwrap();
+        }
+        let snapshot;
+        {
+            let mut db = Database::open(&path).unwrap();
+            let state = db.snapshot(true).unwrap();
+            assert_eq!(state.height, 1);
+            assert_eq!(state.totals.burned_sats, "60");
+            assert_eq!(state.totals.fees_sats, "1000");
+            assert_eq!(state.totals.reward_sparks, "5000000000");
+            assert_eq!(state.minters[0].reward_sparks, "1833333333");
+            assert_eq!(state.minters[1].reward_sparks, "1583333334");
+            assert_eq!(state.minters[2].reward_sparks, "1583333333");
+            assert!(state.contributions.iter().all(|c| c.commission_bps == 500));
+            assert_eq!(state.contributions[0].commission_sparks, "83333333");
+            assert_eq!(state.contributions[1].commission_sparks, "83333333");
+            for (mut retry, quote, id) in [
+                (original_service.clone(), 200, 1),
+                (first.clone(), 0, 2),
+                (second.clone(), 10000, 3),
+            ] {
+                retry.commission_bps = Some(quote);
+                assert_eq!(db.submit(retry).unwrap().id, id);
+            }
+            assert_eq!(
+                db.minter(minter_request(1, None))
+                    .unwrap()
+                    .service_commission_bps,
+                Some(500)
+            );
+            let has_quote:bool=db.connection.query_row("SELECT COUNT(*)>0 FROM pragma_table_info('contributions') WHERE name='commission_bps'",[],|row|row.get(0)).unwrap();
+            assert!(!has_quote);
+            assert!(!db
+                .connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap());
+            snapshot = serde_json::to_value(state).unwrap();
+        }
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(db.snapshot(true).unwrap()).unwrap(),
+            snapshot
+        );
+        assert_eq!(db.submit(first).unwrap().id, 2);
+        assert_eq!(db.submit(second).unwrap().id, 3);
+        let mut newer = original_service;
+        newer.request_id = "new-service-keeps-rate-0001".into();
+        db.submit(newer).unwrap();
+        assert_eq!(db.snapshot(true).unwrap().services[0].commission_bps, 500);
+    }
+
+    #[test]
+    fn zero_full_and_self_commission_conserve_every_spark() {
+        for rate in [0, 10_000] {
+            let mut db = database();
+            set_commission(&mut db, 1, rate).unwrap();
+            let service = db.submit(service_request(1, 1)).unwrap();
+            db.submit(delegated_request(2, 2, service.user_id)).unwrap();
+            db.tick().unwrap();
+            let state = db.snapshot(true).unwrap();
+            assert_eq!(
+                state.contributions[0].commission_sparks,
+                (2_500_000_000i64 * rate / 10_000).to_string()
+            );
+            assert_eq!(
+                state.contributions[0].reward_sparks,
+                (2_500_000_000i64 * (10_000 - rate) / 10_000).to_string()
+            );
+            assert_eq!(
+                state
+                    .minters
+                    .iter()
+                    .map(|m| m.reward_sparks.parse::<i64>().unwrap())
+                    .sum::<i64>(),
+                BLOCK_REWARD_SPARKS
+            );
+        }
+        let mut db = database();
+        set_commission(&mut db, 1, 10_000).unwrap();
+        let service = db.submit(service_request(1, 1)).unwrap();
+        db.submit(delegated_request(1, 2, service.user_id)).unwrap();
+        db.tick().unwrap();
+        let state = db.snapshot(true).unwrap();
+        assert_eq!(state.minters.len(), 1);
+        assert_eq!(
+            state.minters[0].reward_sparks,
+            BLOCK_REWARD_SPARKS.to_string()
+        );
+        assert_eq!(state.minters[0].contribution_count, 2);
+        assert_eq!(state.totals.fees_sats, "1000");
+    }
+
+    #[test]
+    fn commission_credit_overflow_rolls_back_owner_rewards_and_entire_block() {
+        let mut db = database();
+        let service = db.submit(service_request(1, 1)).unwrap();
+        db.submit(delegated_request(2, 2, service.user_id)).unwrap();
+        db.connection
+            .execute(
+                "UPDATE accounts SET reward_sparks=?1 WHERE id=?2",
+                params![i64::MAX - 2_500_000_000, service.user_id],
+            )
+            .unwrap();
+        assert!(matches!(db.tick(), Err(Error::Storage(_))));
+        let state = db.snapshot(true).unwrap();
+        assert_eq!(state.height, 0);
+        assert_eq!(state.totals.reward_sparks, "0");
+        assert!(state
+            .contributions
+            .iter()
+            .all(|c| c.reward_sparks == "0" && c.commission_sparks == "0"));
+        assert_eq!(state.minters[1].reward_sparks, "0");
+        let count: i64 = db
+            .connection
+            .query_row("SELECT COUNT(*) FROM accruals", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn version_one_ledger_migrates_and_delegation_terms_and_balances_survive_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mint.sqlite3");
+        let mut legacy = request(1, 1, 100);
+        legacy.duration = 100;
+        legacy.budget_sats = 100_100;
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(
+                "CREATE TABLE accounts(id INTEGER PRIMARY KEY, address TEXT NOT NULL UNIQUE, name TEXT,
+                     reward_sparks INTEGER NOT NULL DEFAULT 0 CHECK(typeof(reward_sparks)='integer' AND reward_sparks>=0));
+                 CREATE TABLE contributions(id INTEGER PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+                     user_id INTEGER NOT NULL REFERENCES accounts(id), budget_sats INTEGER NOT NULL,
+                     duration INTEGER NOT NULL, delay_blocks INTEGER NOT NULL DEFAULT 0, start_block INTEGER NOT NULL,
+                     CHECK(budget_sats>=duration*1001));
+                 CREATE TABLE blocks(height INTEGER PRIMARY KEY, burned_sats INTEGER NOT NULL, fees_sats INTEGER NOT NULL,
+                     reward_sparks INTEGER NOT NULL CHECK((burned_sats=0 AND reward_sparks=0)
+                         OR (burned_sats>0 AND reward_sparks=5000000000)));
+                 CREATE TABLE accruals(height INTEGER NOT NULL REFERENCES blocks(height),
+                     contribution_id INTEGER NOT NULL REFERENCES contributions(id), burned_sats INTEGER NOT NULL,
+                     fees_sats INTEGER NOT NULL CHECK(fees_sats=1000), reward_sparks INTEGER NOT NULL,
+                     PRIMARY KEY(height,contribution_id));
+                 INSERT INTO blocks VALUES(1,1,1000,5000000000);
+                 PRAGMA user_version=1;",
+            ).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO accounts VALUES(7,?1,'Alice',5000000000)",
+                    [&legacy.address],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO contributions VALUES(42,?1,7,100100,100,0,1)",
+                    [&legacy.request_id],
+                )
+                .unwrap();
+            connection
+                .execute("INSERT INTO accruals VALUES(1,42,1,1000,5000000000)", [])
+                .unwrap();
+        }
+        let delegated;
+        let snapshot;
+        let rewards;
+        {
+            let mut db = Database::open(&path).unwrap();
+            let state = db.snapshot(true).unwrap();
+            assert_eq!(state.contributions[0].id, 42);
+            assert_eq!(state.contributions[0].user_id, 7);
+            assert_eq!(state.contributions[0].mode, "independent");
+            assert_eq!(state.contributions[0].commission_sparks, "0");
+            assert_eq!(state.contributions[0].reward_sparks, "5000000000");
+            assert_eq!(state.contributions[0].user_name, "Alice");
+            assert_eq!(db.submit(legacy.clone()).unwrap().id, 42);
+            set_commission(&mut db, 2, 333).unwrap();
+            let service = db.submit(service_request(2, 2)).unwrap();
+            assert_eq!((service.id, service.user_id), (43, 8));
+            delegated = delegated_request(3, 3, service.user_id);
+            assert_eq!(db.submit(delegated.clone()).unwrap().id, 44);
+            db.tick().unwrap();
+            snapshot = serde_json::to_value(db.snapshot(true).unwrap()).unwrap();
+            rewards = serde_json::to_value(db.rewards().unwrap()).unwrap();
+            assert!(!db
+                .connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap());
+        }
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(db.snapshot(true).unwrap()).unwrap(),
+            snapshot
+        );
+        assert_eq!(
+            serde_json::to_value(db.rewards().unwrap()).unwrap(),
+            rewards
+        );
+        assert_eq!(db.submit(delegated).unwrap().id, 44);
+        assert_eq!(db.submit(legacy).unwrap().id, 42);
+        assert_eq!(db.snapshot(true).unwrap().services[0].commission_bps, 333);
+        assert_eq!(
+            db.snapshot(true).unwrap().contributions[0].commission_bps,
+            333
+        );
+        assert_eq!(
+            db.rewards()
+                .unwrap()
+                .iter()
+                .map(|r| r.reward_sparks.parse::<i64>().unwrap())
+                .sum::<i64>(),
+            2 * BLOCK_REWARD_SPARKS
+        );
+    }
+
+    #[test]
+    fn inactive_delegation_does_not_dilute_independent_rewards_or_pay_commission() {
+        let mut db = database();
+        let mut future = service_request(1, 1);
+        future.delay_blocks = 1000;
+        let service = db.submit(future).unwrap();
+        db.submit(delegated_request(2, 2, service.user_id)).unwrap();
+        db.submit(request(3, 3, 100)).unwrap();
+        db.tick().unwrap();
+        let state = db.snapshot(true).unwrap();
+        assert_eq!(state.totals.burned_sats, "21");
+        assert_eq!(state.totals.fees_sats, "1000");
+        assert_eq!(state.totals.reward_sparks, BLOCK_REWARD_SPARKS.to_string());
+        assert_eq!(
+            state.contributions[0].reward_sparks,
+            BLOCK_REWARD_SPARKS.to_string()
+        );
+        assert_eq!(state.contributions[1].reward_sparks, "0");
+        assert_eq!(state.contributions[1].commission_sparks, "0");
+        assert!(!state.services[0].active);
+    }
+
+    #[test]
+    fn minter_profiles_share_existing_incremental_account_ids() {
+        let mut db = database();
+        let first = db.minter(minter_request(1, None)).unwrap();
+        assert_eq!((first.user_id, first.name.as_str()), (1, "Minter 1"));
+        let mut uppercase = minter_request(1, None);
+        uppercase.address.make_ascii_uppercase();
+        assert_eq!(db.minter(uppercase).unwrap().user_id, 1);
+        assert_eq!(db.snapshot(true).unwrap().totals.contribution_count, 0);
+        assert!(db.snapshot(true).unwrap().contributions.is_empty());
+        let existing = db.submit(request(2, 1, 100)).unwrap();
+        assert_eq!(existing.user_id, 2);
+        let second = db.minter(minter_request(2, None)).unwrap();
+        assert_eq!((second.user_id, second.name.as_str()), (2, "Minter 2"));
+        let renamed = db.minter(minter_request(1, Some("  Alice  "))).unwrap();
+        assert_eq!((renamed.user_id, renamed.name.as_str()), (1, "Alice"));
+        assert_eq!(db.minter(minter_request(1, None)).unwrap().name, "Alice");
+        assert_eq!(
+            db.minter(minter_request(3, Some("Alice"))).unwrap().user_id,
+            3
+        );
+        let original = request(1, 2, 100);
+        let submitted = db.submit(original.clone()).unwrap();
+        assert_eq!((submitted.id, submitted.user_id), (2, 1));
+        db.tick().unwrap();
+        let mut snapshot = serde_json::to_value(db.snapshot(true).unwrap()).unwrap();
+        let rewards = serde_json::to_value(db.rewards().unwrap()).unwrap();
+        db.minter(minter_request(1, Some("Bob"))).unwrap();
+        snapshot["contributions"][0]["user_name"] = "Bob".into();
+        snapshot["contributions"][0]["minter_name"] = "Bob".into();
+        snapshot["minters"][0]["name"] = "Bob".into();
+        assert_eq!(db.submit(original).unwrap().user_id, 1);
+        assert_eq!(
+            serde_json::to_value(db.snapshot(true).unwrap()).unwrap(),
+            snapshot
+        );
+        assert_eq!(
+            serde_json::to_value(db.rewards().unwrap()).unwrap(),
+            rewards
+        );
+    }
+
+    #[test]
+    fn minter_names_are_trimmed_unicode_text_with_strict_length_and_control_checks() {
+        let mut db = database();
+        for name in [
+            "".to_owned(),
+            "   ".to_owned(),
+            "x".repeat(65),
+            "🔥".repeat(65),
+            "Al\0ice".to_owned(),
+            "Alice\n".to_owned(),
+            "\tAlice".to_owned(),
+            "Al\u{7f}ice".to_owned(),
+            "Al\u{85}ice".to_owned(),
+        ] {
+            assert!(matches!(
+                db.minter(minter_request(1, Some(&name))),
+                Err(Error::Invalid(_))
+            ));
+        }
+        assert!(db.rewards().unwrap().is_empty());
+        for name in [
+            "  身🔥  ".to_owned(),
+            "🔥".repeat(64),
+            "x".repeat(64),
+            "<script>alert('x')</script>".to_owned(),
+            "x'); DROP TABLE accounts; --".to_owned(),
+        ] {
+            let minter = db.minter(minter_request(1, Some(&name))).unwrap();
+            assert_eq!(minter.name, name.trim());
+            assert_eq!(
+                db.minter(minter_request(1, None)).unwrap().name,
+                name.trim()
+            );
+        }
+        assert_eq!(db.rewards().unwrap().len(), 1);
+        assert!(matches!(
+            db.minter(MinterRequest {
+                address: "not-an-address".into(),
+                name: None,
+                service_commission_bps: None,
+            }),
+            Err(Error::Invalid(_))
+        ));
+        let mainnet = ReceivingAddress::from_bech32(&address(2), Network::Testnet)
+            .unwrap()
+            .to_bech32(Network::Mainnet);
+        assert!(matches!(
+            db.minter(MinterRequest {
+                address: mainnet,
+                name: None,
+                service_commission_bps: None,
+            }),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(db.rewards().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn existing_accounts_gain_names_without_changing_ledger_and_names_survive_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mint.sqlite3");
+        let original = request(1, 1, 100);
+        let snapshot;
+        let rewards;
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.submit(original.clone()).unwrap();
+            db.tick().unwrap();
+            snapshot = serde_json::to_value(db.snapshot(true).unwrap()).unwrap();
+            rewards = serde_json::to_value(db.rewards().unwrap()).unwrap();
+            db.connection
+                .execute_batch("ALTER TABLE accounts DROP COLUMN name;")
+                .unwrap();
+        }
+        {
+            let mut db = Database::open(&path).unwrap();
+            assert_eq!(
+                serde_json::to_value(db.snapshot(true).unwrap()).unwrap(),
+                snapshot
+            );
+            assert_eq!(
+                serde_json::to_value(db.rewards().unwrap()).unwrap(),
+                rewards
+            );
+            let minter = db.minter(minter_request(1, None)).unwrap();
+            assert_eq!((minter.user_id, minter.name.as_str()), (1, "Minter 1"));
+            assert_eq!(db.submit(original.clone()).unwrap().id, 1);
+            db.minter(minter_request(1, Some("Alice 🔥"))).unwrap();
+            assert_eq!(db.minter(minter_request(2, None)).unwrap().user_id, 2);
+            assert!(!db
+                .connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .exists([])
+                .unwrap());
+        }
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(db.minter(minter_request(1, None)).unwrap().name, "Alice 🔥");
+        assert_eq!(db.minter(minter_request(2, None)).unwrap().name, "Minter 2");
+        assert_eq!(db.submit(original).unwrap().user_id, 1);
+        assert_eq!(db.submit(request(3, 2, 100)).unwrap().user_id, 3);
+        assert_eq!(
+            db.rewards()
+                .unwrap()
+                .iter()
+                .find(|r| r.address == address(1))
+                .unwrap()
+                .reward_sparks,
+            "5000000000"
+        );
     }
 
     #[test]
@@ -843,7 +2450,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_retains_10000_block_boundary_without_losing_lifetime_totals() {
+    fn dashboard_includes_old_contributions_without_losing_lifetime_totals() {
         let mut db = database();
         db.submit(request(1, 1, 100)).unwrap();
         db.tick().unwrap();
@@ -877,9 +2484,8 @@ mod tests {
                 .iter()
                 .map(|c| c.id)
                 .collect::<Vec<_>>(),
-            [future.id, active.id, boundary.id]
+            [future.id, active.id, boundary.id, 1]
         );
-        // The last funded block is inclusive: 200 is 10,001 blocks ago, 201 is 10,000.
         assert_eq!(recent.totals.contribution_count, 4);
         assert_eq!(recent.totals.burned_sats, "1");
         assert_eq!(recent.totals.fees_sats, "1000");
@@ -912,6 +2518,91 @@ mod tests {
             )
             .unwrap();
         assert_eq!(record_counts, (4, 2, 1));
+    }
+
+    #[test]
+    fn dashboard_limits_details_to_latest_200_ids_but_keeps_every_chart_schedule() {
+        let mut db = database();
+        let empty = db.snapshot(false).unwrap();
+        assert!(empty.contributions.is_empty());
+        assert!(empty.chart_contributions.unwrap().is_empty());
+        let mut active = request(1, 1, 100);
+        active.duration = 50_000;
+        active.budget_sats = 100_000_000;
+        db.submit(active).unwrap();
+        db.tick().unwrap();
+        db.connection
+            .execute("INSERT INTO blocks VALUES (20001, 0, 0, 0)", [])
+            .unwrap();
+        for id in 2..=205 {
+            db.connection.execute(
+                "INSERT INTO contributions(id, request_id, user_id, budget_sats, duration, start_block)
+                 VALUES (?1, ?2, 1, 400000, 200, ?3)",
+                params![id, format!("bulk-contribution-{id:016}"), if id == 205 { 1 } else { 20002 }],
+            ).unwrap();
+            if [199, 200, 205].contains(&id) {
+                let recent = db.snapshot(false).unwrap();
+                assert_eq!(recent.contributions.len(), id.min(200) as usize);
+                assert_eq!(recent.contributions[0].id, id);
+                assert_eq!(recent.contributions.last().unwrap().id, (id - 199).max(1));
+                assert_eq!(recent.chart_contributions.unwrap().len(), id as usize);
+                assert_eq!(recent.totals.contribution_count, id);
+                assert_eq!(recent.totals.burned_sats, "1000");
+                assert_eq!(recent.totals.fees_sats, "1000");
+                assert_eq!(recent.totals.reward_sparks, "5000000000");
+            }
+        }
+        let recent = db.snapshot(false).unwrap();
+        assert_eq!(recent.contributions[0].start_block, 1);
+        assert!(recent.contributions.iter().all(|c| c.id != 1));
+        let schedules = recent.chart_contributions.unwrap();
+        let oldest = schedules.last().unwrap();
+        assert_eq!(
+            (oldest.id, oldest.start_block, oldest.duration),
+            (1, 1, 50_000)
+        );
+        assert!(
+            oldest.start_block <= recent.height
+                && oldest.start_block + oldest.duration > recent.height
+        );
+        let schedule_json = serde_json::to_value(oldest).unwrap();
+        assert_eq!(schedule_json.as_object().unwrap().len(), 9);
+        for omitted in [
+            "address",
+            "burned_sats",
+            "fees_sats",
+            "reward_sparks",
+            "delay_blocks",
+        ] {
+            assert!(schedule_json.get(omitted).is_none());
+        }
+        let full = db.snapshot(true).unwrap();
+        assert_eq!(full.contributions.len(), 205);
+        assert_eq!(full.contributions.last().unwrap().id, 1);
+        assert!(full.chart_contributions.is_none());
+        assert!(serde_json::to_value(&full)
+            .unwrap()
+            .get("chart_contributions")
+            .is_none());
+        assert_eq!(
+            full.contributions.last().unwrap().reward_sparks,
+            "5000000000"
+        );
+        assert_eq!(
+            serde_json::to_value(&full.totals).unwrap(),
+            serde_json::to_value(&recent.totals).unwrap()
+        );
+        assert_eq!(db.rewards().unwrap()[0].reward_sparks, "5000000000");
+        let record_counts: (i64, i64, i64) = db
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM contributions), (SELECT COUNT(*) FROM blocks),
+                    (SELECT COUNT(*) FROM accruals)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(record_counts, (205, 2, 1));
     }
 
     #[test]
@@ -1029,7 +2720,8 @@ mod tests {
             db.connection
                 .execute_batch(
                     "INSERT INTO blocks VALUES (1, 1, 1000, 5000000000);
-                 INSERT INTO accruals VALUES (1, 42, 1, 1000, 5000000000);",
+                 INSERT INTO accruals(height, contribution_id, burned_sats, fees_sats, reward_sparks)
+                     VALUES (1, 42, 1, 1000, 5000000000);",
                 )
                 .unwrap();
         }
@@ -1134,7 +2826,8 @@ mod tests {
                          AND start_block >= 1),
                      CHECK(budget_sats >= duration * 1001)
                  );
-                 INSERT INTO contributions_bounded SELECT * FROM contributions;
+                 INSERT INTO contributions_bounded
+                     SELECT id, request_id, user_id, budget_sats, duration, delay_blocks, start_block FROM contributions;
                  DROP TABLE contributions;
                  ALTER TABLE contributions_bounded RENAME TO contributions;
                  PRAGMA user_version = 0;

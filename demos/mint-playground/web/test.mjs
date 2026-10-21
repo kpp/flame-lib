@@ -4,9 +4,10 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('./app.js', import.meta.url), 'utf8');
-const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, ZOOM_KEY, ZOOM_MIN, ZOOM_DEFAULT, chartBlocks, blockDate, burnAt, feeAt, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote, BUDGET_STEP, parseInputNumber, snapToRange, inputToSats, inputToBlocks } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const { BUDGET_MIN, BUDGET_MAX, DURATION_MIN, DURATION_MAX, DELAY_MAX, BLOCKS_PER_DAY, TIME_KEY, ZOOM_KEY, ZOOM_MIN, ZOOM_DEFAULT, chartBlocks, blockDate, burnAt, feeAt, contributionFee, projectedReward, PALETTE, userColor, contributionStatus, FEE, SPARKS, UNIT_KEY, formatMoney, parseBtcUsdQuote, BUDGET_STEP, parseInputNumber, snapToRange, inputToSats, inputToBlocks } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 const DEFAULT_ZOOM = 500;
-const plan = (options = {}) => ({ user_id: 1, budget_sats: 300005, duration: 100, start_block: 10, ...options });
+const BLUE_PALETTE = ['#64b5ff', '#2354d8', '#409bff', '#173a9e', '#2478ed', '#83c7ff', '#3865ba', '#a3d9ff', '#3289f5', '#2b46ad', '#51a8ff', '#2d68db'];
+const plan = (options = {}) => ({ user_id: 1, budget_sats: 300005, duration: 100, start_block: 10, burned_sats: '0', fees_sats: '0', reward_sparks: '0', commission_sparks: '0', ...options });
 
 test('budget is a native linear slider with the requested endpoints', async () => {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
@@ -67,6 +68,48 @@ test('integer schedule spreads the remainder into the first blocks and conserves
   let burn = 0;
   for (let block = 0; block < 200; block++) burn += burnAt(contribution, block);
   assert.equal(burn + contribution.duration * FEE, contribution.budget_sats);
+});
+
+test('delegating contributions burn their full budget and pay no per-block mining fee', () => {
+  for (const mode of [undefined, 'independent', 'service', 'delegating']) {
+    const contribution = plan({ mode, budget_sats: 300005 });
+    const fee = mode === 'delegating' ? 0 : FEE;
+    assert.equal(contributionFee(contribution), fee);
+    let total = 0;
+    for (let block = contribution.start_block; block < contribution.start_block + contribution.duration; block++) {
+      total += burnAt(contribution, block) + feeAt(contribution, block);
+      assert.equal(feeAt(contribution, block), fee);
+    }
+    assert.equal(total, contribution.budget_sats);
+    assert.equal(burnAt(contribution, 10), mode === 'delegating' ? 3001 : 2001);
+    assert.equal(feeAt(contribution, 9), 0);
+    assert.equal(feeAt(contribution, 110), 0);
+  }
+});
+
+test('delegated forecasts deduct commission from FLM, not from the burned budget', () => {
+  const service = plan({ mode: 'service', user_id: 2, budget_sats: 300000, start_block: 11, commission_bps: 200 });
+  for (const commission_bps of [0, 200, 1250, 10000]) {
+    const draft = plan({ mode: 'delegating', service_user_id: 2, budget_sats: 300000, start_block: 11, commission_bps });
+    const expected = 3000 * SPARKS * (10000 - commission_bps) / 10000;
+    assert.equal(projectedReward([service], draft), expected);
+    assert.equal(projectedReward([], draft), 0, 'burning without an active provider earns no FLM');
+    assert.equal(burnAt(draft, 11), 3000, 'commission never reduces the underlying burned satoshis');
+  }
+  assert.equal(projectedReward([], service), 5000 * SPARKS, 'service forecasts do not speculate about future commission income');
+});
+
+test('delegated forecasts pause on provider expiry, resume on later service windows, and retain all burned costs', () => {
+  const draft = plan({ mode: 'delegating', service_user_id: 2, commission_bps: 200, budget_sats: 200000, start_block: 11 });
+  const first = plan({ mode: 'service', user_id: 2, budget_sats: 75000, duration: 25, start_block: 11 });
+  const later = { ...first, start_block: 61 };
+  assert.equal(projectedReward([first], draft), 25 * 25 * SPARKS * .98);
+  assert.equal(projectedReward([first, later], draft), 50 * 25 * SPARKS * .98);
+  assert.equal(projectedReward([{ ...first, mode: 'independent' }], draft), 0, 'independent activity by the same account is not a Service endorsement');
+  assert.equal(projectedReward([{ ...first, user_id: 3 }], draft), 0, 'a different active Service cannot mint for the selected provider');
+  assert.equal(Array.from({ length: 100 }, (_, i) => burnAt(draft, 11 + i)).reduce((sum, value) => sum + value), 200000, 'inactive windows still consume the full delegation budget');
+  const independent = plan({ start_block: 11, budget_sats: 300000 });
+  assert.equal(projectedReward([draft], independent), 5000 * SPARKS, 'orphaned delegated burn does not dilute eligible rewards');
 });
 
 test('mining fees count concurrent contributions, including the same address, not their budgets', () => {
@@ -153,6 +196,50 @@ test('event-based forecasts match a per-block reference across randomized starts
   }
 });
 
+test('delegated forecasts match per-block eligibility across overlapping providers, restarts, self-delegation, and remainders', () => {
+  let seed = 91041;
+  const random = limit => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed % limit; };
+  const schedule = () => {
+    const mode = ['independent', 'service', 'delegating'][random(3)];
+    const duration = random(50) + 1;
+    const fee = mode === 'delegating' ? 0 : FEE;
+    return plan({ mode, user_id: random(3) + 1, service_user_id: random(3) + 1, commission_bps: random(10001), duration, start_block: random(100), budget_sats: duration * (fee + 1) + random(100000) });
+  };
+  const eligible = (contribution, block, all) => contribution.mode !== 'delegating' || all.some(provider => provider.mode === 'service' && provider.user_id === contribution.service_user_id && block >= provider.start_block && block < provider.start_block + provider.duration);
+  for (let sample = 0; sample < 300; sample++) {
+    const draft = schedule();
+    const contributions = Array.from({ length: random(10) }, schedule);
+    const all = [...contributions, draft];
+    let expected = 0;
+    for (let block = draft.start_block; block < draft.start_block + draft.duration; block++) {
+      if (!eligible(draft, block, all)) continue;
+      const total = all.reduce((sum, contribution) => sum + (eligible(contribution, block, all) ? burnAt(contribution, block) : 0), 0);
+      expected += 50 * SPARKS * burnAt(draft, block) / total;
+    }
+    if (draft.mode === 'delegating' && draft.user_id !== draft.service_user_id) expected *= (10000 - draft.commission_bps) / 10000;
+    const actual = projectedReward(contributions, draft);
+    assert.ok(Math.abs(actual - expected) <= Math.max(1, expected) * 1e-12, `delegated schedule ${sample}: ${actual} differs from ${expected}`);
+  }
+});
+
+test('trillion-block delegation forecasts follow provider boundaries without per-block work', () => {
+  const duration = 1000000000000;
+  const draft = plan({ mode: 'delegating', service_user_id: 2, commission_bps: 200, start_block: 100, duration, budget_sats: duration });
+  const provider = plan({ mode: 'service', user_id: 2, start_block: 100 + duration / 2, duration: duration / 2, budget_sats: duration / 2 * (FEE + 1) });
+  const started = performance.now();
+  assert.equal(projectedReward([provider], draft), duration / 2 * 25 * SPARKS * .98);
+  assert.ok(performance.now() - started < 1000);
+});
+
+test('self-delegation forecasts return commission to the same owner, including a one-hundred-percent commission', () => {
+  const provider = plan({ mode: 'service', user_id: 1, budget_sats: 300000, start_block: 11 });
+  for (const commission_bps of [0, 200, 10000]) {
+    const draft = plan({ mode: 'delegating', user_id: 1, service_user_id: 1, commission_bps, budget_sats: 200000, start_block: 11 });
+    assert.equal(projectedReward([provider], draft), 2500 * SPARKS);
+    assert.equal(projectedReward([{ ...provider, start_block: 111 }], draft), 0, 'self-delegation still needs active Service endorsements');
+  }
+});
+
 test('trillion-block forecasts scale with schedule events rather than the number of blocks', () => {
   const duration = 1000000000000;
   const draft = plan({ duration, start_block: 1000000000000, budget_sats: duration * (FEE + 1) });
@@ -191,12 +278,443 @@ test('the twelve-color fixed palette preserves the originals and their rounded R
   assert.doesNotMatch(source, /Math\.random|shuffledPalette|addressColors|paletteKey/);
 });
 
+test('delegating user colors use the specified stable blue palette while services remain warm', () => {
+  for (const userId of [0, 1, 2, 5, 11, 12, 13, 26, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(userColor(userId, 'delegating'), BLUE_PALETTE[userId % BLUE_PALETTE.length]);
+    assert.equal(userColor(userId, 'independent'), PALETTE[userId % PALETTE.length]);
+    assert.equal(userColor(userId, 'service'), PALETTE[userId % PALETTE.length]);
+  }
+});
+
 test('every referenced UI element exists once in the page', async () => {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]);
   assert.equal(ids.length, new Set(ids).size, 'duplicate element IDs');
   for (const [, id] of source.matchAll(/element\('([^']+)'\)/g)) assert.ok(ids.includes(id), `missing #${id}`);
   assert.doesNotMatch(html, /\bcomposition(?:-label)?\b|type="checkbox"/, 'contribution colors have no toggle');
+});
+
+test('both pages keep Dashboard and Mint links together on the left and mark the active page', async () => {
+  const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
+  const header = html.match(/<header\b[^>]*>[\s\S]*?<\/header>/)[0];
+  assert.match(header, /<a\b[^>]*id="nav-dashboard"[^>]*href="\/"[^>]*>Dashboard<\/a>/);
+  assert.match(header, /<a\b[^>]*id="nav-mint"[^>]*href="\/mint"[^>]*>Mint<\/a>/);
+  assert.ok(header.indexOf('id="nav-dashboard"') < header.indexOf('id="nav-mint"'));
+  assert.ok(header.indexOf('id="nav-mint"') < header.indexOf('class="topbar-actions"'));
+  assert.doesNotMatch(header, /id="navigation"/);
+  for (const pathname of ['/', '/mint']) {
+    const page = await openPage(pathname);
+    assert.equal(page.elements.get(pathname === '/' ? 'nav-dashboard' : 'nav-mint')['aria-current'], 'page');
+    assert.notEqual(page.elements.get(pathname === '/' ? 'nav-mint' : 'nav-dashboard')['aria-current'], 'page');
+    assert.equal(page.elements.get('nav-dashboard').textContent, 'Dashboard');
+    assert.equal(page.elements.get('nav-mint').textContent, 'Mint');
+    assert.equal(page.elements.get('page-title').textContent, pathname === '/' ? 'Mint playground' : 'Mint');
+  }
+});
+
+test('minter names load only on the mint page after the wallet has been saved, not on polls or display changes', async () => {
+  const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
+  assert.match(html, /<input\b[^>]*id="minter-name"[^>]*maxlength="64"/);
+  assert.match(html, /<[^>]*id="minter-name-status"[^>]*role="status"/);
+  const dashboard = await openPage('/');
+  assert.equal(dashboard.elements.get('minter-profile').hidden, true);
+  assert.equal(profileRequests(dashboard).length, 0);
+  let finishWallet;
+  const walletReady = new Promise(resolve => { finishWallet = resolve; });
+  const storage = new Map();
+  const page = await openPage('/mint', storage, undefined, walletReady, { profile: body => {
+    assert.equal(JSON.parse(storage.get('flame-mint-playground-wallet-v1')).address, body.address, 'identity must be saved before registration');
+    return profileResponse();
+  } });
+  assert.equal(page.elements.get('minter-profile').hidden, false);
+  assert.equal(page.elements.get('minter-name').disabled, true);
+  assert.equal(page.elements.get('save-minter-name').disabled, true);
+  assert.equal(profileRequests(page).length, 0);
+  finishWallet();
+  await page.settle();
+  assert.equal(page.elements.get('minter-name').value, 'Minter 1');
+  assert.equal(page.elements.get('minter-name').disabled, false);
+  assert.deepEqual(profileRequests(page).map(request => JSON.parse(request.options.body)), [{ address: 'tf1demo-address' }]);
+  page.elements.get('minter-name').value = 'An unfinished edit';
+  await page.refresh();
+  await page.event('unit-btc', 'click');
+  await page.event('time-days', 'click');
+  await page.event('zoom-out', 'click');
+  await page.timer(60000);
+  assert.equal(page.elements.get('minter-name').value, 'An unfinished edit', 'rendering must not overwrite an in-progress edit');
+  assert.equal(profileRequests(page).length, 1, 'profile lookup is not repeated by background polling');
+});
+
+test('minter names are saved explicitly, trimmed by the service, and loaded from the service after reload', async () => {
+  let savedName = 'Minter 1';
+  const profile = body => {
+    if (body.name !== undefined) savedName = body.name.trim();
+    return profileResponse(savedName);
+  };
+  const storage = new Map();
+  const page = await openPage('/mint', storage, undefined, undefined, { profile });
+  const name = '<img src=x onerror=alert(1)> & Alice';
+  page.elements.get('minter-name').value = `  ${name}  `;
+  await page.refresh();
+  assert.equal(profileRequests(page).length, 1, 'typing and polling do not auto-save');
+  await page.event('minter-profile', 'submit');
+  assert.deepEqual(JSON.parse(profileRequests(page).at(-1).options.body), { address: 'tf1demo-address', name });
+  assert.equal(page.elements.get('minter-name').value, name, 'the validated display name is plain input text');
+  assert.equal(savedName, name);
+  assert.equal(page.elements.get('wallet-address').textContent, 'tf1demo-address');
+  assert.equal(page.storage.get('flame-mint-playground-wallet-v1').includes(name), false, 'display names do not modify wallet keys');
+  assert.equal(page.requests.filter(request => request.url === '/api/contributions').length, 0);
+  const reloaded = await openPage('/mint', storage, undefined, undefined, { profile });
+  assert.equal(reloaded.elements.get('minter-name').value, name);
+  assert.deepEqual(profileRequests(reloaded).map(request => JSON.parse(request.options.body)), [{ address: 'tf1demo-address' }]);
+  assert.doesNotMatch(source, /\.innerHTML\s*=/, 'user names are never interpreted as markup');
+});
+
+test('a busy name save locks only the profile controls and errors keep the edit available for retry', async () => {
+  let finishSave;
+  let calls = 0;
+  const page = await openPage('/mint', new Map(), undefined, undefined, { profile: () => ++calls === 1 ? profileResponse() : new Promise(resolve => { finishSave = resolve; }) });
+  page.elements.get('minter-name').value = 'Alice';
+  const saving = page.event('minter-profile', 'submit');
+  await page.settle();
+  assert.equal(page.elements.get('minter-name').disabled, true);
+  assert.equal(page.elements.get('save-minter-name').disabled, true);
+  assert.equal(page.elements.get('submit').disabled, false, 'name registration is not a prerequisite for minting');
+  await page.event('unit-usd', 'click');
+  assert.equal(page.elements.get('minter-name').value, 'Alice');
+  finishSave({ ok: false, status: 400, json: async () => ({ error: 'Invalid minter name' }) });
+  await saving;
+  assert.equal(page.elements.get('minter-name').value, 'Alice');
+  assert.equal(page.elements.get('minter-name').disabled, false);
+  assert.equal(page.elements.get('save-minter-name').disabled, false);
+  assert.match(page.elements.get('minter-name-status').textContent, /Invalid minter name/);
+  const retrying = page.event('minter-profile', 'submit');
+  await page.settle();
+  finishSave(profileResponse('Alice'));
+  await retrying;
+  assert.equal(profileRequests(page).length, 3);
+  assert.equal(page.elements.get('minter-name').value, 'Alice');
+  assert.equal(page.elements.get('save-minter-name').disabled, false);
+});
+
+test('profile lookup failures can be retried without replacing or disabling the wallet', async () => {
+  let calls = 0;
+  const page = await openPage('/mint', new Map(), undefined, undefined, { profile: () => {
+    if (++calls === 1) throw new Error('Name service offline');
+    return profileResponse('Minter 1');
+  } });
+  assert.match(page.elements.get('minter-name-status').textContent, /Name service offline/);
+  assert.equal(page.elements.get('wallet-status').textContent, 'Saved locally. Keys stay in this browser.');
+  assert.equal(page.elements.get('submit').disabled, false);
+  assert.equal(page.elements.get('save-minter-name').disabled, false);
+  await page.event('minter-profile', 'submit');
+  assert.equal(page.elements.get('minter-name').value, 'Minter 1');
+  assert.deepEqual(profileRequests(page).map(request => JSON.parse(request.options.body)), [{ address: 'tf1demo-address' }, { address: 'tf1demo-address' }]);
+  const broken = await openPage('/mint', new Map([['flame-mint-playground-wallet-v1', '{bad json']]));
+  assert.equal(profileRequests(broken).length, 0);
+  assert.equal(broken.elements.get('minter-name').disabled, true);
+  assert.equal(broken.elements.get('save-minter-name').disabled, true);
+});
+
+test('a stale profile response cannot rename a replacement wallet after reset', async () => {
+  let finishOld;
+  let identities = 0;
+  const page = await openPage('/mint', new Map(), undefined, undefined, {
+    walletAddress: () => ++identities === 1 ? 'old-wallet' : 'new-wallet',
+    profile: body => body.address === 'old-wallet' ? new Promise(resolve => { finishOld = resolve; }) : profileResponse('Minter 2', 2),
+  });
+  assert.equal(page.elements.get('wallet-address').textContent, 'old-wallet');
+  await page.event('reset-wallet', 'click');
+  assert.equal(page.elements.get('wallet-address').textContent, 'new-wallet');
+  assert.equal(page.elements.get('minter-name').value, 'Minter 2');
+  finishOld(profileResponse('Old name', 1));
+  await page.settle();
+  assert.equal(page.elements.get('minter-name').value, 'Minter 2');
+  assert.equal(page.elements.get('wallet-address').textContent, 'new-wallet');
+  assert.equal(page.elements.get('minter-name').disabled, false);
+  assert.equal(page.elements.get('save-minter-name').disabled, false);
+});
+
+test('mint modes expose only their own options and delegated estimates use net rewards with no mining fees', async () => {
+  const page = await openPage('/mint');
+  assert.equal(page.elements.get('mode-independent').checked, true);
+  assert.equal(page.elements.get('service-options').hidden, true);
+  assert.equal(page.elements.get('delegation-options').hidden, true);
+  await page.event('mode-service', 'change');
+  assert.equal(page.elements.get('mode-service').checked, true);
+  assert.equal(page.elements.get('service-options').hidden, false);
+  assert.equal(page.elements.get('delegation-options').hidden, true);
+  assert.equal(page.elements.get('commission').value, '2');
+  for (const value of ['-1', '100.01', '0.001', 'bad']) {
+    page.elements.get('commission').value = value;
+    await page.event('commission', 'input');
+    assert.equal(page.elements.get('submit').disabled, true, `invalid commission ${value}`);
+  }
+  page.elements.get('commission').value = '2';
+  await page.event('commission', 'input');
+  page.snapshot.services = [{ user_id: 2, name: '<Service 2>', commission_bps: 200, active: true }];
+  page.snapshot.contributions = [plan({ id: 2, user_id: 2, address: 'provider', mode: 'service', commission_bps: 200, duration: 500, start_block: 11, budget_sats: 1500000 })];
+  await page.refresh();
+  await page.event('mode-delegating', 'change');
+  assert.equal(page.elements.get('service-options').hidden, true);
+  assert.equal(page.elements.get('delegation-options').hidden, false);
+  assert.equal(page.elements.get('submit').disabled, true, 'a provider must be selected explicitly');
+  assert.ok(page.elements.get('service-select').children.some(option => String(option.value) === '2' && option.textContent.includes('<Service 2>') && option.textContent.includes('2%')));
+  page.elements.get('service-select').value = '2';
+  await page.event('service-select', 'change');
+  assert.equal(page.elements.get('submit').disabled, false);
+  assert.equal(page.elements.get('projected-fees').textContent, '0 sat');
+  assert.equal(page.elements.get('projected-burn').textContent, '1,000,000 sat');
+  assert.equal(page.elements.get('projected-reward').textContent, '12,250');
+  assert.equal(page.elements.get('projected-rate').textContent, '81 sat / FLM');
+  page.snapshot.services[0].active = false;
+  page.snapshot.contributions = [];
+  await page.refresh();
+  assert.equal(page.elements.get('submit').disabled, false, 'inactive service offers remain available for scheduling');
+  assert.equal(page.elements.get('projected-reward').textContent, '0');
+  assert.equal(page.elements.get('projected-burn').textContent, '1,000,000 sat', 'inactive delegation is still spent');
+  assert.equal(page.elements.get('projected-rate').textContent, '—');
+});
+
+test('commission is saved on the service identity and never embedded in a contribution request', async () => {
+  const page = await openPage('/mint');
+  await page.event('mode-service', 'change');
+  page.elements.get('commission').value = '12.34';
+  await page.event('commission', 'input');
+  assert.equal(page.elements.get('submit').disabled, true, 'unsaved identity changes must not silently travel inside a contribution');
+  await page.event('save-commission', 'click');
+  assert.deepEqual(JSON.parse(profileRequests(page).at(-1).options.body), { address: 'tf1demo-address', service_commission_bps: 1234 });
+  await page.event('contribution-form', 'submit');
+  const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(request.mode, 'service');
+  assert.equal(Object.hasOwn(request, 'commission_bps'), false);
+  assert.equal(Object.hasOwn(request, 'service_user_id'), false);
+  const independent = await openPage('/mint');
+  await independent.event('contribution-form', 'submit');
+  const plain = JSON.parse(independent.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(plain.mode ?? 'independent', 'independent');
+  assert.equal(Object.hasOwn(plain, 'service_user_id'), false);
+});
+
+test('the mint form estimates self-delegation at gross reward when all commission returns to its owner', async () => {
+  const page = await openPage('/mint');
+  page.snapshot.services = [{ user_id: 1, name: 'My service', commission_bps: 10000, active: true }];
+  page.snapshot.contributions = [plan({ id: 1, user_id: 1, address: 'tf1demo-address', mode: 'service', duration: 500, start_block: 11, budget_sats: 1500000 })];
+  await page.refresh();
+  await page.event('mode-delegating', 'change');
+  page.elements.get('service-select').value = '1';
+  await page.event('service-select', 'change');
+  assert.equal(page.elements.get('projected-reward').textContent, '12,500');
+  assert.equal(page.elements.get('projected-rate').textContent, '80 sat / FLM');
+  assert.equal(page.elements.get('projected-fees').textContent, '0 sat');
+  assert.match(page.elements.get('projection-note').textContent, /commission returns to you/i);
+});
+
+test('saved delegation retries preserve the provider while commission follows its current identity rate', async () => {
+  const storage = new Map();
+  const page = await openPage('/mint', storage, async () => { throw new Error('Response lost'); });
+  page.snapshot.services = [{ user_id: 2, name: 'Service 2', commission_bps: 200, active: false }];
+  await page.refresh();
+  await page.event('mode-delegating', 'change');
+  page.elements.get('service-select').value = '2';
+  await page.event('service-select', 'change');
+  await page.event('contribution-form', 'submit');
+  const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(request.mode, 'delegating');
+  assert.equal(request.service_user_id, 2);
+  assert.equal(Object.hasOwn(request, 'commission_bps'), false);
+  for (const id of ['mode-independent', 'mode-service', 'mode-delegating', 'commission', 'service-select']) assert.equal(page.elements.get(id).disabled, true);
+  const retry = await openPage('/mint', storage);
+  assert.equal(retry.elements.get('mode-delegating').checked, true);
+  assert.equal(retry.elements.get('submit').disabled, false, 'an accepted-but-unconfirmed request can be retried after its provider disappears');
+  retry.snapshot.services = [{ user_id: 2, name: 'Changed service', commission_bps: 9900, active: false }];
+  await retry.refresh();
+  const selected = retry.elements.get('service-select').children.find(option => String(option.value) === '2');
+  assert.match(selected.textContent, /99%/, 'even a pending retry shows the provider’s current identity rate');
+  retry.elements.get('commission').value = '99';
+  retry.elements.get('service-select').value = '999';
+  await retry.event('mode-service', 'change');
+  await retry.event('unit-btc', 'click');
+  await retry.event('time-days', 'click');
+  await retry.event('contribution-form', 'submit');
+  assert.deepEqual(JSON.parse(retry.requests.find(request => request.url === '/api/contributions').options.body), request);
+  const unknown = await openPage('/mint');
+  await unknown.event('mode-delegating', 'change');
+  unknown.elements.get('service-select').value = '999';
+  await unknown.event('service-select', 'change');
+  assert.equal(unknown.elements.get('submit').disabled, true, 'unknown offers cannot create new delegations');
+});
+
+test('service option nodes survive unchanged renders while rate changes preserve selection and update pending previews', async () => {
+  const page = await openPage('/mint', new Map(), async () => { throw new Error('Response lost'); });
+  page.snapshot.services = [
+    { user_id: 2, name: 'Service A', commission_bps: 200, active: false },
+    { user_id: 3, name: 'Service B', commission_bps: 300, active: false },
+  ];
+  await page.refresh();
+  await page.event('mode-delegating', 'change');
+  const select = page.elements.get('service-select');
+  select.value = '3';
+  await page.event('service-select', 'change');
+  let options = [...select.children];
+  await page.refresh();
+  await page.event('unit-btc', 'click');
+  await page.event('time-days', 'click');
+  assert.ok(select.children.every((option, index) => option === options[index]), 'unchanged renders do not interrupt the native picker by replacing its option nodes');
+  assert.equal(select.value, '3');
+  page.snapshot.services[0].name = 'Renamed A';
+  await page.refresh();
+  assert.notEqual(select.children[0], options[0], 'a changed service name rebuilds the catalog');
+  assert.ok(select.children.some(option => option.textContent.includes('Renamed A')));
+  assert.equal(select.value, '3');
+  options = [...select.children];
+  page.snapshot.services[1].commission_bps = 450;
+  await page.refresh();
+  assert.notEqual(select.children[0], options[0], 'a changed commission rebuilds the catalog');
+  assert.equal(select.value, '3');
+  assert.match(select.children.find(option => option.value === '3').textContent, /4\.5%/);
+  await page.event('contribution-form', 'submit');
+  const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(request.service_user_id, 3);
+  assert.equal(Object.hasOwn(request, 'commission_bps'), false);
+  page.snapshot.services[1].commission_bps = 900;
+  await page.refresh();
+  const pendingOption = select.children.find(option => option.value === '3');
+  assert.match(pendingOption.textContent, /9%/, 'pending previews follow the current identity instead of freezing a quote');
+  await page.refresh();
+  await page.event('unit-sat', 'click');
+  assert.equal(select.children.find(option => option.value === '3'), pendingOption);
+});
+
+test('old saved commission quotes are removed from retry bodies without changing request identity or payment terms', async () => {
+  for (const mode of ['service', 'delegating']) {
+    const legacy = { address: 'tf1demo-address', request_id: `legacy-${mode}-request`, budget_sats: 1000000, duration: 500, delay_blocks: 17, mode, commission_bps: 1234, ...(mode === 'delegating' ? { service_user_id: 2 } : {}) };
+    const storage = new Map([['flame-mint-playground-pending-v1', JSON.stringify(legacy)]]);
+    const page = await openPage('/mint', storage);
+    assert.equal(page.elements.get('submit').disabled, false);
+    await page.event('contribution-form', 'submit');
+    const { commission_bps, ...expected } = legacy;
+    assert.equal(commission_bps, 1234);
+    assert.deepEqual(JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body), expected);
+  }
+});
+
+test('a pending delegation forecast immediately reprices at the provider’s current identity rate', async () => {
+  const page = await openPage('/mint', new Map(), async () => { throw new Error('Response lost'); });
+  page.snapshot.services = [{ user_id: 2, name: 'Service 2', commission_bps: 200, active: true }];
+  page.snapshot.contributions = [plan({ id: 2, user_id: 2, address: 'provider', mode: 'service', duration: 500, start_block: 11, budget_sats: 1500000 })];
+  await page.refresh();
+  await page.event('mode-delegating', 'change');
+  page.elements.get('service-select').value = '2';
+  await page.event('service-select', 'change');
+  assert.equal(page.elements.get('projected-reward').textContent, '12,250');
+  await page.event('contribution-form', 'submit');
+  const original = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(Object.hasOwn(original, 'commission_bps'), false);
+  page.snapshot.services[0].commission_bps = 5000;
+  await page.refresh();
+  assert.equal(page.elements.get('projected-reward').textContent, '6,250');
+  assert.equal(page.elements.get('projected-rate').textContent, '160 sat / FLM');
+  await page.event('contribution-form', 'submit');
+  assert.deepEqual(JSON.parse(page.requests.filter(request => request.url === '/api/contributions').at(-1).options.body), original);
+});
+
+test('commission saves preserve unsaved edits, isolate failures, and refresh repriced balances immediately', async () => {
+  let finishSave;
+  const page = await openPage('/mint', new Map(), undefined, undefined, { profile: body => Object.hasOwn(body, 'service_commission_bps') ? new Promise(resolve => { finishSave = resolve; }) : profileResponse('Minter 1', 1, 200) });
+  await page.event('mode-service', 'change');
+  page.elements.get('commission').value = '50';
+  await page.event('commission', 'input');
+  page.elements.get('minter-name').value = 'An unsaved name';
+  await page.refresh();
+  await page.event('unit-btc', 'click');
+  assert.equal(page.elements.get('commission').value, '50', 'polls do not overwrite an edited global rate');
+  assert.equal(page.elements.get('submit').disabled, true);
+  assert.match(page.elements.get('budget-error').textContent, /save commission before submitting/i);
+  const saving = page.event('save-commission', 'click');
+  await page.settle();
+  assert.equal(page.elements.get('commission').disabled, true);
+  assert.equal(page.elements.get('save-commission').disabled, true);
+  await page.event('mode-independent', 'change');
+  assert.equal(page.elements.get('submit').disabled, false, 'a pending profile change does not stop independent minting');
+  finishSave({ ok: false, status: 503, json: async () => ({ error: 'Cannot save rate' }) });
+  await saving;
+  assert.match(page.elements.get('commission-status').textContent, /Cannot save rate/);
+  assert.equal(page.elements.get('commission').value, '50');
+  assert.equal(page.elements.get('minter-name').value, 'An unsaved name');
+  await page.event('mode-service', 'change');
+  const before = stateRequests(page).length;
+  const retrying = page.event('save-commission', 'click');
+  await page.settle();
+  page.snapshot.services = [{ user_id: 1, name: 'Minter 1', commission_bps: 5000, active: false }];
+  finishSave(profileResponse('Minter 1', 1, 5000));
+  await retrying;
+  assert.deepEqual(JSON.parse(profileRequests(page).at(-1).options.body), { address: 'tf1demo-address', service_commission_bps: 5000 });
+  assert.equal(stateRequests(page).length, before + 1, 'successful saves fetch repriced state without waiting for the periodic poll');
+  assert.equal(page.elements.get('minter-name').value, 'An unsaved name', 'saving a rate must not save or discard a separate name edit');
+  assert.equal(page.elements.get('commission').value, '50');
+  assert.equal(page.elements.get('submit').disabled, false);
+});
+
+test('a pending Service contribution does not freeze the separate identity commission setting', async () => {
+  const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
+  assert.match(html, /<input\b[^>]*id="commission"[^>]*form="commission-profile"/, 'identity-rate validity is separate from payment-form validity');
+  const page = await openPage('/mint', new Map(), async () => { throw new Error('Response lost'); });
+  await page.event('mode-service', 'change');
+  await page.event('contribution-form', 'submit');
+  const request = JSON.parse(page.requests.find(request => request.url === '/api/contributions').options.body);
+  assert.equal(Object.hasOwn(request, 'commission_bps'), false);
+  assert.equal(page.elements.get('mode-independent').disabled, true);
+  assert.equal(page.elements.get('budget').disabled, true);
+  assert.equal(page.elements.get('commission').disabled, false);
+  page.elements.get('commission').value = 'bad';
+  await page.event('commission', 'input');
+  assert.equal(page.elements.get('submit').disabled, false, 'an invalid unsaved global rate cannot block retrying an existing payment');
+  await page.event('contribution-form', 'submit');
+  assert.deepEqual(JSON.parse(page.requests.filter(request => request.url === '/api/contributions').at(-1).options.body), request);
+  page.elements.get('commission').value = '25';
+  await page.event('commission', 'input');
+  await page.event('save-commission', 'click');
+  assert.deepEqual(JSON.parse(profileRequests(page).at(-1).options.body), { address: 'tf1demo-address', service_commission_bps: 2500 });
+  await page.event('contribution-form', 'submit');
+  assert.deepEqual(JSON.parse(page.requests.filter(request => request.url === '/api/contributions').at(-1).options.body), request);
+});
+
+test('an older in-flight snapshot cannot overwrite balances refreshed by a successful commission save', async () => {
+  let page, deferNext = false, finishOld;
+  page = await openPage('/mint', new Map(), undefined, undefined, {
+    state: snapshot => {
+      const frozen = JSON.parse(JSON.stringify(snapshot));
+      const response = { ok: true, json: async () => frozen };
+      if (!deferNext) return response;
+      deferNext = false;
+      return new Promise(resolve => { finishOld = () => resolve(response); });
+    },
+    profile: body => {
+      if (Object.hasOwn(body, 'service_commission_bps')) {
+        page.snapshot.services[0].commission_bps = body.service_commission_bps;
+        page.snapshot.minters[0].reward_sparks = String(4321 * SPARKS);
+        return profileResponse('Minter 1', 1, body.service_commission_bps);
+      }
+      return profileResponse('Minter 1', 1, 200);
+    },
+  });
+  page.snapshot.services = [{ user_id: 1, name: 'Minter 1', commission_bps: 200, active: false }];
+  page.snapshot.minters = [{ user_id: 1, address: 'tf1demo-address', name: 'Minter 1', mode: 'service', commission_bps: 200, contribution_count: 1, burned_sats: '100000', fees_sats: '1000', reward_sparks: String(1234 * SPARKS) }];
+  await page.refresh();
+  assert.equal(page.elements.get('total-reward').textContent, '1,234\u00a0FLM');
+  deferNext = true;
+  const oldPoll = page.refresh();
+  await page.settle();
+  await page.event('mode-service', 'change');
+  page.elements.get('commission').value = '50';
+  await page.event('commission', 'input');
+  await page.event('save-commission', 'click');
+  assert.equal(page.elements.get('total-reward').textContent, '4,321\u00a0FLM');
+  finishOld();
+  await oldPoll;
+  assert.equal(page.elements.get('total-reward').textContent, '4,321\u00a0FLM');
+  assert.equal(page.elements.get('commission').value, '50');
 });
 
 test('reward address follows the contribution table outside the mint form, with the palette footer last', async () => {
@@ -225,16 +743,17 @@ test('reward address follows the contribution table outside the mint form, with 
   }
 });
 
-test('both pages render exactly one accessible swatch per palette color and never accumulate swatches on redraw', async () => {
+test('both pages render exactly one accessible swatch per warm and blue color without accumulating swatches', async () => {
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
     const preview = page.elements.get('palette-preview');
+    const colors = [...PALETTE, ...BLUE_PALETTE];
     const check = () => {
-      assert.equal(preview.children.length, PALETTE.length);
-      assert.deepEqual(preview.children.map(swatch => swatch.tag), PALETTE.map(() => 'span'));
-      assert.deepEqual(preview.children.map(swatch => swatch.style.background), PALETTE);
-      assert.deepEqual(preview.children.map(swatch => swatch.title), PALETTE);
-      assert.deepEqual(preview.children.map(swatch => swatch['aria-label']), PALETTE);
+      assert.equal(preview.children.length, colors.length);
+      assert.deepEqual(preview.children.map(swatch => swatch.tag), colors.map(() => 'span'));
+      assert.deepEqual(preview.children.map(swatch => swatch.style.background), colors);
+      assert.deepEqual(preview.children.map(swatch => swatch.title), colors);
+      assert.deepEqual(preview.children.map(swatch => swatch['aria-label']), colors);
       assert.ok(preview.children.every(swatch => swatch.role === 'listitem'));
     };
     check();
@@ -264,12 +783,14 @@ test('linear slider budgets conserve the complete budget at duration boundaries 
 });
 
 const quoteResponse = amount => ({ ok: true, json: async () => ({ data: { base: 'BTC', currency: 'USD', amount: String(amount) } }) });
+const profileResponse = (name = 'Minter 1', user_id = 1, service_commission_bps = null) => ({ ok: true, json: async () => ({ user_id, name, service_commission_bps }) });
+const profileRequests = page => page.requests.filter(request => request.url === '/api/minter');
 
 async function openPage(pathname, storage = new Map(), post = async () => ({ id: 2, user_id: 1, start_block: 11 }), walletReady = Promise.resolve(), pageOptions = {}) {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
   const draws = [];
   class Element {
-    constructor(tag = 'div') { this.tag = tag; this.children = []; this.style = {}; this.handlers = {}; this.value = ''; this.hidden = false; this.disabled = false; }
+    constructor(tag = 'div') { this.tag = tag; this.children = []; this.style = {}; this.handlers = {}; this.value = ''; this.hidden = false; this.disabled = false; this.checked = false; }
     append(...children) { for (const child of children) this.children.push(...(child.tag === 'fragment' ? child.children : [child])); }
     replaceChildren(...children) { this.children = []; this.append(...children); }
     addEventListener(event, handler) { this.handlers[event] = handler; }
@@ -283,17 +804,22 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
     }
     get clientWidth() { return 800; }
     get clientHeight() { return 275; }
+    get options() { return this.tag === 'select' ? this.children : undefined; }
   }
   const elements = new Map([...html.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)].map(([, tag, id]) => [id, new Element(tag)]));
   for (const [tag, , id] of html.matchAll(/<([a-z][a-z0-9]*)\b[^>]*\bid="([^"]+)"[^>]*>/g)) {
     elements.get(id).hidden = /\bhidden(?:\s|>)/.test(tag);
     elements.get(id).disabled = /\bdisabled(?:\s|>)/.test(tag);
+    elements.get(id).checked = /\bchecked(?:\s|>)/.test(tag);
+    const value = tag.match(/\bvalue="([^"]*)"/);
+    if (value) elements.get(id).value = value[1];
   }
   for (const [, id, text] of html.matchAll(/\bid="([^"]+)"[^>]*>([^<]*)</g)) elements.get(id).textContent = text.replaceAll('&nbsp;', '\u00a0');
   elements.get('budget').value = '1000000'; elements.get('duration').value = '500';
   elements.get('delay').value = '0';
   const requests = [], frames = [], timers = new Map(), abortTimeouts = [];
   let nextTimer = 0;
+  let profileCommission = null;
   const snapshot = { height: 10, totals: { contribution_count: 1, burned_sats: '100000', fees_sats: '1000', reward_sparks: '50000000000' }, contributions: [{ id: 1, user_id: 1, address: 'tf1demo-address', budget_sats: 300000, duration: 100, start_block: 10, burned_sats: '2000', fees_sats: '1000', reward_sparks: '5000000000' }] };
   const context = vm.createContext({
     document: { getElementById: id => elements.get(id), createElement: tag => new Element(tag), createDocumentFragment: () => new Element('fragment') },
@@ -306,11 +832,16 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
     ResizeObserver: class { observe() {} },
     setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
     clearTimeout: id => timers.delete(id),
-    walletModule: { default: async () => walletReady, generateMnemonic: () => 'a browser only recovery phrase', Wallet: { fromMnemonic: () => ({ nextAddress: () => ({ address: 'tf1demo-address' }), free() {} }) } },
+    walletModule: { default: async () => walletReady, generateMnemonic: () => 'a browser only recovery phrase', Wallet: { fromMnemonic: mnemonic => ({ nextAddress: () => ({ address: pageOptions.walletAddress ? pageOptions.walletAddress(mnemonic) : 'tf1demo-address' }), free() {} }) } },
     fetch: async (url, options = {}) => {
       requests.push({ url, options });
-      if (url === '/api/state' || url === '/api/state?full_history=true') return { ok: true, json: async () => snapshot };
+      if (url === '/api/state' || url === '/api/state?full_history=true') return pageOptions.state ? pageOptions.state(snapshot, url) : { ok: true, json: async () => snapshot };
       if (url === 'https://api.coinbase.com/v2/prices/BTC-USD/spot') return pageOptions.quote ? pageOptions.quote() : quoteResponse(50000);
+      if (url === '/api/minter') {
+        const body = JSON.parse(options.body);
+        if (Object.hasOwn(body, 'service_commission_bps')) profileCommission = body.service_commission_bps;
+        return pageOptions.profile ? pageOptions.profile(body, options) : profileResponse(body.name?.trim() ?? 'Minter 1', 1, profileCommission);
+      }
       assert.equal(url, '/api/contributions', 'unexpected request');
       return { ok: true, json: async () => post(JSON.parse(options.body)) };
     },
@@ -321,7 +852,7 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
   await settle();
   return {
     elements, requests, storage, snapshot, draws, settle, timers, abortTimeouts,
-    event: async (id, event) => { await elements.get(id).handlers[event]({ preventDefault() {} }); await settle(); },
+    event: async (id, event) => { await elements.get(id).handlers[event]({ target: elements.get(id), preventDefault() {} }); await settle(); },
     timer: async delay => {
       const pending = [...timers].find(([, timer]) => timer.delay === delay);
       assert.ok(pending, `no ${delay}ms timer scheduled`);
@@ -349,6 +880,7 @@ test('both charts center now between five hundred past and future blocks by defa
     page.snapshot.contributions = [plan({ id: 1, address: 'tf1demo-address', start_block: page.snapshot.height - 200, duration: 1000, budget_sats: 3000000 })];
     page.draws.length = 0;
     await page.refresh();
+    assert.equal(page.elements.get('connection').textContent, 'Live');
     const draws = page.draws.filter(call => call.canvas === page.elements.get('chart'));
     const ticks = draws.filter(call => call.method === 'fillText' && call.args[2] === 267);
     assert.deepEqual(ticks.map(call => call.args[0]), minting ? ['0', '250', '500', '750', '1,000'] : ['1,000', '1,250', '1,500', '1,750', '2,000']);
@@ -638,9 +1170,8 @@ test('dashboard includes scheduled contributions in future bands and shows their
   page.draws.length = 0;
   await page.refresh();
   const row = page.elements.get('contributions').children[0];
-  assert.equal(row.children[1].children[0].textContent, 'Scheduled');
-  assert.match(row.children[0].children[0].children[1].textContent, /432,000 sat \/ 144 blocks/);
-  assert.match(row.children[0].children[1].textContent, /Blocks 145–288/);
+  assert.equal(row.children[2].children[0].textContent, 'Scheduled at block 145');
+  assert.equal(row.children[0].children[1].textContent, '432,000 sat / 144 blocks');
   let path = [];
   let band;
   for (const call of page.draws.filter(call => call.canvas === page.elements.get('chart'))) {
@@ -659,8 +1190,8 @@ test('dashboard includes scheduled contributions in future bands and shows their
   const totals = page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
   await page.event('time-days', 'click');
   const dayRow = page.elements.get('contributions').children[0];
-  assert.match(dayRow.children[0].children[0].children[1].textContent, /432,000 sat \/ 1 day$/);
-  assert.match(dayRow.children[0].children[1].textContent, /Jan 12–Jan 12/);
+  assert.equal(dayRow.children[0].children[1].textContent, '432,000 sat / 1 day');
+  assert.equal(dayRow.children[2].children[0].textContent, 'Scheduled at Jan 12');
   assert.deepEqual(page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent), totals, 'calendar display does not alter all-time totals');
 });
 
@@ -744,42 +1275,201 @@ test('dashboard initializes, polls, draws, and renders the actual contribution s
   assert.equal(page.elements.get('current-block').textContent, '10');
   assert.equal(page.elements.get('connection').textContent, 'Live');
   assert.equal(page.elements.get('contributions').children.length, 1);
-  assert.match(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, /#1.*300,000 sat.*100 blocks/, 'public rows disclose the known budget and duration');
+  assert.equal(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, 'Minter 1 #1');
+  assert.equal(page.elements.get('contributions').children[0].children[0].children[1].textContent, '300,000 sat / 100 blocks', 'public rows disclose the known budget and duration');
   assert.equal(page.requests.filter(request => request.url === '/api/state').length, 1);
   assert.equal(page.requests.length, 2, 'state and BTC/USD quote are loaded independently');
   assert.equal(page.storage.size, 0, 'dashboard does not need palette or wallet storage');
 });
 
-test('dashboard contribution rows show only the schedule, never an address or address tooltip', async () => {
+test('contribution rows show a name, budget and status without exposing addresses on the dashboard', async () => {
   for (const pathname of ['/', '/mint']) {
     const page = await openPage(pathname);
     const contribution = page.snapshot.contributions[0];
     const address = contribution.address;
-    const checkRow = schedule => {
+    const checkRow = () => {
       const row = page.elements.get('contributions').children[0];
       const heading = row.children[0].children[0].children[1];
       const details = row.children[0].children[1];
-      assert.equal(heading.textContent, '#1 · 300,000 sat / 100 blocks');
-      assert.equal(details.textContent, schedule);
+      assert.equal(heading.textContent, 'Minter 1 #1');
+      assert.equal(details.textContent, '300,000 sat / 100 blocks');
       assert.equal(details.title, pathname === '/mint' ? address : '');
       assert.equal(page.snapshot.contributions[0].address, address, 'API address data remains available for ownership matching');
     };
-    checkRow('Blocks 10–109');
+    checkRow();
     await page.event('time-days', 'click');
     const row = page.elements.get('contributions').children[0];
-    assert.equal(row.children[0].children[1].textContent, 'Jan 11–Jan 11');
+    assert.equal(row.children[0].children[1].textContent, '300,000 sat / 0.694 days');
     assert.equal(row.children[0].children[1].title, pathname === '/mint' ? address : '');
-    assert.match(row.children[0].children[0].children[1].textContent, /^#1 · 300,000 sat \/ 0\.694 days$/);
+    assert.equal(row.children[0].children[0].children[1].textContent, 'Minter 1 #1');
   }
 });
 
-test('dashboard requests recent contributions but uses server all-time totals, even with no visible rows', async () => {
+test('contribution status reports the exact schedule and floors progress by coins burned, not elapsed blocks', async () => {
+  const page = await openPage('/');
+  const contribution = page.snapshot.contributions[0];
+  page.snapshot.height = 59;
+  contribution.budget_sats = 300005;
+  contribution.burned_sats = '100002';
+  const status = () => page.elements.get('contributions').children[0].children[2].children[0].textContent;
+  await page.refresh();
+  assert.equal(status(), 'Active 49%');
+  contribution.burned_sats = '100003';
+  await page.refresh();
+  assert.equal(status(), 'Active 50%');
+  contribution.start_block = 145;
+  await page.refresh();
+  assert.equal(status(), 'Scheduled at block 145');
+  await page.event('time-days', 'click');
+  assert.equal(status(), 'Scheduled at Jan 12');
+  contribution.start_block = 10;
+  page.snapshot.height = 109;
+  await page.refresh();
+  assert.equal(status(), 'Finished on Jan 11');
+  await page.event('time-blocks', 'click');
+  assert.equal(status(), 'Finished on block 109');
+});
+
+test('contribution identity and minter names remain distinct plain text for delegating users', async () => {
+  const page = await openPage('/');
+  const contribution = page.snapshot.contributions[0];
+  contribution.mode = 'delegating';
+  contribution.user_name = '<Alice & Bob>';
+  contribution.minter_name = '<Service & co>';
+  contribution.minter_id = 2;
+  await page.refresh();
+  const row = page.elements.get('contributions').children[0];
+  assert.equal(row.children[0].children[0].children[1].textContent, '<Alice & Bob> #1');
+  assert.equal(row.children[0].children[1].textContent, '300,000 sat / 100 blocks');
+  assert.equal(row.children[1].textContent, '<Service & co>');
+  assert.equal(row.children[0].children[0].children[0].style.background, BLUE_PALETTE[1]);
+  assert.equal(row.children[0].children[1].title, '');
+});
+
+test('service and delegating personal totals conserve net rewards without claiming the delegate’s burned coins', async () => {
+  const service = { id: 1, user_id: 1, user_name: 'Service 1', minter_id: 1, minter_name: 'Service 1', address: 'tf1demo-address', mode: 'service', commission_bps: 200, service_user_id: null, budget_sats: 300000, duration: 100, start_block: 10, burned_sats: '200000', fees_sats: '100000', reward_sparks: String(2500 * SPARKS), commission_sparks: '0' };
+  const delegated = { id: 2, user_id: 2, user_name: 'Delegate 2', minter_id: 1, minter_name: 'Service 1', address: 'delegator', mode: 'delegating', commission_bps: 200, service_user_id: 1, budget_sats: 200000, duration: 100, start_block: 10, burned_sats: '200000', fees_sats: '0', reward_sparks: String(2450 * SPARKS), commission_sparks: String(50 * SPARKS) };
+  const accounts = [
+    { user_id: 1, address: service.address, name: 'Service 1', mode: 'service', commission_bps: 200, contribution_count: 1, burned_sats: '200000', fees_sats: '100000', reward_sparks: String(2550 * SPARKS) },
+    { user_id: 2, address: delegated.address, name: 'Delegate 2', mode: 'delegating', commission_bps: 200, contribution_count: 1, burned_sats: '200000', fees_sats: '0', reward_sparks: String(2450 * SPARKS) },
+  ];
+  const setup = async page => {
+    page.snapshot.height = 109;
+    page.snapshot.contributions = [{ ...service }, { ...delegated }];
+    page.snapshot.minters = accounts.map(account => ({ ...account }));
+    page.snapshot.services = [{ user_id: 1, name: 'Service 1', commission_bps: 200, active: false }];
+    page.snapshot.totals = { contribution_count: 2, burned_sats: '400000', fees_sats: '100000', reward_sparks: String(5000 * SPARKS) };
+    page.draws.length = 0;
+    await page.refresh();
+  };
+  const provider = await openPage('/mint');
+  await setup(provider);
+  assert.equal(provider.elements.get('total-burned').textContent, '200,000\u00a0sat');
+  assert.equal(provider.elements.get('total-fees').textContent, '100,000\u00a0sat');
+  assert.equal(provider.elements.get('total-reward').textContent, '2,550\u00a0FLM');
+  assert.equal(provider.elements.get('total-rate').textContent, '78\u00a0sat/FLM');
+  assert.equal(provider.elements.get('contributions').children.length, 2, 'the service can inspect its linked delegating contribution');
+  const linked = provider.elements.get('contributions').children[0];
+  assert.equal(linked.children[0].children[0].children[1].textContent, 'Delegate 2 #2');
+  assert.equal(linked.children[0].children[0].children[0].style.background, BLUE_PALETTE[2]);
+  assert.deepEqual(linked.children.slice(3).map(cell => cell.textContent), ['0', '50', '0', '0'], 'linked rows show only commission income, never the delegate’s costs or net reward');
+  assert.deepEqual(footerValues(provider), ['200,000', '2,550', '100,000', '78']);
+  assert.ok(provider.draws.some(call => call.method === 'fill' && call.fillStyle === BLUE_PALETTE[2]), 'the service chart exposes linked delegation in blue');
+  const delegate = await openPage('/mint', new Map(), undefined, undefined, { walletAddress: () => delegated.address, profile: () => profileResponse('Delegate 2', 2) });
+  await setup(delegate);
+  assert.equal(delegate.elements.get('contributions').children.length, 1, 'delegators do not acquire the service’s own contribution');
+  assert.equal(delegate.elements.get('total-burned').textContent, '200,000\u00a0sat');
+  assert.equal(delegate.elements.get('total-fees').textContent, '0\u00a0sat');
+  assert.equal(delegate.elements.get('total-reward').textContent, '2,450\u00a0FLM');
+  assert.equal(delegate.elements.get('total-rate').textContent, '81\u00a0sat/FLM');
+  assert.deepEqual(rowValues(delegate), ['200,000', '2,450', '0', '81']);
+  const dashboard = await openPage('/');
+  await setup(dashboard);
+  assert.equal(dashboard.elements.get('total-reward').textContent, '5,000\u00a0FLM');
+  assert.equal(accounts.reduce((sum, account) => sum + Number(account.reward_sparks), 0), Number(dashboard.snapshot.totals.reward_sparks));
+  for (const page of [provider, delegate, dashboard]) {
+    const oldDelegation = page.snapshot.contributions.find(contribution => contribution.id === 2);
+    oldDelegation.commission_bps = 5000;
+    oldDelegation.reward_sparks = String(1250 * SPARKS);
+    oldDelegation.commission_sparks = String(1250 * SPARKS);
+    page.snapshot.services[0].commission_bps = 5000;
+    page.snapshot.minters[0].commission_bps = 5000;
+    page.snapshot.minters[0].reward_sparks = String(3750 * SPARKS);
+    page.snapshot.minters[1].commission_bps = 5000;
+    page.snapshot.minters[1].reward_sparks = String(1250 * SPARKS);
+    await page.refresh();
+  }
+  assert.equal(provider.elements.get('total-reward').textContent, '3,750\u00a0FLM');
+  assert.equal(provider.elements.get('total-rate').textContent, '53\u00a0sat/FLM');
+  assert.deepEqual(rowValues(provider), ['0', '1,250', '0', '0'], 'finished linked rows reflect the identity’s retroactive commission');
+  assert.equal(delegate.elements.get('total-reward').textContent, '1,250\u00a0FLM');
+  assert.equal(delegate.elements.get('total-rate').textContent, '160\u00a0sat/FLM');
+  assert.deepEqual(rowValues(delegate), ['200,000', '1,250', '0', '160']);
+  assert.equal(dashboard.elements.get('total-reward').textContent, '5,000\u00a0FLM', 'repricing historical allocations does not create or destroy global rewards');
+});
+
+test('dashboard minter totals sort by raw numeric values, preserve modes and colors, and do not mutate the snapshot', async () => {
+  const page = await openPage('/');
+  const alice = { user_id: 1, address: 'alice', name: 'Alice', mode: 'independent', commission_bps: 0, contribution_count: 1, burned_sats: '200', reward_sparks: String(1000 * SPARKS), fees_sats: '2' };
+  const bob = { user_id: 2, address: 'bob', name: 'Bob', mode: 'service', commission_bps: 200, contribution_count: 1, burned_sats: '100', reward_sparks: String(201 * SPARKS), fees_sats: '10001' };
+  const zebra = { user_id: 3, address: 'zebra', name: 'Zebra', mode: 'delegating', commission_bps: 200, contribution_count: 1, burned_sats: '9', reward_sparks: String(SPARKS), fees_sats: '900' };
+  page.snapshot.minters = [zebra, alice, bob];
+  await page.refresh();
+  const rows = () => page.elements.get('minters').children;
+  const names = () => rows().map(row => row.children[0].children[0].children[1].textContent.replace(/\s*·?\s*2%$/, ''));
+  assert.equal(page.elements.get('minters-panel').hidden, false);
+  assert.deepEqual(names(), ['Alice', 'Bob', 'Zebra']);
+  assert.equal(rows()[0].children[0].children[0].children[0].style.background, userColor(1));
+  assert.equal(rows()[2].children[0].children[0].children[0].style.background, BLUE_PALETTE[3]);
+  const text = node => `${node.textContent ?? ''}${node.children.map(text).join('')}`;
+  assert.match(text(rows()[1].children[0]), /2%/, 'service commission appears next to its name, not in a separate column');
+  assert.ok(rows().every(row => row.children.length === 5));
+  await page.event('sort-name', 'click');
+  assert.deepEqual(names(), ['Zebra', 'Bob', 'Alice']);
+  for (const [id, expected] of [
+    ['burned_sats', ['Alice', 'Bob', 'Zebra']],
+    ['reward_sparks', ['Alice', 'Bob', 'Zebra']],
+    ['fees_sats', ['Bob', 'Zebra', 'Alice']],
+    ['rate', ['Zebra', 'Bob', 'Alice']],
+  ]) {
+    await page.event(`sort-${id}`, 'click');
+    assert.deepEqual(names(), expected, `descending ${id}`);
+    await page.event(`sort-${id}`, 'click');
+    assert.deepEqual(names(), [...expected].reverse(), `ascending ${id}`);
+  }
+  assert.deepEqual(page.snapshot.minters.map(minter => minter.user_id), [3, 1, 2]);
+  await page.event('unit-btc', 'click');
+  assert.deepEqual(names(), ['Alice', 'Bob', 'Zebra'], 'currency changes do not change raw mint-rate sort order');
+  bob.name = '<b>Bob</b>';
+  await page.refresh();
+  assert.ok(rows().some(row => row.children[0].children[0].children[1].textContent.includes('<b>Bob</b>')), 'untrusted names remain text');
+  const mint = await openPage('/mint');
+  assert.equal(mint.elements.get('minters-panel').hidden, true);
+});
+
+test('self-delegation appears once and reunites its net reward and commission in the owner’s balance', async () => {
+  const page = await openPage('/mint');
+  const first = page.snapshot.contributions[0];
+  page.snapshot.height = 109;
+  page.snapshot.contributions = [
+    { ...first, mode: 'service', commission_bps: 200, burned_sats: '200000', fees_sats: '100000', reward_sparks: String(2500 * SPARKS) },
+    { ...first, id: 2, mode: 'delegating', service_user_id: 1, minter_id: 1, commission_bps: 200, budget_sats: 200000, burned_sats: '200000', fees_sats: '0', reward_sparks: String(2450 * SPARKS), commission_sparks: String(50 * SPARKS) },
+  ];
+  page.snapshot.minters = [{ user_id: 1, address: first.address, name: 'Minter 1', mode: 'delegating', commission_bps: 200, contribution_count: 2, burned_sats: '400000', fees_sats: '100000', reward_sparks: String(5000 * SPARKS) }];
+  await page.refresh();
+  assert.equal(page.elements.get('contributions').children.length, 2);
+  assert.deepEqual(rowValues(page), ['200,000', '2,500', '0', '80']);
+  assert.deepEqual(footerValues(page), ['400,000', '5,000', '100,000', '80']);
+  assert.equal(page.elements.get('total-reward').textContent, '5,000\u00a0FLM');
+});
+
+test('dashboard uses server-supplied latest contributions and all-time totals, even with no visible rows', async () => {
   const page = await openPage('/');
   page.snapshot.totals = { contribution_count: 42, burned_sats: '9876543', fees_sats: '1234567', reward_sparks: '123456789999' };
   await page.refresh();
   const footer = () => page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
-  assert.equal(page.elements.get('contributions').children.length, 1, 'only the returned recent row is displayed');
-  assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '7,999']);
+  assert.equal(page.elements.get('contributions').children.length, 1, 'only the returned detailed row is displayed');
+  assert.deepEqual(footer(), ['All-time total', '', '42 contributions', '9,876,543', '1,234', '1,234,567', '7,999']);
   assert.equal(page.elements.get('total-burned').textContent, '9,876,543\u00a0sat');
   assert.equal(page.elements.get('total-fees').textContent, '1,234,567\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '1,234\u00a0FLM');
@@ -788,25 +1478,96 @@ test('dashboard requests recent contributions but uses server all-time totals, e
   await page.refresh();
   assert.equal(page.elements.get('contributions').children.length, 0);
   assert.equal(page.elements.get('empty-table').hidden, false);
-  assert.equal(page.elements.get('empty-table').textContent, 'No recent contributions.');
+  assert.equal(page.elements.get('empty-table').textContent, 'No contributions.');
   assert.ok(!page.draws.some(call => call.method === 'fill' && PALETTE.includes(call.fillStyle)), 'omitted contributions create no chart bands');
-  assert.deepEqual(footer(), ['All-time total', '42 contributions', '9,876,543', '1,234', '1,234,567', '7,999']);
+  assert.deepEqual(footer(), ['All-time total', '', '42 contributions', '9,876,543', '1,234', '1,234,567', '7,999']);
   assert.ok(page.requests.filter(request => request.url.startsWith('/api/state')).every(request => request.url === '/api/state'), 'dashboard never requests full history');
+});
+
+test('dashboard renders the server’s latest two hundred rows without an age cutoff or client-side limit', async () => {
+  const page = await openPage('/');
+  const first = page.snapshot.contributions[0];
+  page.snapshot.height = 100000;
+  page.snapshot.totals = { contribution_count: 12345, burned_sats: '9876543', fees_sats: '1234567', reward_sparks: '123456789999' };
+  page.snapshot.contributions = Array.from({ length: 200 }, (_, index) => ({ ...first, id: 600 - index, start_block: 1 }));
+  await page.refresh();
+  const rows = () => page.elements.get('contributions').children;
+  const identifier = row => row.children[0].children[0].children[1].textContent.match(/#\d+$/)[0];
+  assert.equal(rows().length, 200);
+  assert.equal(identifier(rows()[0]), '#600');
+  assert.equal(identifier(rows().at(-1)), '#401');
+  assert.ok(rows().every(row => row.children[2].children[0].textContent === 'Finished on block 100'), 'old returned rows are not filtered by block age');
+  assert.deepEqual(page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent), ['All-time total', '', '12345 contributions', '9,876,543', '1,234', '1,234,567', '7,999']);
+  page.snapshot.contributions.push({ ...first, id: 400, start_block: 1 });
+  await page.refresh();
+  assert.equal(rows().length, 201, 'the database, not the browser, owns the response limit');
+  assert.equal(identifier(rows().at(-1)), '#400');
+  assert.ok(page.requests.filter(request => request.url.startsWith('/api/state')).every(request => request.url === '/api/state'));
+});
+
+test('lightweight chart schedules preserve omitted old active contributions and the current mint rate', async () => {
+  const page = await openPage('/');
+  const first = page.snapshot.contributions[0];
+  page.snapshot.height = 20000;
+  const detailed = { ...first, id: 600, user_id: 3, start_block: 20001 };
+  const old = { id: 1, user_id: 2, start_block: 1, duration: 50000, budget_sats: 150000000 };
+  const { id, user_id, start_block, duration, budget_sats } = detailed;
+  page.snapshot.contributions = [detailed];
+  page.snapshot.chart_contributions = [old, { id, user_id, start_block, duration, budget_sats }];
+  page.draws.length = 0;
+  await page.refresh();
+  assert.equal(page.elements.get('contributions').children.length, 1, 'chart-only schedules do not create detailed table rows');
+  assert.equal(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, 'Minter 3 #600');
+  assert.equal(page.elements.get('total-rate').textContent, '40\u00a0sat/FLM', 'the old contribution still burns 2,000 sats in the current block');
+  assert.ok(page.draws.some(call => call.method === 'fill' && call.fillStyle === userColor(old.user_id)), 'the old active user still has a chart band');
+  assert.equal(page.elements.get('total-burned').textContent, '100,000\u00a0sat', 'all-time counters still come from server totals');
+  page.snapshot.height = 20001;
+  await page.refresh();
+  assert.equal(page.elements.get('total-rate').textContent, '80\u00a0sat/FLM', 'all current schedules, including the new detailed row, contribute once');
+  page.snapshot.chart_contributions = [];
+  page.draws.length = 0;
+  await page.refresh();
+  assert.equal(page.elements.get('total-rate').textContent, '—\u00a0sat/FLM', 'an explicitly empty chart list is authoritative');
+  assert.ok(!page.draws.some(call => call.method === 'fill' && PALETTE.includes(call.fillStyle)));
+  assert.equal(page.elements.get('contributions').children.length, 1, 'the detailed list remains independent');
+});
+
+test('orphaned delegated burns remain blue on charts but create no fees or fictitious current mint rate', async () => {
+  const page = await openPage('/');
+  const first = page.snapshot.contributions[0];
+  const orphan = { ...first, user_id: 2, mode: 'delegating', service_user_id: 99, commission_bps: 200, budget_sats: 300000 };
+  page.snapshot.height = 20;
+  page.snapshot.contributions = [orphan];
+  page.draws.length = 0;
+  await page.refresh();
+  assert.equal(page.elements.get('total-rate').textContent, '—\u00a0sat/FLM');
+  assert.ok(page.draws.some(call => call.method === 'fill' && call.fillStyle === BLUE_PALETTE[2]));
+  let path = [], fees;
+  for (const call of page.draws.filter(call => call.canvas === page.elements.get('chart'))) {
+    if (call.method === 'beginPath') path = [];
+    if (call.method === 'moveTo' || call.method === 'lineTo') path.push(call.args);
+    if (call.method === 'fill' && call.fillStyle?.kind === 'pattern') fees = path;
+  }
+  assert.ok(fees.every(point => point[1] === fees[0][1]), 'orphaned delegations never fabricate mining fees');
+  page.snapshot.contributions.push({ ...first, id: 2, user_id: 3 });
+  await page.refresh();
+  assert.equal(page.elements.get('total-rate').textContent, '100\u00a0sat/FLM', 'the factual rate includes 3,000 wasted plus 2,000 eligible sats burned for 50 FLM');
 });
 
 test('mint requests full history and retains personal totals for contributions finished more than 10,000 blocks ago', async () => {
   const page = await openPage('/mint');
   page.snapshot.height = 20000;
   page.snapshot.contributions[0].reward_sparks = '199999999';
+  assert.equal(Object.hasOwn(page.snapshot, 'chart_contributions'), false, 'full-history responses do not need a duplicate chart list');
   await page.refresh();
   assert.ok(page.requests.filter(request => request.url.startsWith('/api/state')).every(request => request.url === '/api/state?full_history=true'));
   assert.equal(page.elements.get('contributions').children.length, 1);
-  assert.equal(page.elements.get('contributions').children[0].children[1].children[0].textContent, 'Finished');
+  assert.equal(page.elements.get('contributions').children[0].children[2].children[0].textContent, 'Finished on block 109');
   assert.equal(page.elements.get('total-burned').textContent, '2,000\u00a0sat');
   assert.equal(page.elements.get('total-reward').textContent, '1\u00a0FLM');
   assert.equal(page.elements.get('total-fees').textContent, '1,000\u00a0sat');
   assert.equal(page.elements.get('total-rate').textContent, '1,000\u00a0sat/FLM');
-  assert.deepEqual(page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent), ['Total', '1 contributions', '2,000', '1', '1,000', '1,000']);
+  assert.deepEqual(page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent), ['Total', '', '1 contributions', '2,000', '1', '1,000', '1,000']);
 });
 
 test('FLM and sat/FLM displays truncate fractions without changing rewards or projection calculations', async () => {
@@ -820,8 +1581,8 @@ test('FLM and sat/FLM displays truncate fractions without changing rewards or pr
     await page.refresh();
     const row = page.elements.get('contributions').children[0].children.map(cell => cell.textContent);
     const footer = page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
-    assert.deepEqual(row.slice(2), ['1,000', '1', '999', '500']);
-    assert.deepEqual(footer.slice(2), ['1,000', '1', '999', '500']);
+    assert.deepEqual(row.slice(3), ['1,000', '1', '999', '500']);
+    assert.deepEqual(footer.slice(3), ['1,000', '1', '999', '500']);
     assert.equal(page.elements.get('total-reward').textContent, '1\u00a0FLM');
     assert.equal(page.elements.get('total-fees').textContent, '999\u00a0sat');
     assert.equal(page.elements.get('total-rate').textContent, `${pathname === '/mint' ? '500' : '40'}\u00a0sat/FLM`);
@@ -835,7 +1596,7 @@ test('FLM and sat/FLM displays truncate fractions without changing rewards or pr
     assert.equal(JSON.stringify(page.snapshot), before, 'display formatting never changes stored or received quantities');
     contribution.burned_sats = '7'; contribution.fees_sats = '0'; contribution.reward_sparks = '7000000';
     await page.refresh();
-    assert.deepEqual(page.elements.get('contributions').children[0].children.slice(2).map(cell => cell.textContent), ['7', '0', '0', '100'], 'an exact integer rate does not lose one to floating-point division by FLM');
+    assert.deepEqual(page.elements.get('contributions').children[0].children.slice(3).map(cell => cell.textContent), ['7', '0', '0', '100'], 'an exact integer rate does not lose one to floating-point division by FLM');
   }
 });
 
@@ -868,8 +1629,8 @@ test('mint totals separate accrued mining fees and calculate effective rate from
   assert.equal(page.elements.get('total-rate-label').textContent, 'Effective rate');
   assert.match(page.elements.get('total-rate-label').title, /excluding.*fees/i);
   const table = page.elements.get('contribution-totals').children[0].children.map(cell => cell.textContent);
-  assert.deepEqual(table.slice(2), ['122,345', '133', '117,000', '917'], 'header and table truncate only displayed reward and burn-only rate');
-  assert.deepEqual(page.elements.get('contributions').children.map(row => row.children[1].children[0].textContent), ['Scheduled', 'Active', 'Finished']);
+  assert.deepEqual(table.slice(3), ['122,345', '133', '117,000', '917'], 'header and table truncate only displayed reward and burn-only rate');
+  assert.deepEqual(page.elements.get('contributions').children.map(row => row.children[2].children[0].textContent.split(' ')[0]), ['Scheduled', 'Active', 'Finished']);
   page.elements.get('budget').value = String(BUDGET_MAX);
   await page.event('budget', 'input');
   page.elements.get('duration').value = '1000';
@@ -994,7 +1755,7 @@ test('dashboard sums each user’s burns and moves their complete band on top wh
     close(initial[index].top, initial[0].base - total * pixelsPerSat);
     assert.ok(initial[index].top < initial[index].base, 'each user has a positive band for their combined burns');
   }
-  assert.deepEqual(page.elements.get('contributions').children.map(row => row.children[0].children[0].children[1].textContent.split(' · ')[0]), ['#3', '#2', '#1'], 'table remains newest first');
+  assert.deepEqual(page.elements.get('contributions').children.map(row => row.children[0].children[0].children[1].textContent.match(/#\d+$/)[0]), ['#3', '#2', '#1'], 'table remains newest first');
   await redraw(page, [contributions[1], contributions[0], contributions[2]]);
   assert.deepEqual(bands(page), initial, 'input order has no effect on band order or geometry');
   const latest = { ...first, id: 4, user_id: 26, address: 'another-user', budget_sats: 110000, start_block: 11 };
@@ -1066,7 +1827,7 @@ test('mint draft stays grey until a poll provides the wallet address’s assigne
 
 test('user colors match across clients, reloads, reordered snapshots, and repeated contributions', async () => {
   const page = await openPage('/');
-  const colorById = page => new Map(page.elements.get('contributions').children.map(row => [row.children[0].children[0].children[1].textContent.split(' · ')[0], row.children[0].children[0].children[0].style.background]));
+  const colorById = page => new Map(page.elements.get('contributions').children.map(row => [row.children[0].children[0].children[1].textContent.match(/#\d+$/)[0], row.children[0].children[0].children[0].style.background]));
   const first = page.snapshot.contributions[0];
   page.snapshot.contributions = Array.from({ length: 8 }, (_, index) => ({ ...first, id: 9 - index, user_id: index === 0 ? first.user_id : 9 - index, address: index === 0 ? first.address : `user-${9 - index}` })).concat(first);
   await page.refresh();
@@ -1312,7 +2073,7 @@ test('mint page keeps keys local and persists the exact retry request across a p
   const storage = new Map();
   const first = await openPage('/mint', storage, async () => { throw new Error('Response lost'); });
   assert.equal(first.elements.get('page-title').textContent, 'Mint');
-  assert.equal(first.elements.get('navigation').textContent, 'Dashboard');
+  assert.equal(first.elements.get('nav-dashboard').textContent, 'Dashboard');
   assert.equal(first.elements.get('empty-table').textContent, 'No contributions.');
   assert.equal(first.elements.get('wallet-address').textContent, 'tf1demo-address');
   assert.equal(first.elements.get('wallet-status').textContent, 'Saved locally. Keys stay in this browser.');
@@ -1381,7 +2142,8 @@ test('the moved wallet panel reveals its recovery phrase only on explicit disclo
   assert.equal(page.elements.get('seed-phrase').textContent, '');
   assert.equal(page.elements.get('wallet-address').textContent, 'tf1demo-address');
   assert.equal(page.requests.filter(request => request.url === '/api/contributions').length, 0);
-  assert.ok(page.requests.every(request => request.options.body === undefined), 'moving the wallet does not send its recovery phrase anywhere');
+  assert.ok(page.requests.filter(request => request.url !== '/api/minter').every(request => request.options.body === undefined));
+  assert.deepEqual(profileRequests(page).map(request => JSON.parse(request.options.body)), [{ address: 'tf1demo-address' }], 'registration sends only the public reward address, never the recovery phrase');
 });
 
 test('the moved wallet retains retry and confirmed reset behavior without silently replacing stored keys', async () => {
@@ -1435,8 +2197,8 @@ test('the quote parser accepts only positive finite USD prices of BTC', () => {
 
 const quoteRequests = page => page.requests.filter(request => request.url.startsWith('https:'));
 const stateRequests = page => page.requests.filter(request => request.url.startsWith('/api/state'));
-const rowValues = page => page.elements.get('contributions').children[0].children.slice(2).map(cell => cell.textContent);
-const footerValues = page => page.elements.get('contribution-totals').children[0].children.slice(2).map(cell => cell.textContent);
+const rowValues = page => page.elements.get('contributions').children[0].children.slice(3).map(cell => cell.textContent);
+const footerValues = page => page.elements.get('contribution-totals').children[0].children.slice(3).map(cell => cell.textContent);
 const chartGeometry = page => page.draws.filter(call => call.canvas === page.elements.get('chart') && ['moveTo', 'lineTo'].includes(call.method)).map(call => [call.method, call.args[1]]);
 
 test('both pages offer an accessible three-state unit selection while always showing the BTC/USD quote', async () => {
@@ -1549,7 +2311,7 @@ test('mint budget, fees, contribution labels, validation, and projection follow 
   assert.equal(page.elements.get('projected-fees').textContent, '0.00500000 BTC');
   assert.equal(page.elements.get('projected-burn').textContent, '0.00500000 BTC');
   assert.match(page.elements.get('fee-label').textContent, /0\.00001000 BTC/);
-  assert.match(page.elements.get('contributions').children[0].children[0].children[0].children[1].textContent, /0\.00300000 BTC/);
+  assert.match(page.elements.get('contributions').children[0].children[0].children[1].textContent, /0\.00300000 BTC/);
   const draft = { budget_sats: 1000000, duration: 500, start_block: 11 };
   const estimate = projectedReward(page.snapshot.contributions, draft, 'tf1demo-address', 10);
   assert.equal(page.elements.get('projected-rate').textContent, `${formatMoney((draft.budget_sats - draft.duration * FEE) * SPARKS / estimate, 'BTC', null, true)} BTC / FLM`);
@@ -1575,7 +2337,7 @@ test('USD mode reuses the public quote fetched without identity and converts all
     assert.equal(request.options.referrerPolicy, 'no-referrer');
     assert.equal(request.options.body, undefined, 'wallet addresses and keys are never sent to the quote API');
     assert.ok(request.options.signal instanceof AbortSignal);
-    assert.equal(page.abortTimeouts.length, 2, 'the snapshot and the quote each have a timeout');
+    assert.equal(page.abortTimeouts.length, pathname === '/mint' ? 3 : 2, 'the snapshot, quote and mint profile each have a timeout');
     assert.ok(page.abortTimeouts.every(delay => delay === 10000), 'price requests cannot hang beyond ten seconds');
     assert.equal(page.elements.get('price-status').hidden, false);
     assert.match(page.elements.get('price-status').textContent, /50,000|50000/);
