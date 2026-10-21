@@ -27,6 +27,10 @@ network = "testnet"
 # tests call A, so a fresh devnet is spendable out of the box. Exactly one
 # of `address` and `predicate` names the holder; an operator writes the
 # address a wallet printed and never handles a wallet-internal value.
+#
+# The image (flamed/Dockerfile) keeps everything here but the address, which
+# it replaces with the first receiving address of the genesis mnemonic, so
+# keep exactly one allocation, named by `address`.
 [[genesis]]
 address = "t1ujp3zt7heh0nqyxnhlzdu2cnc7dnsef8zv6mmamae7pfl6pw0d4sm0hkyqi192pxpkrvup9md82dpt8p0a5h6ujq4t4ccvwkv5aj6ej38p45csjqh9wsn6"
 qty_sparks = 100000000000
