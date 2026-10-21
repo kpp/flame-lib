@@ -12,6 +12,7 @@ mod node;
 mod rpc;
 mod times;
 mod transactions;
+mod unspent;
 
 use std::path::Path;
 

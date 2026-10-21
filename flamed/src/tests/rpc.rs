@@ -204,6 +204,21 @@ async fn every_method_over_http() {
     assert_eq!(scan.outputs[0].id, ContractId(fixture.b_id));
     assert!(scan.outputs[0].spent.is_none());
 
+    // unspent, by B's address: the same contract, with a proof.
+    let b_address = account(&SEED_B)
+        .address_at(RECEIVING, 0)
+        .expect("address")
+        .to_bech32(flamekd::Network::Testnet);
+    let unspent = client
+        .unspent(b_address.clone(), None)
+        .await
+        .expect("unspent");
+    assert_eq!(unspent.tip.height, 2);
+    assert_eq!(unspent.predicate, PredicatePoint(fixture.b_predicate));
+    assert_eq!(unspent.outputs.len(), 1);
+    assert_eq!(unspent.outputs[0].id, ContractId(fixture.b_id));
+    assert!(unspent.outputs[0].proof.is_some());
+
     // The note crossed HTTP with the contract, and it opens: this is all B
     // needs to spend what A sent.
     let b = account(&SEED_B);
@@ -253,6 +268,15 @@ async fn every_method_over_http() {
         ),
         codes::LIMIT_EXCEEDED
     );
+    assert_eq!(
+        code_of(
+            client
+                .unspent("t1notanaddress".into(), None)
+                .await
+                .unwrap_err()
+        ),
+        codes::INVALID_ADDRESS
+    );
 
     // A transaction the node does accept shows up as `Mempool`.
     let accepted = {
@@ -283,6 +307,23 @@ async fn every_method_over_http() {
         client.tx_status(txid).await.expect("tx_status"),
         TxStatusResult::Mempool
     ));
+
+    // And `unspent` sees that spend only when asked to.
+    assert_eq!(
+        client
+            .unspent(b_address.clone(), Some(false))
+            .await
+            .expect("unspent")
+            .outputs
+            .len(),
+        1
+    );
+    assert!(client
+        .unspent(b_address, Some(true))
+        .await
+        .expect("unspent")
+        .outputs
+        .is_empty());
 
     // Drop the client first: the server drains its connections before
     // `stopped()` resolves, and a live keep-alive would stall that.

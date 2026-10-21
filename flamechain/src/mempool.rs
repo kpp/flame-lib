@@ -39,6 +39,7 @@ impl Default for MempoolPolicy {
 
 pub struct MempoolEntry {
     block_tx: BlockTx,
+    log: TxLog,
     txid: TxID,
     fee: u64,
     witness_bytes: usize,
@@ -47,6 +48,11 @@ pub struct MempoolEntry {
 impl MempoolEntry {
     pub fn transaction(&self) -> &BlockTx {
         &self.block_tx
+    }
+
+    /// The effects admission verified, against the pool's current base tip.
+    pub fn log(&self) -> &TxLog {
+        &self.log
     }
 
     pub fn txid(&self) -> TxID {
@@ -189,6 +195,7 @@ impl Mempool {
         self.txids.insert(*txid.as_bytes());
         self.entries.push(MempoolEntry {
             block_tx,
+            log,
             txid,
             fee,
             witness_bytes,

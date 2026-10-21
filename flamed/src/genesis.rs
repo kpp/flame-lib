@@ -131,7 +131,7 @@ mod devnet {
 
     use super::{genesis_anchor, holder, GenesisError};
     use crate::cells::contract_bytes;
-    use crate::config::{ChainParamsFile, GenesisContract, GenesisFile};
+    use crate::config::{ChainParamsFile, ChainSection, GenesisContract, GenesisFile};
 
     /// Derives a genesis from a network definition.
     ///
@@ -183,7 +183,7 @@ mod devnet {
         let (chain, _catchup) = Blockchain::devnet_genesis(params, &ids)?;
         Ok(GenesisFile {
             genesis_hash: BlockId(chain.tip().into_bytes()),
-            chain: params.into(),
+            chain: ChainSection::new(params, chainparams.network),
             contracts,
         })
     }

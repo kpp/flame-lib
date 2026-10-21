@@ -15,7 +15,8 @@ use jsonrpsee::proc_macros::rpc;
 use crate::types::{
     ActorId, ActorQueryResult, ActorResult, BlockId, BlockResult, BlockTxEnvelope, BlocksResult,
     ContractId, ContractResult, PendingTransactionsResult, PredicatePoint, ProofResult, ScanResult,
-    TipResult, TransactionResult, TransactionsResult, TxId, TxStatusResult, ValueEnvelope,
+    TipResult, TransactionResult, TransactionsResult, TxId, TxStatusResult, UnspentResult,
+    ValueEnvelope,
 };
 
 /// The `flamed` JSON-RPC 2.0 API. Parameters are positional, in the order
@@ -104,4 +105,17 @@ pub trait FlamedApi {
         predicates: Vec<PredicatePoint>,
         since_height: u64,
     ) -> RpcResult<ScanResult>;
+
+    /// Every unspent contract locked to one receiving or tracking address,
+    /// with a proof for each against the current tip. Set `with_pending` to
+    /// true to apply the mempool on top: contracts a pending transaction
+    /// spends are left out, and contracts it creates are added without a
+    /// height or a proof. The default is false.
+    /// `INVALID_ADDRESS` if the address does not decode for this network.
+    #[method(name = "unspent")]
+    async fn unspent(
+        &self,
+        address: String,
+        with_pending: Option<bool>,
+    ) -> RpcResult<UnspentResult>;
 }

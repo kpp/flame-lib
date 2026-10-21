@@ -102,10 +102,13 @@ lowercase hex strings; blobs are standard base64.
 | `submit_tx` | `block_tx` | the txid, once the mempool has taken it |
 | `tx_status` | `txid` | `unknown`, `mempool`, or `confirmed` with where |
 | `scan` | `predicates`, `since_height` | every contract created under those predicates since that height, each with its note |
+| `unspent` | `address`, `with_pending?` | every unspent contract locked to a receiving or tracking address, with its note, block time and a proof at the tip; with `with_pending`, mempool spends are removed and pending outputs are added with `received_at` instead of a height, time or proof |
 
 Server-defined error codes, in the JSON-RPC 2.0 server range: `-32001`
 `NOT_FOUND`, `-32002` `MEMPOOL_REJECTED`, `-32003` `LIMIT_EXCEEDED`,
-`-32004` `INVALID_BYTES`, `-32005` `STALE_BLOCK`, `-32006` `QUERY_FAILED`.
+`-32004` `INVALID_BYTES`, `-32005` `STALE_BLOCK`, `-32006` `QUERY_FAILED`,
+`-32012` `INVALID_ADDRESS`. `-32007` through `-32011` are skipped because
+jsonrpsee uses them for its own errors, such as an oversized request.
 Anything else is `-32603`, which means the node is
 broken rather than the request.
 
@@ -148,10 +151,10 @@ three times, each vouched for by someone different.
 
 | Field | Where | Who vouches for it |
 |---|---|---|
-| `time` | `BlockSummary`, and `ScanEntry` for the creating block | the core indexer |
+| `time` | `BlockSummary`, and `ScanEntry` and `UnspentEntry` for the creating block | the core indexer |
 | `block_time` | `TransactionResult` | the core indexer, through the block |
 | `locktime` | `TransactionSummary`, `PendingTransaction` | the sender: signed, never checked |
-| `received_at` | `PendingTransaction`, `TransactionResult` | this node's clock |
+| `received_at` | `PendingTransaction`, `TransactionResult`, and `UnspentEntry` while pending | this node's clock |
 
 All are Unix seconds. `time` and `block_time` are absent for genesis and for a
 block the indexer does not know. `received_at` is absent on a confirmed

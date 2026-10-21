@@ -20,9 +20,9 @@ pub use types::{
     ContractEnvelope, ContractId, ContractResult, DictEntry, ExecutionData, InstructionView,
     NoteEnvelope, PendingTransaction, PendingTransactionsResult, PredicatePoint, ProofBytes,
     ProofResult, ScanEntry, ScanResult, SpentAt, StateCommitment, TipResult, TransactionResult,
-    TransactionSummary, TransactionsResult, TxEntry, TxId, TxStatusResult, TxValue, ValueCell,
-    ValueEnvelope, MAX_PAGE_SIZE, MAX_PROOF_IDS, MAX_QUERY_BYTES, MAX_QUERY_GAS,
-    MAX_SCAN_PREDICATES,
+    TransactionSummary, TransactionsResult, TxEntry, TxId, TxStatusResult, TxValue, UnspentEntry,
+    UnspentResult, ValueCell, ValueEnvelope, MAX_PAGE_SIZE, MAX_PROOF_IDS, MAX_QUERY_BYTES,
+    MAX_QUERY_GAS, MAX_SCAN_PREDICATES,
 };
 
 /// Required on any `impl FlamedApiServer`.

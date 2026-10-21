@@ -15,7 +15,7 @@ use flamed_rpc::{
     BlockTxEnvelope, BlocksResult, ContractEnvelope, ContractId, ContractResult, ErrorCode,
     ErrorObjectOwned, FlamedApiServer, PendingTransactionsResult, PredicatePoint, ProofBytes,
     ProofResult, RpcResult, ScanResult, TipResult, TransactionResult, TransactionsResult, TxId,
-    TxStatusResult, ValueEnvelope, MAX_PROOF_IDS, MAX_QUERY_BYTES, MAX_QUERY_GAS,
+    TxStatusResult, UnspentResult, ValueEnvelope, MAX_PROOF_IDS, MAX_QUERY_BYTES, MAX_QUERY_GAS,
     MAX_SCAN_PREDICATES,
 };
 use jsonrpsee::server::{BatchRequestConfig, Server, ServerConfig, ServerHandle};
@@ -227,6 +227,15 @@ impl FlamedApiServer for FlamedRpc {
         })
         .await
     }
+
+    async fn unspent(
+        &self,
+        address: String,
+        with_pending: Option<bool>,
+    ) -> RpcResult<UnspentResult> {
+        self.with_node(move |node| node.unspent(&address, with_pending.unwrap_or(false)))
+            .await
+    }
 }
 
 /// Binds an HTTP server, starts it, and says where it listens.
@@ -265,6 +274,7 @@ impl From<NodeError> for ErrorObjectOwned {
             NodeError::Decode(_) | NodeError::QueryDecode(_) => codes::INVALID_BYTES,
             NodeError::StaleBlock => codes::STALE_BLOCK,
             NodeError::Query(_) => codes::QUERY_FAILED,
+            NodeError::Address(_) | NodeError::WrongNetwork { .. } => codes::INVALID_ADDRESS,
             _ => ErrorCode::InternalError.code(),
         };
         ErrorObjectOwned::owned(code, error.to_string(), None::<()>)

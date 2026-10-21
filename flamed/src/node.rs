@@ -24,15 +24,17 @@ use flamed_rpc::{
     ActorCode, ActorId, ActorQueryResult, ActorResult, ActorStateEnvelope, BlockHeader, BlockId,
     BlockResult, BlockSummary, BlockTxEnvelope, BlocksResult, ContractEnvelope, ContractId,
     ExecutionData, NoteEnvelope, PendingTransaction, PendingTransactionsResult, PredicatePoint,
-    ScanEntry, SpentAt, StateCommitment, TransactionResult, TransactionSummary, TransactionsResult,
-    TxId, ValueEnvelope, MAX_PAGE_SIZE, MAX_QUERY_BYTES, MAX_QUERY_GAS,
+    ProofBytes, ScanEntry, SpentAt, StateCommitment, TipResult, TransactionResult,
+    TransactionSummary, TransactionsResult, TxId, UnspentEntry, UnspentResult, ValueEnvelope,
+    MAX_PAGE_SIZE, MAX_QUERY_BYTES, MAX_QUERY_GAS,
 };
+use flamekd::{Network, ReceivingAddress, TrackingAddress};
 use flamevm::{
     ActorID, Cell, CellDecode, CellEncode, CellEnvelope, CellError, CellID, CellReader, ContractID,
-    TxEntry, TxID, VMError, Value,
+    Predicate, TxEntry, TxID, VMError, Value,
 };
 
-use crate::cells::{contract_bytes, log_bytes};
+use crate::cells::{contract_bytes, log_bytes, proof_bytes};
 use crate::config::{GenesisFile, NodeConfig};
 use crate::genesis::{self, GenesisError};
 use crate::index::{OutputIndex, OutputRecord, SpendRecord, TxIndex, TxRecord};
@@ -70,6 +72,7 @@ pub use crate::indexer::core_block_hash;
 /// An archival node.
 pub struct Node {
     params: ChainParams,
+    network: Network,
     chain: Blockchain,
     mempool: Mempool,
     utxos: UtxoSet,
@@ -224,6 +227,7 @@ impl Node {
 
         Ok(Node {
             params,
+            network: genesis.chain.network.into(),
             chain,
             mempool,
             utxos,
@@ -524,6 +528,83 @@ impl Node {
         hits
     }
 
+    /// Every unspent contract locked to one address, each with its proof at
+    /// the tip, in creation order.
+    ///
+    /// With `with_pending`, the mempool is applied on top in admission
+    /// order: what it spends is left out, and what it creates follows the
+    /// confirmed contracts without a height or a proof. A contract one
+    /// pending transaction creates and a later one spends is in neither.
+    pub fn unspent(&self, address: &str, with_pending: bool) -> Result<UnspentResult, NodeError> {
+        let predicate = address_predicate(address, self.network)?;
+
+        let mut spent = BTreeSet::new();
+        let mut pending = Vec::new();
+        if with_pending {
+            for entry in self.mempool.entries() {
+                let entries = entry.log().entries();
+                for (index, effect) in entries.iter().enumerate() {
+                    match effect {
+                        TxEntry::Input(id) => {
+                            spent.insert(*id);
+                        }
+                        TxEntry::Output(contract)
+                            if contract.predicate.to_point().to_bytes() == predicate =>
+                        {
+                            pending.push(UnspentEntry {
+                                id: ContractId(contract.id()),
+                                txid: TxId(entry.txid().0),
+                                bytes: ContractEnvelope(contract_bytes(contract)?),
+                                note: note_after(entries, index).map(NoteEnvelope),
+                                height: None,
+                                time: None,
+                                received_at: self.received.get(&entry.txid().0).copied(),
+                                proof: None,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let mut outputs = Vec::new();
+        for id in self.outputs.under(&predicate) {
+            let (Some(proof), Some(record)) = (self.utxos.get(id), self.outputs.get(id)) else {
+                continue;
+            };
+            if spent.contains(id) {
+                continue;
+            }
+            outputs.push(UnspentEntry {
+                id: ContractId(*id),
+                txid: TxId(record.txid.0),
+                bytes: ContractEnvelope(record.contract.clone()),
+                note: record.note.clone().map(NoteEnvelope),
+                height: Some(record.height),
+                time: self.block_time(record.height),
+                received_at: None,
+                proof: Some(ProofBytes(proof_bytes(proof))),
+            });
+        }
+        outputs.extend(
+            pending
+                .into_iter()
+                .filter(|output| !spent.contains(&output.id.0)),
+        );
+
+        let tip = self.tip();
+        Ok(UnspentResult {
+            tip: TipResult {
+                hash: BlockId(tip.hash.into_bytes()),
+                height: tip.height,
+                contract_root: tip.contract_root,
+            },
+            predicate: PredicatePoint(predicate),
+            outputs,
+        })
+    }
+
     /// The time of the block at `height`, if the indexer knew it.
     pub fn block_time(&self, height: u64) -> Option<u64> {
         self.txindex.block(height).and_then(|block| block.time)
@@ -724,6 +805,51 @@ impl Node {
     }
 }
 
+/// The predicate payments to a receiving or tracking address are locked
+/// by: `Predicate::opaque(S)`, the rule `flamepayments` builds outputs with.
+fn address_predicate(text: &str, network: Network) -> Result<[u8; 32], NodeError> {
+    predicate_of(text, network).map_err(|error| {
+        // `flamekd` reports a foreign network as a bad encoding; an address
+        // that decodes for the other network is well formed, just not ours.
+        let other = match network {
+            Network::Mainnet => Network::Testnet,
+            Network::Testnet => Network::Mainnet,
+        };
+        match predicate_of(text, other) {
+            Ok(_) => NodeError::WrongNetwork {
+                address: other,
+                node: network,
+            },
+            Err(_) => NodeError::Address(error),
+        }
+    })
+}
+
+/// [`address_predicate`] for one network, with `flamekd`'s own error.
+fn predicate_of(text: &str, network: Network) -> Result<[u8; 32], flamekd::Error> {
+    // A receiving address is a tracking address with an encryption key
+    // appended, so length alone says which one was meant, and the error
+    // names the right one.
+    let spending = if text.len() > TRACKING_ADDRESS_CHARS {
+        *ReceivingAddress::from_bech32(text, network)?.spending_key()
+    } else {
+        *TrackingAddress::from_bech32(text, network)?.spending_key()
+    };
+    Ok(Predicate::opaque(spending.compress()).to_point().to_bytes())
+}
+
+/// The length of a tracking address on either network.
+const TRACKING_ADDRESS_CHARS: usize = 60;
+
+/// An output's note: the entry right after it in its log, when that entry
+/// is `Data`, byte for byte.
+fn note_after(entries: &[TxEntry], index: usize) -> Option<Vec<u8>> {
+    match entries.get(index + 1) {
+        Some(TxEntry::Data(note)) => Some(note.clone()),
+        _ => None,
+    }
+}
+
 fn page_limit(limit: u32) -> Result<usize, NodeError> {
     if limit == 0 || limit > MAX_PAGE_SIZE {
         return Err(NodeError::Limit {
@@ -851,10 +977,7 @@ fn connect_block(
                             txid,
                             predicate: contract.predicate.to_point().to_bytes(),
                             contract: contract_bytes(contract)?,
-                            note: match entries.get(index + 1) {
-                                Some(TxEntry::Data(note)) => Some(note.clone()),
-                                _ => None,
-                            },
+                            note: note_after(entries, index),
                         },
                     ));
                 }
@@ -1051,6 +1174,12 @@ pub enum NodeError {
     /// A getter failed without committing effects.
     #[error("actor query failed: {0}")]
     Query(VMError),
+    /// An address that does not decode for this node's network.
+    #[error("invalid address: {0}")]
+    Address(flamekd::Error),
+    /// A well-formed address for the other network.
+    #[error("invalid address: it is a {address:?} address, and this node is on {node:?}")]
+    WrongNetwork { address: Network, node: Network },
     /// The mempool refused a transaction.
     #[error(transparent)]
     Mempool(#[from] MempoolError),

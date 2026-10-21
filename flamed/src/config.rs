@@ -181,23 +181,29 @@ pub struct GenesisSpec {
 pub struct ChainSection {
     /// The Flame protocol version.
     pub version: u32,
+    /// The network whose addresses the node reads, as `chainparams.toml`
+    /// named it. Not a chain parameter, so not in the genesis hash; absent
+    /// from a `genesis.json` written before it was recorded, which reads as
+    /// testnet, the same default `chainparams.toml` has.
+    #[serde(default)]
+    pub network: NetworkName,
     /// Storage parameters, every field written out.
     pub storage: StorageSection,
     /// Block limits, every field written out.
     pub limits: LimitsSection,
 }
 
-impl From<ChainParams> for ChainSection {
-    fn from(params: ChainParams) -> Self {
+impl ChainSection {
+    /// Records these parameters, and the network they were derived for.
+    pub fn new(params: ChainParams, network: NetworkName) -> Self {
         Self {
             version: params.version,
+            network,
             storage: params.storage.into(),
             limits: params.limits.into(),
         }
     }
-}
 
-impl ChainSection {
     /// The upstream parameters this section records.
     pub fn params(&self) -> ChainParams {
         ChainParams {
