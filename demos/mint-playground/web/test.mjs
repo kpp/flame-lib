@@ -832,7 +832,7 @@ async function openPage(pathname, storage = new Map(), post = async () => ({ id:
     ResizeObserver: class { observe() {} },
     setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
     clearTimeout: id => timers.delete(id),
-    walletModule: { default: async () => walletReady, generateMnemonic: () => 'a browser only recovery phrase', Wallet: { fromMnemonic: mnemonic => ({ nextAddress: () => ({ address: pageOptions.walletAddress ? pageOptions.walletAddress(mnemonic) : 'tf1demo-address' }), free() {} }) } },
+    walletModule: { default: async () => walletReady, generateMnemonic: () => 'a browser only recovery phrase', Wallet: { fromMnemonic: mnemonic => ({ nextAddress: () => ({ receivingAddress: pageOptions.walletAddress ? pageOptions.walletAddress(mnemonic) : 'tf1demo-address' }), free() {} }) } },
     fetch: async (url, options = {}) => {
       requests.push({ url, options });
       if (url === '/api/state' || url === '/api/state?full_history=true') return pageOptions.state ? pageOptions.state(snapshot, url) : { ok: true, json: async () => snapshot };

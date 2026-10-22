@@ -1,7 +1,7 @@
 //! Reading a contract an indexer served.
 
 use flamepayments::InputSpec;
-use flamevm::Value;
+use flamevm::{Scalar, Value, FLAME_FLAVOR};
 
 use crate::error::FlameError;
 use crate::transfer::Opening;
@@ -21,12 +21,28 @@ pub struct ContractInfo {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ContractValue {
     /// A cleartext token: the amount is public. A devnet genesis allocation
-    /// is one.
-    Clear { qty: u64, flavor: Vec<u8> },
+    /// is one. `is_native` says whether `flavor` is [`native_flavor`].
+    Clear {
+        qty: u64,
+        flavor: Vec<u8>,
+        is_native: bool,
+    },
     /// A confidential token: the amount is readable only with its opening.
     Confidential,
     /// Anything that is not a bare token; no transfer spends it.
     Other,
+}
+
+/// The flavor of flames, the native token, in the 32 bytes
+/// [`decode_contract`] and [`crate::Wallet::open_note`] give a flavor in.
+#[uniffi::export]
+pub fn native_flavor() -> Vec<u8> {
+    FLAME_FLAVOR.to_bytes().to_vec()
+}
+
+/// Whether `flavor` is [`native_flavor`]: what `is_native` reports.
+pub(crate) fn is_native(flavor: Scalar) -> bool {
+    flavor == FLAME_FLAVOR
 }
 
 /// Decodes a contract from its published bytes.
@@ -38,6 +54,7 @@ pub fn decode_contract(bytes: Vec<u8>) -> Result<ContractInfo, FlameError> {
             Some(qty) => ContractValue::Clear {
                 qty,
                 flavor: token.flv().to_bytes().to_vec(),
+                is_native: is_native(token.flv()),
             },
             None => ContractValue::Other,
         },

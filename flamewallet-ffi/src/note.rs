@@ -13,6 +13,8 @@ use crate::transfer::Opening;
 pub struct ReceivedNote {
     /// What a [`crate::TransferInput`] spends the output with.
     pub opening: Opening,
+    /// Whether the opening's flavor is [`crate::native_flavor`]: flames.
+    pub is_native: bool,
     /// The memo, as the sender wrote it.
     pub memo: Vec<u8>,
 }
@@ -78,6 +80,7 @@ pub(crate) fn open<K: ViewingKey>(
         })?;
     Ok(ReceivedNote {
         opening: Opening::from_wallet(&received.opening),
+        is_native: contract::is_native(received.opening.flv),
         memo: received.memo,
     })
 }
