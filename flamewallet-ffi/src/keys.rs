@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use crate::convert::array32;
 use crate::error::FlameError;
 use crate::note::{self, ReceivedNote};
-use crate::transfer::{self, Transfer, TransferRequest};
+use crate::transfer::{self, IssueRequest, Transfer, TransferRequest};
 
 /// Which network the address's two bech32f components are encoded for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -356,6 +356,19 @@ impl Wallet {
             holder => return Err(holder.refuse(WalletKind::Spend)),
         };
         transfer::build(&account, request)
+    }
+
+    /// Builds, proves and signs a confidential issuance, as
+    /// [`Wallet::build_transfer`] does a transfer. The issuer's key signs
+    /// the issuance program, which fixes the amount, the outputs and the
+    /// one contract it spends, so the published signature authorizes
+    /// nothing else.
+    pub fn build_issue(&self, request: IssueRequest) -> Result<Transfer, FlameError> {
+        let account = match &*self.account() {
+            Holder::Spend(account) => account.clone(),
+            holder => return Err(holder.refuse(WalletKind::Spend)),
+        };
+        transfer::issue(&account, request)
     }
 }
 

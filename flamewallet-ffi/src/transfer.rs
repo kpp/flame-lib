@@ -63,6 +63,25 @@ pub struct TransferRequest {
     pub locktime: u32,
 }
 
+/// A confidential issuance: `qty` of the flavor [`issued_flavor`] names
+/// for the issuer's predicate and `tag`, minted by spending `issuer`.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct IssueRequest {
+    /// The one contract spent; its key is the issuer, so the flavor follows
+    /// the address it is locked to.
+    pub issuer: TransferInput,
+    pub tag: Vec<u8>,
+    pub qty: u64,
+    /// Must balance per flavor: the issuer's token less `fee`, and `qty`
+    /// of the minted flavor.
+    pub outputs: Vec<TransferOutput>,
+    /// In sparks.
+    pub fee: u64,
+    pub gas: u64,
+    /// `0` for none; otherwise as in Bitcoin.
+    pub locktime: u32,
+}
+
 /// One contract the transfer creates.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct CreatedOutput {
@@ -115,30 +134,117 @@ pub(crate) fn build(
     let mut specs = Vec::with_capacity(request.inputs.len());
     let mut keys = Zeroizing::new(Vec::with_capacity(request.inputs.len()));
     for (position, input) in request.inputs.iter().enumerate() {
-        let published = contract::decode(&input.contract)?;
-        let proof = flamechain::codec::proof_from_bytes(&input.proof)
-            .map_err(|error| FlameError::bytes("proof", format!("{error:?}")))?;
-        let KeyPath { branch, index } = input.path;
-        // A wrong path signs with a key the predicate never names; the
-        // transaction would build, prove and sign, and every node refuse it.
-        if published.predicate.to_point() != account.predicate_at(branch, index)?.to_point() {
-            return Err(FlameError::KeyMismatch {
-                input: position as u32,
-            });
-        }
-        let key = account.spending_key_at(branch, index)?;
-        let spec = match &input.opening {
-            None => InputSpec::clear(published, proof, key),
-            Some(opening) => InputSpec::confidential(&published, &opening.to_wallet()?, proof, key),
-        }
-        .map_err(FlameError::transfer)?;
+        let (spec, key) = input_spec(account, input, position)?;
         specs.push(spec);
         keys.push(key);
     }
+    let outputs = output_specs(account, &request.outputs)?;
 
+    let header = TxHeader {
+        version: TX_VERSION,
+        locktime: request.locktime,
+    };
+    let limits = Limits { gas: request.gas };
+    let unsigned =
+        flamepayments::build_transfer(&specs, &outputs, request.fee, header, limits, &mut OsRng)
+            .map_err(FlameError::transfer)?;
+
+    let created = created(unsigned.log())?;
+    let txid = unsigned.txid();
+
+    let proofs = specs.iter().map(|spec| spec.proof().clone()).collect();
+    let signed = flamepayments::sign(unsigned, &keys).map_err(FlameError::transfer)?;
+    let block_tx = flamepayments::block_tx(signed, limits, proofs)
+        .to_bytes()
+        .map_err(FlameError::transfer)?;
+
+    Ok(Transfer {
+        txid: txid.0.to_vec(),
+        block_tx,
+        outputs: created,
+    })
+}
+
+pub(crate) fn issue(account: &SpendAccount, request: IssueRequest) -> Result<Transfer, FlameError> {
+    let (spec, _key) = input_spec(account, &request.issuer, 0)?;
+    let outputs = output_specs(account, &request.outputs)?;
+    let header = TxHeader {
+        version: TX_VERSION,
+        locktime: request.locktime,
+    };
+    let limits = Limits { gas: request.gas };
+    let (tx, outputs) = flamepayments::build_issue(
+        &spec,
+        &request.tag,
+        request.qty,
+        &outputs,
+        request.fee,
+        header,
+        limits,
+        &mut OsRng,
+    )
+    .map_err(FlameError::transfer)?;
+
+    let created = outputs
+        .iter()
+        .map(|(contract, note)| created_output(contract, note))
+        .collect::<Result<Vec<_>, FlameError>>()?;
+    let txid = tx.txid;
+    let block_tx = flamepayments::block_tx(tx, limits, vec![spec.proof().clone()])
+        .to_bytes()
+        .map_err(FlameError::transfer)?;
+    Ok(Transfer {
+        txid: txid.0.to_vec(),
+        block_tx,
+        outputs: created,
+    })
+}
+
+/// The flavor an issuance mints under `predicate` (32 bytes, as
+/// [`crate::address_to_predicate`] gives it) and `tag`: 32 bytes.
+#[uniffi::export]
+pub fn issued_flavor(predicate: Vec<u8>, tag: Vec<u8>) -> Result<Vec<u8>, FlameError> {
+    let point = curve25519_dalek::ristretto::CompressedRistretto(convert::array32(
+        "predicate",
+        &predicate,
+    )?);
+    let predicate = flamevm::Predicate::opaque(point);
+    Ok(flamepayments::issued_flavor(&predicate, &tag)
+        .to_bytes()
+        .to_vec())
+}
+
+fn input_spec(
+    account: &SpendAccount,
+    input: &TransferInput,
+    position: usize,
+) -> Result<(InputSpec, curve25519_dalek::scalar::Scalar), FlameError> {
+    let published = contract::decode(&input.contract)?;
+    let proof = flamechain::codec::proof_from_bytes(&input.proof)
+        .map_err(|error| FlameError::bytes("proof", format!("{error:?}")))?;
+    let KeyPath { branch, index } = input.path;
+    // A wrong path signs with a key the predicate never names; the
+    // transaction would build, prove and sign, and every node refuse it.
+    if published.predicate.to_point() != account.predicate_at(branch, index)?.to_point() {
+        return Err(FlameError::KeyMismatch {
+            input: position as u32,
+        });
+    }
+    let key = account.spending_key_at(branch, index)?;
+    let spec = match &input.opening {
+        None => InputSpec::clear(published, proof, key),
+        Some(opening) => InputSpec::confidential(&published, &opening.to_wallet()?, proof, key),
+    }
+    .map_err(FlameError::transfer)?;
+    Ok((spec, key))
+}
+
+fn output_specs(
+    account: &SpendAccount,
+    outputs: &[TransferOutput],
+) -> Result<Vec<OutputSpec>, FlameError> {
     let network = account.network();
-    let outputs = request
-        .outputs
+    outputs
         .iter()
         .map(|output| {
             Ok(OutputSpec {
@@ -152,41 +258,25 @@ pub(crate) fn build(
                 memo: output.memo.clone(),
             })
         })
-        .collect::<Result<Vec<_>, FlameError>>()?;
+        .collect()
+}
 
-    let header = TxHeader {
-        version: TX_VERSION,
-        locktime: request.locktime,
-    };
-    let limits = Limits { gas: request.gas };
-    let unsigned =
-        flamepayments::build_transfer(&specs, &outputs, request.fee, header, limits, &mut OsRng)
-            .map_err(FlameError::transfer)?;
-
-    let created = flamepayments::outputs_with_notes(unsigned.log())
+fn created(log: &flamevm::TxLog) -> Result<Vec<CreatedOutput>, FlameError> {
+    flamepayments::outputs_with_notes(log)
         .into_iter()
         .map(|(contract, note)| {
-            Ok(CreatedOutput {
-                contract_id: contract.id().to_vec(),
-                contract: flamechain::codec::contract_bytes(contract)
-                    .map_err(FlameError::transfer)?,
-                note: note
-                    .expect("the builder writes a note after every output")
-                    .to_vec(),
-            })
+            created_output(
+                contract,
+                note.expect("the builder writes a note after every output"),
+            )
         })
-        .collect::<Result<Vec<_>, FlameError>>()?;
-    let txid = unsigned.txid();
+        .collect()
+}
 
-    let proofs = specs.iter().map(|spec| spec.proof().clone()).collect();
-    let signed = flamepayments::sign(unsigned, &keys).map_err(FlameError::transfer)?;
-    let block_tx = flamepayments::block_tx(signed, limits, proofs)
-        .to_bytes()
-        .map_err(FlameError::transfer)?;
-
-    Ok(Transfer {
-        txid: txid.0.to_vec(),
-        block_tx,
-        outputs: created,
+fn created_output(contract: &flamevm::Contract, note: &[u8]) -> Result<CreatedOutput, FlameError> {
+    Ok(CreatedOutput {
+        contract_id: contract.id().to_vec(),
+        contract: flamechain::codec::contract_bytes(contract).map_err(FlameError::transfer)?,
+        note: note.to_vec(),
     })
 }

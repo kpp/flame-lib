@@ -27,8 +27,8 @@ use flamechain::utreexo::Proof;
 use flamechain::BlockTx;
 use flamekd::ReceivingAddress;
 use flamevm::{
-    CellValue, Commitment, Contract, ExternalTx, Limits, Scalar, ScriptBuilder, Token, TxHeader,
-    UnsignedTx, VMError, Value,
+    flavor_from_predicate, Anchor, CellValue, Commitment, Contract, ExternalTx, Limits, Point,
+    Predicate, Scalar, ScriptBuilder, Token, TxHeader, UnsignedTx, VMError, Value,
 };
 use merlin::Transcript;
 use musig::{Multisignature, MusigError};
@@ -211,21 +211,8 @@ pub fn build_transfer<R: RngCore + CryptoRng>(
         return Err(BuilderError::MemoTooLong(output.memo.len()));
     }
 
-    // Seal every output, then put them in the order they are published in.
     let mut rng = hedged_rng(&header, inputs, fee, outputs, rng);
-    let mut sealed: Vec<SealedOutput> = outputs
-        .iter()
-        .map(|output| SealedOutput::new(output, &mut rng))
-        .collect();
-    sealed.sort_by_key(|output| output.qty_point.to_bytes());
-    let count = sealed.len();
-
-    // The commitments go to the script by move, never by copy: each one
-    // holds its blinding factor.
-    let (commitments, published): (Vec<_>, Vec<_>) = sealed
-        .into_iter()
-        .map(|output| ((output.qty, output.flv), (output.predicate, output.note)))
-        .unzip();
+    let sealed = seal(outputs, &mut rng);
 
     let mut program = ScriptBuilder::new();
     for input in inputs {
@@ -241,6 +228,176 @@ pub fn build_transfer<R: RngCore + CryptoRng>(
         program = program.push_int(fee).fee();
         mix_inputs += 1;
     }
+
+    Ok(mix_and_output(program, mix_inputs, sealed)?.build_tx(header, limits)?)
+}
+
+/// Builds and signs a confidential issuance: `qty` of a new flavor, minted
+/// under the predicate of `issuer`'s contract, and paid out with that
+/// contract's own token to `outputs`.
+///
+/// The minted flavor is [`issued_flavor`] of that predicate and `tag`, so
+/// coins minted from one address under one tag are one fungible flavor;
+/// the same tag minted from another address is another. `outputs` must
+/// balance per flavor: the issuer's token less `fee` in its flavor, and
+/// `qty` of the new one.
+///
+/// `issuepriv` runs only inside a contract's own frame, so the issuer is
+/// spent with `signcall` rather than `signtx`. A `signcall` signature
+/// covers the program and nothing else: not the transaction, not the
+/// contract. Anything the program leaves to its caller, anyone holding a
+/// copy of the published program and signature could decide instead, on
+/// any contract under the same key. The program therefore decides
+/// everything itself:
+///
+/// ```text
+/// drop                                    the call's unit argument
+/// anchor <anchor> eq verify drop drop     this contract and no other
+/// <qty commitment> commit <tag> issuepriv the minted token
+/// fee > 0: <fee> fee
+/// mix, outputs and notes                  as `build_transfer`'s
+/// ```
+///
+/// The anchor a contract's frame starts with is split from the contract's
+/// id, which is spent once, so the signature is good for that one spend;
+/// and a copy of the transaction can only publish exactly these outputs.
+/// The frame ends with an empty stack, which returns unit, and the root
+/// discards it: the root holds nothing but the call.
+///
+/// The transaction carries no `signtx`, and so no envelope signature. It
+/// comes back with the contracts it creates, each with its note, in the
+/// order they are published.
+#[allow(clippy::too_many_arguments)]
+pub fn build_issue<R: RngCore + CryptoRng>(
+    issuer: &InputSpec,
+    tag: &[u8],
+    qty: u64,
+    outputs: &[OutputSpec],
+    fee: u64,
+    header: TxHeader,
+    limits: Limits,
+    rng: &mut R,
+) -> Result<(ExternalTx, Vec<Created>), BuilderError> {
+    if outputs.len() > MAX_OUTPUTS {
+        return Err(BuilderError::TooManyOutputs(outputs.len()));
+    }
+    if let Some(output) = outputs.iter().find(|output| output.memo.len() > MEMO_MAX) {
+        return Err(BuilderError::MemoTooLong(output.memo.len()));
+    }
+
+    let mut rng = hedged_rng(&header, core::slice::from_ref(issuer), fee, outputs, rng);
+    let (program, signature) = issue_program(issuer, tag, qty, outputs, fee, &mut rng)?;
+    signcall_tx(&issuer.contract, program, signature, header, limits)
+}
+
+/// The signed program of [`build_issue`], and its signature.
+pub(crate) fn issue_program<R: RngCore + CryptoRng>(
+    issuer: &InputSpec,
+    tag: &[u8],
+    qty: u64,
+    outputs: &[OutputSpec],
+    fee: u64,
+    rng: &mut R,
+) -> Result<(ScriptBuilder, [u8; 64]), BuilderError> {
+    let minted = Commitment::blinded_with_factor(Scalar::from(qty), nonzero_scalar(rng));
+    let sealed = seal(outputs, rng);
+
+    // `input` sets the root's anchor to the contract's id, and nothing
+    // between it and `signcall` consumes one.
+    let (anchor, _) = Anchor(issuer.contract.id()).split();
+    let mut program = ScriptBuilder::new()
+        .drop_()
+        .anchor()
+        .push_literal(CellValue::from_bytes(anchor.0.to_vec()).map_err(VMError::from)?)
+        .eq()
+        .verify()
+        // `eq` leaves both operands.
+        .drop_()
+        .drop_()
+        .push_point_typed(Point::commitment(minted))
+        .commit()
+        .push_literal(CellValue::from_bytes(tag.to_vec()).map_err(VMError::from)?)
+        .issuepriv();
+    // The issuer's token, the minted one, and the fee debt.
+    let mut mix_inputs = 2;
+    if fee > 0 {
+        program = program.push_int(fee).fee();
+        mix_inputs += 1;
+    }
+    let program = mix_and_output(program, mix_inputs, sealed)?;
+
+    let root = program.to_cell().map_err(VMError::from)?;
+    let signature =
+        musig::Signature::sign(&mut flamevm::signcall_transcript(&root), issuer.signing_key);
+    Ok((program, signature.to_bytes()))
+}
+
+/// A transaction that spends `contract` through `program`, and does
+/// nothing else.
+pub(crate) fn signcall_tx(
+    contract: &Contract,
+    program: ScriptBuilder,
+    signature: [u8; 64],
+    header: TxHeader,
+    limits: Limits,
+) -> Result<(ExternalTx, Vec<Created>), BuilderError> {
+    let unsigned = ScriptBuilder::new()
+        .push_cell(CellValue::contract(contract.clone()).map_err(VMError::from)?)
+        .input()
+        .push_script(program)
+        .map_err(VMError::from)?
+        .push_literal(CellValue::from_bytes(signature.to_vec()).map_err(VMError::from)?)
+        // Charged up front and refunded unspent; the root's own steps are
+        // a handful of pushes.
+        .push_int(limits.gas / 2)
+        .push_int(0u64)
+        .signcall()
+        .verify()
+        .drop_()
+        .build_tx(header, limits)?;
+    let created = note::outputs_with_notes(unsigned.log())
+        .into_iter()
+        .map(|(contract, note)| {
+            let note = note.expect("every output is followed by its note");
+            (contract.clone(), note.to_vec())
+        })
+        .collect();
+    Ok((unsigned.without_signature()?, created))
+}
+
+/// A contract a transaction creates, and the note that follows it.
+pub type Created = (Contract, Vec<u8>);
+
+/// The flavor [`build_issue`] mints under `issuer` and `tag`.
+pub fn issued_flavor(issuer: &Predicate, tag: &[u8]) -> Scalar {
+    flavor_from_predicate(issuer, tag)
+}
+
+/// Seals every output, then puts them in the order they are published in.
+fn seal<R: RngCore + CryptoRng>(outputs: &[OutputSpec], rng: &mut R) -> Vec<SealedOutput> {
+    let mut sealed: Vec<SealedOutput> = outputs
+        .iter()
+        .map(|output| SealedOutput::new(output, rng))
+        .collect();
+    sealed.sort_by_key(|output| output.qty_point.to_bytes());
+    sealed
+}
+
+/// `mix` over the `mix_inputs` tokens on top of the stack, then every
+/// output and its note.
+fn mix_and_output(
+    mut program: ScriptBuilder,
+    mix_inputs: usize,
+    sealed: Vec<SealedOutput>,
+) -> Result<ScriptBuilder, BuilderError> {
+    let count = sealed.len();
+
+    // The commitments go to the script by move, never by copy: each one
+    // holds its blinding factor.
+    let (commitments, published): (Vec<_>, Vec<_>) = sealed
+        .into_iter()
+        .map(|output| ((output.qty, output.flv), (output.predicate, output.note)))
+        .unzip();
 
     for (qty, flv) in commitments {
         program = program
@@ -263,8 +420,7 @@ pub fn build_transfer<R: RngCore + CryptoRng>(
             .push_cell(Cell::new(note, vec![]).map_err(VMError::from)?)
             .log();
     }
-
-    Ok(program.build_tx(header, limits)?)
+    Ok(program)
 }
 
 /// One output, sealed: its commitments, the point it is sorted by, and its

@@ -1,6 +1,6 @@
-//! The wallet file: the secret, the network, the node, and the receiving
-//! counter. That is the whole of a wallet's own state; coins and history
-//! are the node's to answer.
+//! The wallet file: the secret, the network, the node, the receiving
+//! counter and any other paths handed out. That is the whole of a wallet's
+//! own state; coins and history are the node's to answer.
 //!
 //! The secret is stored in the clear. This is a development wallet: the
 //! file is created readable by its owner only, and nothing more is done.
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::Error;
+use crate::path::DerivationPath;
 
 const FORMAT_VERSION: u32 = 1;
 
@@ -33,6 +34,9 @@ pub struct WalletFile {
     /// The next receiving index not yet issued. Every index below it, and
     /// index 0 always, is watched.
     pub next_index: u32,
+    /// Other paths `address --path` has handed out, watched as well.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch: Vec<DerivationPath>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

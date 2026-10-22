@@ -1,4 +1,5 @@
 use crate::amount::{format_qty, parse_qty, Flavor};
+use crate::path::DerivationPath;
 use crate::session::{coin_for_test, select, Coins};
 use crate::store::{NetworkName, Secret, WalletFile};
 
@@ -107,6 +108,7 @@ fn a_wallet_file_round_trips_and_is_never_overwritten() {
             hex: "a1".repeat(64),
         },
         next_index: 1,
+        watch: Vec::new(),
     };
     file.create(&path).unwrap();
     assert!(file.create(&path).is_err());
@@ -129,4 +131,61 @@ fn a_wallet_file_round_trips_and_is_never_overwritten() {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
+}
+
+#[test]
+fn a_path_reads_as_branch_slash_index() {
+    let path: DerivationPath = "2/0".parse().unwrap();
+    assert_eq!((path.branch, path.index), (2, 0));
+    assert_eq!(path.to_string(), "2/0");
+    assert_eq!(
+        "1/2147483647".parse::<DerivationPath>().unwrap().index,
+        (1 << 31) - 1
+    );
+    for bad in [
+        "",
+        "2",
+        "2/",
+        "/0",
+        "2/0/1",
+        "-1/0",
+        "+2/0",
+        "2/2147483648",
+        "a/0",
+        " 2/0",
+    ] {
+        assert!(bad.parse::<DerivationPath>().is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn watched_paths_round_trip_and_old_files_still_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wallet.json");
+    let file = WalletFile {
+        version: 1,
+        network: NetworkName::Testnet,
+        node: "http://127.0.0.1:8545".into(),
+        secret: Secret::Seed {
+            hex: "a1".repeat(64),
+        },
+        next_index: 1,
+        watch: vec!["2/0".parse().unwrap(), "2/1".parse().unwrap()],
+    };
+    file.create(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(r#""2/0""#), "{text}");
+    let read = WalletFile::load(&path).unwrap();
+    assert_eq!(read.watch, file.watch);
+
+    // A file written before paths were watched has no `watch` field.
+    let old = dir.path().join("old.json");
+    std::fs::write(
+        &old,
+        text.replace(",\n  \"watch\": [\n    \"2/0\",\n    \"2/1\"\n  ]", ""),
+    )
+    .unwrap();
+    let old_text = std::fs::read_to_string(&old).unwrap();
+    assert!(!old_text.contains("watch"), "{old_text}");
+    assert!(WalletFile::load(&old).unwrap().watch.is_empty());
 }

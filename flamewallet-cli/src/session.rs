@@ -9,13 +9,14 @@ use flamed_rpc::{
     HistoryEntry, HttpClient, HttpClientBuilder, TipResult, TxId, TxStatusResult,
 };
 use flamewallet_ffi::{
-    ContractValue, FlameError, IssuedAddress, KeyPath, Opening, TransferInput, TransferOutput,
-    TransferRequest, Wallet, CHANGE, RECEIVING,
+    ContractValue, FlameError, IssueRequest as FfiIssueRequest, IssuedAddress, KeyPath, Opening,
+    TransferInput, TransferOutput, TransferRequest, Wallet, CHANGE, RECEIVING,
 };
 use serde::{Serialize, Serializer};
 
 use crate::amount::{format_qty, Flavor};
 use crate::error::Error;
+use crate::path::DerivationPath;
 use crate::store::WalletFile;
 
 /// What a send pays when the caller names no fee. The devnet's floor is
@@ -32,6 +33,8 @@ const POLL: Duration = Duration::from_secs(1);
 pub struct Session {
     pub wallet: Arc<Wallet>,
     pub client: HttpClient,
+    /// Paths watched beyond the receiving and change ones.
+    pub watch: Vec<DerivationPath>,
 }
 
 /// One unspent contract locked to one of the wallet's keys.
@@ -161,6 +164,9 @@ impl Coins {
 }
 
 pub struct SendRequest {
+    /// Spend only coins at this path, and return change there; otherwise
+    /// any coin, with change to the change address.
+    pub from: Option<DerivationPath>,
     pub to: String,
     pub qty: u64,
     pub flavor: Flavor,
@@ -174,6 +180,32 @@ pub struct SendRequest {
 pub struct Sent {
     pub txid: TxId,
     pub inputs: Vec<ContractId>,
+    #[serde(serialize_with = "as_string")]
+    pub fee: u64,
+}
+
+pub struct IssueRequest {
+    /// The issuer: the coin spent is one at this path, and the Flame left
+    /// over returns to it.
+    pub from: DerivationPath,
+    /// Names the flavor, with the issuer's key.
+    pub tag: String,
+    pub qty: u64,
+    /// Where the minted coin goes; the issuer's address when `None`.
+    pub to: Option<String>,
+    pub memo: Vec<u8>,
+    /// In sparks.
+    pub fee: u64,
+    pub gas: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Issued {
+    pub txid: TxId,
+    pub flavor: Flavor,
+    pub from: DerivationPath,
+    /// The coin the issuance spent, at the issuer's address.
+    pub input: ContractId,
     #[serde(serialize_with = "as_string")]
     pub fee: u64,
 }
@@ -217,11 +249,17 @@ impl Session {
         Ok(Session {
             wallet: file.open()?,
             client: HttpClientBuilder::default().build(node)?,
+            watch: file.watch.clone(),
         })
     }
 
-    /// Every receiving address issued, index 0 always, and the one change
-    /// address sends return to.
+    /// The address at `path`.
+    pub fn address_at(&self, path: DerivationPath) -> Result<IssuedAddress, Error> {
+        Ok(self.wallet.address(path.key_path())?)
+    }
+
+    /// Every receiving address issued, index 0 always, the one change
+    /// address sends return to, and every other path handed out.
     pub fn watched(&self) -> Result<Vec<IssuedAddress>, Error> {
         let issued = self.wallet.next_index().max(1);
         let mut addresses = (0..issued)
@@ -233,6 +271,11 @@ impl Session {
             })
             .collect::<Result<Vec<_>, FlameError>>()?;
         addresses.push(self.change_address()?);
+        for &path in &self.watch {
+            if !addresses.iter().any(|a| a.path == path.key_path()) {
+                addresses.push(self.address_at(path)?);
+            }
+        }
         Ok(addresses)
     }
 
@@ -254,9 +297,22 @@ impl Session {
     /// block between two calls is harmless, since a send rebuilds from
     /// scratch if the node refuses its proofs.
     pub async fn coins(&self) -> Result<Coins, Error> {
+        self.coins_at(self.watched()?).await
+    }
+
+    /// The coins at `from` alone, watched or not; every watched coin when
+    /// `None`.
+    async fn coins_from(&self, from: Option<DerivationPath>) -> Result<Coins, Error> {
+        match from {
+            Some(path) => self.coins_at(vec![self.address_at(path)?]).await,
+            None => self.coins().await,
+        }
+    }
+
+    async fn coins_at(&self, addresses: Vec<IssuedAddress>) -> Result<Coins, Error> {
         let mut coins = Vec::new();
         let mut tip_height = 0;
-        for address in self.watched()? {
+        for address in addresses {
             let unspent = self.client.unspent(address.address, Some(true)).await?;
             tip_height = tip_height.max(unspent.tip.height);
             for entry in unspent.outputs {
@@ -279,7 +335,8 @@ impl Session {
     }
 
     /// Builds, proves, signs and submits a payment, with change for every
-    /// flavor it spends going back to the change address.
+    /// flavor it spends going back to the change address, or with `from`
+    /// to that address.
     ///
     /// A block that lands between reading the coins and submitting makes
     /// the proofs stale and the node refuse them, so a refusal is retried
@@ -287,7 +344,7 @@ impl Session {
     pub async fn send(&self, request: &SendRequest) -> Result<Sent, Error> {
         let mut retried = false;
         loop {
-            let coins = self.coins().await?;
+            let coins = self.coins_from(request.from).await?;
             let (transfer, inputs) = self.build(request, &coins)?;
             match self.client.submit_tx(BlockTxEnvelope(transfer)).await {
                 Ok(txid) => {
@@ -317,7 +374,10 @@ impl Session {
         *need.entry(Flavor::flame()).or_default() += u128::from(request.fee);
 
         let spendable: Vec<&Coin> = coins.coins.iter().filter(|c| c.is_spendable()).collect();
-        let change = self.change_address()?.address;
+        let change = match request.from {
+            Some(path) => self.address_at(path)?.address,
+            None => self.change_address()?.address,
+        };
         let mut inputs = Vec::new();
         let mut outputs = vec![TransferOutput {
             address: request.to.clone(),
@@ -363,6 +423,104 @@ impl Session {
             locktime: 0,
         })?;
         Ok((transfer.block_tx, ids))
+    }
+
+    /// The flavor [`Session::issue`] mints from `from` under `tag`.
+    pub fn issued_flavor(&self, from: DerivationPath, tag: &str) -> Result<Flavor, Error> {
+        let issuer = self.address_at(from)?;
+        Flavor::from_bytes(&flamewallet_ffi::issued_flavor(
+            issuer.predicate,
+            tag.as_bytes().to_vec(),
+        )?)
+    }
+
+    /// Mints `qty` of the tag's flavor by spending the largest Flame coin
+    /// at the issuer's path, and returns that coin, less the fee, to the
+    /// same address: the next issuance has a coin to spend once this one
+    /// is mined.
+    ///
+    /// Retried once from fresh coins on a refusal, as [`Session::send`].
+    pub async fn issue(&self, request: &IssueRequest) -> Result<Issued, Error> {
+        let flavor = self.issued_flavor(request.from, &request.tag)?;
+        let mut retried = false;
+        loop {
+            let coins = self.coins_from(Some(request.from)).await?;
+            let (transfer, input) = self.build_issue(request, flavor, &coins)?;
+            match self.client.submit_tx(BlockTxEnvelope(transfer)).await {
+                Ok(txid) => {
+                    return Ok(Issued {
+                        txid,
+                        flavor,
+                        from: request.from,
+                        input,
+                        fee: request.fee,
+                    })
+                }
+                Err(ClientError::Call(error))
+                    if error.code() == codes::MEMPOOL_REJECTED && !retried =>
+                {
+                    retried = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn build_issue(
+        &self,
+        request: &IssueRequest,
+        flavor: Flavor,
+        coins: &Coins,
+    ) -> Result<(Vec<u8>, ContractId), Error> {
+        let issuer = self.address_at(request.from)?;
+        let coin = coins
+            .coins
+            .iter()
+            .filter(|coin| coin.is_spendable())
+            .filter_map(|coin| match coin.value.token() {
+                Some((qty, f)) if f.is_flame() && qty >= request.fee => Some((qty, coin)),
+                _ => None,
+            })
+            .max_by_key(|(qty, _)| *qty)
+            .map(|(_, coin)| coin)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "no confirmed Flame coin of at least the fee at {} ({}); \
+                     send one there, or wait for a pending one to be mined",
+                    request.from, issuer.address
+                ))
+            })?;
+        let (held, _) = coin.value.token().expect("a token was chosen");
+
+        let mut outputs = vec![TransferOutput {
+            address: request.to.clone().unwrap_or_else(|| issuer.address.clone()),
+            qty: request.qty,
+            flavor: native_or(flavor),
+            memo: request.memo.clone(),
+        }];
+        if held > request.fee {
+            outputs.push(TransferOutput {
+                address: issuer.address.clone(),
+                qty: held - request.fee,
+                flavor: None,
+                memo: Vec::new(),
+            });
+        }
+        let transfer = self.wallet.build_issue(FfiIssueRequest {
+            issuer: TransferInput {
+                contract: coin.contract.clone(),
+                proof: coin.proof.clone().expect("only spendable coins are chosen"),
+                path: issuer.path,
+                opening: coin.opening.clone(),
+            },
+            tag: request.tag.as_bytes().to_vec(),
+            qty: request.qty,
+            outputs,
+            fee: request.fee,
+            gas: request.gas,
+            locktime: 0,
+        })?;
+        Ok((transfer.block_tx, coin.id))
     }
 
     pub async fn status(&self, txid: TxId) -> Result<TxStatusResult, Error> {

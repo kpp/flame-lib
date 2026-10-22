@@ -11,8 +11,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use flamed_rpc::{TxId, TxStatusResult};
 use flamewallet_cli::{
-    format_qty, parse_qty, Error, Flavor, NetworkName, Secret, SendRequest, Session, WalletFile,
-    DEFAULT_FEE, DEFAULT_GAS, DEFAULT_NODE,
+    format_qty, parse_qty, DerivationPath, Error, Flavor, IssueRequest, NetworkName, Secret,
+    SendRequest, Session, WalletFile, DEFAULT_FEE, DEFAULT_GAS, DEFAULT_NODE,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -68,11 +68,16 @@ enum Command {
         #[arg(long, env = "FLAMEWALLET_PASSPHRASE", default_value = "")]
         passphrase: String,
     },
-    /// Prints the receiving addresses issued so far.
+    /// Prints the receiving addresses issued so far, or with `--path` the
+    /// address at one path, which the wallet watches from then on.
     Address {
         /// Issue the next one first.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "path")]
         new: bool,
+        /// `branch/index`, as `2/0`: 0 is receiving, 1 change, any other
+        /// branch yours to use.
+        #[arg(long)]
+        path: Option<DerivationPath>,
     },
     /// Balance per flavor.
     Balance,
@@ -83,6 +88,10 @@ enum Command {
     Send {
         to: String,
         amount: String,
+        /// Spend only coins at this path, `branch/index`, and return the
+        /// change there; by default any coin, change to `1/0`.
+        #[arg(long)]
+        from: Option<DerivationPath>,
         /// `FLM`, or a flavor's 64 hex digits.
         #[arg(long, default_value = "FLM")]
         flavor: Flavor,
@@ -99,6 +108,40 @@ enum Command {
         /// How long `--wait` waits, in seconds.
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+    },
+    /// Mints `amount` whole units of a new confidential flavor, named by
+    /// `tag` and the issuer's address, and prints the flavor. Spends a
+    /// Flame coin at the issuer's address for the fee and returns the rest
+    /// there.
+    Issue {
+        amount: String,
+        #[arg(long)]
+        tag: String,
+        /// The issuer, `branch/index`: one flavor per issuer and tag.
+        #[arg(long, default_value = "0/0")]
+        from: DerivationPath,
+        /// Where the minted coin goes; the issuer's address by default.
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value = "")]
+        memo: String,
+        /// In sparks, always paid in Flame.
+        #[arg(long, default_value_t = DEFAULT_FEE)]
+        fee: u64,
+        #[arg(long, default_value_t = DEFAULT_GAS)]
+        gas: u64,
+        /// Wait until it is in a block.
+        #[arg(long)]
+        wait: bool,
+        /// How long `--wait` waits, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// The flavor `issue --tag TAG --from PATH` mints, without minting.
+    Flavor {
+        tag: String,
+        #[arg(long, default_value = "0/0")]
+        from: DerivationPath,
     },
     /// Transactions that touched the wallet, newest first.
     History {
@@ -188,7 +231,25 @@ async fn run(cli: Cli) -> Result<(), Error> {
                 format!("address: {address}")
             });
         }
-        &Command::Address { new } => {
+        &Command::Address {
+            path: Some(path), ..
+        } => {
+            let mut file = WalletFile::load(&cli.wallet)?;
+            let address = file.open()?.address(path.key_path())?.address;
+            // Issued receiving addresses and the change address are watched
+            // without being listed.
+            let receiving =
+                path.branch == flamewallet_ffi::RECEIVING && path.index < file.next_index;
+            let change = path.branch == flamewallet_ffi::CHANGE && path.index == 0;
+            if !receiving && !change && !file.watch.contains(&path) {
+                file.watch.push(path);
+                file.save(&cli.wallet)?;
+            }
+            out.print(&json!({ "path": path, "address": address }), || {
+                format!("{path}  {address}")
+            });
+        }
+        &Command::Address { new, path: None } => {
             let mut file = WalletFile::load(&cli.wallet)?;
             let wallet = file.open()?;
             if new {
@@ -298,6 +359,7 @@ async fn run(cli: Cli) -> Result<(), Error> {
         Command::Send {
             to,
             amount,
+            from,
             flavor,
             memo,
             fee,
@@ -309,6 +371,7 @@ async fn run(cli: Cli) -> Result<(), Error> {
             let session = session(&cli)?;
             let sent = session
                 .send(&SendRequest {
+                    from: *from,
                     to: to.clone(),
                     qty: parse_qty(amount, flavor)?,
                     flavor,
@@ -333,6 +396,57 @@ async fn run(cli: Cli) -> Result<(), Error> {
                 }
                 text
             });
+        }
+        Command::Issue {
+            amount,
+            tag,
+            from,
+            to,
+            memo,
+            fee,
+            gas,
+            wait,
+            timeout,
+        } => {
+            let (from, fee, gas, wait, timeout) = (*from, *fee, *gas, *wait, *timeout);
+            let session = session(&cli)?;
+            let flavor = session.issued_flavor(from, tag)?;
+            let issued = session
+                .issue(&IssueRequest {
+                    from,
+                    tag: tag.clone(),
+                    qty: parse_qty(amount, flavor)?,
+                    to: to.clone(),
+                    memo: memo.as_bytes().to_vec(),
+                    fee,
+                    gas,
+                })
+                .await?;
+            let status = if wait {
+                Some(
+                    session
+                        .wait(issued.txid, Duration::from_secs(timeout))
+                        .await?,
+                )
+            } else {
+                None
+            };
+            out.print(&json!({ "issued": issued, "status": status }), || {
+                let mut text = format!("{}\nflavor {}", issued.txid, issued.flavor);
+                if let Some(status) = &status {
+                    text += &format!("\n{}", describe(status));
+                }
+                text
+            });
+        }
+        Command::Flavor { tag, from } => {
+            let session = session(&cli)?;
+            let flavor = session.issued_flavor(*from, tag)?;
+            let issuer = session.address_at(*from)?.address;
+            out.print(
+                &json!({ "tag": tag, "from": from, "flavor": flavor, "issuer": issuer }),
+                || flavor.to_hex(),
+            );
         }
         Command::History { limit, older } => {
             let session = session(&cli)?;
@@ -399,6 +513,7 @@ fn create(cli: &Cli, network: NetworkName, secret: Secret) -> Result<WalletFile,
         node: cli.node.clone().unwrap_or_else(|| DEFAULT_NODE.into()),
         secret,
         next_index: 1,
+        watch: Vec::new(),
     };
     // Opened before it is written, so a bad seed leaves no file behind.
     file.open()?;

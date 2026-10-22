@@ -11,14 +11,16 @@
 
 mod amount;
 mod error;
+mod path;
 mod session;
 mod store;
 
 pub use amount::{format_qty, parse_qty, Flavor};
 pub use error::Error;
+pub use path::DerivationPath;
 pub use session::{
-    Balance, Coin, CoinValue, Coins, FlavorDelta, HistoryItem, HistoryPage, SendRequest, Sent,
-    Session, DEFAULT_FEE, DEFAULT_GAS,
+    Balance, Coin, CoinValue, Coins, FlavorDelta, HistoryItem, HistoryPage, IssueRequest, Issued,
+    SendRequest, Sent, Session, DEFAULT_FEE, DEFAULT_GAS,
 };
 pub use store::{NetworkName, Secret, WalletFile, DEFAULT_NODE};
 

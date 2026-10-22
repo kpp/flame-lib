@@ -27,6 +27,8 @@ an opaque handle; spending keys never leave a call. Keys are named by
 | `open_note(contract, note, path)` | Opening and memo from an output's note; not on a receive wallet. |
 | `opening_matches(contract, opening)` | Whether an opening opens a contract. |
 | `build_transfer(request)` | Txid, `BlockTx` bytes, each output with its note; spend wallet only. |
+| `build_issue(request)` | The same, for a confidential issuance spending one coin; spend wallet only. |
+| `issued_flavor(predicate, tag)` | Flavor an issuance spending a coin under `predicate` mints for `tag`. |
 
 Errors are `FlameError`; `InvalidBytes { what }` names the bad field,
 `Note { failure }` says why a note did not open, and `NotPermitted { wallet,

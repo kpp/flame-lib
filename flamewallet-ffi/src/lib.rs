@@ -30,7 +30,8 @@ pub use keys::{
 };
 pub use note::{NoteFailure, ReceivedNote};
 pub use transfer::{
-    CreatedOutput, Opening, Transfer, TransferInput, TransferOutput, TransferRequest,
+    issued_flavor, CreatedOutput, IssueRequest, Opening, Transfer, TransferInput, TransferOutput,
+    TransferRequest,
 };
 
 /// Branch `0` of the standard path: addresses handed out to payers.
