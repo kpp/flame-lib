@@ -10,7 +10,12 @@ exclude-dev = true
 [advisories]
 # Every RustSec advisory fails the check unless it is listed here, with the
 # reason it does not apply and who decided so.
-ignore = []
+ignore = [
+    # basic-toml (via uniffi_bindgen → askama_derive 0.16.1): unmaintained, no fix
+    # released yet. askama replaced it with `toml` on main (askama-rs/askama#771);
+    # drop this entry and `cargo update -p askama` once askama > 0.16.1 is out.
+    { id = "RUSTSEC-2026-0374", reason = "fixed upstream in askama#771, awaiting release" },
+]
 
 [licenses]
 # What may be linked into a shipped binary. A new license in the graph fails
