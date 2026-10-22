@@ -21,7 +21,7 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         persist-credentials: false
-    # One build for both scripts: each builds the same two binaries again,
+    # One build for every script: each builds the same two binaries again,
     # which is then a no-op.
     - name: Build flamed and flamewallet
       run: |
@@ -31,3 +31,5 @@ jobs:
       run: e2e/devnet-smoke.sh
     - name: Minted tokens
       run: e2e/devnet-tokens.sh
+    - name: Counterparties
+      run: e2e/devnet-counterparty.sh
