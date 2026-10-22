@@ -147,13 +147,13 @@ fn write_fixtures() {
         }],
         outputs: vec![
             TransferOutput {
-                address: bob_at.address.clone(),
+                address: bob_at.receiving_address.clone(),
                 qty: PAYMENT,
                 flavor: None,
                 memo: Vec::new(),
             },
             TransferOutput {
-                address: alice.address(change()).expect("change").address,
+                address: alice.address(change()).expect("change").receiving_address,
                 qty: ALLOCATION - PAYMENT - FEE,
                 flavor: None,
                 memo: Vec::new(),
@@ -196,13 +196,13 @@ fn write_fixtures() {
         }],
         outputs: vec![
             TransferOutput {
-                address: alice_at.address.clone(),
+                address: alice_at.receiving_address.clone(),
                 qty: back,
                 flavor: None,
                 memo: Vec::new(),
             },
             TransferOutput {
-                address: bob.address(change()).expect("change").address,
+                address: bob.address(change()).expect("change").receiving_address,
                 qty: PAYMENT - back - FEE,
                 flavor: None,
                 memo: Vec::new(),

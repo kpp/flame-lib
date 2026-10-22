@@ -1,6 +1,5 @@
 //! A transfer, from served bytes to signed bytes, in one call.
 
-use flamekd::ReceivingAddress;
 use flamepayments::{InputSpec, OutputSpec, SpendAccount};
 use flamevm::{Limits, TxHeader};
 use rand::rngs::OsRng;
@@ -9,7 +8,7 @@ use zeroize::Zeroizing;
 use crate::contract;
 use crate::convert;
 use crate::error::FlameError;
-use crate::keys::KeyPath;
+use crate::keys::{self, KeyPath};
 
 /// The transaction version every chain today accepts.
 const TX_VERSION: u32 = 1;
@@ -47,8 +46,15 @@ pub struct TransferOutput {
     /// `None` for flames.
     pub flavor: Option<Vec<u8>>,
     /// Sealed into the output's note with the amount; only the recipient
-    /// reads it. At most 4006 bytes; empty for none.
+    /// reads it. At most [`crate::memo_max_bytes`]; empty for none.
     pub memo: Vec<u8>,
+}
+
+/// The longest memo, in bytes, one [`TransferOutput`] takes: what fits the
+/// output's note in one cell.
+#[uniffi::export]
+pub fn memo_max_bytes() -> u32 {
+    flamepayments::MEMO_MAX as u32
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -142,11 +148,7 @@ pub(crate) fn build(
         .iter()
         .map(|output| {
             Ok(OutputSpec {
-                address: ReceivingAddress::from_bech32(&output.address, network).map_err(
-                    |error| FlameError::InvalidAddress {
-                        reason: error.to_string(),
-                    },
-                )?,
+                address: keys::parse_receiving_address(&output.address, network)?,
                 qty: output.qty,
                 flv: convert::flavor(output.flavor.as_deref())?,
                 memo: output.memo.clone(),
