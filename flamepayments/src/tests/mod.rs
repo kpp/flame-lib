@@ -1,6 +1,7 @@
 //! Tests for the wallet crate, and the fixtures they share.
 
 mod builder;
+mod issue;
 mod keys;
 mod note;
 mod roundtrip;

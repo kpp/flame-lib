@@ -1,0 +1,33 @@
+name: Devnet end-to-end
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  devnet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: 4
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    # One build for both scripts: each builds the same two binaries again,
+    # which is then a no-op.
+    - name: Build flamed and flamewallet
+      run: |
+        cargo build -p flamed --features devnet
+        cargo build -p flamewallet-cli
+    - name: Payments
+      run: e2e/devnet-smoke.sh
+    - name: Minted tokens
+      run: e2e/devnet-tokens.sh

@@ -187,9 +187,29 @@ inputs lower the ceiling further. So `MAX_OUTPUTS` is a guard against a
 silent `roll_k` overflow rather than a limit anyone reaches, and a wallet
 splitting into many outputs should expect the proving ceiling first.
 
+## Issuance
+
+`build_issue` mints `qty` of a confidential flavor by spending one coin,
+the issuer. The flavor is `issued_flavor(predicate, tag)`: the issuer
+coin's predicate, so the address it is locked to, and a tag. Coins minted
+from one address under one tag are one flavor.
+
+`issuepriv` runs only in a contract's own frame, so the issuer is spent
+with `signcall`, not `signtx`. A `signcall` signature covers its program
+and nothing else, and the program and signature are published with the
+transaction; whatever the program left to its caller, anyone could decide
+instead, on any coin under the same key. So the signed program does it
+all: it checks the frame's anchor, which is split from the issuer coin's
+id and so names that one coin, mints a quantity committed in its own
+bytes, pays the fee, and creates every output with its note. The root
+does nothing but the call. A copy of the transaction can only publish the
+same issuance, and the coin can be spent once.
+
+With no `signtx`, the transaction has no envelope signature.
+
 ## What is not here
 
 A lookahead policy: `owns` takes the gap as an argument, and how far past
 its last used index a wallet looks is the wallet's choice. Talking to a
-node. Anything on disk, and any command line. Issued tokens. Each belongs to
+node. Anything on disk, and any command line. Burning tokens. Each belongs to
 a later phase.

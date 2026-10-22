@@ -42,7 +42,9 @@ pub use prover::Prover;
 pub use scalar::Scalar;
 pub use script::{Script, ScriptBuilder};
 pub use slice::Slice;
-pub use token::{flavor_from_actor, ClearToken, Token, WideToken, FLAME_FLAVOR};
+pub use token::{
+    flavor_from_actor, flavor_from_predicate, ClearToken, Token, WideToken, FLAME_FLAVOR,
+};
 pub use value::Value;
 pub use verifier::Verifier;
 
@@ -52,7 +54,7 @@ pub use tx::{
 };
 #[cfg(feature = "debugger")]
 pub use vm::debugger;
-pub use vm::{query_actor, Anchor, BlockContext, QueryResult};
+pub use vm::{query_actor, signcall_transcript, Anchor, BlockContext, QueryResult};
 
 pub use cells::{
     read_cell, resolve_cell, Cell, CellBuilder, CellDecode, CellEncode, CellEnvelope, CellError,

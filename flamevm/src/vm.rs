@@ -117,6 +117,12 @@ pub(crate) fn signcall_verification_transcript(message: &[u8]) -> Transcript {
     transcript
 }
 
+/// The transcript a `signcall` signature over `program` is made with: what
+/// a wallet signs, and what the VM checks it against.
+pub fn signcall_transcript(program: &Cell) -> Transcript {
+    signcall_verification_transcript(&VM::signcall_message(program))
+}
+
 /// Block-level immutable context (height, chain stats).
 pub struct BlockContext {
     pub height: u64,

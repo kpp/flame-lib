@@ -17,7 +17,8 @@ pub mod keys;
 pub mod note;
 
 pub use builder::{
-    block_tx, build_transfer, sign, BuilderError, InputSpec, Opening, OutputSpec, MAX_OUTPUTS,
+    block_tx, build_issue, build_transfer, issued_flavor, sign, BuilderError, Created, InputSpec,
+    Opening, OutputSpec, MAX_OUTPUTS,
 };
 pub use keys::{
     Account, AccountKey, KeyError, ReceiveAccount, SpendAccount, ViewAccount, ViewingKey,
