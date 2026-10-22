@@ -5,6 +5,9 @@
 amounts `bigint`, errors a thrown `FlameError` with `kind`. Types are in
 `src/types.d.ts`.
 
+wasm-bindgen exports no constants, so `memoMaxBytes()` and `nativeFlavor()`
+are functions; call them once and keep the result.
+
 `buildTransfer` is synchronous (~80 ms) — run it in a Web Worker.
 
 ## Building

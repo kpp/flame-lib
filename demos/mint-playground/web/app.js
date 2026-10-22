@@ -489,7 +489,7 @@ if (typeof document !== 'undefined') {
         const mnemonic = stored ? stored.mnemonic : generateMnemonic(12);
         const keys = Wallet.fromMnemonic(mnemonic, '', 'testnet', 0);
         try {
-          const address = keys.nextAddress().address;
+          const address = keys.nextAddress().receivingAddress;
           if (stored && stored.address !== address) throw new Error('The saved address does not match the recovery phrase');
           return { mnemonic, address };
         } finally { keys.free(); }

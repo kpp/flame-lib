@@ -23,9 +23,11 @@ pub struct KeyPath {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IssuedAddress {
     pub path: KeyPath,
-    pub address: String,
+    pub receiving_address: String,
+    pub tracking_address: String,
     #[serde(with = "serde_bytes")]
     pub predicate: Vec<u8>,
 }
@@ -42,10 +44,12 @@ pub struct ContractInfo {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ContractValue {
+    #[serde(rename_all = "camelCase")]
     Clear {
         qty: u64,
         #[serde(with = "serde_bytes")]
         flavor: Vec<u8>,
+        is_native: bool,
     },
     Confidential,
     Other,
@@ -106,8 +110,10 @@ pub struct CreatedOutput {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReceivedNote {
     pub opening: Opening,
+    pub is_native: bool,
     #[serde(with = "serde_bytes")]
     pub memo: Vec<u8>,
 }
@@ -162,7 +168,8 @@ impl From<ffi::IssuedAddress> for IssuedAddress {
     fn from(issued: ffi::IssuedAddress) -> IssuedAddress {
         IssuedAddress {
             path: issued.path.into(),
-            address: issued.address,
+            receiving_address: issued.receiving_address,
+            tracking_address: issued.tracking_address,
             predicate: issued.predicate,
         }
     }
@@ -174,7 +181,15 @@ impl From<ffi::ContractInfo> for ContractInfo {
             id: info.id,
             predicate: info.predicate,
             value: match info.value {
-                ffi::ContractValue::Clear { qty, flavor } => ContractValue::Clear { qty, flavor },
+                ffi::ContractValue::Clear {
+                    qty,
+                    flavor,
+                    is_native,
+                } => ContractValue::Clear {
+                    qty,
+                    flavor,
+                    is_native,
+                },
                 ffi::ContractValue::Confidential => ContractValue::Confidential,
                 ffi::ContractValue::Other => ContractValue::Other,
             },
@@ -256,6 +271,7 @@ impl From<ffi::ReceivedNote> for ReceivedNote {
     fn from(received: ffi::ReceivedNote) -> ReceivedNote {
         ReceivedNote {
             opening: received.opening.into(),
+            is_native: received.is_native,
             memo: received.memo,
         }
     }

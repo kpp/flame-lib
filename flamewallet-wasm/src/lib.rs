@@ -68,11 +68,62 @@ pub fn mnemonic_to_seed(phrase: String, passphrase: String) -> Result<Vec<u8>, J
     flamewallet_ffi::mnemonic_to_seed(phrase, passphrase).map_err(error)
 }
 
-/// The predicate a payment to `address` is locked with.
-#[wasm_bindgen(js_name = addressToPredicate)]
-pub fn address_to_predicate(address: String, network: JsNetwork) -> Result<Vec<u8>, JsValue> {
+/// The predicate a payment to receiving `address` is locked with.
+#[wasm_bindgen(js_name = receivingAddressToPredicate)]
+pub fn receiving_address_to_predicate(
+    address: String,
+    network: JsNetwork,
+) -> Result<Vec<u8>, JsValue> {
     let network: Network = from_js(network.into())?;
-    flamewallet_ffi::address_to_predicate(address, network.into()).map_err(error)
+    flamewallet_ffi::receiving_address_to_predicate(address, network.into()).map_err(error)
+}
+
+/// The tracking address, `f1…` / `t1…`, that names a 32-byte predicate:
+/// the first half of every receiving address it locks payments to.
+#[wasm_bindgen(js_name = predicateToTrackingAddress)]
+pub fn predicate_to_tracking_address(
+    predicate: Vec<u8>,
+    network: JsNetwork,
+) -> Result<String, JsValue> {
+    let network: Network = from_js(network.into())?;
+    flamewallet_ffi::predicate_to_tracking_address(predicate, network.into()).map_err(error)
+}
+
+/// Whether `address` is a receiving address, `f1…e1…` / `t1…i1…`, for
+/// `network`. A bad address is `false`; a `network` that is not
+/// `"mainnet"` or `"testnet"` is a caller's bug and throws a `TypeError`.
+#[wasm_bindgen(js_name = validateReceivingAddress)]
+pub fn validate_receiving_address(address: String, network: JsNetwork) -> Result<bool, JsValue> {
+    let network: Network = from_js(network.into())?;
+    Ok(flamewallet_ffi::validate_receiving_address(
+        address,
+        network.into(),
+    ))
+}
+
+/// Whether `address` is a tracking address, `f1…` / `t1…`, for `network`.
+/// A whole receiving address is not one. A bad `network` throws a
+/// `TypeError`, as in `validateReceivingAddress`.
+#[wasm_bindgen(js_name = validateTrackingAddress)]
+pub fn validate_tracking_address(address: String, network: JsNetwork) -> Result<bool, JsValue> {
+    let network: Network = from_js(network.into())?;
+    Ok(flamewallet_ffi::validate_tracking_address(
+        address,
+        network.into(),
+    ))
+}
+
+/// The longest memo, in bytes, one transfer output takes.
+#[wasm_bindgen(js_name = memoMaxBytes)]
+pub fn memo_max_bytes() -> u32 {
+    flamewallet_ffi::memo_max_bytes()
+}
+
+/// The 32-byte flavor of flames, as `decodeContract` and `openNote` give
+/// a flavor.
+#[wasm_bindgen(js_name = nativeFlavor)]
+pub fn native_flavor() -> Vec<u8> {
+    flamewallet_ffi::native_flavor()
 }
 
 /// Id, predicate, and a cleartext amount if the contract has one.

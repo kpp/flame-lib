@@ -123,7 +123,7 @@ fn a_wallet_file_round_trips_and_is_never_overwritten() {
             index: 0,
         })
         .unwrap();
-    assert!(first.address.starts_with("t1"));
+    assert!(first.receiving_address.starts_with("t1"));
 
     #[cfg(unix)]
     {

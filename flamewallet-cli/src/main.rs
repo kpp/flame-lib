@@ -235,7 +235,7 @@ async fn run(cli: Cli) -> Result<(), Error> {
             path: Some(path), ..
         } => {
             let mut file = WalletFile::load(&cli.wallet)?;
-            let address = file.open()?.address(path.key_path())?.address;
+            let address = file.open()?.address(path.key_path())?.receiving_address;
             // Issued receiving addresses and the change address are watched
             // without being listed.
             let receiving =
@@ -264,7 +264,7 @@ async fn run(cli: Cli) -> Result<(), Error> {
                             branch: flamewallet_ffi::RECEIVING,
                             index,
                         })
-                        .map(|a| (index, a.address))
+                        .map(|a| (index, a.receiving_address))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let json: Vec<_> = addresses
@@ -442,7 +442,7 @@ async fn run(cli: Cli) -> Result<(), Error> {
         Command::Flavor { tag, from } => {
             let session = session(&cli)?;
             let flavor = session.issued_flavor(*from, tag)?;
-            let issuer = session.address_at(*from)?.address;
+            let issuer = session.address_at(*from)?.receiving_address;
             out.print(
                 &json!({ "tag": tag, "from": from, "flavor": flavor, "issuer": issuer }),
                 || flavor.to_hex(),
@@ -528,7 +528,7 @@ fn first_address(file: &WalletFile) -> Result<String, Error> {
             branch: flamewallet_ffi::RECEIVING,
             index: 0,
         })?
-        .address)
+        .receiving_address)
 }
 
 fn session(cli: &Cli) -> Result<Session, Error> {

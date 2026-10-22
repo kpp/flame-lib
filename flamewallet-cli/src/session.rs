@@ -313,7 +313,10 @@ impl Session {
         let mut coins = Vec::new();
         let mut tip_height = 0;
         for address in addresses {
-            let unspent = self.client.unspent(address.address, Some(true)).await?;
+            let unspent = self
+                .client
+                .unspent(address.receiving_address, Some(true))
+                .await?;
             tip_height = tip_height.max(unspent.tip.height);
             for entry in unspent.outputs {
                 let note = entry.note.map(Vec::from);
@@ -375,8 +378,8 @@ impl Session {
 
         let spendable: Vec<&Coin> = coins.coins.iter().filter(|c| c.is_spendable()).collect();
         let change = match request.from {
-            Some(path) => self.address_at(path)?.address,
-            None => self.change_address()?.address,
+            Some(path) => self.address_at(path)?.receiving_address,
+            None => self.change_address()?.receiving_address,
         };
         let mut inputs = Vec::new();
         let mut outputs = vec![TransferOutput {
@@ -487,20 +490,23 @@ impl Session {
                 Error::Invalid(format!(
                     "no confirmed Flame coin of at least the fee at {} ({}); \
                      send one there, or wait for a pending one to be mined",
-                    request.from, issuer.address
+                    request.from, issuer.receiving_address
                 ))
             })?;
         let (held, _) = coin.value.token().expect("a token was chosen");
 
         let mut outputs = vec![TransferOutput {
-            address: request.to.clone().unwrap_or_else(|| issuer.address.clone()),
+            address: request
+                .to
+                .clone()
+                .unwrap_or_else(|| issuer.receiving_address.clone()),
             qty: request.qty,
             flavor: native_or(flavor),
             memo: request.memo.clone(),
         }];
         if held > request.fee {
             outputs.push(TransferOutput {
-                address: issuer.address.clone(),
+                address: issuer.receiving_address.clone(),
                 qty: held - request.fee,
                 flavor: None,
                 memo: Vec::new(),
@@ -561,7 +567,7 @@ impl Session {
         let page = self
             .client
             .history(
-                watched.into_iter().map(|a| a.address).collect(),
+                watched.into_iter().map(|a| a.receiving_address).collect(),
                 older,
                 limit,
                 Some(first),
@@ -651,7 +657,7 @@ impl Session {
     ) -> Result<(CoinValue, Option<Opening>), Error> {
         let info = flamewallet_ffi::decode_contract(contract.to_vec())?;
         Ok(match info.value {
-            ContractValue::Clear { qty, flavor } => (
+            ContractValue::Clear { qty, flavor, .. } => (
                 CoinValue::Clear {
                     qty,
                     flavor: Flavor::from_bytes(&flavor)?,
