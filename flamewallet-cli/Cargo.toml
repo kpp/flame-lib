@@ -1,0 +1,34 @@
+[package]
+name = "flamewallet-cli"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "A command-line Flame wallet over flamed's JSON-RPC, for development, end-to-end tests and scripts"
+readme = "flamewallet-cli.md"
+
+# The library is the wallet; the binary only parses arguments and prints.
+# A terminal or graphical wallet takes the library and leaves `main.rs`.
+[lib]
+name = "flamewallet_cli"
+
+[[bin]]
+name = "flamewallet"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+flamechain = { path = "../flamechain" }
+flamed-rpc = { path = "../flamed-rpc" }
+flamevm = { path = "../flamevm" }
+# The facade Safely and the browser wallet run, so a send from here goes
+# through the same code as a send from a phone.
+flamewallet-ffi = { path = "../flamewallet-ffi" }
+hex = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.53.1", features = ["macros", "rt", "time"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"

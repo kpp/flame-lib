@@ -21,6 +21,7 @@ members = [
     "flamed-rpc",
     "flamed",
     "flamebench",
+    "flamewallet-cli",
 ]
 
 # Use the runflame fork of merlin to enable its `dynamic-labels`

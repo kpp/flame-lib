@@ -1240,6 +1240,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "flamewallet-cli"
+version = "0.0.1"
+dependencies = [
+ "clap 4.6.7",
+ "flamechain",
+ "flamed-rpc",
+ "flamevm",
+ "flamewallet-ffi",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "flamewallet-ffi"
 version = "0.0.1"
 dependencies = [
