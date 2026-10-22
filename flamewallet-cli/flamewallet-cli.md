@@ -115,10 +115,10 @@ from fresh coins.
 The default fee is 1000 sparks and the default gas limit 1 000 000, what
 the node's tests and Safely use.
 
-## Devnet smoke test
+## Devnet tests
 
 ```sh
-flamewallet-cli/scripts/devnet-smoke.sh
+e2e/devnet-smoke.sh
 ```
 
 Starts a throwaway node with two-second blocks, restores the genesis
@@ -127,7 +127,7 @@ every balance. `KEEP=1` keeps the scratch directory; `PORT` changes the
 RPC port (default 18545).
 
 ```sh
-flamewallet-cli/scripts/devnet-tokens.sh
+e2e/devnet-tokens.sh
 ```
 
 The same throwaway node, with tokens: the genesis wallet funds minting

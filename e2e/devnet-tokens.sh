@@ -8,77 +8,20 @@
 # way and exits non-zero on the first thing that is wrong. Run from
 # anywhere:
 #
-#   flamewallet-cli/scripts/devnet-tokens.sh
+#   e2e/devnet-tokens.sh
 #
-# Builds with -j1 by default; set CARGO_BUILD_JOBS to change that. Set
-# KEEP=1 to keep the scratch directory and print its path; PORT changes
-# the RPC port (default 18546).
-set -euo pipefail
-
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-port="${PORT:-18546}"
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
-
-cargo build --manifest-path "$root/Cargo.toml" -p flamed --features devnet
-cargo build --manifest-path "$root/Cargo.toml" -p flamewallet-cli
-flamed="$root/target/debug/flamed"
-wallet="$root/target/debug/flamewallet"
-
-dir="$(mktemp -d)"
-node_pid=""
-cleanup() {
-    [[ -n "$node_pid" ]] && kill "$node_pid" 2>/dev/null && wait "$node_pid" 2>/dev/null || true
-    if [[ "${KEEP:-}" == 1 ]]; then echo "kept $dir"; else rm -rf "$dir"; fi
-}
-trap cleanup EXIT
-
-"$flamed" genesis --chainparams "$root/flamed/configs/chainparams.toml" --out "$dir/genesis.json"
-cat >"$dir/flamed.toml" <<EOF
-data_dir = "$dir/data"
-genesis = "$dir/genesis.json"
-rpc_bind = "127.0.0.1:$port"
-block_interval_secs = 2
-minimum_fee = 0
-EOF
-"$flamed" run --config "$dir/flamed.toml" >"$dir/node.log" 2>&1 &
-node_pid=$!
-
-export FLAMEWALLET_NODE="http://127.0.0.1:$port"
-for _ in $(seq 50); do grep -q "serving JSON-RPC" "$dir/node.log" 2>/dev/null && break; sleep 0.2; done
+# KEEP=1, PORT (default 18546) and CARGO_BUILD_JOBS as in devnet.sh.
+port=18546
+source "$(dirname "${BASH_SOURCE[0]}")/devnet.sh"
 
 a=(--wallet "$dir/a.json")
 b=(--wallet "$dir/b.json")
-field() { python3 -c "import json,sys; v=json.load(sys.stdin); print(eval('v' + sys.argv[1]))" "$1"; }
-# The confirmed balance of one flavor (64 hex digits, or FLM), 0 if none.
-balance() {
-    local flavor="$1"; shift
-    [[ "$flavor" == FLM ]] && flavor="$flame"
-    "$wallet" "$@" --json balance | python3 -c "
-import json, sys
-balances = json.load(sys.stdin)['balances']
-print(next((b['confirmed'] for b in balances if b['flavor'] == sys.argv[1]), '0'))" "$flavor"
-}
-# The confirmed amount of one flavor held at one path, 0 if none.
-held_at() {
-    local path="$1" flavor="$2"; shift 2
-    [[ "$flavor" == FLM ]] && flavor="$flame"
-    "$wallet" "$@" --json coins | python3 -c "
-import json, sys
-branch, index = map(int, sys.argv[1].split('/'))
-print(sum(int(c['qty']) for c in json.load(sys.stdin)['coins']
-          if (c['branch'], c['index']) == (branch, index) and c.get('flavor') == sys.argv[2]
-          and c['height'] is not None))" "$path" "$flavor"
-}
-expect() { [[ "$2" == "$3" ]] || { echo "FAIL: $1: expected $3, got $2" >&2; exit 1; }; }
-say() { printf '\n== %s\n' "$*"; }
-show() { echo "-- $1"; "$wallet" "${@:2}" balance | sed 's/^/   /'; }
 
 # The genesis allocation is under the seed a1 x 64.
 printf 'a1%.0s' $(seq 64) | "$wallet" "${a[@]}" restore --seed >/dev/null
 "$wallet" "${b[@]}" new >/dev/null 2>&1
 a_address="$("$wallet" "${a[@]}" --json address | field "[0]['address']")"
 b_address="$("$wallet" "${b[@]}" --json address | field "[0]['address']")"
-flame="$("$wallet" "${a[@]}" --json balance | field "['balances'][0]['flavor']")"
 
 say "A hands out two minting addresses and funds each with 10 Flame"
 a_soot_mint="$("$wallet" "${a[@]}" --json address --path 2/0 | field "['address']")"
