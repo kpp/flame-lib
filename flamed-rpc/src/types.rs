@@ -307,6 +307,27 @@ pub struct HistoryEntry {
     /// Contracts of the asked addresses it spent, each with the bytes and
     /// note it was created with: by address, then in log order.
     pub spent: Vec<HistoryContract>,
+    /// Who else's contracts it spent: on a receive, who paid. Each
+    /// predicate once, in log order.
+    #[serde(default)]
+    pub others_spent: Vec<Counterparty>,
+    /// Who else it created contracts for: on a send, who was paid; on a
+    /// receive, the payer's change. Each predicate once, in log order.
+    #[serde(default)]
+    pub others_created: Vec<Counterparty>,
+}
+
+/// The other side of a history entry: a predicate none of the asked
+/// addresses resolved to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Counterparty {
+    /// The predicate.
+    pub predicate: PredicatePoint,
+    /// Its tracking address, `f1…` / `t1…`, when it is one. A receiving
+    /// address cannot be rebuilt from a predicate: its encryption key is
+    /// not on chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 /// A page of history, and the cursors around it.

@@ -127,7 +127,8 @@ pub trait FlamedApi {
     /// first. Every page needs the same `addresses`, up to
     /// `MAX_HISTORY_ADDRESSES`. `limit` is 1..=`MAX_PAGE_SIZE`.
     /// `with_pending` (default false) adds the mempool to a first or newer
-    /// page.
+    /// page. Each entry also names the other side: whose contracts it spent
+    /// and whom it created contracts for, beyond the asked addresses.
     /// `STALE_BLOCK` if the block a cursor stands on is no longer in the
     /// chain: start again without one. `INVALID_ADDRESS` for an address,
     /// invalid params for a cursor that does not read or was made for other
