@@ -23,11 +23,11 @@ use flamechain::{
 use flamed_rpc::{
     ActorCode, ActorId, ActorQueryResult, ActorResult, ActorStateEnvelope, BlockHeader, BlockId,
     BlockResult, BlockSummary, BlockTxEnvelope, BlocksResult, ContractEnvelope, ContractId,
-    ExecutionData, HistoryContract, HistoryEntry, HistoryResult, NoteEnvelope, PendingTransaction,
-    PendingTransactionsResult, PredicatePoint, ProofBytes, ScanEntry, SpentAt, StateCommitment,
-    TipResult, TransactionResult, TransactionSummary, TransactionsResult, TxId, UnspentEntry,
-    UnspentResult, ValueEnvelope, MAX_HISTORY_ADDRESSES, MAX_PAGE_SIZE, MAX_QUERY_BYTES,
-    MAX_QUERY_GAS,
+    Counterparty, ExecutionData, HistoryContract, HistoryEntry, HistoryResult, NoteEnvelope,
+    PendingTransaction, PendingTransactionsResult, PredicatePoint, ProofBytes, ScanEntry, SpentAt,
+    StateCommitment, TipResult, TransactionResult, TransactionSummary, TransactionsResult, TxId,
+    UnspentEntry, UnspentResult, ValueEnvelope, MAX_HISTORY_ADDRESSES, MAX_PAGE_SIZE,
+    MAX_QUERY_BYTES, MAX_QUERY_GAS,
 };
 use flamekd::{Network, ReceivingAddress, TrackingAddress};
 use flamevm::{
@@ -643,7 +643,7 @@ impl Node {
         );
         let entries = touches
             .iter()
-            .map(|touch| self.history_entry(touch))
+            .map(|touch| self.history_entry(touch, &predicates))
             .collect();
 
         let tip = self.tip();
@@ -719,8 +719,13 @@ impl Node {
     }
 
     /// One confirmed transaction in a history.
-    fn history_entry(&self, touch: &Touch) -> HistoryEntry {
+    fn history_entry(&self, touch: &Touch, predicates: &BTreeSet<[u8; 32]>) -> HistoryEntry {
         let record = self.txindex.get(&touch.txid);
+        let (all_spent, all_created) = self
+            .outputs
+            .of_tx(&touch.txid)
+            .map_or((&[][..], &[][..]), |tx| (&tx.spent[..], &tx.created[..]));
+        let predicate_of = |id: &ContractID| self.outputs.get(id).map(|output| output.predicate);
         let (height, _) = touch.position;
         HistoryEntry {
             txid: TxId(touch.txid.0),
@@ -741,7 +746,35 @@ impl Node {
                 .iter()
                 .filter_map(|id| self.history_contract(id))
                 .collect(),
+            others_spent: self
+                .counterparties(all_spent.iter().filter_map(predicate_of), predicates),
+            others_created: self
+                .counterparties(all_created.iter().filter_map(predicate_of), predicates),
         }
+    }
+
+    /// The predicates in `seen` that are not among `predicates`, each once
+    /// in the order first seen, with their tracking addresses.
+    fn counterparties(
+        &self,
+        seen: impl IntoIterator<Item = [u8; 32]>,
+        predicates: &BTreeSet<[u8; 32]>,
+    ) -> Vec<Counterparty> {
+        let mut others: Vec<[u8; 32]> = Vec::new();
+        for predicate in seen {
+            if !predicates.contains(&predicate) && !others.contains(&predicate) {
+                others.push(predicate);
+            }
+        }
+        others
+            .into_iter()
+            .map(|predicate| Counterparty {
+                predicate: PredicatePoint(predicate),
+                address: TrackingAddress::from_bytes(&predicate)
+                    .ok()
+                    .map(|address| address.to_bech32(self.network)),
+            })
+            .collect()
     }
 
     /// A contract as a history shows it, as it was created.
@@ -759,20 +792,27 @@ impl Node {
     /// order, and whether the list was cut at `MAX_PAGE_SIZE`.
     ///
     /// A pending transaction can spend what an earlier pending one created,
-    /// so the contracts the pool creates for these addresses are kept as
-    /// they go by.
+    /// so the contracts the pool creates are kept as they go by: whole for
+    /// these addresses, by predicate for the others.
     fn pending_history(
         &self,
         predicates: &BTreeSet<[u8; 32]>,
     ) -> Result<(Vec<HistoryEntry>, bool), NodeError> {
         let mut created_here = BTreeMap::new();
+        let mut pool_predicates = BTreeMap::new();
         let mut entries = Vec::new();
         for entry in self.mempool.entries() {
             let log = entry.log().entries();
             let (mut created, mut spent, mut fee) = (Vec::new(), Vec::new(), 0u128);
+            let (mut all_spent, mut all_created) = (Vec::new(), Vec::new());
             for (index, effect) in log.iter().enumerate() {
                 match effect {
                     TxEntry::Input(id) => {
+                        all_spent.extend(
+                            pool_predicates
+                                .remove(id)
+                                .or_else(|| self.outputs.get(id).map(|output| output.predicate)),
+                        );
                         let ours = created_here.remove(id).or_else(|| {
                             self.history_contract(id)
                                 .filter(|contract| predicates.contains(&contract.predicate.0))
@@ -781,6 +821,8 @@ impl Node {
                     }
                     TxEntry::Output(contract) => {
                         let predicate = contract.predicate.to_point().to_bytes();
+                        pool_predicates.insert(contract.id(), predicate);
+                        all_created.push(predicate);
                         if predicates.contains(&predicate) {
                             let ours = HistoryContract {
                                 id: ContractId(contract.id()),
@@ -810,6 +852,8 @@ impl Node {
                 fee_sparks: fee.to_string(),
                 created,
                 spent,
+                others_spent: self.counterparties(all_spent, predicates),
+                others_created: self.counterparties(all_created, predicates),
             });
         }
         Ok((entries, false))

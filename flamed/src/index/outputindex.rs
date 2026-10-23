@@ -52,6 +52,16 @@ pub struct Touch {
     pub spent: Vec<ContractID>,
 }
 
+/// What one transaction created and spent, under any predicate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TxContracts {
+    /// What it created, in log order.
+    pub created: Vec<ContractID>,
+    /// What it spent, in log order, including contracts this index never
+    /// saw created.
+    pub spent: Vec<ContractID>,
+}
+
 /// Every contract the node has ever seen, spent or not.
 #[derive(Debug, Default)]
 pub struct OutputIndex {
@@ -59,6 +69,8 @@ pub struct OutputIndex {
     spent: BTreeMap<ContractID, SpendRecord>,
     by_predicate: BTreeMap<[u8; 32], Vec<ContractID>>,
     history: BTreeMap<[u8; 32], Vec<Touch>>,
+    // Keyed on the raw bytes, as `TxIndex` is: `TxID` is not `Ord`.
+    by_tx: BTreeMap<[u8; 32], TxContracts>,
 }
 
 impl OutputIndex {
@@ -78,6 +90,7 @@ impl OutputIndex {
         if self.outputs.insert(id, record).is_none() {
             self.by_predicate.entry(predicate).or_default().push(id);
             self.touch(predicate, position, txid).created.push(id);
+            self.by_tx.entry(txid.0).or_default().created.push(id);
         }
     }
 
@@ -87,6 +100,7 @@ impl OutputIndex {
         let position = (record.height, record.index);
         let txid = record.txid;
         self.spent.insert(id, record);
+        self.by_tx.entry(txid.0).or_default().spent.push(id);
         if let Some(predicate) = self.outputs.get(&id).map(|output| output.predicate) {
             self.touch(predicate, position, txid).spent.push(id);
         }
@@ -133,6 +147,11 @@ impl OutputIndex {
             .get(predicate)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    /// What one confirmed transaction created and spent, if anything.
+    pub fn of_tx(&self, txid: &TxID) -> Option<&TxContracts> {
+        self.by_tx.get(&txid.0)
     }
 
     /// How many contracts have ever existed.

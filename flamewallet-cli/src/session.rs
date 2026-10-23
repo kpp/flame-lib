@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flamed_rpc::{
-    codes, BlockTxEnvelope, ClientError, ContractId, FlamedApiClient, HistoryContract,
+    codes, BlockTxEnvelope, ClientError, ContractId, Counterparty, FlamedApiClient, HistoryContract,
     HistoryEntry, HttpClient, HttpClientBuilder, TipResult, TxId, TxStatusResult,
 };
 use flamewallet_ffi::{
@@ -225,6 +225,13 @@ pub struct HistoryItem {
     pub changes: Vec<FlavorDelta>,
     /// The memo of a payment received, if the sender wrote one.
     pub memo: Option<String>,
+    /// Who paid the wallet: the other addresses whose coins this
+    /// transaction spent.
+    pub from: Vec<String>,
+    /// Whom the wallet paid: when only the wallet's coins were spent, every
+    /// other address it created coins for. Empty otherwise, since what a
+    /// payer creates beside the wallet's coins is the payer's change.
+    pub to: Vec<String>,
     /// Contracts of the wallet's this transaction touched whose amount could
     /// not be read, and so are in no delta.
     pub unreadable: usize,
@@ -618,7 +625,14 @@ impl Session {
                 }
             }
         }
+        let to = if entry.others_spent.is_empty() {
+            addresses(&entry.others_created)
+        } else {
+            Vec::new()
+        };
         Ok(HistoryItem {
+            from: addresses(&entry.others_spent),
+            to,
             txid: entry.txid,
             height: entry.height,
             time: entry.time,
@@ -744,4 +758,18 @@ pub(crate) fn coin_for_test(id: u8, qty: u64, flavor: Flavor, confirmed: bool) -
         proof: confirmed.then(Vec::new),
         opening: None,
     }
+}
+
+/// Counterparties as the wallet shows them: by tracking address, or by
+/// predicate where the node could name none.
+fn addresses(others: &[Counterparty]) -> Vec<String> {
+    others
+        .iter()
+        .map(|other| {
+            other
+                .address
+                .clone()
+                .unwrap_or_else(|| hex::encode(other.predicate.0))
+        })
+        .collect()
 }

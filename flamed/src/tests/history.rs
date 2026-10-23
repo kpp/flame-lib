@@ -58,6 +58,24 @@ fn pay(
     paying(&contracts, a, CHANGE, n).id()
 }
 
+/// The tracking address at one path, as `history` names a counterparty.
+fn tracking<K: AccountKey>(account: &Account<K>, branch: u32, n: u32) -> Option<String> {
+    Some(
+        account
+            .address_at(branch, n)
+            .expect("address")
+            .to_tracking_address()
+            .to_bech32(Network::Testnet),
+    )
+}
+
+fn others(counterparties: &[flamed_rpc::Counterparty]) -> Vec<Option<String>> {
+    counterparties
+        .iter()
+        .map(|other| other.address.clone())
+        .collect()
+}
+
 fn heights(entries: &[flamed_rpc::HistoryEntry]) -> Vec<u64> {
     entries
         .iter()
@@ -87,6 +105,8 @@ fn history_pages_both_ways_from_its_cursors() {
     assert_eq!(allocation.fee_sparks, "0");
     assert_eq!(allocation.created[0].id.0, genesis_id);
     assert!(allocation.spent.is_empty());
+    assert!(allocation.others_spent.is_empty());
+    assert!(allocation.others_created.is_empty());
     assert_eq!(first.older, None);
     assert!(!first.has_newer);
     assert_eq!(first.pending, None);
@@ -112,11 +132,24 @@ fn history_pages_both_ways_from_its_cursors() {
     assert_eq!(waiting.fee_sparks, FEE.to_string());
     assert_eq!(waiting.spent[0].id.0, genesis_id);
     assert_eq!(waiting.created[0].id.0, change0);
+    // A sees whom it paid, and nothing of its own as the other side.
+    assert!(waiting.others_spent.is_empty());
+    assert_eq!(
+        others(&waiting.others_created),
+        [tracking(&b, RECEIVING, 0)]
+    );
     let b_side = node
         .history(&addresses(&b, &[(RECEIVING, 0)]), None, 10, true)
         .expect("history");
     assert!(b_side.entries.is_empty());
-    assert_eq!(b_side.pending.expect("asked for")[0].created.len(), 1);
+    let b_waiting = &b_side.pending.expect("asked for")[0];
+    assert_eq!(b_waiting.created.len(), 1);
+    // B sees who paid it, and where the payer's change went.
+    assert_eq!(
+        others(&b_waiting.others_spent),
+        [tracking(&a, RECEIVING, 0)]
+    );
+    assert_eq!(others(&b_waiting.others_created), [tracking(&a, CHANGE, 0)]);
     let unchanged = node
         .history(&wallet, Some(&head), 10, true)
         .expect("history");
@@ -134,6 +167,16 @@ fn history_pages_both_ways_from_its_cursors() {
     assert_eq!(caught.entries[0].spent[0].id.0, genesis_id);
     assert_eq!(caught.entries[0].created[0].id.0, change0);
     assert_eq!(caught.entries[0].time, node.block_time(1));
+    assert_eq!(caught.entries[0].others_created, waiting.others_created);
+    let b_side = node
+        .history(&addresses(&b, &[(RECEIVING, 0)]), None, 10, false)
+        .expect("history");
+    assert_eq!(b_side.entries[0].others_spent, b_waiting.others_spent);
+    assert_eq!(b_side.entries[0].others_created, b_waiting.others_created);
+    assert_eq!(
+        b_side.entries[0].others_spent[0].predicate,
+        pending.predicates[0]
+    );
     assert_eq!(caught.older, None);
     assert!(!caught.has_newer);
     assert_eq!(caught.pending, Some(Vec::new()));

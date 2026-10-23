@@ -61,6 +61,11 @@ node writes them; flavors are 64 hex digits.
 store it in the file; every other command uses it instead of the stored
 one.
 
+`history` names the other side of each transaction by tracking address:
+`from` whoever paid the wallet, `to` whomever it paid. `to` is left empty
+when someone else's coins were spent too, since what a payer creates beside
+the wallet's coins is the payer's change.
+
 ## Flavors
 
 Every amount is per flavor. Flame (`FLM`) is written in flames with up to
@@ -137,3 +142,13 @@ keeps minting soot of the same flavor from `2/0` with no top-up, sends
 included. The fresh wallet mints a `soot` of its own, a different flavor.
 Checks every balance on the way. `KEEP=1` and `PORT` (default
 18546) as above.
+
+```sh
+e2e/devnet-counterparty.sh
+```
+
+The same throwaway node, checking that `history` names the other side:
+the genesis wallet pays a fresh wallet, which pays part of it back, and
+each side's newest item, pending and then confirmed, is `from` or `to`
+the other's tracking address. `KEEP=1` and `PORT` (default 18547) as
+above.

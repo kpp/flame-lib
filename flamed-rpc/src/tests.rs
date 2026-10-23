@@ -3,9 +3,9 @@
 //! on.
 
 use crate::types::{
-    BlockId, ContractEnvelope, ContractId, HistoryContract, HistoryEntry, HistoryResult,
-    NoteEnvelope, PredicatePoint, ProofBytes, ProofResult, ScanEntry, ScanResult, SpentAt,
-    TipResult, TxId, TxStatusResult, UnspentEntry, UnspentResult,
+    BlockId, ContractEnvelope, ContractId, Counterparty, HistoryContract, HistoryEntry,
+    HistoryResult, NoteEnvelope, PredicatePoint, ProofBytes, ProofResult, ScanEntry, ScanResult,
+    SpentAt, TipResult, TxId, TxStatusResult, UnspentEntry, UnspentResult,
 };
 
 #[test]
@@ -375,6 +375,11 @@ fn a_history_page_omits_what_does_not_apply() {
         fee_sparks: "1000".into(),
         created: vec![contract.clone()],
         spent: vec![],
+        others_spent: vec![Counterparty {
+            predicate: PredicatePoint([0x66; 32]),
+            address: None,
+        }],
+        others_created: vec![],
     };
     let result = HistoryResult {
         tip: TipResult {
@@ -398,6 +403,21 @@ fn a_history_page_omits_what_does_not_apply() {
     assert!(json["entries"][0].get("received_at").is_none());
     assert!(json["entries"][0]["created"][0].get("note").is_none());
     assert_eq!(json["entries"][0]["spent"], serde_json::json!([]));
+    assert!(json["entries"][0]["others_spent"][0]
+        .get("address")
+        .is_none());
+    // An entry from a node that does not know the other side yet.
+    let mut older_node = json["entries"][0].clone();
+    older_node
+        .as_object_mut()
+        .expect("an object")
+        .remove("others_spent");
+    older_node
+        .as_object_mut()
+        .expect("an object")
+        .remove("others_created");
+    let read: HistoryEntry = serde_json::from_value(older_node).expect("deserialize");
+    assert!(read.others_spent.is_empty() && read.others_created.is_empty());
     assert_eq!(
         serde_json::from_value::<HistoryResult>(json).expect("deserialize"),
         result

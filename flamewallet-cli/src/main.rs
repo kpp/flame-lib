@@ -470,6 +470,12 @@ async fn run(cli: Cli) -> Result<(), Error> {
                             .collect::<Vec<_>>()
                             .join(", ");
                         let mut line = format!("{when}  {}  {changes}", item.txid);
+                        if !item.from.is_empty() {
+                            line += &format!("  from {}", item.from.join(", "));
+                        }
+                        if !item.to.is_empty() {
+                            line += &format!("  to {}", item.to.join(", "));
+                        }
                         if let Some(memo) = &item.memo {
                             line += &format!("  memo {memo:?}");
                         }
