@@ -4,7 +4,7 @@
 data_dir = "./data"
 genesis = "./genesis.json"
 rpc_bind = "127.0.0.1:8545"
-block_interval_secs = 15
+block_interval_secs = 5
 minimum_fee = 0
 # Where the mock core indexer keeps the times of the core blocks it hands
 # out. Default: <data_dir>/indexer.
