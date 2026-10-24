@@ -115,9 +115,10 @@ broken rather than the request.
 
 `query_actor` invokes the actor with one data argument, no authenticated
 caller, and `readwrite = false`. Its argument and result are base64
-`CellEnvelope`s encoding one VM `Value`: Scalar, Point, Cell, or a portable
-Dict containing only these values recursively. Empty and nested Dicts are
-accepted; token and runtime values are rejected at any depth. Envelopes
+`CellEnvelope`s encoding one VM `Value`: Scalar, Point, Cell, or a Dict whose
+sticky `copyable` and `portable` flags remain true. Fresh empty and nested Dicts
+are accepted; inserting a non-copyable value permanently disqualifies that Dict,
+even after removal. Token and runtime values are rejected at any depth. Envelopes
 are limited to 64 KiB, typed Dict decoding is bounded, and execution gas must
 be 1..=1,000,000. The result's
 `gas_used` includes VM work but excludes bounded envelope decoding. No fee

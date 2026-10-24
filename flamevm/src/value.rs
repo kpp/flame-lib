@@ -98,7 +98,7 @@ impl Value {
     /// - **Every copyable type is droppable.** Discarding it is a strict
     ///   subset of duplicate-then-discard, and the type holds no
     ///   exclusive content. Plain-data: `Scalar`, `Cell`, `Point`.
-    ///   Dicts: droppable iff their sticky `droppable` flag is set.
+    ///   Dicts: droppable when empty or their sticky `droppable` flag is set.
     /// - **Zero-quantity `ClearToken`** is droppable. It's a flavor
     ///   nameplate with no balance attached.
     /// - **Pure-computation values** are droppable: `Expression`,

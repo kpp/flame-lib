@@ -55,7 +55,10 @@ struct Contract {
 
 Dict keys reverse canonical Scalar bytes into 32-byte BE ordered paths.
 The count and sticky flags belong to the Dict, not the Trie: portable bit 0,
-droppable bit 1; other bits are invalid. No special list encoding exists.
+droppable bit 1, copyable bit 2; other bits are invalid. New empty Dicts set all
+three bits. Decoding preserves cleared bits, including for an empty Dict: an
+older header without bit 2 remains non-copyable. Claiming copyability without
+droppability is invalid. No special list encoding exists.
 Runtime representations, capability rules and admission checks are specified
 under [Dict](flamevm.md#dict) and [Types](flamevm.md#types).
 

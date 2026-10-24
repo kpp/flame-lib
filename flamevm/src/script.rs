@@ -905,7 +905,7 @@ impl ScriptBuilder {
     }
 
     /// Actor call with `readwrite = false`: `arg gas addr query → result 1 | arg 0`.
-    /// Arguments and results must be portable data, including data-only Dicts.
+    /// Arguments and results must be copyable and portable.
     pub fn query(mut self) -> Self {
         self.instructions.push(Instruction::Query);
         self

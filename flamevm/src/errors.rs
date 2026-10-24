@@ -203,7 +203,7 @@ pub enum VMError {
     #[error("Operation requires readwrite permission")]
     ReadOnlyViolation,
 
-    #[error("Actor queries accept and return only portable data and data-only Dicts")]
+    #[error("Actor queries accept and return only copyable portable values")]
     NonDataInQuery,
 
     #[error("Read-only save changed the actor state commitment")]

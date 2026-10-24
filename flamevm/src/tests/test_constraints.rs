@@ -101,7 +101,8 @@ fn getdup_copies_variable_without_copying_its_dictionary() {
     assert_eq!(variable, original);
     assert_eq!(assignment, original_assignment);
     assert_eq!(*assignment, Some(Scalar::from(7u64)));
-    assert!(!Value::Dict(dict.clone()).is_copyable());
+    assert!(Value::Dict(dict.clone()).is_copyable());
+    assert!(!dict.is_portable());
 }
 
 /// Regression: in external context, `eq` of two Cells (or Points) must

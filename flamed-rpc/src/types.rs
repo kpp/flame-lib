@@ -50,7 +50,7 @@ pub struct ActorQueryResult {
     pub block: BlockId,
     /// Height of that block.
     pub height: u64,
-    /// One data Value (Scalar, Point, Cell, or recursively data-only portable Dict).
+    /// One copyable, portable Value, including a Dict retaining both sticky flags.
     pub value: ValueEnvelope,
     /// VM execution gas consumed, excluding transport decoding.
     pub gas_used: u64,

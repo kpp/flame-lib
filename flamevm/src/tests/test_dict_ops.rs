@@ -10,7 +10,11 @@ fn dict_construction_zero_pairs() {
     let mut vm = vm_with_script(ScriptBuilder::new().push_int(0u64).dict().to_bytecode());
     run_to_end(&mut vm).unwrap();
     match &vm.current_call.stack[0] {
-        Value::Dict(d) => assert!(d.is_empty()),
+        Value::Dict(d) => {
+            assert!(d.is_empty());
+            assert!(d.is_copyable());
+            assert!(d.try_clone().unwrap().is_empty());
+        }
         other => panic!("expected Dict, got {}", value_kind(other)),
     }
 }
@@ -241,6 +245,88 @@ fn getdup_copyable() {
 }
 
 #[test]
+fn getdup_nested_data_dict_keeps_mutations_independent() {
+    let inner = Dict::from_values(vec![Value::Scalar(Scalar::from(50u64))]);
+    let outer = Dict::from_values(vec![Value::Dict(inner)]);
+    let lazy = Dict::from_trusted_cell(&outer.to_cell().unwrap(), &mut ()).unwrap();
+    for dict in [outer, lazy] {
+        let mut vm = vm_with_script(
+            ScriptBuilder::new()
+                .push_int(0u64)
+                .get_dup()
+                .verify()
+                .push_int(0u64)
+                .push_int(99u64)
+                .replace()
+                .verify()
+                .drop_()
+                .to_bytecode(),
+        );
+        vm.push_value(Value::Dict(dict));
+        run_to_end(&mut vm).unwrap();
+        let [Value::Dict(outer), Value::Dict(copy)] = vm.current_call.stack.as_slice() else {
+            panic!("expected original outer Dict and modified inner copy")
+        };
+        let Value::Dict(original) = outer.get(&Scalar::ZERO).unwrap() else {
+            panic!("expected original inner Dict")
+        };
+        let mut original = original.clone();
+        assert_int(
+            original
+                .get_resolved(&Scalar::ZERO, &mut ())
+                .unwrap()
+                .unwrap(),
+            Scalar::from(50u64),
+        );
+        assert_int(copy.get(&Scalar::ZERO).unwrap(), Scalar::from(99u64));
+        assert!(outer.is_copyable());
+        assert!(copy.is_copyable());
+    }
+}
+
+#[test]
+fn dict_copyability_stays_poisoned_after_removal_or_replacement() {
+    let initial = ScriptBuilder::new()
+        .push_int(0u64)
+        .dict()
+        .push_int(5u64)
+        .push_int(7u64)
+        .pushtoken()
+        .put();
+    for program in [
+        initial.clone().push_int(5u64).get().drop_().drop_(),
+        initial
+            .push_int(5u64)
+            .push_int(50u64)
+            .replace()
+            .verify()
+            .drop_(),
+        ScriptBuilder::new()
+            .push_int(50u64)
+            .push_int(5u64)
+            .push_int(1u64)
+            .dict()
+            .push_int(5u64)
+            .push_int(7u64)
+            .pushtoken()
+            .replace()
+            .verify()
+            .drop_()
+            .push_int(5u64)
+            .get()
+            .drop_()
+            .drop_(),
+    ] {
+        let mut vm = vm_with_script(program.dup_k(0).to_bytecode());
+        assert!(matches!(run_to_end(&mut vm), Err(VMError::TypeNotCopyable)));
+        let Value::Dict(dict) = &vm.current_call.stack[0] else {
+            panic!("expected poisoned Dict")
+        };
+        assert!(!dict.is_copyable());
+    }
+}
+
+#[test]
 fn getdup_missing_pushes_zero() {
     let script = ScriptBuilder::new()
         .push_int(0u64)
@@ -274,9 +360,8 @@ fn getdup_noncopyable_errors() {
 }
 
 /// Conservation: `getdup` of a key whose value is a *nested* Dict
-/// containing a token must also fail `TypeNotCopyable` — the recursive
-/// `Dict::try_clone` copyability check blocks duplicating tokens buried
-/// inside sub-dicts, not just top-level ones (audit p9).
+/// containing a token must also fail `TypeNotCopyable`: nested dictionaries
+/// propagate their poisoned copyability to the enclosing dictionary.
 #[test]
 fn getdup_nested_token_dict_errors() {
     // outer = { 9: inner } where inner = { 5: ClearToken(0, 7) }.

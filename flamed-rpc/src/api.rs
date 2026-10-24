@@ -56,8 +56,8 @@ pub trait FlamedApi {
     async fn actor(&self, id: ActorId) -> RpcResult<ActorResult>;
 
     /// Runs an actor getter against the current committed tip, without effects.
-    /// Arguments and results are Scalar, Point, Cell, or portable Dicts whose
-    /// entries recursively contain only these data values, as Value envelopes.
+    /// Arguments and results must be copyable and portable, as Value envelopes.
+    /// Dicts must retain both sticky flags, including when empty.
     /// Gas must be 1..=MAX_QUERY_GAS; envelopes are limited to MAX_QUERY_BYTES.
     /// If supplied, `expected_block` must match the current tip; a mismatch
     /// returns STALE_BLOCK. Historical blocks are not queried.

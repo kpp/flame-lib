@@ -52,7 +52,7 @@ All downward call arguments must be portable, just like asynchronous `send`
 payloads. Read/write return values are unrestricted: non-portable liabilities and
 VM-local values may travel upward so the caller can resolve them, but they may
 not be delegated to another callee. Read-only actor calls restrict both their
-argument and result to recursively data-only portable values; see [Actor queries](#actor-queries).
+argument and result to copyable, portable values; see [Actor queries](#actor-queries).
 
 Actor state is its re-entrancy lock. `load` moves state out of the registry;
 while checked out, another frame cannot enter, observe, or mutate that actor.
@@ -199,7 +199,7 @@ Ownership: every type on the stack is always owned. FlameVM does not allow refer
 
 Plain data types: scalars, immutable Cells, Ristretto points. These can be copied and ported.
 
-Structured data types: dicts that are used as lists, dictionaries and enum variants. Dicts are **never copyable** and cache sticky portability and droppability capabilities (see §Dict).
+Structured data types: dicts that are used as lists, dictionaries and enum variants. Dicts cache sticky copyability, portability and droppability capabilities (see §Dict).
 
 Bearer types: Contract, WideToken, Token and ClearToken.
 
@@ -220,7 +220,7 @@ droppable, but non-copyable pure-computation values may be droppable too.
 | Cell (raw serialized data) | yes | yes | yes |
 | Slice | yes | yes | no |
 | Builder | no | yes | no |
-| Dict | no | empty or sticky flag | sticky flag |
+| Dict | sticky flag | empty or sticky flag | sticky flag |
 | Token | no | no | yes |
 | ClearToken | no | quantity is zero | centered quantity is non-negative |
 | WideToken, Contract | no | no | no |
@@ -489,7 +489,21 @@ without transferring the rejected value. While nonempty the watermark never
 decreases; fully draining the Dict resets it to 1. It is not serialized. This
 runtime bound is distinct from the unchanged typed encoding-depth bound of 128.
 
-**Dicts are never copyable**: `dup`/`getdup` of a Dict value always fails `TypeNotCopyable`. Each Dict carries independent sticky `portable` and `droppable` flags. A newly constructed empty Dict starts with both flags true. Every successful insertion applies `dict.portable &= value.is_portable()` and `dict.droppable &= value.is_droppable()`. Removal and replacement never restore a cleared flag; a rejected strict insertion does not change either flag. Emptiness overrides only droppability: after every member is extracted, the empty Dict can be dropped while the extracted bearer values remain owned by the script. Portability remains sticky because it governs domain admission rather than disposal.
+**Sticky capabilities.** Each Dict carries `copyable`, `portable` and `droppable`
+flags. A newly constructed empty Dict starts with all three true. Every
+successful insertion applies `dict.copyable &= value.is_copyable()`,
+`dict.portable &= value.is_portable()` and
+`dict.droppable &= value.is_droppable()`. Inserting one non-copyable value
+permanently poisons copyability. Removing or replacing that value, including
+fully draining the Dict, never restores the flag. A rejected strict insertion
+changes no flags. Emptiness overrides only droppability: after every member is
+extracted, the empty Dict can be dropped while the extracted bearer values
+remain owned by the script.
+
+`dup` and `getdup` may copy a Dict only while its `copyable` flag is true;
+otherwise they fail `TypeNotCopyable`. Admission checks read the cached flag in
+O(1), including for nested Dicts. Copying still pays for actual owned-value
+cloning; the implementation does not provide constant-cost copy-on-write Dicts.
 
 The `dict` / `put` / `replace` opcodes may insert any Value. A non-portable Dict remains usable on the stack, but `contract`, `output`, `send`, `call`, `open`, `signcall`, and actor-state storage reject it at their portability boundary. Checking a Dict is O(1), including when it is nested: inserting a nested Dict reads that Dict's already-cached flag. Dict values are owned and cannot be mutated through an alias, so the cached parent flag cannot become stale.
 
@@ -497,6 +511,9 @@ The [Dict encoding](encoding.md#values-and-contracts) preserves sticky flags,
 including on an empty Dict. Generic imports validate count, paths and members
 against claimed capabilities. Previously authenticated storage can preserve
 pruned branches and use committed summaries without loading every member.
+Headers without the copyable bit remain valid and conservatively non-copyable;
+decoding never upgrades their flags from their current contents. New copyable
+Dicts commit the additional flag bit and therefore have different CellIDs.
 
 Drilling down the nested dict preserving ownership with `get` and `put` instructions: 
 
@@ -603,13 +620,13 @@ Read-only execution has these consensus rules:
 - Entry accepts only an existing `ActorAddress::Address`; `Init` and `Restore`
   are rejected even when their destination already exists. Missing, frozen and
   checked-out actors retain their ordinary failure behavior.
-- Both argument and result must be query data: `Scalar`, `Point`, `Cell`, or a
-  portable `Dict` whose entries recursively satisfy the same rule. Empty and
-  nested Dicts are accepted, including DNS records with multiple fields. Tokens,
-  including zero-quantity tokens, and runtime values are rejected at any depth
-  with `NonDataInQuery`. This admission rule is independent of VM copyability:
-  Dicts still cannot be duplicated by `dup` or `getdup`. Raw token bytes inside
-  a Cell remain data and grant no token ownership.
+- Both argument and result must be copyable and portable: `Scalar`, `Point`,
+  `Cell`, or a `Dict` retaining both sticky flags. Fresh empty Dicts and nested
+  DNS records are accepted. A Dict whose copyability was poisoned remains
+  rejected after removing the offending value, even when empty. Tokens,
+  including zero-quantity tokens, and runtime-only values are rejected at any
+  depth with `NonDataInQuery`. Raw token bytes inside a Cell remain data and
+  grant no token ownership.
 - Cross-boundary Dicts are hydrated and recursively checked, and Cell graphs
   are materialized using the current scoped resolver and gas budget, preserving
   explicit pruning and failing on missing ordinary bodies. Private annotations
@@ -1423,8 +1440,9 @@ consumes one handle into a non-copyable Expression referring to that same
 allocation. Thus `alloc dup:0 expr roll:1 expr mul` squares one allocated
 value without copying an expression tree. To reuse a larger computation,
 allocate a variable, constrain one expression of it equal to that computation,
-and consume further handle copies in other expressions. Dicts and Expressions
-remain non-copyable. An allocated handle has no public commitment and is not
+and consume further handle copies in other expressions. Expressions remain
+non-copyable and poison the copyability of any Dict containing them. An
+allocated handle has no public commitment and is not
 a substitute for a committed Variable in `borrow` or `issuepriv`.
 
 ### expr
@@ -1822,15 +1840,15 @@ An empty-stack run-off-the-end child exit returns Scalar `0` (unit) followed by
 argument for actor calls, or the original locked Contract and argument for
 `open`/`signcall`. The Contract payload is never returned separately on failure.
 Use a Dict for multiple application results, including query results whose
-entries are recursively data-only. Error recovery uses prebuilt
+copyable and portable flags remain true. Error recovery uses prebuilt
 entry snapshots and requires no new encoding or Cell resolution.
 
 In read/write execution, `return` deliberately performs no portability check. Non-portable values,
 including negative `ClearToken`s and `WideToken`s, may move upward to the
 caller, which owns responsibility for balancing or consuming them. Every
 downward boundary (`call`, `open`, `signcall`, and asynchronous `send`) accepts
-portable values only. A read-only result must satisfy the recursive query-data
-rule; its Dict contents and Cell graphs are made available before discarding
+portable values only. A read-only result must be copyable and portable;
+its Dict contents and Cell graphs are made available before discarding
 the callee's checkpoint.
 Both return paths reject an unrestored read-only checkout.
 

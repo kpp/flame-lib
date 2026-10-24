@@ -277,22 +277,42 @@ fn roll_out_of_range_errors() {
 }
 
 #[test]
-fn dup_of_dict_errors_noncopyable() {
-    // {5: 50}, dup:0 — dicts are never VM-copyable, so even an
-    // all-Int dict can't be duplicated on the stack.
+fn dup_of_nested_data_dict_keeps_mutations_independent() {
     let mut vm = vm_with_script(
         ScriptBuilder::new()
             .push_int(50u64)
+            .push_int(3u64)
+            .push_int(1u64)
+            .dict()
             .push_int(5u64)
             .push_int(1u64)
             .dict()
             .dup_k(0)
+            .push_int(5u64)
+            .get()
+            .push_int(3u64)
+            .push_int(99u64)
+            .replace()
+            .verify()
+            .drop_()
+            .put()
             .to_bytecode(),
     );
-    assert!(matches!(
-        run_to_end(&mut vm).unwrap_err(),
-        VMError::TypeNotCopyable
-    ));
+    run_to_end(&mut vm).unwrap();
+    assert_eq!(vm.current_call.stack.len(), 2);
+    for (value, expected) in vm.current_call.stack.iter().zip([50u64, 99u64]) {
+        let Value::Dict(outer) = value else {
+            panic!("expected outer Dict")
+        };
+        let Value::Dict(inner) = outer.get(&Scalar::from(5u64)).unwrap() else {
+            panic!("expected inner Dict")
+        };
+        assert_int(
+            inner.get(&Scalar::from(3u64)).unwrap(),
+            Scalar::from(expected),
+        );
+        assert!(outer.is_copyable());
+    }
 }
 
 #[test]
@@ -312,4 +332,25 @@ fn dup_of_noncopyable_dict_errors() {
         run_to_end(&mut vm).unwrap_err(),
         VMError::TypeNotCopyable
     ));
+}
+
+#[test]
+fn dup_of_nested_dict_charges_for_copying_values() {
+    let program = ScriptBuilder::new().dup_k(0).to_bytecode();
+    let mut previous_gas = 0;
+    for count in [0, 8] {
+        let inner = Dict::from_values(vec![Value::Scalar(Scalar::ONE); count]);
+        let value = Value::Dict(Dict::from_values(vec![Value::Dict(inner)]));
+        let mut vm = vm_with_script(program.clone());
+        vm.push_value(value.clone());
+        run_to_end(&mut vm).unwrap();
+        let gas = vm.current_call.gas_used;
+        assert!(gas > previous_gas);
+        previous_gas = gas;
+
+        let mut limited = vm_with_script(program.clone());
+        limited.current_call.gas_limit = gas - 1;
+        limited.push_value(value);
+        assert!(matches!(run_to_end(&mut limited), Err(VMError::OutOfGas)));
+    }
 }
