@@ -1,5 +1,5 @@
 # Sourced by the devnet scripts beside it: builds flamed and flamewallet,
-# starts a throwaway node with two-second blocks, points FLAMEWALLET_NODE
+# starts a throwaway node with one-second blocks, points FLAMEWALLET_NODE
 # at it, and defines the helpers the scripts check balances with. The node
 # is stopped and its scratch directory removed on exit; on a failure the
 # end of the node's log is printed first.
@@ -36,7 +36,7 @@ cat >"$dir/flamed.toml" <<TOML
 data_dir = "$dir/data"
 genesis = "$dir/genesis.json"
 rpc_bind = "127.0.0.1:$port"
-block_interval_secs = 2
+block_interval_secs = 1
 minimum_fee = 0
 TOML
 "$flamed" run --config "$dir/flamed.toml" >"$dir/node.log" 2>&1 &

@@ -126,7 +126,7 @@ the node's tests and Safely use.
 e2e/devnet-smoke.sh
 ```
 
-Starts a throwaway node with two-second blocks, restores the genesis
+Starts a throwaway node with one-second blocks, restores the genesis
 wallet, pays a fresh wallet with a memo, pays part of it back, and checks
 every balance. `KEEP=1` keeps the scratch directory; `PORT` changes the
 RPC port (default 18545).
