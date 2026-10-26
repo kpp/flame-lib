@@ -1,9 +1,9 @@
-use std::sync::Arc;
-
+use super::{
+    EndorsementReservation, MinterJournal, sending::endorsement_sender::EndorsementSender,
+};
 use btc_integration::MintingEndorsementData;
 use flamechain::Block;
-
-use super::{EndorsementReservation, MinterJournal, ports::EndorsementSender};
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EndorsementError<S, J> {

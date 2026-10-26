@@ -1,12 +1,15 @@
 pub mod block_processing;
 pub mod consensus;
-mod consensus_handle;
-pub mod core_block_notifier;
 pub mod minter;
 pub mod orchestrator;
 pub mod rewards;
 
-pub use block_processing::FlameBlockArrivalHandler;
-pub use block_processing::{CONSENSUS_QUEUE_CAPACITY, ConsensusSendError, ConsensusStatus};
-pub use consensus_handle::ConsensusHandle;
+pub use block_processing::{
+    CONSENSUS_QUEUE_CAPACITY, ConsensusHandle, ConsensusSendError, ConsensusStatus,
+    FlameBlockArrivalHandler,
+};
 pub use orchestrator::MintingOrchestrator;
+
+pub mod core_block_notifier {
+    pub use crate::orchestrator::core_block_notifier::*;
+}

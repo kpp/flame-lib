@@ -1,19 +1,13 @@
+use crate::consensus::{ConsensusStorage, MintingProtocolParams};
+use btc_integration::BtcBlockTip;
+use flamechain::{BlockHeader, CoreBlockTip};
 use std::collections::BTreeMap;
 
-use btc_integration::BtcBlockTip;
-use flamechain::{BlockHeader, BlockTip, CoreBlockTip};
-use flamevm::Predicate;
-
-use crate::consensus::{ConsensusStorage, MintingProtocolParams};
+pub use super::block_weight_calculator_error::BlockWeightCalculatorError;
+pub use crate::rewards::model::reward_weight::RewardWeight;
 
 pub type PredicatePair = ([u8; 32], [u8; 32]);
 pub type BlockWeights = BTreeMap<PredicatePair, RewardWeight>;
-
-pub struct RewardWeight {
-    pub flame_predicate: Predicate,
-    pub access_predicate: Predicate,
-    pub weight: f64,
-}
 
 pub struct BlockWeightCalculator<'a, C: ConsensusStorage> {
     pub header: &'a BlockHeader,
@@ -102,14 +96,4 @@ impl<C: ConsensusStorage> BlockWeightCalculator<'_, C> {
         }
         Ok(weights)
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum BlockWeightCalculatorError<C> {
-    ConsensusStorage(C),
-    NotCoreBlock(BlockTip),
-    EndorsementBeforeTarget {
-        inclusion_height: u64,
-        target_height: u64,
-    },
 }

@@ -1,4 +1,4 @@
-#[path = "common/reorg.rs"]
+#[path = "common/bitcoin_reorg.rs"]
 mod support;
 
 use support::{Fixture, bitcoin_block};

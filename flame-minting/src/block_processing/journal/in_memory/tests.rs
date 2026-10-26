@@ -1,53 +1,53 @@
+use super::InMemoryConsensusJournalError as Error;
+use crate::block_processing::journal::*;
+use crate::consensus::{BitcoinRollbackPlan, ConsensusOutcome, ConsensusUndo, MintingOutcome};
+use btc_integration::{BtcBlockTip, IndexedBlock};
+use corepc_client::bitcoin::BlockHash;
 use corepc_client::bitcoin::hashes::Hash;
 use flame_chain_service::ChainPath;
-use flamechain::{BlockHash as FlameBlockHash, BlockTip};
-use flamevm::Predicate;
+use flamechain::BlockTip;
+use flamechain::{BlockHash as FlameBlockHash, CoreBlockTip};
+use std::{collections::BTreeMap, sync::Arc};
 
-use crate::rewards::{PendingReward, RewardIndex, RewardsOutcome, RewardsUndo};
+use crate::{
+    consensus::engine::tests::endorsement_for_tip,
+    rewards::{RewardsOutcome, RewardsUndo},
+};
 
 use super::*;
 
-const CONSENSUS_STAGES: [ApplyStage; 6] = [
-    ApplyStage::RemoveEndorsements,
-    ApplyStage::StoreEndorsements,
-    ApplyStage::StoreAcquisitions,
-    ApplyStage::StoreBlockWeights,
-    ApplyStage::StoreDoubleSigns,
-    ApplyStage::StorePendingEndorsements,
-];
-
-const ROLLBACK_STAGES: [RollbackStage; 11] = [
-    RollbackStage::RemoveEndorsements,
-    RollbackStage::RestoreAcquisitions,
-    RollbackStage::StoreDoubleSigns,
-    RollbackStage::StoreEndorsements,
-    RollbackStage::StorePendingEndorsements,
-    RollbackStage::StoreBlockWeights,
-    RollbackStage::PrepareFlameTransition,
-    RollbackStage::ApplyFlameTransition,
-    RollbackStage::PrepareRewards,
-    RollbackStage::ApplyRewards,
-    RollbackStage::StoreCursor,
-];
-
-fn tip(height: u64, hash: u8) -> BtcBlockTip {
+fn btc_tip(height: u64, hash: u8) -> BtcBlockTip {
     BtcBlockTip {
         hash: BlockHash::from_byte_array([hash; 32]),
         height,
     }
 }
 
-fn outcome(btc_tip: BtcBlockTip) -> MintingOutcome {
-    MintingOutcome {
-        consensus: crate::consensus::ConsensusOutcome::default(),
-        next_btc_cursor: btc_tip,
-    }
-}
-
 fn flame_tip(hash: u8) -> BlockTip {
     BlockTip {
         hash: FlameBlockHash::new([hash; 32]),
-        height: 0.into(),
+        height: 1.into(),
+    }
+}
+
+fn block(tip: BtcBlockTip) -> IndexedBlock {
+    IndexedBlock {
+        btc_block_tip: tip,
+        acquisitions: Vec::new(),
+        endorsements: vec![endorsement_for_tip(
+            1,
+            CoreBlockTip {
+                hash: flame_tip(1).hash,
+                height: 1.into(),
+            },
+        )],
+    }
+}
+
+fn outcome(tip: BtcBlockTip) -> MintingOutcome {
+    MintingOutcome {
+        next_btc_cursor: tip,
+        consensus: ConsensusOutcome::default(),
     }
 }
 
@@ -58,502 +58,680 @@ fn undo(hash: u8) -> ConsensusUndo {
     }
 }
 
-fn transition(hash: u8) -> FlameTransition {
+fn transition() -> FlameTransition {
     FlameTransition {
-        previous_tip: flame_tip(hash),
-        next_tip: flame_tip(hash),
+        previous_tip: flame_tip(1),
+        next_tip: flame_tip(2),
         path: ChainPath::default(),
         attached_core_headers: Vec::new(),
     }
 }
 
-fn reward(amount: u64) -> PendingReward {
-    PendingReward {
-        flame_predicate: Predicate::opaque(Predicate::unspendable_key()),
-        access_predicate: Predicate::opaque(Predicate::unspendable_key()),
-        amount,
-    }
-}
-
-fn changes(amount: u64) -> RewardsChanges {
+fn rewards() -> RewardsChanges {
     RewardsChanges {
         outcomes: vec![RewardsOutcome {
-            target_block_height: 200.into(),
-            rewards: vec![reward(amount)],
+            target_block_height: 1.into(),
+            rewards: Vec::new(),
         }],
-        undo: RewardsUndo {
-            rewards: BTreeMap::from([(
-                (200.into(), RewardIndex::from(&reward(amount))),
-                Some(reward(amount / 2)),
-            )]),
-        },
+        undo: RewardsUndo::default(),
     }
 }
 
-async fn advance_to_flame(journal: &InMemoryBitcoinBlockJournal, btc_tip: BtcBlockTip) {
-    for stage in CONSENSUS_STAGES {
-        journal.complete_apply_stage(btc_tip, stage).await.unwrap();
-        journal.complete_apply_stage(btc_tip, stage).await.unwrap();
-    }
-}
-
-async fn advance_to_rewards(journal: &InMemoryBitcoinBlockJournal, btc_tip: BtcBlockTip) {
-    advance_to_flame(journal, btc_tip).await;
-    journal
-        .store_flame_transition(btc_tip, &transition(1))
-        .await
-        .unwrap();
-    journal
-        .complete_apply_stage(btc_tip, ApplyStage::PrepareFlameTransition)
-        .await
-        .unwrap();
-    journal
-        .complete_apply_stage(btc_tip, ApplyStage::ApplyFlameTransition)
-        .await
-        .unwrap();
-}
-
-async fn finish_apply(journal: &InMemoryBitcoinBlockJournal, btc_tip: BtcBlockTip) {
-    advance_to_rewards(journal, btc_tip).await;
-    journal
-        .store_rewards_changes(btc_tip, &changes(10))
-        .await
-        .unwrap();
-    for stage in [
-        ApplyStage::PrepareRewards,
-        ApplyStage::ApplyRewards,
-        ApplyStage::StoreCursor,
-    ] {
-        journal.complete_apply_stage(btc_tip, stage).await.unwrap();
-    }
-}
-
-async fn finish_rollback(journal: &InMemoryBitcoinBlockJournal, btc_tip: BtcBlockTip) {
-    journal.begin_rollback(btc_tip).await.unwrap();
-    for stage in ROLLBACK_STAGES {
-        journal
-            .complete_rollback_stage(btc_tip, stage)
-            .await
-            .unwrap();
-    }
-}
-
-#[tokio::test]
-async fn pending_and_applied_entries_keep_owned_outcome_and_undo_snapshots() {
-    let initial = tip(100, 1);
-    let btc_tip = tip(101, 2);
-    let journal = InMemoryBitcoinBlockJournal::new(initial);
-    assert!(journal.get_entry(btc_tip).await.unwrap().is_none());
-    assert!(journal.get_pending_entry().await.unwrap().is_none());
-    let mut original = outcome(btc_tip);
-    let mut original_undo = undo(1);
-    journal
-        .begin_apply(initial, &original, &original_undo)
-        .await
-        .unwrap();
-    original.next_btc_cursor = tip(101, 3);
-    original_undo.weighted_blocks.clear();
-    let mut snapshot = journal.get_pending_entry().await.unwrap().unwrap();
-    snapshot.consensus_undo.weighted_blocks.clear();
-    snapshot.minting_outcome.next_btc_cursor = original.next_btc_cursor;
-    snapshot.status = JournalStatus::Applied;
-    assert_eq!(
-        journal
-            .begin_apply(initial, &original, &original_undo)
-            .await,
-        Err(Error::OperationInProgress(btc_tip))
-    );
-    let stored = journal.get_entry(btc_tip).await.unwrap().unwrap();
-    assert_eq!(stored.minting_outcome, outcome(btc_tip));
-    assert_eq!(stored.consensus_undo, undo(1));
-    assert_eq!(
-        stored.status,
-        JournalStatus::Applying(ApplyStage::RemoveEndorsements)
-    );
-    finish_apply(&journal, btc_tip).await;
-    assert!(journal.get_pending_entry().await.unwrap().is_none());
-    let stored = journal.get_entry(btc_tip).await.unwrap().unwrap();
-    assert_eq!(stored.status, JournalStatus::Applied);
-    assert_eq!(stored.consensus_undo, undo(1));
-    assert_eq!(stored.minting_outcome, outcome(btc_tip));
-    assert_eq!(
-        stored
-            .rewards_changes
-            .unwrap()
-            .undo
-            .rewards
-            .values()
-            .next()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .amount,
-        5
-    );
-}
-
-#[tokio::test]
-async fn preparation_requires_data_and_rejects_overwriting_saved_plans() {
-    let initial = tip(100, 1);
-    let btc_tip = tip(101, 2);
-    let journal = InMemoryBitcoinBlockJournal::new(initial);
-    journal
-        .begin_apply(initial, &outcome(btc_tip), &undo(1))
-        .await
-        .unwrap();
-    assert!(matches!(
-        journal
-            .store_flame_transition(btc_tip, &transition(1))
-            .await,
-        Err(Error::UnexpectedStatus { .. })
-    ));
-    assert!(matches!(
-        journal.store_rewards_changes(btc_tip, &changes(10)).await,
-        Err(Error::UnexpectedStatus { .. })
-    ));
-    advance_to_flame(&journal, btc_tip).await;
-    assert_eq!(
-        journal
-            .complete_apply_stage(btc_tip, ApplyStage::PrepareFlameTransition)
-            .await,
-        Err(Error::MissingFlameTransition)
-    );
-    let mut flame = transition(1);
-    journal
-        .store_flame_transition(btc_tip, &flame)
-        .await
-        .unwrap();
-    flame.next_tip = flame_tip(9);
-    assert_eq!(
-        journal.store_flame_transition(btc_tip, &flame).await,
-        Err(Error::FlameTransitionAlreadyPrepared)
-    );
-    assert_eq!(
-        journal
-            .get_pending_entry()
-            .await
-            .unwrap()
-            .unwrap()
-            .flame_transition,
-        Some(transition(1))
-    );
-    journal
-        .complete_apply_stage(btc_tip, ApplyStage::PrepareFlameTransition)
-        .await
-        .unwrap();
-    journal
-        .complete_apply_stage(btc_tip, ApplyStage::ApplyFlameTransition)
-        .await
-        .unwrap();
-    assert_eq!(
-        journal
-            .complete_apply_stage(btc_tip, ApplyStage::PrepareRewards)
-            .await,
-        Err(Error::MissingRewardsChanges)
-    );
-    let mut rewards = changes(10);
-    journal
-        .store_rewards_changes(btc_tip, &rewards)
-        .await
-        .unwrap();
-    rewards.outcomes[0].rewards[0].amount = 99;
-    rewards.undo.rewards.clear();
-    assert_eq!(
-        journal.store_rewards_changes(btc_tip, &rewards).await,
-        Err(Error::RewardsChangesAlreadyPrepared)
-    );
-    let mut snapshot = journal
-        .get_pending_entry()
-        .await
-        .unwrap()
-        .unwrap()
-        .rewards_changes
-        .unwrap();
-    snapshot.outcomes[0].rewards[0].amount = 99;
-    snapshot.undo.rewards.clear();
-    let saved = journal
-        .get_pending_entry()
-        .await
-        .unwrap()
-        .unwrap()
-        .rewards_changes
-        .unwrap();
-    assert_eq!(saved.outcomes[0].rewards[0].amount, 10);
-    assert_eq!(
-        saved
-            .undo
-            .rewards
-            .values()
-            .next()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .amount,
-        5
-    );
-}
-
-#[tokio::test]
-async fn incomplete_operations_cannot_finish_or_start_another_operation() {
-    let initial = tip(100, 1);
-    let btc_tip = tip(101, 2);
-    let journal = InMemoryBitcoinBlockJournal::new(initial);
-    journal
-        .begin_apply(initial, &outcome(btc_tip), &undo(1))
-        .await
-        .unwrap();
-    assert!(matches!(
-        journal
-            .complete_apply_stage(btc_tip, ApplyStage::StoreCursor)
-            .await,
-        Err(Error::UnexpectedStatus { .. })
-    ));
-    assert_eq!(
-        journal.begin_rollback(btc_tip).await,
-        Err(Error::OperationInProgress(btc_tip))
-    );
-    finish_apply(&journal, btc_tip).await;
-    journal
-        .complete_apply_stage(btc_tip, ApplyStage::StoreCursor)
-        .await
-        .unwrap();
-    journal.begin_rollback(btc_tip).await.unwrap();
-    assert!(matches!(
-        journal
-            .complete_rollback_stage(btc_tip, RollbackStage::StoreCursor)
-            .await,
-        Err(Error::UnexpectedStatus { .. })
-    ));
-    assert_eq!(
-        journal
-            .begin_apply(btc_tip, &outcome(tip(102, 3)), &undo(2))
-            .await,
-        Err(Error::OperationInProgress(btc_tip))
-    );
-    assert_eq!(
-        journal.get_pending_entry().await.unwrap().unwrap().status,
-        JournalStatus::RollingBack(RollbackStage::RemoveEndorsements)
-    );
-    for stage in ROLLBACK_STAGES {
-        journal
-            .complete_rollback_stage(btc_tip, stage)
-            .await
-            .unwrap();
-        journal
-            .complete_rollback_stage(btc_tip, stage)
-            .await
-            .unwrap();
-    }
-    assert!(journal.get_pending_entry().await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn history_rolls_back_from_the_tip_and_retains_both_branches_at_the_same_height() {
-    let initial = tip(100, 1);
-    let first = tip(101, 2);
-    let second = tip(102, 3);
-    let replacement = tip(101, 4);
-    let journal = InMemoryBitcoinBlockJournal::new(initial);
-    for (previous, next) in [(initial, first), (first, second)] {
-        journal
-            .begin_apply(previous, &outcome(next), &undo(1))
-            .await
-            .unwrap();
-        finish_apply(&journal, next).await;
-    }
-    assert!(matches!(
-        journal.begin_rollback(first).await,
-        Err(Error::BlockTipMismatch { .. })
-    ));
-    assert!(journal.get_pending_entry().await.unwrap().is_none());
-    finish_rollback(&journal, second).await;
-    finish_rollback(&journal, first).await;
-    journal
-        .begin_apply(initial, &outcome(replacement), &undo(2))
-        .await
-        .unwrap();
-    finish_apply(&journal, replacement).await;
-    assert_eq!(
-        journal
-            .begin_apply(replacement, &outcome(second), &undo(2))
-            .await,
-        Err(Error::BlockTipMismatch {
-            expected: first,
-            actual: replacement
-        })
-    );
-    for (btc_tip, expected) in [
-        (first, JournalStatus::RolledBack),
-        (second, JournalStatus::RolledBack),
-        (replacement, JournalStatus::Applied),
-    ] {
+async fn finish_bitcoin(journal: &InMemoryConsensusJournal, id: OperationId) {
+    while let Some(snapshot) = journal.bitcoin_journal().pending_entry().await.unwrap() {
+        assert_eq!(snapshot.id, id);
+        let bitcoin = journal.bitcoin_journal();
+        match snapshot.operation.entry.status {
+            JournalStatus::Applying(stage) => {
+                match stage {
+                    ApplyStage::PrepareFlameTransition => {
+                        bitcoin
+                            .store_flame_transition(id, &transition())
+                            .await
+                            .unwrap();
+                    }
+                    ApplyStage::PrepareRewards => {
+                        bitcoin.store_rewards_changes(id, &rewards()).await.unwrap();
+                    }
+                    _ => {}
+                }
+                bitcoin.complete_apply_stage(id, stage).await.unwrap();
+                bitcoin.complete_apply_stage(id, stage).await.unwrap();
+            }
+            JournalStatus::RollingBack(stage) => {
+                match stage {
+                    RollbackStage::PrepareFlameTransition => bitcoin
+                        .store_flame_transition(id, &transition())
+                        .await
+                        .unwrap(),
+                    RollbackStage::PrepareRewards => {
+                        bitcoin.store_rewards_changes(id, &rewards()).await.unwrap()
+                    }
+                    _ => {}
+                }
+                bitcoin.complete_rollback_stage(id, stage).await.unwrap();
+                bitcoin.complete_rollback_stage(id, stage).await.unwrap();
+            }
+            status => panic!("unexpected pending status: {status:?}"),
+        }
+        let latest = journal.clone().latest_entry().await.unwrap().unwrap();
+        assert_eq!(latest.id, id);
         assert_eq!(
-            journal.get_entry(btc_tip).await.unwrap().unwrap().status,
-            expected
+            latest.is_complete(),
+            journal.read().unwrap().pending.is_none()
+        );
+    }
+}
+
+async fn finish_flame(journal: &InMemoryConsensusJournal, id: OperationId) {
+    while let Some(snapshot) = journal.flame_journal().pending_entry().await.unwrap() {
+        assert_eq!(snapshot.id, id);
+        let FlameJournalStatus::Applying(stage) = snapshot.operation.status else {
+            panic!("expected a pending arrival");
+        };
+        let flame = journal.flame_journal();
+        match stage {
+            FlameApplyStage::PrepareTransition => {
+                flame.store_transition(id, &transition()).await.unwrap();
+            }
+            FlameApplyStage::PrepareRewards => {
+                flame.store_rewards(id, &rewards()).await.unwrap();
+            }
+            _ => {}
+        }
+        flame.complete_apply_stage(id, stage).await.unwrap();
+        flame.complete_apply_stage(id, stage).await.unwrap();
+        let latest = journal.clone().latest_entry().await.unwrap().unwrap();
+        assert_eq!(latest.id, id);
+        assert_eq!(
+            latest.is_complete(),
+            journal.read().unwrap().pending.is_none()
         );
     }
 }
 
 #[tokio::test]
-async fn an_empty_rewards_plan_is_prepared_and_can_be_applied_and_rolled_back() {
-    let initial = tip(100, 1);
-    let btc_tip = tip(101, 2);
-    let journal = InMemoryBitcoinBlockJournal::new(initial);
-    journal
-        .begin_apply(initial, &outcome(btc_tip), &ConsensusUndo::default())
+async fn creating_views_does_not_create_an_operation() {
+    let journal = InMemoryConsensusJournal::new(btc_tip(100, 1));
+    let bitcoin = journal.bitcoin_journal();
+    let flame = journal.flame_journal();
+    assert!(journal.latest_entry().await.unwrap().is_none());
+    assert!(bitcoin.pending_entry().await.unwrap().is_none());
+    assert!(flame.pending_entry().await.unwrap().is_none());
+    assert!(bitcoin.get_entry(btc_tip(101, 2)).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn bitcoin_flame_and_rollback_share_one_order_and_one_pending_operation() {
+    let initial = btc_tip(100, 1);
+    let next = btc_tip(101, 2);
+    let journal = InMemoryConsensusJournal::new(initial);
+    let bitcoin = journal.bitcoin_journal();
+    let flame = journal.flame_journal();
+    let apply = bitcoin
+        .begin_apply(initial, &block(next), &outcome(next), &undo(1))
         .await
         .unwrap();
-    advance_to_rewards(&journal, btc_tip).await;
-    journal
-        .store_rewards_changes(
-            btc_tip,
-            &RewardsChanges {
-                outcomes: Vec::new(),
-                undo: RewardsUndo::default(),
-            },
+    assert_eq!(apply, OperationId(0));
+    assert!(flame.pending_entry().await.unwrap().is_none());
+    assert_eq!(
+        flame
+            .begin_apply(
+                flame_tip(1),
+                initial,
+                &ConsensusOutcome::default(),
+                &undo(1)
+            )
+            .await,
+        Err(Error::OperationInProgress(apply))
+    );
+    finish_bitcoin(&journal, apply).await;
+    let arrival = flame
+        .begin_apply(flame_tip(1), next, &ConsensusOutcome::default(), &undo(2))
+        .await
+        .unwrap();
+    assert_eq!(arrival, OperationId(1));
+    assert!(bitcoin.pending_entry().await.unwrap().is_none());
+    assert_eq!(
+        bitcoin
+            .begin_rollback(next, &BitcoinRollbackPlan::default())
+            .await,
+        Err(Error::OperationInProgress(arrival))
+    );
+    assert_eq!(
+        bitcoin
+            .begin_apply(
+                next,
+                &block(btc_tip(102, 3)),
+                &outcome(btc_tip(102, 3)),
+                &undo(3)
+            )
+            .await,
+        Err(Error::OperationInProgress(arrival))
+    );
+    let latest = journal.latest_entry().await.unwrap().unwrap();
+    assert_eq!(latest.btc_tip(), next);
+    assert!(!latest.is_complete());
+    assert!(matches!(latest.operation, ConsensusOperation::Flame(_)));
+    finish_flame(&journal, arrival).await;
+    let rollback = bitcoin
+        .begin_rollback(next, &BitcoinRollbackPlan::default())
+        .await
+        .unwrap();
+    assert_eq!(rollback, OperationId(2));
+    finish_bitcoin(&journal, rollback).await;
+    let state = journal.read().unwrap();
+    assert_eq!(state.applied_btc_tip, initial);
+    assert_eq!(state.entries.len(), 3);
+    assert!(
+        state
+            .entries
+            .values()
+            .all(ConsensusJournalEntry::is_complete)
+    );
+    let ConsensusOperation::Bitcoin(original) = &state.entries[&apply].operation else {
+        panic!()
+    };
+    assert_eq!(original.kind, BitcoinOperationKind::Apply);
+    assert_eq!(original.entry.status, JournalStatus::Applied);
+    let ConsensusOperation::Flame(original) = &state.entries[&arrival].operation else {
+        panic!()
+    };
+    assert_eq!(original.status, FlameJournalStatus::Applied);
+}
+
+#[tokio::test]
+async fn saved_bitcoin_input_and_undo_survive_rollback_and_reapplication() {
+    let initial = btc_tip(100, 1);
+    let next = btc_tip(101, 2);
+    let journal = InMemoryConsensusJournal::new(initial);
+    let bitcoin = journal.bitcoin_journal();
+    let mut input = block(next);
+    let mut original_outcome = outcome(next);
+    let mut original_undo = undo(1);
+    let apply = bitcoin
+        .begin_apply(initial, &input, &original_outcome, &original_undo)
+        .await
+        .unwrap();
+    input.endorsements.clear();
+    original_outcome.next_btc_cursor = initial;
+    original_undo.weighted_blocks.clear();
+    let mut snapshot = bitcoin.pending_entry().await.unwrap().unwrap();
+    snapshot.operation.block.endorsements.clear();
+    snapshot
+        .operation
+        .entry
+        .consensus_undo
+        .weighted_blocks
+        .clear();
+    let stored = bitcoin.get_entry(next).await.unwrap().unwrap();
+    assert_eq!(stored.operation.block, block(next));
+    assert!(
+        stored
+            .operation
+            .entry
+            .minting_outcome
+            .consensus
+            .accepted_endorsements
+            .is_empty()
+    );
+    assert_eq!(stored.operation.entry.consensus_undo, undo(1));
+    assert_eq!(stored.operation.entry.minting_outcome, outcome(next));
+    finish_bitcoin(&journal, apply).await;
+    let rollback = bitcoin
+        .begin_rollback(next, &BitcoinRollbackPlan::default())
+        .await
+        .unwrap();
+    let stored = bitcoin.pending_entry().await.unwrap().unwrap();
+    assert_eq!(stored.operation.kind, BitcoinOperationKind::Rollback);
+    assert_eq!(stored.operation.block, block(next));
+    assert_eq!(stored.operation.entry.consensus_undo, undo(1));
+    assert_eq!(stored.operation.entry.flame_transition, None);
+    finish_bitcoin(&journal, rollback).await;
+    assert_eq!(
+        bitcoin
+            .get_entry(next)
+            .await
+            .unwrap()
+            .unwrap()
+            .operation
+            .entry
+            .status,
+        JournalStatus::RolledBack
+    );
+    let reapplied = bitcoin
+        .begin_apply(initial, &block(next), &outcome(next), &undo(2))
+        .await
+        .unwrap();
+    assert_eq!(reapplied, OperationId(2));
+    assert_eq!(
+        bitcoin
+            .pending_entry()
+            .await
+            .unwrap()
+            .unwrap()
+            .operation
+            .entry
+            .consensus_undo,
+        undo(2)
+    );
+    let state = journal.read().unwrap();
+    let ConsensusOperation::Bitcoin(original) = &state.entries[&apply].operation else {
+        panic!()
+    };
+    assert_eq!(original.entry.consensus_undo, undo(1));
+    assert_eq!(original.entry.status, JournalStatus::Applied);
+    assert_eq!(state.entries.len(), 3);
+}
+
+#[tokio::test]
+async fn bitcoin_plans_must_be_saved_before_advancing_and_cannot_be_overwritten() {
+    let initial = btc_tip(100, 1);
+    let next = btc_tip(101, 2);
+    let journal = InMemoryConsensusJournal::new(initial);
+    let bitcoin = journal.bitcoin_journal();
+    let id = bitcoin
+        .begin_apply(initial, &block(next), &outcome(next), &undo(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        bitcoin
+            .complete_apply_stage(id, ApplyStage::StoreCursor)
+            .await,
+        Err(Error::UnexpectedBitcoinStatus { .. })
+    ));
+    assert!(matches!(
+        bitcoin.store_flame_transition(id, &transition()).await,
+        Err(Error::UnexpectedBitcoinStatus { .. })
+    ));
+    for stage in [
+        ApplyStage::RemoveEndorsements,
+        ApplyStage::StoreEndorsements,
+        ApplyStage::StoreAcquisitions,
+        ApplyStage::StoreBlockWeights,
+        ApplyStage::StoreDoubleSigns,
+        ApplyStage::StorePendingEndorsements,
+    ] {
+        bitcoin.complete_apply_stage(id, stage).await.unwrap();
+    }
+    assert_eq!(
+        bitcoin
+            .complete_apply_stage(id, ApplyStage::PrepareFlameTransition)
+            .await,
+        Err(Error::MissingTransition)
+    );
+    bitcoin
+        .store_flame_transition(id, &transition())
+        .await
+        .unwrap();
+    assert_eq!(
+        bitcoin.store_flame_transition(id, &transition()).await,
+        Err(Error::PlanAlreadyStored)
+    );
+    bitcoin
+        .complete_apply_stage(id, ApplyStage::PrepareFlameTransition)
+        .await
+        .unwrap();
+    bitcoin
+        .complete_apply_stage(id, ApplyStage::ApplyFlameTransition)
+        .await
+        .unwrap();
+    assert_eq!(
+        bitcoin
+            .complete_apply_stage(id, ApplyStage::PrepareRewards)
+            .await,
+        Err(Error::MissingRewards)
+    );
+    let mut plan = rewards();
+    bitcoin.store_rewards_changes(id, &plan).await.unwrap();
+    plan.outcomes.clear();
+    assert_eq!(
+        bitcoin.store_rewards_changes(id, &plan).await,
+        Err(Error::PlanAlreadyStored)
+    );
+    bitcoin
+        .complete_apply_stage(id, ApplyStage::PrepareRewards)
+        .await
+        .unwrap();
+    let stored = bitcoin
+        .pending_entry()
+        .await
+        .unwrap()
+        .unwrap()
+        .operation
+        .entry;
+    assert_eq!(stored.flame_transition, Some(transition()));
+    assert_eq!(stored.rewards_changes.unwrap().outcomes.len(), 1);
+    finish_bitcoin(&journal, id).await;
+}
+
+#[tokio::test]
+async fn flame_plans_and_snapshots_keep_recovery_data_without_changing_the_btc_cursor() {
+    let initial = btc_tip(100, 1);
+    let journal = InMemoryConsensusJournal::new(initial);
+    let flame = journal.flame_journal();
+    let mut original_undo = undo(1);
+    let id = flame
+        .begin_apply(
+            flame_tip(2),
+            initial,
+            &ConsensusOutcome::default(),
+            &original_undo,
         )
         .await
         .unwrap();
-    for stage in [
-        ApplyStage::PrepareRewards,
-        ApplyStage::ApplyRewards,
-        ApplyStage::StoreCursor,
-    ] {
-        journal.complete_apply_stage(btc_tip, stage).await.unwrap();
-        journal.complete_apply_stage(btc_tip, stage).await.unwrap();
-    }
-    finish_rollback(&journal, btc_tip).await;
-    let stored = journal.get_entry(btc_tip).await.unwrap().unwrap();
-    assert_eq!(stored.status, JournalStatus::RolledBack);
-    assert!(stored.rewards_changes.unwrap().outcomes.is_empty());
-    assert!(journal.get_pending_entry().await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn a_rolled_back_block_can_start_a_fresh_application_with_new_undo() {
-    let initial = tip(100, 1);
-    let btc_tip = tip(101, 2);
-    let journal = InMemoryBitcoinBlockJournal::new(initial);
-    journal
-        .begin_apply(initial, &outcome(btc_tip), &undo(1))
-        .await
-        .unwrap();
-    assert_eq!(
-        journal
-            .begin_apply(initial, &outcome(btc_tip), &undo(2))
+    original_undo.weighted_blocks.clear();
+    assert!(matches!(
+        flame
+            .complete_apply_stage(id, FlameApplyStage::RemovePending)
             .await,
-        Err(Error::OperationInProgress(btc_tip))
-    );
-    finish_apply(&journal, btc_tip).await;
-    assert!(
-        journal
-            .begin_apply(initial, &outcome(btc_tip), &undo(2))
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        journal
-            .get_entry(btc_tip)
-            .await
-            .unwrap()
-            .unwrap()
-            .consensus_undo,
-        undo(1)
-    );
-    finish_rollback(&journal, btc_tip).await;
-    journal
-        .begin_apply(initial, &outcome(btc_tip), &undo(2))
+        Err(Error::UnexpectedFlameStatus { .. })
+    ));
+    flame
+        .complete_apply_stage(id, FlameApplyStage::Consensus)
         .await
         .unwrap();
-    let entry = journal.get_pending_entry().await.unwrap().unwrap();
-    assert_eq!(entry.consensus_undo, undo(2));
-    assert!(entry.flame_transition.is_none());
-    assert!(entry.rewards_changes.is_none());
     assert_eq!(
-        entry.status,
-        JournalStatus::Applying(ApplyStage::RemoveEndorsements)
+        flame
+            .complete_apply_stage(id, FlameApplyStage::PrepareTransition)
+            .await,
+        Err(Error::MissingTransition)
     );
-    finish_apply(&journal, btc_tip).await;
+    let mut plan = transition();
+    flame.store_transition(id, &plan).await.unwrap();
+    plan.next_tip = flame_tip(3);
+    assert_eq!(
+        flame.store_transition(id, &plan).await,
+        Err(Error::PlanAlreadyStored)
+    );
+    flame
+        .complete_apply_stage(id, FlameApplyStage::PrepareTransition)
+        .await
+        .unwrap();
+    flame
+        .complete_apply_stage(id, FlameApplyStage::ApplyTransition)
+        .await
+        .unwrap();
+    assert_eq!(
+        flame
+            .complete_apply_stage(id, FlameApplyStage::PrepareRewards)
+            .await,
+        Err(Error::MissingRewards)
+    );
+    flame.store_rewards(id, &rewards()).await.unwrap();
+    assert_eq!(
+        flame.store_rewards(id, &rewards()).await,
+        Err(Error::PlanAlreadyStored)
+    );
+    flame
+        .complete_apply_stage(id, FlameApplyStage::PrepareRewards)
+        .await
+        .unwrap();
+    let mut snapshot = flame.pending_entry().await.unwrap().unwrap();
+    snapshot.operation.undo.weighted_blocks.clear();
+    snapshot
+        .operation
+        .rewards
+        .as_mut()
+        .unwrap()
+        .outcomes
+        .clear();
+    let stored = journal
+        .clone()
+        .flame_journal()
+        .pending_entry()
+        .await
+        .unwrap()
+        .unwrap()
+        .operation;
+    assert_eq!(stored.tip, flame_tip(2));
+    assert_eq!(stored.undo, undo(1));
+    assert_eq!(stored.transition, Some(transition()));
+    assert_eq!(stored.rewards.unwrap().outcomes.len(), 1);
+    finish_flame(&journal, id).await;
+    assert_eq!(journal.read().unwrap().applied_btc_tip, initial);
 }
 
 #[tokio::test]
-async fn invalid_cursors_and_wrong_heights_do_not_change_the_journal() {
-    let initial = tip(100, 1);
-    let journal = InMemoryBitcoinBlockJournal::new(initial);
-    for next in [tip(100, 2), tip(102, 2), tip(101, 1)] {
+async fn operation_ids_reject_the_wrong_view_and_stale_writes() {
+    let initial = btc_tip(100, 1);
+    let next = btc_tip(101, 2);
+    let journal = InMemoryConsensusJournal::new(initial);
+    let bitcoin = journal.bitcoin_journal();
+    let flame = journal.flame_journal();
+    let apply = bitcoin
+        .begin_apply(initial, &block(next), &outcome(next), &undo(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        flame
+            .complete_apply_stage(apply, FlameApplyStage::Consensus)
+            .await,
+        Err(Error::WrongOperationKind(apply))
+    );
+    assert_eq!(
+        flame.store_transition(apply, &transition()).await,
+        Err(Error::WrongOperationKind(apply))
+    );
+    assert_eq!(
+        bitcoin
+            .complete_apply_stage(OperationId(99), ApplyStage::RemoveEndorsements)
+            .await,
+        Err(Error::MissingEntry(OperationId(99)))
+    );
+    finish_bitcoin(&journal, apply).await;
+    let arrival = flame
+        .begin_apply(flame_tip(1), next, &ConsensusOutcome::default(), &undo(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        bitcoin.store_rewards_changes(apply, &rewards()).await,
+        Err(Error::NotPending(apply))
+    );
+    assert_eq!(
+        bitcoin
+            .complete_apply_stage(arrival, ApplyStage::StoreCursor)
+            .await,
+        Err(Error::WrongOperationKind(arrival))
+    );
+    finish_flame(&journal, arrival).await;
+    let rollback = bitcoin
+        .begin_rollback(next, &BitcoinRollbackPlan::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        bitcoin
+            .complete_rollback_stage(apply, RollbackStage::RemoveEndorsements)
+            .await,
+        Err(Error::NotPending(apply))
+    );
+    assert_eq!(
+        flame.store_transition(arrival, &transition()).await,
+        Err(Error::NotPending(arrival))
+    );
+    assert_eq!(journal.latest_entry().await.unwrap().unwrap().id, rollback);
+}
+
+#[tokio::test]
+async fn invalid_btc_inputs_and_flame_context_do_not_create_operations() {
+    let initial = btc_tip(100, 1);
+    let next = btc_tip(101, 2);
+    let journal = InMemoryConsensusJournal::new(initial);
+    let bitcoin = journal.bitcoin_journal();
+    for next in [btc_tip(100, 2), btc_tip(102, 2), btc_tip(101, 1)] {
         assert!(matches!(
-            journal.begin_apply(initial, &outcome(next), &undo(1)).await,
+            bitcoin
+                .begin_apply(initial, &block(next), &outcome(next), &undo(1))
+                .await,
             Err(Error::InvalidSuccessor { .. })
         ));
     }
     assert!(matches!(
+        bitcoin
+            .begin_apply(initial, &block(next), &outcome(btc_tip(101, 3)), &undo(1))
+            .await,
+        Err(Error::BlockTipMismatch { .. })
+    ));
+    assert!(matches!(
         journal
-            .begin_apply(tip(100, 9), &outcome(tip(101, 2)), &undo(1))
+            .flame_journal()
+            .begin_apply(flame_tip(1), next, &ConsensusOutcome::default(), &undo(1))
             .await,
         Err(Error::BlockTipMismatch { .. })
     ));
     assert_eq!(
-        journal.begin_rollback(initial).await,
-        Err(Error::EntryNotFound(initial))
+        bitcoin
+            .begin_rollback(initial, &BitcoinRollbackPlan::default())
+            .await,
+        Err(Error::BitcoinEntryNotFound(initial))
     );
-    assert!(journal.get_pending_entry().await.unwrap().is_none());
-    assert!(journal.state.read().unwrap().entries.is_empty());
-    let btc_tip = tip(101, 2);
-    journal
-        .begin_apply(initial, &outcome(btc_tip), &undo(1))
+    assert!(journal.latest_entry().await.unwrap().is_none());
+    let id = bitcoin
+        .begin_apply(initial, &block(next), &outcome(next), &undo(1))
         .await
         .unwrap();
-    let wrong_height = tip(102, 2);
+    assert_eq!(id, OperationId(0));
     assert!(matches!(
-        journal.get_entry(wrong_height).await,
+        bitcoin.get_entry(btc_tip(102, 2)).await,
         Err(Error::BlockTipMismatch { .. })
-    ));
-    assert!(matches!(
-        journal
-            .complete_apply_stage(wrong_height, ApplyStage::RemoveEndorsements)
-            .await,
-        Err(Error::BlockTipMismatch { .. })
-    ));
-    assert_eq!(
-        journal.get_pending_entry().await.unwrap().unwrap().status,
-        JournalStatus::Applying(ApplyStage::RemoveEndorsements)
-    );
-    let initial = tip(u64::MAX, 1);
-    let overflow = InMemoryBitcoinBlockJournal::new(initial);
-    assert!(matches!(
-        overflow
-            .begin_apply(initial, &outcome(tip(0, 2)), &undo(1))
-            .await,
-        Err(Error::InvalidSuccessor { .. })
     ));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_clones_can_start_only_one_operation() {
-    let initial = tip(100, 1);
-    let journal = InMemoryBitcoinBlockJournal::new(initial);
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-    let mut tasks = Vec::new();
-    for hash in [2, 3] {
-        let journal = journal.clone();
-        let barrier = barrier.clone();
-        tasks.push(tokio::spawn(async move {
-            barrier.wait().await;
-            journal
-                .begin_apply(initial, &outcome(tip(101, hash)), &undo(hash))
+#[tokio::test]
+async fn rollback_uses_btc_history_even_when_the_latest_operation_is_a_flame_arrival() {
+    let initial = btc_tip(100, 1);
+    let first = btc_tip(101, 2);
+    let second = btc_tip(102, 3);
+    let replacement = btc_tip(101, 4);
+    let journal = InMemoryConsensusJournal::new(initial);
+    let bitcoin = journal.bitcoin_journal();
+    for (previous, next) in [(initial, first), (first, second)] {
+        let id = bitcoin
+            .begin_apply(previous, &block(next), &outcome(next), &undo(1))
+            .await
+            .unwrap();
+        finish_bitcoin(&journal, id).await;
+    }
+    let arrival = journal
+        .flame_journal()
+        .begin_apply(flame_tip(1), second, &ConsensusOutcome::default(), &undo(1))
+        .await
+        .unwrap();
+    finish_flame(&journal, arrival).await;
+    assert!(matches!(
+        bitcoin
+            .begin_rollback(first, &BitcoinRollbackPlan::default())
+            .await,
+        Err(Error::BlockTipMismatch { .. })
+    ));
+    for tip in [second, first] {
+        let id = bitcoin
+            .begin_rollback(tip, &BitcoinRollbackPlan::default())
+            .await
+            .unwrap();
+        finish_bitcoin(&journal, id).await;
+    }
+    let id = bitcoin
+        .begin_apply(
+            initial,
+            &block(replacement),
+            &outcome(replacement),
+            &undo(2),
+        )
+        .await
+        .unwrap();
+    finish_bitcoin(&journal, id).await;
+    for (tip, status) in [
+        (first, JournalStatus::RolledBack),
+        (second, JournalStatus::RolledBack),
+        (replacement, JournalStatus::Applied),
+    ] {
+        assert_eq!(
+            bitcoin
+                .get_entry(tip)
                 .await
-        }));
+                .unwrap()
+                .unwrap()
+                .operation
+                .entry
+                .status,
+            status
+        );
     }
-    let mut succeeded = 0;
-    let mut rejected = 0;
-    for task in tasks {
-        match task.await.unwrap() {
-            Ok(()) => succeeded += 1,
-            Err(Error::OperationInProgress(_)) => rejected += 1,
-            other => panic!("unexpected result: {other:?}"),
-        }
-    }
-    assert_eq!((succeeded, rejected), (1, 1));
-    assert_eq!(journal.state.read().unwrap().entries.len(), 1);
-    assert!(journal.get_pending_entry().await.unwrap().is_some());
+    let state = journal.read().unwrap();
+    assert_eq!(state.applied_btc_tip, replacement);
+    let ConsensusOperation::Flame(entry) = &state.entries[&arrival].operation else {
+        panic!()
+    };
+    assert_eq!(entry.status, FlameJournalStatus::Applied);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_bitcoin_and_flame_views_can_start_only_one_operation() {
+    let initial = btc_tip(100, 1);
+    let next = btc_tip(101, 2);
+    let journal = InMemoryConsensusJournal::new(initial);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let bitcoin = journal.bitcoin_journal();
+    let flame = journal.flame_journal();
+    let bitcoin_barrier = barrier.clone();
+    let bitcoin_task = tokio::spawn(async move {
+        bitcoin_barrier.wait().await;
+        bitcoin
+            .begin_apply(initial, &block(next), &outcome(next), &undo(1))
+            .await
+    });
+    let flame_task = tokio::spawn(async move {
+        barrier.wait().await;
+        flame
+            .begin_apply(
+                flame_tip(1),
+                initial,
+                &ConsensusOutcome::default(),
+                &undo(2),
+            )
+            .await
+    });
+    let results = [bitcoin_task.await.unwrap(), flame_task.await.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == Err(Error::OperationInProgress(OperationId(0))))
+            .count(),
+        1
+    );
+    assert_eq!(journal.read().unwrap().entries.len(), 1);
+}
+
+#[tokio::test]
+async fn id_overflow_preserves_history_and_the_btc_index() {
+    let initial = btc_tip(100, 1);
+    let next = btc_tip(101, 2);
+    let journal = InMemoryConsensusJournal::new(initial);
+    journal.write().unwrap().next_id = u64::MAX;
+    assert_eq!(
+        journal
+            .bitcoin_journal()
+            .begin_apply(initial, &block(next), &outcome(next), &undo(1))
+            .await,
+        Err(Error::IdOverflow)
+    );
+    assert_eq!(
+        journal
+            .flame_journal()
+            .begin_apply(
+                flame_tip(1),
+                initial,
+                &ConsensusOutcome::default(),
+                &undo(1)
+            )
+            .await,
+        Err(Error::IdOverflow)
+    );
+    let state = journal.read().unwrap();
+    assert!(state.entries.is_empty());
+    assert!(state.bitcoin_entries.is_empty());
+    assert!(state.pending.is_none());
+    assert_eq!(state.applied_btc_tip, initial);
 }

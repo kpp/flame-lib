@@ -1,17 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
-
-use flame_storage::ChainStorage;
-
+use super::{
+    acquisition_provider::AcquisitionProvider,
+    endorsement_validator::{EndorsementValidationError, EndorsementValidator},
+    weight::weighter::Weighter,
+};
 use crate::consensus::{
     ConsensusOutcome, ConsensusStorage, EndorsementIndex, IncludedAcquisition, IncludedEndorsement,
     MintingEngineError, MintingProtocolParams,
 };
-
-use super::{
-    acquisition_provider::AcquisitionProvider,
-    endorsement_validation::{EndorsementValidationError, EndorsementValidator},
-    weighter::Weighter,
-};
+use flame_storage::ChainStorage;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(in crate::consensus) struct ConsensusEvaluator<'a, C, H> {
     pub protocol_params: &'a MintingProtocolParams,

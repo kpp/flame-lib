@@ -1,14 +1,10 @@
-use std::{num::NonZeroU16, sync::Arc};
-
-use btc_integration::BtcBlockTip;
-use flame_chain_service::ChainAccess;
-use flame_storage::{chain::InMemoryChainStorage, state::canonical::InMemoryCanonicalStorage};
-
-use super::{consensus::ConsensusLoop, cursor_storage::InMemoryCursorStorage};
+use crate::block_processing::bitcoin::{
+    consensus_loop::ConsensusLoop, in_memory_cursor_storage::InMemoryCursorStorage,
+};
 use crate::{
     block_processing::{
         BitcoinBlockProcessor, ConsensusManager, FlameBlockProcessor,
-        journal::consensus::{
+        journal::{
             ConsensusJournal, InMemoryBitcoinJournal, InMemoryConsensusJournal,
             InMemoryFlameJournal,
         },
@@ -16,6 +12,10 @@ use crate::{
     consensus::{MintingEngineFactory, MintingProtocolParams, storage::InMemoryConsensusStorage},
     rewards::{RewardsEngine, storage::InMemoryRewardsStorage},
 };
+use btc_integration::BtcBlockTip;
+use flame_chain_service::ChainAccess;
+use flame_storage::{chain::InMemoryChainStorage, state::canonical::InMemoryCanonicalStorage};
+use std::{num::NonZeroU16, sync::Arc};
 
 type Engine =
     MintingEngineFactory<InMemoryConsensusStorage, InMemoryChainStorage, InMemoryCanonicalStorage>;
@@ -44,7 +44,10 @@ pub type DefaultConsensusLoop<H> = ConsensusLoop<
     InMemoryConsensusJournal,
 >;
 
-pub(super) fn consensus_loop<H>(chain: H, initial_cursor: BtcBlockTip) -> DefaultConsensusLoop<H>
+pub(in crate::orchestrator) fn consensus_loop<H>(
+    chain: H,
+    initial_cursor: BtcBlockTip,
+) -> DefaultConsensusLoop<H>
 where
     H: ChainAccess + Clone + Send + Sync + 'static,
     H::Error: Send + 'static,

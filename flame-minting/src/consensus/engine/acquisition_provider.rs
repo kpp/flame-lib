@@ -1,10 +1,8 @@
-use std::collections::{HashMap, hash_map::Entry};
-
-use btc_integration::MinterP2wsh;
-
 use crate::consensus::{
     ConsensusStorage, IncludedAcquisition, MinterAcquisitions, MintingProtocolParams,
 };
+use btc_integration::MinterP2wsh;
+use std::collections::{HashMap, hash_map::Entry};
 
 pub struct AcquisitionProvider<'a, C> {
     pub storage: &'a C,

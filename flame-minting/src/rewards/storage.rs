@@ -1,47 +1,8 @@
-use std::future::Future;
+pub mod in_memory_rewards_storage;
+pub mod reward_index;
+pub mod rewards_storage;
 
-use flamechain::CoreFlameHeight;
-
-use super::PendingReward;
-
-pub mod in_memory;
-mod index;
-
-pub use in_memory::{InMemoryRewardsStorage, InMemoryRewardsStorageError};
-pub use index::RewardIndex;
-
-pub trait RewardsStorage {
-    type Error;
-
-    fn get_pending_rewards(
-        &self,
-        _target_block_height: CoreFlameHeight,
-    ) -> impl Future<Output = Result<Vec<PendingReward>, Self::Error>> + Send {
-        async { unimplemented!() }
-    }
-
-    fn get_pending_reward(
-        &self,
-        _target_block_height: CoreFlameHeight,
-        _index: RewardIndex,
-    ) -> impl Future<Output = Result<Option<PendingReward>, Self::Error>> + Send {
-        async { unimplemented!() }
-    }
-
-    fn restore_pending_reward(
-        &self,
-        _target_block_height: CoreFlameHeight,
-        _index: RewardIndex,
-        _previous: Option<&PendingReward>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        async { unimplemented!() }
-    }
-
-    fn store_pending_reward(
-        &self,
-        _target_block_height: CoreFlameHeight,
-        _reward: &PendingReward,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        async { unimplemented!() }
-    }
-}
+pub use in_memory_rewards_storage as in_memory;
+pub use in_memory_rewards_storage::{InMemoryRewardsStorage, InMemoryRewardsStorageError};
+pub use reward_index::RewardIndex;
+pub use rewards_storage::RewardsStorage;
