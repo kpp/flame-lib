@@ -10,7 +10,7 @@ use flamed_rpc::{
 };
 use flamewallet_ffi::{
     ContractValue, FlameError, IssueRequest as FfiIssueRequest, IssuedAddress, KeyPath, Opening,
-    TransferInput, TransferOutput, TransferRequest, Wallet, CHANGE, RECEIVING,
+    Transfer, TransferInput, TransferOutput, TransferRequest, Wallet, CHANGE, RECEIVING,
 };
 use serde::{Serialize, Serializer};
 
@@ -174,6 +174,26 @@ pub struct SendRequest {
     /// In sparks.
     pub fee: u64,
     pub gas: u64,
+}
+
+/// One recipient of [`Session::build_payments`].
+#[derive(Clone, Debug)]
+pub struct Payment {
+    pub to: String,
+    pub qty: u64,
+    pub flavor: Flavor,
+    pub memo: Vec<u8>,
+}
+
+/// A signed transfer the node has not seen yet.
+pub struct Built {
+    pub txid: TxId,
+    pub block_tx: Vec<u8>,
+    pub inputs: Vec<ContractId>,
+    /// The tip its proofs were read at. They survive one block past it, so
+    /// once the node is two blocks further on, this transfer can never be
+    /// accepted.
+    pub tip_height: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -353,10 +373,26 @@ impl Session {
     /// once from fresh coins; a second one is the node's real answer.
     pub async fn send(&self, request: &SendRequest) -> Result<Sent, Error> {
         let mut retried = false;
+        let payment = Payment {
+            to: request.to.clone(),
+            qty: request.qty,
+            flavor: request.flavor,
+            memo: request.memo.clone(),
+        };
         loop {
             let coins = self.coins_from(request.from).await?;
-            let (transfer, inputs) = self.build(request, &coins)?;
-            match self.client.submit_tx(BlockTxEnvelope(transfer)).await {
+            let (transfer, inputs) = self.build(
+                request.from,
+                std::slice::from_ref(&payment),
+                request.fee,
+                request.gas,
+                &coins,
+            )?;
+            match self
+                .client
+                .submit_tx(BlockTxEnvelope(transfer.block_tx))
+                .await
+            {
                 Ok(txid) => {
                     return Ok(Sent {
                         txid,
@@ -374,27 +410,71 @@ impl Session {
         }
     }
 
+    /// Builds and signs one transfer paying every payment from the
+    /// wallet's confirmed coins, with change to the change address, and
+    /// does not submit it: for a caller that must record the txid before
+    /// the node can see the transfer. [`Session::submit`] sends it.
+    ///
+    /// Change is spendable only once mined, so a second build before then
+    /// finds only the coins this one did not spend.
+    pub async fn build_payments(
+        &self,
+        payments: &[Payment],
+        fee: u64,
+        gas: u64,
+    ) -> Result<Built, Error> {
+        let coins = self.coins().await?;
+        let (transfer, inputs) = self.build(None, payments, fee, gas, &coins)?;
+        Ok(Built {
+            txid: TxId(
+                <[u8; 32]>::try_from(transfer.txid.as_slice()).map_err(|_| {
+                    Error::Invalid(format!("a txid of {} bytes", transfer.txid.len()))
+                })?,
+            ),
+            block_tx: transfer.block_tx,
+            inputs,
+            tip_height: coins.tip_height,
+        })
+    }
+
+    /// Hands a [`Built`] transfer to the node, once: a refusal is returned,
+    /// not retried, since the caller decides what a refused txid means.
+    pub async fn submit(&self, built: &Built) -> Result<TxId, Error> {
+        Ok(self
+            .client
+            .submit_tx(BlockTxEnvelope(built.block_tx.clone()))
+            .await?)
+    }
+
     fn build(
         &self,
-        request: &SendRequest,
+        from: Option<DerivationPath>,
+        payments: &[Payment],
+        fee: u64,
+        gas: u64,
         coins: &Coins,
-    ) -> Result<(Vec<u8>, Vec<ContractId>), Error> {
+    ) -> Result<(Transfer, Vec<ContractId>), Error> {
         let mut need: BTreeMap<Flavor, u128> = BTreeMap::new();
-        *need.entry(request.flavor).or_default() += u128::from(request.qty);
-        *need.entry(Flavor::flame()).or_default() += u128::from(request.fee);
+        for payment in payments {
+            *need.entry(payment.flavor).or_default() += u128::from(payment.qty);
+        }
+        *need.entry(Flavor::flame()).or_default() += u128::from(fee);
 
         let spendable: Vec<&Coin> = coins.coins.iter().filter(|c| c.is_spendable()).collect();
-        let change = match request.from {
+        let change = match from {
             Some(path) => self.address_at(path)?.receiving_address,
             None => self.change_address()?.receiving_address,
         };
         let mut inputs = Vec::new();
-        let mut outputs = vec![TransferOutput {
-            address: request.to.clone(),
-            qty: request.qty,
-            flavor: native_or(request.flavor),
-            memo: request.memo.clone(),
-        }];
+        let mut outputs: Vec<TransferOutput> = payments
+            .iter()
+            .map(|payment| TransferOutput {
+                address: payment.to.clone(),
+                qty: payment.qty,
+                flavor: native_or(payment.flavor),
+                memo: payment.memo.clone(),
+            })
+            .collect();
         for (&flavor, &amount) in &need {
             if amount == 0 {
                 continue;
@@ -428,11 +508,11 @@ impl Session {
                 })
                 .collect(),
             outputs,
-            fee: request.fee,
-            gas: request.gas,
+            fee,
+            gas,
             locktime: 0,
         })?;
-        Ok((transfer.block_tx, ids))
+        Ok((transfer, ids))
     }
 
     /// The flavor [`Session::issue`] mints from `from` under `tag`.

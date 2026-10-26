@@ -8,8 +8,9 @@ name: Mint playground image
 # host runs `:main` with podman auto-update and pulls a new image on its own
 # within a minute or two (infrastructure repo, dev README → mint-playground).
 #
-# The paths are what the image is built from: the demo, the wallet and
-# flamekd with the workspace crates they depend on, and the toolchain.
+# The paths are what the image is built from: the demo, the browser wallet,
+# flamekd and the payout wallet (flamewallet-cli, flamed-rpc) with the
+# workspace crates they depend on, and the toolchain.
 
 on:
   push:
@@ -21,9 +22,11 @@ on:
       - 'rust-toolchain.toml'
       - 'cells/**'
       - 'flamechain/**'
+      - 'flamed-rpc/**'
       - 'flamekd/**'
       - 'flamepayments/**'
       - 'flamevm/**'
+      - 'flamewallet-cli/**'
       - 'flamewallet-ffi/**'
       - 'flamewallet-wasm/**'
       - 'merkle/**'
@@ -41,9 +44,11 @@ on:
       - 'rust-toolchain.toml'
       - 'cells/**'
       - 'flamechain/**'
+      - 'flamed-rpc/**'
       - 'flamekd/**'
       - 'flamepayments/**'
       - 'flamevm/**'
+      - 'flamewallet-cli/**'
       - 'flamewallet-ffi/**'
       - 'flamewallet-wasm/**'
       - 'merkle/**'

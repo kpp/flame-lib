@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod db;
+mod payout;
 
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
@@ -20,6 +21,9 @@ enum Command {
     Submit(db::ContributionRequest, Reply<db::Submitted>),
     Minter(db::MinterRequest, Reply<db::Minter>),
     Rewards(Reply<Vec<db::RewardBalance>>),
+    PayoutState(i64, i64, Reply<db::PayoutState>),
+    RecordPayout(db::PendingPayout, Vec<db::PayoutItem>, Reply<()>),
+    SettlePayout(String, Option<i64>, Reply<()>),
     Tick(Reply<()>),
     Stop(oneshot::Sender<()>),
 }
@@ -55,6 +59,15 @@ impl Store {
                         }
                         Command::Rewards(reply) => {
                             let _ = reply.send(database.rewards());
+                        }
+                        Command::PayoutState(min_sparks, limit, reply) => {
+                            let _ = reply.send(database.payout_state(min_sparks, limit));
+                        }
+                        Command::RecordPayout(payout, items, reply) => {
+                            let _ = reply.send(database.record_payout(payout, items));
+                        }
+                        Command::SettlePayout(txid, height, reply) => {
+                            let _ = reply.send(database.settle_payout(&txid, height));
                         }
                         Command::Tick(reply) => {
                             let _ = reply.send(database.tick());
@@ -345,6 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
+    let payout = payout::Payout::from_env().map_err(std::io::Error::other)?;
     let (store, thread) = Store::open(path).map_err(std::io::Error::other)?;
     let address = std::env::var("MINT_LISTEN").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
@@ -355,6 +369,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = tokio::select! {
         result = axum::serve(listener, router(store.clone())) => result,
         result = clock(store.clone()) => Err(std::io::Error::other(result.err().map(|error| error.1).unwrap_or_default())),
+        result = async {
+            match payout {
+                Some(payout) => payout.run(store.clone()).await,
+                None => std::future::pending().await,
+            }
+        } => Err(std::io::Error::other(result.err().unwrap_or_default())),
         result = tokio::signal::ctrl_c() => result,
     };
     store.stop().await;

@@ -18,7 +18,7 @@ printf 'a1%.0s' $(seq 64) | "$wallet" "${a[@]}" restore --seed >/dev/null
 b_address="$("$wallet" "${b[@]}" --json address | field "[0]['address']")"
 a_address="$("$wallet" "${a[@]}" --json address | field "[0]['address']")"
 
-expect "A at genesis" "$(balance FLM "${a[@]}")" 100000000000
+expect "A at genesis" "$(balance FLM "${a[@]}")" 1000000000000000000
 
 "$wallet" "${a[@]}" send "$b_address" 12.5 --memo smoke --wait >/dev/null
 expect "B after receiving" "$(balance FLM "${b[@]}")" 1250000000
@@ -26,6 +26,6 @@ expect "B's memo" "$("$wallet" "${b[@]}" --json history | field "['items'][0]['m
 
 "$wallet" "${b[@]}" send "$a_address" 2 --wait >/dev/null
 expect "B after paying back" "$(balance FLM "${b[@]}")" 1049999000
-expect "A after both" "$(balance FLM "${a[@]}")" 98949999000
+expect "A after both" "$(balance FLM "${a[@]}")" 999999998949999000
 
 echo "devnet smoke: ok"

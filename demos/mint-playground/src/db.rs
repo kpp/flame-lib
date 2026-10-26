@@ -170,6 +170,32 @@ pub struct Snapshot {
 pub struct RewardBalance {
     pub address: String,
     pub reward_sparks: String,
+    /// What on-chain payouts confirmed so far; zero without payouts.
+    pub paid_sparks: String,
+}
+
+/// One account's share of an on-chain payout.
+#[derive(Debug)]
+pub struct PayoutItem {
+    pub account_id: i64,
+    pub address: String,
+    pub qty_sparks: i64,
+}
+
+/// A payout transaction recorded before its submission and not yet
+/// confirmed.
+#[derive(Debug)]
+pub struct PendingPayout {
+    pub txid: String,
+    /// The chain tip its proofs were read at.
+    pub tip_height: i64,
+}
+
+#[derive(Debug)]
+pub struct PayoutState {
+    pub pending: Option<PendingPayout>,
+    /// Accounts owed at least the minimum, the most owed first.
+    pub due: Vec<PayoutItem>,
 }
 
 pub struct Database {
@@ -240,7 +266,7 @@ pub fn reset(
     let transaction = database
         .connection
         .transaction_with_behavior(TransactionBehavior::Exclusive)?;
-    transaction.execute_batch("DELETE FROM accruals; DELETE FROM contributions; DELETE FROM blocks; DELETE FROM accounts;")?;
+    transaction.execute_batch("DELETE FROM payout_items; DELETE FROM payouts; DELETE FROM accruals; DELETE FROM contributions; DELETE FROM blocks; DELETE FROM accounts;")?;
     transaction.commit()?;
     Ok(())
 }
@@ -301,6 +327,22 @@ impl Database {
              );
              CREATE INDEX IF NOT EXISTS accruals_by_contribution
                  ON accruals(contribution_id);
+             -- On-chain payouts. A row is written before the transaction is
+             -- submitted, so an account counts as paid while it is pending.
+             CREATE TABLE IF NOT EXISTS payouts (
+                 txid TEXT PRIMARY KEY CHECK(length(txid) = 64),
+                 tip_height INTEGER NOT NULL CHECK(typeof(tip_height) = 'integer'),
+                 confirmed_height INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS payout_items (
+                 txid TEXT NOT NULL REFERENCES payouts(txid) ON DELETE CASCADE,
+                 account_id INTEGER NOT NULL REFERENCES accounts(id),
+                 qty_sparks INTEGER NOT NULL CHECK(typeof(qty_sparks) = 'integer'
+                     AND qty_sparks > 0),
+                 PRIMARY KEY(txid, account_id)
+             );
+             CREATE INDEX IF NOT EXISTS payout_items_by_account
+                 ON payout_items(account_id);
              COMMIT;",
         )?;
         let schema_version: i64 =
@@ -958,18 +1000,98 @@ impl Database {
     }
 
     pub fn rewards(&self) -> Result<Vec<RewardBalance>, Error> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT address, reward_sparks FROM accounts ORDER BY address")?;
+        let mut statement = self.connection.prepare(
+            "SELECT a.address, a.reward_sparks,
+                 (SELECT COALESCE(SUM(i.qty_sparks), 0) FROM payout_items i
+                  JOIN payouts p ON p.txid = i.txid
+                  WHERE i.account_id = a.id AND p.confirmed_height IS NOT NULL)
+             FROM accounts a ORDER BY a.address",
+        )?;
         let rewards = statement
             .query_map([], |row| {
                 Ok(RewardBalance {
                     address: row.get(0)?,
                     reward_sparks: row.get::<_, i64>(1)?.to_string(),
+                    paid_sparks: row.get::<_, i64>(2)?.to_string(),
                 })
             })?
             .collect::<Result<_, _>>()?;
         Ok(rewards)
+    }
+
+    /// The pending payout, if any, and up to `limit` accounts whose rewards
+    /// exceed what payouts, pending ones included, already sent them by at
+    /// least `min_sparks`. A reward that shrank below what was paid is
+    /// owed nothing; the excess stays paid.
+    pub fn payout_state(&self, min_sparks: i64, limit: i64) -> Result<PayoutState, Error> {
+        let pending = self
+            .connection
+            .query_row(
+                "SELECT txid, tip_height FROM payouts WHERE confirmed_height IS NULL
+                 ORDER BY rowid LIMIT 1",
+                [],
+                |row| {
+                    Ok(PendingPayout {
+                        txid: row.get(0)?,
+                        tip_height: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, address, owed FROM (
+                 SELECT a.id, a.address, a.reward_sparks - COALESCE(
+                     (SELECT SUM(qty_sparks) FROM payout_items i WHERE i.account_id = a.id), 0) AS owed
+                 FROM accounts a)
+             WHERE owed >= ?1 ORDER BY owed DESC, id LIMIT ?2",
+        )?;
+        let due = statement
+            .query_map(params![min_sparks.max(1), limit], |row| {
+                Ok(PayoutItem {
+                    account_id: row.get(0)?,
+                    address: row.get(1)?,
+                    qty_sparks: row.get(2)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(PayoutState { pending, due })
+    }
+
+    pub fn record_payout(
+        &mut self,
+        payout: PendingPayout,
+        items: Vec<PayoutItem>,
+    ) -> Result<(), Error> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO payouts(txid, tip_height) VALUES (?1, ?2)",
+            params![payout.txid, payout.tip_height],
+        )?;
+        for item in items {
+            transaction.execute(
+                "INSERT INTO payout_items(txid, account_id, qty_sparks) VALUES (?1, ?2, ?3)",
+                params![payout.txid, item.account_id, item.qty_sparks],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Marks a payout mined at `height`, or with `None` forgets one that can
+    /// never be mined, so its accounts are owed its amounts again.
+    pub fn settle_payout(&mut self, txid: &str, height: Option<i64>) -> Result<(), Error> {
+        match height {
+            Some(height) => self.connection.execute(
+                "UPDATE payouts SET confirmed_height = ?2 WHERE txid = ?1",
+                params![txid, height],
+            )?,
+            None => self
+                .connection
+                .execute("DELETE FROM payouts WHERE txid = ?1", [txid])?,
+        };
+        Ok(())
     }
 }
 
@@ -2641,6 +2763,83 @@ mod tests {
             "1666666667"
         );
         assert_eq!(snapshot.contributions[0].id, 3);
+    }
+
+    #[test]
+    fn payouts_count_while_pending_report_once_confirmed_and_dropped_ones_are_owed_again() {
+        let mut db = database();
+        for (seed, nonce, burn) in [(1, 1, 100), (2, 2, 100), (1, 3, 100)] {
+            db.submit(request(seed, nonce, burn)).unwrap();
+        }
+        db.tick().unwrap();
+        let owed = |db: &Database, min| {
+            let state = db.payout_state(min, 12).unwrap();
+            let due: Vec<_> = state
+                .due
+                .iter()
+                .map(|item| (item.address.clone(), item.qty_sparks))
+                .collect();
+            (state.pending.map(|p| p.txid), due)
+        };
+        let paid = |db: &Database, seed| {
+            db.rewards()
+                .unwrap()
+                .into_iter()
+                .find(|item| item.address == address(seed))
+                .unwrap()
+                .paid_sparks
+        };
+        assert_eq!(
+            owed(&db, 1),
+            (
+                None,
+                vec![(address(1), 3_333_333_333), (address(2), 1_666_666_667)]
+            )
+        );
+        assert_eq!(owed(&db, 2_000_000_000).1, [(address(1), 3_333_333_333)]);
+
+        let first = "a".repeat(64);
+        let mut due = db.payout_state(1, 12).unwrap().due;
+        due.truncate(1);
+        db.record_payout(
+            PendingPayout {
+                txid: first.clone(),
+                tip_height: 7,
+            },
+            due,
+        )
+        .unwrap();
+        assert_eq!(
+            owed(&db, 1),
+            (Some(first.clone()), vec![(address(2), 1_666_666_667)])
+        );
+        assert_eq!(paid(&db, 1), "0");
+
+        db.settle_payout(&first, Some(9)).unwrap();
+        assert_eq!(owed(&db, 1).0, None);
+        assert_eq!(paid(&db, 1), "3333333333");
+
+        let second = "b".repeat(64);
+        let due = db.payout_state(1, 12).unwrap().due;
+        db.record_payout(
+            PendingPayout {
+                txid: second.clone(),
+                tip_height: 9,
+            },
+            due,
+        )
+        .unwrap();
+        assert_eq!(owed(&db, 1), (Some(second.clone()), vec![]));
+        db.settle_payout(&second, None).unwrap();
+        assert_eq!(owed(&db, 1), (None, vec![(address(2), 1_666_666_667)]));
+        assert_eq!(paid(&db, 2), "0");
+
+        // New rewards are owed on top of what was paid, the most owed first.
+        db.tick().unwrap();
+        assert_eq!(
+            owed(&db, 1).1,
+            [(address(2), 3_333_333_334), (address(1), 3_333_333_333)]
+        );
     }
 
     #[test]

@@ -237,13 +237,13 @@ delay the transaction; it is the sender's claim, covered by the TxID.
 ```console
 $ cargo run -p flamed --features devnet -- genesis \
       --chainparams flamed/configs/chainparams.toml --out ./genesis.json
-genesis fc159f2a12e80c2fb711a0075cb7836df207b715d7726407ce2f6a9bdaf5dd25 with 1 allocation(s) -> ./genesis.json
+genesis 38808a50580d7a1b8bebe2dce32e589e08b6951c38a341edf9b6d2961b4ca8a9 with 1 allocation(s) -> ./genesis.json
 
 $ cargo run -p flamed --features devnet -- run --config flamed/configs/flamed.toml
 flamed: height 0 with 1 unspent contract(s), 0 block(s) archived
 flamed: serving JSON-RPC on http://127.0.0.1:8545
-flamed: minting every 15s
-block 1 04e8da3d74ea0c67ee5469029f9d296a296721eb94e3429d5836654cee736ccc txs=0 dropped=0
+flamed: minting every 5s
+block 1 fb14e45762eafae0a0933ebb67c06dbbe68b37e9447b479a208a1131923c5d39 txs=0 dropped=0
 ```
 
 Running `genesis` twice on the same network definition gives identical
@@ -254,10 +254,10 @@ same network by comparing files.
 $ curl -s -X POST -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"tip","params":[]}' \
     http://127.0.0.1:8545
-{"jsonrpc":"2.0","id":1,"result":{"hash":"fc159f2a…","height":0,"contract_root":"8669b06a…"}}
+{"jsonrpc":"2.0","id":1,"result":{"hash":"38808a50…","height":0,"contract_root":"fa4a1dea…"}}
 
 $ curl -s -X POST -H 'content-type: application/json' \
-    --data '{"jsonrpc":"2.0","id":2,"method":"proof","params":["e870be9e…"]}' \
+    --data '{"jsonrpc":"2.0","id":2,"method":"proof","params":["373dbd58…"]}' \
     http://127.0.0.1:8545
 {"jsonrpc":"2.0","id":2,"result":{"status":"unspent","proof":"AQAAAAAAAAAAAAAAAA=="}}
 ```
@@ -340,8 +340,8 @@ Stated plainly, because each of these is a real limit and not a detail:
 - **Memory grows with the chain.** `Blockchain` keeps one `BlockUndo` per
   connected block — a header, a cloned `Forest`, and an actor undo record —
   and releases them only on a disconnect or a reorganization, neither of
-  which a single node with no peers ever performs. At a 15-second interval
-  that is roughly 5,800 records a day. A long-lived `flamed run` is bounded
+  which a single node with no peers ever performs. At the image's 5-second
+  interval that is 17,280 records a day. A long-lived `flamed run` is bounded
   by memory, not by disk.
 - **`scan` is bounded in questions, not in work.** At most 1024 predicates
   per call, but each one walks every contract ever created under it with the
