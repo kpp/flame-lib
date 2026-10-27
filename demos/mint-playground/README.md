@@ -122,7 +122,7 @@ Both pages always show the BTC/USD price in a reserved single-line ticker. Coinb
 
 ## On-chain payouts
 
-With both `MINT_PAYOUT_MNEMONIC_FILE` (a file holding the payout wallet's BIP-39 phrase, such as a podman secret) and `MINT_PAYOUT_NODE` (a `flamed` JSON-RPC URL) set, the service pays rewards in FLM from that wallet; with neither, it only simulates, and with one alone it refuses to start. At startup it prints the wallet's address, which must be funded on chain before anything can be paid.
+With both `MINT_PAYOUT_MNEMONIC_FILE` (a file holding the payout wallet's BIP-39 phrase, such as a podman secret) and `MINT_PAYOUT_NODE` (a `flamed` JSON-RPC URL) set, the service pays rewards in FLM from that wallet; with neither, it only simulates, and with one alone it refuses to start. At startup it prints the wallet's address, which must be funded on chain before anything can be paid. `mint-playground --new-payout-key` prints a fresh 24-word phrase and nothing else, for piping into a secret store (`… | podman secret create <name> -`), so the phrase need never be shown or written anywhere else.
 
 Every 5 seconds the service pays the accounts whose `reward_sparks` exceed what payouts have sent them by at least `MINT_PAYOUT_MIN_SPARKS` (default 100,000,000, one FLM), the most owed first: up to 12 per transaction, 13 outputs with the change, which is what one transfer proves. Each payout carries the memo `Mint playground reward` and a fee of 1,000 sparks. Change is spendable only once mined, so there is one payout transaction per block at most, and recipients are paid in turns when more than 12 are owed.
 

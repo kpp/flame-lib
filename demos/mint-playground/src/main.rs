@@ -343,14 +343,22 @@ async fn clock(store: Store) -> Result<(), ApiError> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let first = arguments.next();
+    if first
+        .as_deref()
+        .is_some_and(|value| value == "--new-payout-key")
+        && arguments.len() == 0
+    {
+        return payout::new_key(&mut std::io::stdout().lock());
+    }
     let resetting = first.as_deref().is_some_and(|value| value == "--reset-db");
     let path = if resetting { arguments.next() } else { first }
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/mint.sqlite3"));
     if arguments.next().is_some() {
-        return Err(
-            std::io::Error::other("Usage: mint-playground [--reset-db] [database-path]").into(),
-        );
+        return Err(std::io::Error::other(
+            "Usage: mint-playground [--reset-db] [database-path] | --new-payout-key",
+        )
+        .into());
     }
     if resetting {
         return db::reset(&path, &mut std::io::stdout().lock());
@@ -391,6 +399,26 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn a_new_payout_key_is_a_fresh_phrase_a_wallet_opens() {
+        let key = || {
+            let mut out = Vec::new();
+            crate::payout::new_key(&mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let (first, second) = (key(), key());
+        assert_ne!(first, second);
+        assert!(first.ends_with('\n'));
+        assert_eq!(first.split_whitespace().count(), 24);
+        flamewallet_ffi::Wallet::from_mnemonic(
+            first.trim().into(),
+            String::new(),
+            flamewallet_ffi::Network::Testnet,
+            0,
+        )
+        .unwrap();
+    }
 
     async fn json(response: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)

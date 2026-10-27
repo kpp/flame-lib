@@ -31,6 +31,18 @@ const DEFAULT_MIN_SPARKS: i64 = 100_000_000;
 
 const MEMO: &[u8] = b"Mint playground reward";
 
+/// Writes a fresh payout wallet phrase, and nothing else, to `out`: what
+/// `--new-payout-key` pipes into `podman secret create`, so the phrase is
+/// born on the host that keeps it and is never shown or stored anywhere
+/// else.
+pub fn new_key(out: &mut impl std::io::Write) -> Result<(), Box<dyn std::error::Error>> {
+    let phrase = zeroize::Zeroizing::new(flamewallet_ffi::generate_mnemonic(24)?);
+    out.write_all(phrase.as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    Ok(())
+}
+
 pub struct Payout {
     session: Session,
     min_sparks: i64,
