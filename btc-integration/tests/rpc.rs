@@ -85,8 +85,10 @@ async fn acquisition_sender_works_with_core31_rpc_api() -> bitcoind::anyhow::Res
         flamevm::Predicate::unspendable_key(),
     );
     assert_eq!(
-        acquisitions[0].data().validator_pubkey,
-        ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
+        confirmed_transaction.output[acquisitions[0].output_index()]
+            .script_pubkey
+            .len(),
+        71,
     );
 
     Ok(())

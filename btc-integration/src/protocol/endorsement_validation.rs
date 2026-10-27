@@ -208,6 +208,7 @@ mod tests {
         let predicate = Predicate::opaque(Predicate::unspendable_key());
         minter_witness_script::build_with_authorization(
             &predicate,
+            &ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
             corepc_client::bitcoin::Script::from_bytes(&[0x51]),
         )
         .into_bytes()

@@ -308,6 +308,7 @@ pub(crate) fn endorsement_for_tip(
 ) -> AuthenticatedMintingEndorsement {
     let witness_script = minter_witness_script::build_with_authorization(
         &Predicate::opaque(Predicate::unspendable_key()),
+        &ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
         Script::from_bytes(&[minter]),
     );
     let mut payload = b"FLMB".to_vec();
@@ -419,11 +420,7 @@ fn acquisition_for_minter(minter: MinterP2wsh, duration: Option<u16>) -> Acquisi
 }
 
 fn acquisition_with_amount(minter: MinterP2wsh, duration: Option<u16>, amount: u64) -> Acquisition {
-    let mut data = AcquisitionData::new(
-        minter,
-        Predicate::opaque(Predicate::unspendable_key()),
-        ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
-    );
+    let mut data = AcquisitionData::new(minter, Predicate::opaque(Predicate::unspendable_key()));
     data.duration = duration;
     let transaction = Transaction {
         version: transaction::Version::TWO,

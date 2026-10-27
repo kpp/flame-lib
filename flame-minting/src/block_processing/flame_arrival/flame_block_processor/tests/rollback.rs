@@ -60,7 +60,6 @@ async fn restores_acquisitions_separately_and_preserves_surviving_acquisitions()
             .minter()
             .p2wsh(),
         Predicate::opaque(Predicate::unspendable_key()),
-        ed25519_dalek::SigningKey::from_bytes(&[3; 32]).verifying_key(),
     );
     let transaction = Transaction {
         version: transaction::Version::TWO,

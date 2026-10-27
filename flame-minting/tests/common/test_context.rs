@@ -62,7 +62,6 @@ impl TestContext {
             TestAcquisitionConfig {
                 wallet_rpc_url: bitcoin.node.rpc_url_with_wallet("default"),
                 access_predicate: identity_config.access_predicate,
-                validator_pubkey: identity_config.validator_pubkey,
             },
         )
         .await?;
@@ -125,7 +124,6 @@ impl TestContext {
             TestAcquisitionConfig {
                 wallet_rpc_url: self.bitcoin.node.rpc_url_with_wallet("default"),
                 access_predicate: config.access_predicate,
-                validator_pubkey: config.validator_pubkey,
             },
         )
         .await?;

@@ -47,11 +47,16 @@ async fn preserves_existing_secret_and_external_configuration() {
     let external = config();
     let expected = MinterIdentity::single_key(
         &external.flame_predicate,
+        &external.validator_pubkey,
         &secret.public_key(&Secp256k1::signing_only()),
     );
     let manager = IdentityManager::new(storage.clone(), external.clone());
 
     assert_eq!(manager.startup().await.unwrap(), &expected);
+    assert_eq!(
+        manager.identity().unwrap().validator_pubkey(),
+        &external.validator_pubkey
+    );
     assert_eq!(storage.get_secret_key().await.unwrap(), secret);
     assert_eq!(
         manager.config().access_predicate.to_point(),
@@ -187,6 +192,7 @@ async fn concurrent_managers_use_the_secret_that_was_stored_first() {
     let secret = storage.get_secret_key().await.unwrap();
     let expected = MinterIdentity::single_key(
         &config().flame_predicate,
+        &config().validator_pubkey,
         &secret.public_key(&Secp256k1::signing_only()),
     );
     assert_eq!(first, &expected);

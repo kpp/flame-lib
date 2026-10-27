@@ -231,11 +231,7 @@ fn acquisition(
     amount: u64,
     duration: Option<u16>,
 ) -> IncludedAcquisition {
-    let mut data = AcquisitionData::new(
-        minter,
-        predicate(access),
-        ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key(),
-    );
+    let mut data = AcquisitionData::new(minter, predicate(access));
     data.duration = duration;
     let transaction = Transaction {
         version: transaction::Version::TWO,

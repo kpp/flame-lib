@@ -26,6 +26,11 @@ async fn minting_sender_publishes_an_authenticated_endorsement_on_regtest()
     let endorsements = validate_transaction_endorsements(&confirmed)?;
 
     assert_eq!(endorsements.len(), 1);
+    assert_eq!(endorsements[0].auth().minter(), sender.minter());
+    assert_eq!(
+        endorsements[0].auth().minter().validator_pubkey(),
+        &ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
+    );
     assert_eq!(endorsements[0].txid(), endorsement_txid);
     let endorsement_output_index = endorsements[0].output().output_index as usize;
     assert_eq!(

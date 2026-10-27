@@ -35,7 +35,6 @@ impl DemoMinter {
             TestAcquisitionConfig {
                 wallet_rpc_url: bitcoin.wallet_rpc_url(),
                 access_predicate: config.access_predicate.clone(),
-                validator_pubkey: config.validator_pubkey,
             },
         )
         .await?;

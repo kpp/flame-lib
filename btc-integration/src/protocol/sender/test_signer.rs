@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use corepc_client::{bitcoin::Transaction, client_sync::Error as RpcError};
-use ed25519_dalek::VerifyingKey;
 use flamevm::Predicate;
 
 use crate::btc::{bitcoin_facade::BitcoinFacade, rpc::RpcApi};
@@ -18,7 +17,6 @@ pub struct TestSigner<R: ?Sized, S> {
     acquisition_wallet: Arc<BitcoinFacade<R>>,
     endorsement: EndorsementSigner<R, S>,
     access_predicate: Predicate,
-    validator_pubkey: VerifyingKey,
 }
 
 impl<R: ?Sized, S> TestSigner<R, S> {
@@ -26,22 +24,16 @@ impl<R: ?Sized, S> TestSigner<R, S> {
         acquisition_wallet: Arc<BitcoinFacade<R>>,
         endorsement: EndorsementSigner<R, S>,
         access_predicate: Predicate,
-        validator_pubkey: VerifyingKey,
     ) -> Self {
         Self {
             acquisition_wallet,
             endorsement,
             access_predicate,
-            validator_pubkey,
         }
     }
 
     pub(super) fn acquisition_data(&self, minter: &MinterIdentity) -> AcquisitionData {
-        AcquisitionData::new(
-            minter.p2wsh(),
-            self.access_predicate.clone(),
-            self.validator_pubkey,
-        )
+        AcquisitionData::new(minter.p2wsh(), self.access_predicate.clone())
     }
 }
 

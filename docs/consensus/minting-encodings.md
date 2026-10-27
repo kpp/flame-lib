@@ -28,16 +28,16 @@ prefix.
 An Acquisition Output script has exactly one of the following forms:
 
 ```text
-OP_RETURN OP_PUSHDATA1 101 "FLMS" <Version> <Minter P2WSH> <Access Predicate> <Validator Pubkey>
+OP_RETURN OP_PUSHBYTES_69 "FLMS" <Version> <Minter P2WSH> <Access Predicate>
 
-OP_RETURN OP_PUSHDATA1 103 "FLMS" <Version> <Minter P2WSH> <Access Predicate> <Validator Pubkey> <Duration>
+OP_RETURN OP_PUSHBYTES_71 "FLMS" <Version> <Minter P2WSH> <Access Predicate> <Duration>
 ```
 
 The corresponding opcode and length bytes are:
 
 ```text
-without Duration: 0x6a 0x4c 0x65
-with Duration:    0x6a 0x4c 0x67
+without Duration: 0x6a 0x45
+with Duration:    0x6a 0x47
 ```
 
 The payload layout is:
@@ -48,11 +48,14 @@ The payload layout is:
 |      4 |      1 | Version; must equal `1` |
 |      5 |     32 | Minter P2WSH            |
 |     37 |     32 | Access Predicate        |
-|     69 |     32 | Validator Pubkey        |
-|    101 | 0 or 2 | Optional Duration       |
+|     69 | 0 or 2 | Optional Duration       |
 
 The Bitcoin output value must be non-zero. Each valid Acquisition Output is processed independently and is identified by
 its transaction ID and output index. When `Duration` is absent, the protocol-defined minimum duration is used.
+
+The payload is exactly 69 or 71 bytes; the complete output script is 71 or 73 bytes. `OP_PUSHDATA1` and other
+alternative push encodings are invalid. The Validator Pubkey and witness script are not included in an Acquisition;
+the Minter P2WSH commits to them through the complete witness script hash.
 
 ## Minting Output
 
@@ -90,18 +93,33 @@ as are malformed fields and trailing script bytes.
 The complete witness script of an authenticating P2WSH input must begin with exactly this prefix:
 
 ```text
-OP_PUSHBYTES_36 "FLMV" <Flame Predicate> OP_DROP
+OP_PUSHBYTES_68 "FLMV" <Flame Predicate> <Validator Pubkey> OP_DROP
 ```
 
 Its byte layout is:
 
 ```text
-0x24 || 0x46 0x4c 0x4d 0x56 || <32-byte Flame Predicate> || 0x75
+0x44 || 0x46 0x4c 0x4d 0x56 || <32-byte Flame Predicate> || <32-byte Validator Pubkey> || 0x75
 ```
 
-`OP_PUSHBYTES_36` (`0x24`) and `OP_DROP` (`0x75`) are mandatory. `OP_PUSHDATA1`, `OP_PUSHDATA2`, `OP_PUSHDATA4`, split
+The prefix is exactly 70 bytes. The Validator Pubkey must decode as an Ed25519 verifying key.
+
+`OP_PUSHBYTES_68` (`0x44`) and `OP_DROP` (`0x75`) are mandatory. `OP_PUSHDATA1`, `OP_PUSHDATA2`, `OP_PUSHDATA4`, split
 pushes, or any other equivalent construction do not form a valid Minter authentication prefix.
 
 The SHA-256 hash of the complete witness script, including all authorization logic following this prefix, must equal the
 Minter P2WSH committed by the Minter's Acquisition. Bitcoin validates execution of the complete witness script; Flame
-uses the prefix to recover the Flame Predicate associated with the authenticated Minter.
+uses the prefix to recover the Flame Predicate and BFT Validator Pubkey associated with the authenticated Minter.
+The Validator Pubkey is metadata dropped before the Bitcoin authorization script executes; Bitcoin authorization
+continues to use its own keys and script rules. Changing the Validator Pubkey changes the Minter P2WSH.
+
+With the canonical `<33-byte compressed Bitcoin public key> OP_CHECKSIG` authorization suffix, the complete witness
+script is 105 bytes. The built-in signer estimates the input weight as 345 weight units, allowing a 73-byte Bitcoin
+signature including its sighash byte.
+
+## Format Compatibility
+
+These encodings replace the previous Acquisition payloads containing a separate Validator Pubkey and the previous
+36-byte `FLMV` payload. The old encodings are rejected; no legacy decoding or migration is implemented. Acquisition
+and Minting outputs retain Version `1`. Existing deployments require an explicit protocol transition before adopting
+these incompatible formats.

@@ -15,7 +15,6 @@ use corepc_client::{
     },
     client_sync::Auth,
 };
-use ed25519_dalek::SigningKey;
 use flamevm::Predicate;
 
 use super::TestContext;
@@ -54,8 +53,11 @@ pub async fn create_connection(
     let secret_key = SecretKey::from_slice(&secret_key_bytes)?;
     let public_key = secret_key.public_key(&secp);
     let access_predicate = Predicate::opaque(Predicate::unspendable_key());
-    let identity =
-        identity_from_script(minter_witness_script::build(&access_predicate, &public_key));
+    let identity = identity_from_script(minter_witness_script::build(
+        &access_predicate,
+        &ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
+        &public_key,
+    ));
     let witness_script = identity.witness_script();
 
     let p2wsh_script_pubkey = witness_script.to_p2wsh();
@@ -73,7 +75,6 @@ pub async fn create_connection(
         TestAcquisitionConfig {
             wallet_rpc_url: ctx.rpc_url.clone(),
             access_predicate,
-            validator_pubkey: SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
         },
     )
     .await?;

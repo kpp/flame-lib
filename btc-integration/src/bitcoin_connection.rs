@@ -4,7 +4,6 @@ use corepc_client::{
     bitcoin::Network,
     client_sync::{Auth, Error as RpcError},
 };
-use ed25519_dalek::VerifyingKey;
 use flamevm::Predicate;
 
 use crate::{
@@ -24,7 +23,6 @@ pub struct BitcoinConfig {
 pub struct TestAcquisitionConfig {
     pub wallet_rpc_url: String,
     pub access_predicate: Predicate,
-    pub validator_pubkey: VerifyingKey,
 }
 
 pub struct BitcoinConnection<S> {
@@ -72,7 +70,6 @@ impl<S: SecretStorage> BitcoinConnection<TestSigner<Core31RpcApi, S>> {
             acquisition_wallet,
             EndorsementSigner::new(secret_storage, wallet),
             acquisition.access_predicate,
-            acquisition.validator_pubkey,
         ));
         let sender = Arc::new(Sender::new(Arc::clone(&bitcoin), signer, identity));
         Ok(Self { bitcoin, sender })

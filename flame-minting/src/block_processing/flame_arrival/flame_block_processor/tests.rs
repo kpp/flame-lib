@@ -225,7 +225,6 @@ impl Fixture {
                     * flamevm::Scalar::from(u64::from(minter)).to_dalek())
                 .compress(),
             ),
-            ed25519_dalek::SigningKey::from_bytes(&[2; 32]).verifying_key(),
         );
         let transaction = Transaction {
             version: transaction::Version::TWO,

@@ -8,7 +8,6 @@ use corepc_client::bitcoin::{
     Amount, BlockHash as BitcoinBlockHash, Script, ScriptBuf, Transaction, TxIn, TxOut, Witness,
     absolute, hashes::Hash, transaction,
 };
-use ed25519_dalek::SigningKey;
 use flame_chain_service::{ChainAccess, InMemoryChain};
 use flame_minting::{
     block_processing::{

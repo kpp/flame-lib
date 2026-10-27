@@ -256,6 +256,7 @@ mod tests {
         let flame_predicate = Predicate::opaque(Predicate::unspendable_key());
         let witness_script = minter_witness_script::build_with_authorization(
             &flame_predicate,
+            &ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
             corepc_client::bitcoin::Script::from_bytes(&[0x51]),
         )
         .into_bytes();

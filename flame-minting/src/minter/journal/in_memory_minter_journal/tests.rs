@@ -22,6 +22,7 @@ fn authenticated_endorsement(
 ) -> AuthenticatedMintingEndorsement {
     let witness_script = minter_witness_script::build_with_authorization(
         &Predicate::opaque(Predicate::unspendable_key()),
+        &ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
         Script::from_bytes(&[minter]),
     );
     let mut payload = b"FLMB".to_vec();

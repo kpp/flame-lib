@@ -11,7 +11,7 @@ use corepc_client::bitcoin::Amount;
 
 # async fn example<S: SecretStorage>(config: BitcoinConfig, identity: MinterIdentity,
 # secret_storage: S, acquisition_wallet_rpc_url: String, access_predicate: flamevm::Predicate,
-# validator_pubkey: ed25519_dalek::VerifyingKey, height: u32,
+# height: u32,
 # hash: flamechain::BlockHash) -> Result<(), Box<dyn std::error::Error>> {
 let connection = BitcoinConnection::regtest(
     config,
@@ -20,7 +20,6 @@ let connection = BitcoinConnection::regtest(
     TestAcquisitionConfig {
         wallet_rpc_url: acquisition_wallet_rpc_url,
         access_predicate,
-        validator_pubkey,
     },
 ).await?;
 let sender = connection.get_sender(); // Arc<TestSender<Core31RpcApi, S>>

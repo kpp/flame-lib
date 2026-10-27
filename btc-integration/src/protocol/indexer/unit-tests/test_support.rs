@@ -16,7 +16,6 @@ use corepc_client::{
     },
     client_sync::{Error, Result},
 };
-use ed25519_dalek::SigningKey;
 use flamechain::BlockHash as FlameBlockHash;
 use flamevm::Predicate;
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
@@ -199,7 +198,6 @@ pub(super) fn acquisition_transaction(satoshis: u64) -> BtcTransactionWithPrevou
     let data = AcquisitionData::new(
         [0x11; 32].into(),
         Predicate::opaque(Predicate::unspendable_key()),
-        SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
     );
     BtcTransactionWithPrevouts {
         transaction: Transaction {
@@ -219,6 +217,7 @@ pub(super) fn endorsement_transaction(authenticated: bool) -> BtcTransactionWith
     let predicate = Predicate::opaque(Predicate::unspendable_key());
     let witness_script = minter_witness_script::build_with_authorization(
         &predicate,
+        &ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
         corepc_client::bitcoin::Script::from_bytes(&[0x51]),
     )
     .into_bytes();

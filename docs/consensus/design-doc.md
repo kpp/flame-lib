@@ -43,7 +43,8 @@ Participation in BFT is not required to produce or mint a valid Flame block.
    Minting Power. Minter burns Bitcoins and gaining Minting Power proportional to the burnt coins.
 2. BFT produces Core Block and distributed it in the network. Minters endorse the block by sending special transactions
    in the Bitcoin network.
-3. After endorsements are settled in the Bitcoin Chain, main chain is selected. Main chain is a chain with the greatest cumulative
+3. After endorsements are settled in the Bitcoin Chain, main chain is selected. Main chain is a chain with the greatest
+   cumulative
    Core Block weight.
 
 BFT can produce blocks between Bitcoin blocks. However, it is not required, and system can achieve finality without
@@ -51,7 +52,8 @@ intermediate non-Core blocks.
 
 ## 2. Minting Power
 
-Minting Power represents the consensus weight owned by a minter. It is acquired by burning BTC and is used as BFT voting power
+Minting Power represents the consensus weight owned by a minter. It is acquired by burning BTC and is used as BFT voting
+power
 and Minting endorsement weight.
 
 Minting Power is temporary. Each acquisition becomes active after a maturity period, remains active for a fixed
@@ -96,7 +98,8 @@ TotalMintingPower(Y) =
 
 ### Effective Minting Power
 
-Minting Power defines how much endorsement weight a minter owns. Effective Minting Power defines how much of that weight is
+Minting Power defines how much endorsement weight a minter owns. Effective Minting Power defines how much of that weight
+is
 assigned to a particular Minting endorsement.
 
 A Core Block specifies a target Bitcoin block height `T`. If a Minting Transaction endorsing that Core Block is
@@ -130,7 +133,8 @@ delay = 3  →  12.5% of Minting Power
 delay > 10 →  0%    of Minting Power
 ```
 
-Minting Power is calculated at the target Bitcoin height. A delayed endorsement uses the Minting Power the minter had at that
+Minting Power is calculated at the target Bitcoin height. A delayed endorsement uses the Minting Power the minter had at
+that
 target height `T`, regardless of the minter's Minting Power when the endorsement is later included.
 
 ### Rationale
@@ -152,10 +156,12 @@ mechanism; regular Flame blocks are finalized indirectly as ancestors of an anch
 A Core Block is a valid Flame block explicitly marked as a Core Block by the protocol.
 
 Each Core Block contains a target Bitcoin block height `T`. It determines the earliest Bitcoin block in which the Core
-Block may receive a valid Minting endorsement and the Bitcoin height at which Minting Power for that endorsement is evaluated.
+Block may receive a valid Minting endorsement and the Bitcoin height at which Minting Power for that endorsement is
+evaluated.
 
 For a Core Block with a target Bitcoin height `T`, a Minting Transaction endorsing that Core Block may only be included
-at the height `T` or higher. An endorsement included before `T` is not a valid endorsement for that Core Block. If the endorsement is included
+at the height `T` or higher. An endorsement included before `T` is not a valid endorsement for that Core Block. If the
+endorsement is included
 after `T`, the delayed-endorsement penalty defined in the Minting Power section is applied.
 
 ### Regular Flame Blocks
@@ -177,13 +183,15 @@ canonical chain as well.
 
 Core Blocks provide explicit anchoring points for Minting endorsements.
 
-If minters were allowed to endorse any Flame block, endorsement weight could become fragmented across many nearby blocks. For
+If minters were allowed to endorse any Flame block, endorsement weight could become fragmented across many nearby
+blocks. For
 example, one block could receive 1 unit of Minting Power while another block on the same chain receives 1 000 000.
 
 This would make the meaning of anchoring much less clear: it would be difficult to determine which blocks should be
 considered confirmed and where the tip of the chain is.
 
-Core Blocks reduce this ambiguity by restricting Minting endorsements to explicitly selected anchoring points. All intermediate
+Core Blocks reduce this ambiguity by restricting Minting endorsements to explicitly selected anchoring points. All
+intermediate
 Flame blocks are selected together with the Core Block that contains them as ancestors, while consensus weight is
 concentrated on a smaller set of well-defined checkpoints.
 
@@ -197,7 +205,8 @@ Minting consists of two operations:
 1. **Acquisition** - burning BTC to acquire Minting Power.
 2. **Minting** - using that Minting Power to endorse a Core Block.
 
-Endorsements observed in the Bitcoin chain are the authoritative input for Flame chain selection. The rules for selecting the
+Endorsements observed in the Bitcoin chain are the authoritative input for Flame chain selection. The rules for
+selecting the
 canonical chain from those endorsements are defined separately in the Chain Selection section.
 
 Bitcoin script encodings used by Acquisition and Minting transactions are defined in
@@ -232,8 +241,7 @@ Each Acquisition Output is processed independently. An output that does not sati
 not create an Acquisition.
 
 The BTC amount assigned to an Acquisition Output is permanently unspendable. An Acquisition commits to the Minter's
-Minting identity, the final reward beneficiary, the public key used for BFT participation, and optionally an Acquisition
-duration.
+Minting identity, the final reward beneficiary, and optionally an Acquisition duration.
 
 An Acquisition Output is valid only if:
 
@@ -252,13 +260,15 @@ A Minting Transaction contains:
 - one or more inputs that authenticate participating Minters;
 - exactly one eligible Minting Output identifying the Core Block being endorsed.
 
-Multiple Minters may be included in the same transaction, allowing their endorsements for the same Core Block to be batched.
+Multiple Minters may be included in the same transaction, allowing their endorsements for the same Core Block to be
+batched.
 
 #### Minter Authentication
 
 A Bitcoin input authenticates a Minter if it spends a P2WSH output whose witness script hash matches the
 Minting identity specified by that Minter's Acquisition. The witness script reveals a Flame predicate used for reward
-distribution. Its complete script hash must match the Minting identity committed in the Acquisition.
+distribution and an Ed25519 public key used for BFT participation. Its complete script hash must match the Minting
+identity committed in the Acquisition.
 
 The Flame Predicate is the predicate to which rewards associated with the Minter are issued.
 
@@ -277,7 +287,8 @@ A Minting Output identifies the Core Block being endorsed by its Flame height an
 does not affect endorsement validity or endorsement weight and may be zero or non-zero.
 
 A Minting Transaction must contain exactly one eligible Minting Output. If no eligible Minting Output exists, the
-transaction does not produce any Minting endorsements. If more than one eligible Minting Output exists, the transaction does
+transaction does not produce any Minting endorsements. If more than one eligible Minting Output exists, the transaction
+does
 not produce any Minting endorsements.
 
 #### Endorsement Validity
@@ -324,7 +335,8 @@ chain is considered canonical based on the cumulative weight of its Core Blocks.
 
 ### Core Block Weight
 
-The weight of a Core Block is the base-2 logarithm of the sum of Effective Minting Power of all valid endorsements for that
+The weight of a Core Block is the base-2 logarithm of the sum of Effective Minting Power of all valid endorsements for
+that
 block, rounded down. If the sum is zero, the block weight is zero:
 
 ```text
@@ -357,7 +369,8 @@ Chain Selection is reevaluated whenever new information affecting chain weight b
 
 A delayed endorsement may change the relative weight of an older branch and cause it to become canonical.
 
-Only known and valid Flame blocks participate in Chain Selection. A Minting endorsement referencing a block that is not yet
+Only known and valid Flame blocks participate in Chain Selection. A Minting endorsement referencing a block that is not
+yet
 available cannot affect Chain Selection until the referenced block is available.
 
 ### Reorganizations
@@ -374,7 +387,8 @@ Specific rules of reorganization are not covered in this document.
 
 Chain weight is derived only from Minting endorsements contained in the current canonical Bitcoin chain.
 
-If Bitcoin reorganizes, Minting endorsements contained in removed Bitcoin blocks stop contributing to Flame chain weight. Endorsements
+If Bitcoin reorganizes, Minting endorsements contained in removed Bitcoin blocks stop contributing to Flame chain
+weight. Endorsements
 contained in newly added Bitcoin blocks are processed normally.
 
 Flame Chain Selection is then reevaluated using the resulting set of valid Minting endorsements.
@@ -419,6 +433,9 @@ network Minting Power at the evaluation point:
 
 This threshold limits the active BFT validator set to at most `1024` Validators.
 
+The Validator's Ed25519 public key is part of its Minter witness script and is therefore bound to its Minting identity.
+Changing this key creates a different Minting identity; existing Acquisitions remain assigned to the original identity.
+
 ### BFT Voting Power
 
 A Validator's BFT voting weight is equal to its current Minting Power. New Acquisitions and their expirations may update
@@ -451,7 +468,7 @@ Delegation separates:
 A delegation is created through a regular Acquisition.
 
 To delegate Minting Power to a Validator, the delegator creates an Acquisition associated with the Validator's Minting
-identity and BFT public key while retaining the delegator's own Access Predicate as the reward beneficiary.
+identity while retaining the delegator's own Access Predicate as the reward beneficiary.
 
 The BTC burned in the Acquisition belongs to the Acquisition itself and produces Minting Power according to the normal
 Minting Power rules. The resulting Minting Power is assigned to the Validator for consensus purposes, while rewards
@@ -534,8 +551,10 @@ halvings, the block reward becomes zero and no additional FLM is issued.
 
 ### Reward Eligibility
 
-The reward of a Core Block is distributed only between Minting Power that produced a valid Minting endorsement for that block.
-If Minter has Minting Power at the Core block, but does not produce an endorsement, it does not contribute to the Total Effective
+The reward of a Core Block is distributed only between Minting Power that produced a valid Minting endorsement for that
+block.
+If Minter has Minting Power at the Core block, but does not produce an endorsement, it does not contribute to the Total
+Effective
 Minting Power, therefore does not participate in the rewards distribution.
 
 The reward for the endorsement is calculated as:
@@ -596,7 +615,8 @@ TBD
 Emission is attached to Core Blocks rather than regular Flame blocks because BFT may produce arbitrary number of blocks,
 while amount of Core blocks are strictly attached to the amount of Bitcoin blocks.
 
-Delayed endorsements receive reduced rewards because their contribution to Chain Selection is also reduced. Using the same
+Delayed endorsements receive reduced rewards because their contribution to Chain Selection is also reduced. Using the
+same
 Effective Minting Power for both fork choice and rewards aligns the economic incentive with the consensus value of the
 endorsement.
 
@@ -607,12 +627,9 @@ the reward calculation for individual blocks.
 
 ### Open Questions
 
-Q: How to handle Acquisitions with same Minting identity but different Validator public key? In
-current version, Acquisition needs to specify both the FlamePredicate and ValidatorKey. This system has an issue:
-delegator may specify correct Minter P2WSH but wrong ValidatorKey.
-
 Q: What is protocol behaviour if a Core Block has zero Effective Minting Power? It may seem that this is unlikely case,
-but Bitcoin miners can censor all Flame endorsements for 10+ blocks, in which case no endorsements for the Block will ever be
+but Bitcoin miners can censor all Flame endorsements for 10+ blocks, in which case no endorsements for the Block will
+ever be
 received. Considering that the Core Block is already created but cannot be minted, it is effectively deadlock in the
 current protocol.
 

@@ -71,6 +71,7 @@ impl<S: IdentitySecretStorage> IdentityManager<S> {
                 let public_key = secret.0.public_key(&Secp256k1::signing_only());
                 Ok(MinterIdentity::single_key(
                     &self.config.flame_predicate,
+                    &self.config.validator_pubkey,
                     &public_key,
                 ))
             })

@@ -11,7 +11,6 @@ use btc_integration::{Acquisition, AcquisitionData, BtcBlockTip, MinterP2wsh};
 use corepc_client::bitcoin::{
     Amount, BlockHash as BtcBlockHash, Transaction, TxOut, absolute, hashes::Hash, transaction,
 };
-use ed25519_dalek::SigningKey;
 use flamechain::{BlockHash, Blockchain, ChainParams, CoreBlockHeader};
 use flamevm::Predicate;
 
@@ -57,7 +56,6 @@ fn acquisition(amount: u64) -> IncludedAcquisition {
     let data = AcquisitionData::new(
         [1; 32].into(),
         Predicate::opaque(Predicate::unspendable_key()),
-        SigningKey::from_bytes(&[2; 32]).verifying_key(),
     );
     let transaction = Transaction {
         version: transaction::Version::TWO,

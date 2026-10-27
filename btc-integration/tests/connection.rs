@@ -31,6 +31,7 @@ async fn unsupported_authorization_is_rejected_before_connecting() {
     let identity = common::identity_from_script(
         btc_integration::protocol::minter_witness_script::build_with_authorization(
             &Predicate::opaque(Predicate::unspendable_key()),
+            &ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
             Script::from_bytes(&[0x51]),
         ),
     );
@@ -44,7 +45,6 @@ async fn unsupported_authorization_is_rejected_before_connecting() {
         TestAcquisitionConfig {
             wallet_rpc_url: "not a URL".into(),
             access_predicate: Predicate::opaque(Predicate::unspendable_key()),
-            validator_pubkey: ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
         },
     )
     .await;
@@ -60,6 +60,7 @@ fn identity() -> MinterIdentity {
         .public_key(&Secp256k1::new());
     common::identity_from_script(btc_integration::protocol::minter_witness_script::build(
         &Predicate::opaque(Predicate::unspendable_key()),
+        &ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
         &public_key,
     ))
 }
@@ -78,7 +79,6 @@ async fn connect(
         TestAcquisitionConfig {
             wallet_rpc_url: ctx.rpc_url.clone(),
             access_predicate: Predicate::opaque(Predicate::unspendable_key()),
-            validator_pubkey: ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
         },
     )
     .await?)

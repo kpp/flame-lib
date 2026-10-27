@@ -1,10 +1,9 @@
 use crate::protocol::consts::{
-    ACQUISITION_MAGIC, ACQUISITION_PAYLOAD_LEN, ACQUISITION_WITH_DURATION_PAYLOAD_LEN,
-    OP_PUSHDATA1, OP_RETURN, VERSION_V1,
+    ACQUISITION_MAGIC, ACQUISITION_PAYLOAD_LEN, ACQUISITION_WITH_DURATION_PAYLOAD_LEN, OP_RETURN,
+    VERSION_V1,
 };
 use crate::protocol::minter_p2wsh::{MinterP2wsh, parse_predicate};
 use corepc_client::bitcoin::{Amount, ScriptBuf, Transaction, TxOut, Txid};
-use ed25519_dalek::VerifyingKey;
 use flamevm::Predicate;
 use readerwriter::{ReadError, Reader};
 
@@ -56,21 +55,15 @@ pub struct AcquisitionData {
     pub version: u8,
     pub minter_p2wsh: MinterP2wsh,
     pub access_predicate: Predicate,
-    pub validator_pubkey: VerifyingKey,
     pub duration: Option<u16>,
 }
 
 impl AcquisitionData {
-    pub fn new(
-        minter_p2wsh: MinterP2wsh,
-        access_predicate: Predicate,
-        validator_pubkey: VerifyingKey,
-    ) -> Self {
+    pub fn new(minter_p2wsh: MinterP2wsh, access_predicate: Predicate) -> Self {
         Self {
             version: VERSION_V1,
             minter_p2wsh,
             access_predicate,
-            validator_pubkey,
             duration: None,
         }
     }
@@ -86,13 +79,12 @@ impl AcquisitionData {
         } else {
             ACQUISITION_PAYLOAD_LEN
         };
-        let mut script = Vec::with_capacity(3 + payload_len);
-        script.extend_from_slice(&[OP_RETURN, OP_PUSHDATA1, payload_len as u8]);
+        let mut script = Vec::with_capacity(2 + payload_len);
+        script.extend_from_slice(&[OP_RETURN, payload_len as u8]);
         script.extend_from_slice(&ACQUISITION_MAGIC);
         script.push(self.version);
         script.extend_from_slice(self.minter_p2wsh.as_bytes());
         script.extend_from_slice(self.access_predicate.to_point().as_bytes());
-        script.extend_from_slice(self.validator_pubkey.as_bytes());
         if let Some(duration) = self.duration {
             script.extend_from_slice(&duration.to_le_bytes());
         }
@@ -109,7 +101,7 @@ impl AcquisitionData {
     }
 
     fn read(reader: &mut impl Reader) -> Result<Self, ReadError> {
-        if reader.read_u8()? != OP_RETURN || reader.read_u8()? != OP_PUSHDATA1 {
+        if reader.read_u8()? != OP_RETURN {
             return Err(ReadError::InvalidFormat);
         }
 
@@ -130,8 +122,6 @@ impl AcquisitionData {
         let minter_p2wsh = MinterP2wsh::from(reader.read_u8x32()?);
         let access_predicate =
             parse_predicate(&reader.read_u8x32()?).ok_or(ReadError::InvalidFormat)?;
-        let validator_pubkey = VerifyingKey::from_bytes(&reader.read_u8x32()?)
-            .map_err(|_| ReadError::InvalidFormat)?;
         let duration = match payload_len {
             ACQUISITION_PAYLOAD_LEN => None,
             ACQUISITION_WITH_DURATION_PAYLOAD_LEN => {
@@ -147,7 +137,6 @@ impl AcquisitionData {
             version: VERSION_V1,
             minter_p2wsh,
             access_predicate,
-            validator_pubkey,
             duration,
         })
     }
@@ -158,7 +147,6 @@ impl PartialEq for AcquisitionData {
         self.version == other.version
             && self.minter_p2wsh == other.minter_p2wsh
             && self.access_predicate.to_point() == other.access_predicate.to_point()
-            && self.validator_pubkey == other.validator_pubkey
             && self.duration == other.duration
     }
 }
@@ -170,10 +158,9 @@ mod tests {
     use super::{Acquisition, AcquisitionData};
     use crate::protocol::consts::{
         ACQUISITION_MAGIC, ACQUISITION_PAYLOAD_LEN, ACQUISITION_WITH_DURATION_PAYLOAD_LEN,
-        OP_PUSHDATA1, OP_RETURN, VERSION_V1,
+        OP_RETURN, VERSION_V1,
     };
     use corepc_client::bitcoin::{Amount, ScriptBuf, Transaction, TxOut, absolute, transaction};
-    use ed25519_dalek::SigningKey;
     use flamevm::Predicate;
 
     #[test]
@@ -185,27 +172,52 @@ mod tests {
         assert_eq!(data.version, VERSION_V1);
         assert_eq!(data.minter_p2wsh.as_bytes(), &[0x11; 32]);
         assert_eq!(data.duration, Some(0x1234));
-        assert_eq!(
-            data.validator_pubkey,
-            SigningKey::from_bytes(&[0x22; 32]).verifying_key()
-        );
     }
 
     #[test]
     fn encodes_data_in_the_same_canonical_format_that_it_parses() {
         let access_predicate = Predicate::opaque(Predicate::unspendable_key());
-        let data = AcquisitionData::new(
-            [0x11; 32].into(),
-            access_predicate,
-            SigningKey::from_bytes(&[0x22; 32]).verifying_key(),
-        )
-        .with_duration(0x1234);
-        let output = TxOut {
-            value: Amount::from_sat(42),
-            script_pubkey: data.to_script(),
-        };
+        for (duration, push_opcode, script_len) in [(None, 0x45, 71), (Some(0x1234), 0x47, 73)] {
+            let mut data = AcquisitionData::new([0x11; 32].into(), access_predicate.clone());
+            data.duration = duration;
+            let output = TxOut {
+                value: Amount::from_sat(42),
+                script_pubkey: data.to_script(),
+            };
 
-        assert_eq!(AcquisitionData::from_output(&output), Some(data));
+            assert_eq!(&output.script_pubkey.as_bytes()[..2], &[0x6a, push_opcode]);
+            assert_eq!(output.script_pubkey.len(), script_len);
+            assert_eq!(AcquisitionData::from_output(&output), Some(data));
+        }
+    }
+
+    #[test]
+    fn rejects_noncanonical_and_malformed_outputs() {
+        for duration in [None, Some(0x1234)] {
+            let valid = acquisition_output(42, duration);
+            let script = valid.script_pubkey.as_bytes();
+            let truncated = script[..script.len() - 1].to_vec();
+            let mut trailing = script.to_vec();
+            trailing.push(0);
+            let mut noncanonical = vec![0x6a, 0x4c];
+            noncanonical.extend_from_slice(&script[1..]);
+            let mut legacy = vec![0x6a, 0x4c, if duration.is_some() { 103 } else { 101 }];
+            legacy.extend_from_slice(&script[2..71]);
+            legacy.extend_from_slice(
+                ed25519_dalek::SigningKey::from_bytes(&[0x22; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            );
+            legacy.extend_from_slice(&script[71..]);
+
+            for bytes in [truncated, trailing, noncanonical, legacy] {
+                let output = TxOut {
+                    value: valid.value,
+                    script_pubkey: ScriptBuf::from_bytes(bytes),
+                };
+                assert!(AcquisitionData::from_output(&output).is_none());
+            }
+        }
     }
 
     #[test]
@@ -231,19 +243,17 @@ mod tests {
 
     fn acquisition_output(value: u64, duration: Option<u16>) -> TxOut {
         let access_predicate = Predicate::opaque(Predicate::unspendable_key());
-        let validator_pubkey = SigningKey::from_bytes(&[0x22; 32]).verifying_key();
         let payload_len = if duration.is_some() {
             ACQUISITION_WITH_DURATION_PAYLOAD_LEN
         } else {
             ACQUISITION_PAYLOAD_LEN
         };
-        let mut script = Vec::with_capacity(payload_len + 3);
-        script.extend_from_slice(&[OP_RETURN, OP_PUSHDATA1, payload_len as u8]);
+        let mut script = Vec::with_capacity(payload_len + 2);
+        script.extend_from_slice(&[OP_RETURN, payload_len as u8]);
         script.extend_from_slice(&ACQUISITION_MAGIC);
         script.push(VERSION_V1);
         script.extend_from_slice(&[0x11; 32]);
         script.extend_from_slice(access_predicate.to_point().as_bytes());
-        script.extend_from_slice(validator_pubkey.as_bytes());
         if let Some(duration) = duration {
             script.extend_from_slice(&duration.to_le_bytes());
         }

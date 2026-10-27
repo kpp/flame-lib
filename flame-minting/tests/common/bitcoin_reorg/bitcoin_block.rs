@@ -30,6 +30,7 @@ pub(super) fn btc_tip(height: u64, branch: u8) -> BtcBlockTip {
 fn witness_script(minter: u8) -> ScriptBuf {
     minter_witness_script::build_with_authorization(
         &Predicate::opaque(Predicate::unspendable_key()),
+        &ed25519_dalek::SigningKey::from_bytes(&[minter; 32]).verifying_key(),
         Script::from_bytes(&[minter]),
     )
 }
@@ -41,7 +42,6 @@ pub(super) fn acquisition(minter: u8, amount: u64) -> Acquisition {
     let data = AcquisitionData::new(
         witness_script(minter).wscript_hash().to_byte_array().into(),
         access,
-        SigningKey::from_bytes(&[minter; 32]).verifying_key(),
     );
     let tx = Transaction {
         version: transaction::Version::TWO,

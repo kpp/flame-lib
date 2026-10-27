@@ -2,7 +2,6 @@ use btc_integration::{Acquisition, AcquisitionData, BtcBlockTip};
 use corepc_client::bitcoin::{
     Amount, BlockHash, Transaction, TxOut, Txid, absolute, hashes::Hash, transaction,
 };
-use ed25519_dalek::SigningKey;
 use flamevm::Predicate;
 
 use crate::consensus::{
@@ -14,7 +13,6 @@ fn acquisitions() -> [IncludedAcquisition; 2] {
     let data = AcquisitionData::new(
         [1; 32].into(),
         Predicate::opaque(Predicate::unspendable_key()),
-        SigningKey::from_bytes(&[2; 32]).verifying_key(),
     );
     let transaction = Transaction {
         version: transaction::Version::TWO,
