@@ -197,7 +197,7 @@ fn a_node_serves_two_wallets_across_five_blocks() {
         &a,
         &[(RECEIVING, 0), (RECEIVING, 1), (RECEIVING, 2), (CHANGE, 0)],
     );
-    let hits = node.scan(&a_predicates, 0);
+    let hits = node.scan(&a_predicates, 0).unwrap();
     assert_eq!(
         hits.iter().map(|hit| hit.height).collect::<Vec<_>>(),
         vec![0, 1, 4, 5],
@@ -226,11 +226,13 @@ fn a_node_serves_two_wallets_across_five_blocks() {
     assert_eq!(a_recv2_opening.qty, b_payment);
 
     // `since_height` is the wallet's resume point.
-    let recent = node.scan(&a_predicates, 4);
+    let recent = node.scan(&a_predicates, 4).unwrap();
     assert_eq!(recent.len(), 2);
 
     // B sees its own two contracts and nothing of A's.
-    let b_hits = node.scan(&predicates(&b, &[(RECEIVING, 0), (CHANGE, 0)]), 0);
+    let b_hits = node
+        .scan(&predicates(&b, &[(RECEIVING, 0), (CHANGE, 0)]), 0)
+        .unwrap();
     assert_eq!(b_hits.len(), 2);
     assert_eq!(b_hits[0].id.0, b_id);
     assert_eq!(b_hits[0].spent.expect("B spent it").height, 5);

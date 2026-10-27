@@ -1459,6 +1459,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "zeroize",
 ]
 
 [[package]]

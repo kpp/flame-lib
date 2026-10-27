@@ -371,6 +371,7 @@ fn failed_delivery_summary_matches_its_archived_refund() {
     assert!(!error.is_empty());
     let refund = node
         .scan(&[predicate], 1)
+        .unwrap()
         .into_iter()
         .find(|output| output.txid == bounced.id)
         .unwrap();

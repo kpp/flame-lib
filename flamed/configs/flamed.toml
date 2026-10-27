@@ -9,3 +9,7 @@ minimum_fee = 0
 # Where the mock core indexer keeps the times of the core blocks it hands
 # out. Default: <data_dir>/indexer.
 # indexer_dir = "./data/indexer"
+# Where the indexes keep effect logs, contracts and notes, which are read
+# only on request. A cache: every start deletes and rebuilds it. Default:
+# <data_dir>/cold.bin.
+# cold_path = "./data/cold.bin"

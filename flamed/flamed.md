@@ -33,8 +33,13 @@ are not in it:
   output, the `Data` entry right after it in its log, byte for byte and
   never parsed ([Confidential payments](../docs/payments.md#the-node)).
 
-All three live in memory and are rebuilt by replaying `blocks.bin`. The only
-durable state this node has is that file and `genesis.json`. Block times are
+All three live in memory and are rebuilt by replaying `blocks.bin`, except
+for the bulky bytes the indexes seldom read: effect logs, contracts and
+notes. Those are appended to `cold.bin` and read back on request, each
+checked against a hash its record keeps. `cold.bin` is a cache. Every start
+deletes it and replay writes it again, so a lost or corrupt one costs a
+restart, and a corrupt read is an error that says so, never wrong bytes.
+The only durable state this node has is `blocks.bin` and `genesis.json`. Block times are
 not its own: they belong to the core indexer, which keeps them in its own
 directory ([Times](#times)).
 
@@ -73,7 +78,8 @@ network agree.
 **`flamed.toml`** is one node's local policy: where its data lives, where to
 listen, how often to mint, the fee it will not go below, and where the mock
 core indexer keeps its table (`indexer_dir`, `<data_dir>/indexer` by
-default). None of it is consensus — the block header carries no timestamp,
+default), and where `cold.bin` goes (`cold_path`, `<data_dir>/cold.bin` by
+default; any scratch disk will do). None of it is consensus — the block header carries no timestamp,
 and a fee floor is an opinion about what is worth relaying.
 
 `blocks.bin` sits beside them in the data directory: one record per block, a
@@ -295,7 +301,7 @@ same full hash.
 | `/etc/flamed/flamed.toml` | [`configs/flamed.image.toml`](configs/flamed.image.toml): RPC on `0.0.0.0:8545`, data in `/var/lib/flamed` |
 | `/etc/flamed/chainparams.toml` | `configs/chainparams.toml` with the genesis holder replaced |
 | `/etc/flamed/genesis.json` | derived from it at build time |
-| `/var/lib/flamed` | the volume: `blocks.bin`, nothing else |
+| `/var/lib/flamed` | the volume: `blocks.bin`, the mock indexer's times, and `cold.bin`, a cache rebuilt on every start |
 
 The genesis holder is the first receiving address of a BIP-39 mnemonic with
 no passphrase, the address a wallet restored from that phrase shows first.
@@ -337,12 +343,15 @@ an `any(test, ..)` arm there would name items that library does not have.
 
 Stated plainly, because each of these is a real limit and not a detail:
 
-- **Memory grows with the chain.** `Blockchain` keeps one `BlockUndo` per
-  connected block — a header, a cloned `Forest`, and an actor undo record —
-  and releases them only on a disconnect or a reorganization, neither of
-  which a single node with no peers ever performs. At the image's 5-second
-  interval that is 17,280 records a day. A long-lived `flamed run` is bounded
-  by memory, not by disk.
+- **Memory still grows with the chain, more slowly.** What has to stay in
+  memory does: one live Utreexo proof per unspent contract, which every
+  block rewrites, and per block and per contract, a small index record whose
+  bulk is in `cold.bin`. Undo records, a whole `Forest` each, are kept for
+  the newest `UNDO_DEPTH` (100) blocks only, so the chain cannot be rewound
+  further than that. Nothing rewinds it today: this node has no peers. A
+  long-lived `flamed run` is still bounded by memory, mostly by how many
+  contracts are unspent, and a restart does not help: replay rebuilds the
+  same state.
 - **`scan` is bounded in questions, not in work.** At most 1024 predicates
   per call, but each one walks every contract ever created under it with the
   node lock held, and `since_height` filters records it has already walked
@@ -379,7 +388,6 @@ Stated plainly, because each of these is a real limit and not a detail:
   this machine's clock and can be lost with its directory. Nothing about
   them is consensus until a real indexer authenticates the core block.
 - **The mempool does not survive a restart**, and neither do the indexes —
-  they are rebuilt by replaying every block from genesis. Replay decodes the
-  whole archive into memory before connecting any of it, so the node is
-  slowest and hungriest to start exactly when it has been running longest.
-  Fine for a devnet; not a strategy for a long chain.
+  they are rebuilt by replaying every block from genesis, one block at a
+  time, so the node is slowest to start exactly when it has been running
+  longest. Fine for a devnet; not a strategy for a long chain.

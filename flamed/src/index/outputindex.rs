@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 use flamevm::{ContractID, TxID};
 
+use crate::cold::Cold;
+
 /// One contract, as the node archived it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputRecord {
@@ -16,12 +18,12 @@ pub struct OutputRecord {
     pub txid: TxID,
     /// The compressed point of the predicate that locks it.
     pub predicate: [u8; 32],
-    /// The contract itself, as a `CellEnvelope`.
-    pub contract: Vec<u8>,
+    /// The contract itself, as a `CellEnvelope`, in `cold.bin`.
+    pub contract: Cold,
     /// The entry right after the contract's `Output` in its log, if that
     /// entry is `Data`, byte for byte: the output's note, which this node
-    /// never parses.
-    pub note: Option<Vec<u8>>,
+    /// never parses. In `cold.bin`.
+    pub note: Option<Cold>,
 }
 
 /// What became of a contract.
