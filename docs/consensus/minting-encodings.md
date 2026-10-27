@@ -1,6 +1,6 @@
 # Minting Bitcoin Encodings
 
-This document defines the canonical Bitcoin script encodings used by Flame Acquisition and Minting transactions. Their
+This document defines the canonical Bitcoin script encodings used by Flame Burn and Minting transactions. Their
 consensus meaning, lifecycle, endorsement rules, and reward behavior are defined in [Consensus Design](design-doc.md).
 
 ## Conventions
@@ -23,9 +23,9 @@ Output scripts must contain exactly the specified bytes and must not contain tra
 authentication encoding is a prefix of a complete witness script, so authorization logic may follow its mandatory
 prefix.
 
-## Acquisition Output
+## Burn Output
 
-An Acquisition Output script has exactly one of the following forms:
+A Burn Output script has exactly one of the following forms:
 
 ```text
 OP_RETURN OP_PUSHBYTES_69 "FLMS" <Version> <Minter P2WSH> <Access Predicate>
@@ -50,11 +50,11 @@ The payload layout is:
 |     37 |     32 | Access Predicate        |
 |     69 | 0 or 2 | Optional Duration       |
 
-The Bitcoin output value must be non-zero. Each valid Acquisition Output is processed independently and is identified by
+The Bitcoin output value must be non-zero. Each valid Burn Output is processed independently and is identified by
 its transaction ID and output index. When `Duration` is absent, the protocol-defined minimum duration is used.
 
 The payload is exactly 69 or 71 bytes; the complete output script is 71 or 73 bytes. `OP_PUSHDATA1` and other
-alternative push encodings are invalid. The Validator Pubkey and witness script are not included in an Acquisition;
+alternative push encodings are invalid. The Validator Pubkey and witness script are not included in a Burn;
 the Minter P2WSH commits to them through the complete witness script hash.
 
 ## Minting Output
@@ -108,7 +108,7 @@ The prefix is exactly 70 bytes. The Validator Pubkey must decode as an Ed25519 v
 pushes, or any other equivalent construction do not form a valid Minter authentication prefix.
 
 The SHA-256 hash of the complete witness script, including all authorization logic following this prefix, must equal the
-Minter P2WSH committed by the Minter's Acquisition. Bitcoin validates execution of the complete witness script; Flame
+Minter P2WSH committed by the Minter's Burn. Bitcoin validates execution of the complete witness script; Flame
 uses the prefix to recover the Flame Predicate and BFT Validator Pubkey associated with the authenticated Minter.
 The Validator Pubkey is metadata dropped before the Bitcoin authorization script executes; Bitcoin authorization
 continues to use its own keys and script rules. Changing the Validator Pubkey changes the Minter P2WSH.
@@ -119,7 +119,7 @@ signature including its sighash byte.
 
 ## Format Compatibility
 
-These encodings replace the previous Acquisition payloads containing a separate Validator Pubkey and the previous
-36-byte `FLMV` payload. The old encodings are rejected; no legacy decoding or migration is implemented. Acquisition
+These encodings replace the previous Burn payloads containing a separate Validator Pubkey and the previous
+36-byte `FLMV` payload. The old encodings are rejected; no legacy decoding or migration is implemented. Burn
 and Minting outputs retain Version `1`. Existing deployments require an explicit protocol transition before adopting
 these incompatible formats.

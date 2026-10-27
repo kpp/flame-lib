@@ -39,7 +39,7 @@ Participation in BFT is not required to produce or mint a valid Flame block.
 
 ### Consensus Flow
 
-1. In order to participate in Consensus, Minter creates Acquisition transaction in the Bitcoin Block to acquire
+1. In order to participate in Consensus, Minter creates Burn transaction in the Bitcoin Block to acquire
    Minting Power. Minter burns Bitcoins and gaining Minting Power proportional to the burnt coins.
 2. BFT produces Core Block and distributed it in the network. Minters endorse the block by sending special transactions
    in the Bitcoin network.
@@ -56,37 +56,37 @@ Minting Power represents the consensus weight owned by a minter. It is acquired 
 power
 and Minting endorsement weight.
 
-Minting Power is temporary. Each acquisition becomes active after a maturity period, remains active for a fixed
+Minting Power is temporary. Each burn becomes active after a maturity period, remains active for a fixed
 duration, and then expires.
 
-### Acquisition Lifecycle
+### Burn Lifecycle
 
-An Acquisition is created at Bitcoin block height `X`.
+A Burn is created at Bitcoin block height `X`.
 
-Each Acquisition has:
+Each Burn has:
 
 - a config-defined maturity period `Z`;
 - a duration `D`;
 - an amount `A`, equal to the number of satoshis burned.
 
-For a selected Bitcoin block height `Y`, the Acquisition is active if:
+For a selected Bitcoin block height `Y`, the Burn is active if:
 
 ```text
 X + Z <= Y < X + Z + D
 ```
 
-Before `X + Z`, the Acquisition is maturing and contributes no Minting Power. At and after `X + Z + D`, the Acquisition
+Before `X + Z`, the Burn is maturing and contributes no Minting Power. At and after `X + Z + D`, the Burn
 is expired and contributes no Minting Power.
 
 ### Base Minting Power
 
-The Minting Power provided by an active Acquisition is equal to the amount of BTC burned.
+The Minting Power provided by an active Burn is equal to the amount of BTC burned.
 
-A minter may have multiple active Acquisitions. Its Minting Power at Bitcoin height `Y` is the sum of all its active
-Acquisitions at that height divided by their Duration, rounding down:
+A minter may have multiple active Burns. Its Minting Power at Bitcoin height `Y` is the sum of all its active
+Burns at that height divided by their Duration, rounding down:
 
 ```text
-MintingPower(minter, Y) = Σ AcquisitionAmount / AcquisitionDuration
+MintingPower(minter, Y) = Σ BurnAmount / BurnDuration
 ```
 
 The total Minting Power of the network at Bitcoin height `Y` is:
@@ -202,24 +202,24 @@ transactions.
 
 Minting consists of two operations:
 
-1. **Acquisition** - burning BTC to acquire Minting Power.
+1. **Burn** - burning BTC to acquire Minting Power.
 2. **Minting** - using that Minting Power to endorse a Core Block.
 
 Endorsements observed in the Bitcoin chain are the authoritative input for Flame chain selection. The rules for
 selecting the
 canonical chain from those endorsements are defined separately in the Chain Selection section.
 
-Bitcoin script encodings used by Acquisition and Minting transactions are defined in
+Bitcoin script encodings used by Burn and Minting transactions are defined in
 [Minting Bitcoin Encodings](minting-encodings.md).
 
-### Acquisition
+### Burn
 
-An Acquisition represents a temporary amount of Minting Power created by burning BTC.
+A Burn represents a temporary amount of Minting Power created by burning BTC.
 
-An Acquisition is created by a valid output of a Bitcoin transaction. Each valid output creates an independent
-Acquisition.
+A Burn is created by a valid output of a Bitcoin transaction. Each valid output creates an independent
+Burn.
 
-An Acquisition is uniquely identified by:
+A Burn is uniquely identified by:
 
 ```text
 (txid, output_index)
@@ -227,29 +227,29 @@ An Acquisition is uniquely identified by:
 
 Its Minting Power and lifecycle are calculated according to the rules defined in [Minting Power](#2-minting-power).
 
-#### Acquisition Transaction
+#### Burn Transaction
 
-An Acquisition Transaction:
+A Burn Transaction:
 
 - may contain any number of inputs;
 - may contain any number of outputs;
-- may contain one or more valid Acquisition Outputs.
+- may contain one or more valid Burn Outputs.
 
-Inputs in Acquisition transaction are not validated.
+Inputs in Burn transaction are not validated.
 
-Each Acquisition Output is processed independently. An output that does not satisfy the Acquisition Output rules does
-not create an Acquisition.
+Each Burn Output is processed independently. An output that does not satisfy the Burn Output rules does
+not create a Burn.
 
-The BTC amount assigned to an Acquisition Output is permanently unspendable. An Acquisition commits to the Minter's
-Minting identity, the final reward beneficiary, and optionally an Acquisition duration.
+The BTC amount assigned to a Burn Output is permanently unspendable. A Burn commits to the Minter's
+Minting identity, the final reward beneficiary, and optionally a Burn duration.
 
-An Acquisition Output is valid only if:
+A Burn Output is valid only if:
 
 - its BTC amount is non-zero;
 - all required fields are present;
 - its duration satisfies the protocol configuration.
 
-The exact Minting Power produced by the Acquisition is defined in [Minting Power](#2-minting-power).
+The exact Minting Power produced by the Burn is defined in [Minting Power](#2-minting-power).
 
 ### Minting
 
@@ -266,13 +266,13 @@ batched.
 #### Minter Authentication
 
 A Bitcoin input authenticates a Minter if it spends a P2WSH output whose witness script hash matches the
-Minting identity specified by that Minter's Acquisition. The witness script reveals a Flame predicate used for reward
+Minting identity specified by that Minter's Burn. The witness script reveals a Flame predicate used for reward
 distribution and an Ed25519 public key used for BFT participation. Its complete script hash must match the Minting
-identity committed in the Acquisition.
+identity committed in the Burn.
 
 The Flame Predicate is the predicate to which rewards associated with the Minter are issued.
 
-When rewards are distributed, the Access Predicate specified by the Acquisition is passed to the Flame Predicate as
+When rewards are distributed, the Access Predicate specified by the Burn is passed to the Flame Predicate as
 an argument. The `FlamePredicate` defines how the reward is handled and may, for example:
 
 - forward the entire reward to the Access Predicate;
@@ -312,21 +312,21 @@ referenced Core Block.
 #### Double Endorsements
 
 If after new Bitcoin block arrival it is detected that one minter endorsed two different blocks at the same height,
-all Acquisitions of such Minter became unactive.
+all Burns of such Minter became unactive.
 
 ### Rationale
 
-Acquisition and Minting are separate operations because this requires Minters to commit their Minting Power in advance
+Burn and Minting are separate operations because this requires Minters to commit their Minting Power in advance
 and reduces the risk of short-term fork attacks.
 
 Consider a system where Minting Power can be acquired and used immediately, without any time commitment. An attacker
 attempting a short-term fork would only need to acquire more than 50% of the Minting Power required for a single block.
-In Flame, an Acquisition commits Minting Power for at least the next 2048 active Bitcoin blocks. Therefore, an attacker
+In Flame, a Burn commits Minting Power for at least the next 2048 active Bitcoin blocks. Therefore, an attacker
 attempting the same fork must acquire and maintain more than 50% of the total Minting Power over that period,
 significantly increasing the cost of the attack.
 
-Acquisition duration may be extended beyond the minimum because a longer commitment does not reduce protocol security
-and may be useful for Minters that intend to participate for longer periods without creating additional Acquisitions.
+Burn duration may be extended beyond the minimum because a longer commitment does not reduce protocol security
+and may be useful for Minters that intend to participate for longer periods without creating additional Burns.
 
 ## 5. Chain Selection
 
@@ -434,11 +434,11 @@ network Minting Power at the evaluation point:
 This threshold limits the active BFT validator set to at most `1024` Validators.
 
 The Validator's Ed25519 public key is part of its Minter witness script and is therefore bound to its Minting identity.
-Changing this key creates a different Minting identity; existing Acquisitions remain assigned to the original identity.
+Changing this key creates a different Minting identity; existing Burns remain assigned to the original identity.
 
 ### BFT Voting Power
 
-A Validator's BFT voting weight is equal to its current Minting Power. New Acquisitions and their expirations may update
+A Validator's BFT voting weight is equal to its current Minting Power. New Burns and their expirations may update
 the set of the validators.
 
 ### Blocks Produced Outside BFT
@@ -463,35 +463,35 @@ Delegation separates:
 - consensus authority, represented by the Validator's Minting identity;
 - reward ownership, represented by the delegator's Access Predicate.
 
-### Delegated Acquisition
+### Delegated Burn
 
-A delegation is created through a regular Acquisition.
+A delegation is created through a regular Burn.
 
-To delegate Minting Power to a Validator, the delegator creates an Acquisition associated with the Validator's Minting
+To delegate Minting Power to a Validator, the delegator creates a Burn associated with the Validator's Minting
 identity while retaining the delegator's own Access Predicate as the reward beneficiary.
 
-The BTC burned in the Acquisition belongs to the Acquisition itself and produces Minting Power according to the normal
+The BTC burned in the Burn belongs to the Burn itself and produces Minting Power according to the normal
 Minting Power rules. The resulting Minting Power is assigned to the Validator for consensus purposes, while rewards
-produced by that Acquisition remain associated with the delegator's Access Predicate. A Validator may therefore have
-multiple Acquisitions with the same Validator identity but different Access Predicates:
+produced by that Burn remain associated with the delegator's Access Predicate. A Validator may therefore have
+multiple Burns with the same Validator identity but different Access Predicates:
 
 ```text
-Acquisition A:
+Burn A:
     Validator = V
     Access Predicate = Alice
 
-Acquisition B:
+Burn B:
     Validator = V
     Access Predicate = Bob
 
-Acquisition C:
+Burn C:
     Validator = V
     Access Predicate = Carol
 ```
 
 ### Minting
 
-The Validator performs Minting on behalf of all Acquisitions assigned to it. The delegator does not need to sign or
+The Validator performs Minting on behalf of all Burns assigned to it. The delegator does not need to sign or
 submit Minting Transactions. Delayed-endorsement penalties are applied normally to delegated Minting Power.
 
 ### BFT Participation
@@ -501,9 +501,9 @@ enough to be eligible to become a Validator.
 
 ### Reward Distribution
 
-Rewards are accounted for separately for each Acquisition.
+Rewards are accounted for separately for each Burn.
 
-When a Validator receives rewards for Minting Power originating from an Acquisition, the Acquisition's Access Predicate
+When a Validator receives rewards for Minting Power originating from a Burn, the Burn's Access Predicate
 is passed to the Flame Predicate revealed by the Validator during Minting.
 
 The Flame Predicate determines how the reward is distributed. It is expected that the commission will be sent to the
@@ -529,7 +529,7 @@ applied to rewards generated by both.
 
 ### Delegation Lifetime
 
-Delegation exists for the lifetime of the Acquisition. Once the Acquisition expires, its Minting Power stops
+Delegation exists for the lifetime of the Burn. Once the Burn expires, its Minting Power stops
 contributing to the Validator's Minting Power. Delegation cannot be reassigned to another Validator.
 
 ### Rationale
@@ -540,7 +540,7 @@ mechanism.
 ## 8. Emission and Reward Distribution
 
 Flame uses a finite block-based emission schedule. New FLM is created as a reward for Core Blocks and distributed
-between Acquisitions that contributed Minting Power to those blocks.
+between Burns that contributed Minting Power to those blocks.
 
 Only Core Blocks produce new FLM. Regular Flame blocks do not produce emission.
 
@@ -565,10 +565,10 @@ reward = BlockReward * EffectiveMintingPower / TotalEffectiveMintingPower
 
 ### Reward Destination
 
-Each Acquisition specifies an Access Predicate, while the Validator reveals a Flame Predicate when performing
+Each Burn specifies an Access Predicate, while the Validator reveals a Flame Predicate when performing
 Minting.
 
-For each rewarded Acquisition, the protocol creates a reward associated with:
+For each rewarded Burn, the protocol creates a reward associated with:
 
 ```text
 (Reward Amount, Access Predicate)
