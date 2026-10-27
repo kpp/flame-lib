@@ -243,13 +243,13 @@ delay the transaction; it is the sender's claim, covered by the TxID.
 ```console
 $ cargo run -p flamed --features devnet -- genesis \
       --chainparams flamed/configs/chainparams.toml --out ./genesis.json
-genesis 38808a50580d7a1b8bebe2dce32e589e08b6951c38a341edf9b6d2961b4ca8a9 with 1 allocation(s) -> ./genesis.json
+genesis be80ff0cc5819a66fbc57c13891f682abb45df0d2bdf97d71af5a626c68788fc with 1 allocation(s) -> ./genesis.json
 
 $ cargo run -p flamed --features devnet -- run --config flamed/configs/flamed.toml
 flamed: height 0 with 1 unspent contract(s), 0 block(s) archived
 flamed: serving JSON-RPC on http://127.0.0.1:8545
 flamed: minting every 5s
-block 1 fb14e45762eafae0a0933ebb67c06dbbe68b37e9447b479a208a1131923c5d39 txs=0 dropped=0
+block 1 1941e030099e5a7729ccc499743369501696408ccfdcb93ff0d9969e54e2f45b txs=0 dropped=0
 ```
 
 Running `genesis` twice on the same network definition gives identical
@@ -260,7 +260,7 @@ same network by comparing files.
 $ curl -s -X POST -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"tip","params":[]}' \
     http://127.0.0.1:8545
-{"jsonrpc":"2.0","id":1,"result":{"hash":"38808a50…","height":0,"contract_root":"fa4a1dea…"}}
+{"jsonrpc":"2.0","id":1,"result":{"hash":"be80ff0c…","height":0,"contract_root":"fa4a1dea…"}}
 
 $ curl -s -X POST -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":2,"method":"proof","params":["373dbd58…"]}' \

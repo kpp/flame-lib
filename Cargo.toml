@@ -22,6 +22,10 @@ members = [
     "flamed",
     "flamebench",
     "flamewallet-cli",
+    "flame-chain-service",
+    "flame-minting",
+    "flame-storage",
+    "demo-consensus/backend",
 ]
 
 # Use the runflame fork of merlin to enable its `dynamic-labels`

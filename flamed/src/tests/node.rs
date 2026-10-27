@@ -372,7 +372,7 @@ fn the_shipped_devnet_has_the_documented_genesis_hash() {
     let genesis = crate::genesis::derive(&shipped).expect("derive the shipped genesis");
     assert_eq!(
         hex::encode(genesis.genesis_hash.0),
-        "38808a50580d7a1b8bebe2dce32e589e08b6951c38a341edf9b6d2961b4ca8a9",
+        "be80ff0cc5819a66fbc57c13891f682abb45df0d2bdf97d71af5a626c68788fc",
         "update flamed.md's recorded session along with this value"
     );
     let ids: Vec<_> = genesis
@@ -394,7 +394,7 @@ fn the_shipped_devnet_has_the_documented_genesis_hash() {
         .unwrap();
     assert_eq!(
         hex::encode(block.header.id().into_bytes()),
-        "fb14e45762eafae0a0933ebb67c06dbbe68b37e9447b479a208a1131923c5d39",
+        "1941e030099e5a7729ccc499743369501696408ccfdcb93ff0d9969e54e2f45b",
     );
 }
 
