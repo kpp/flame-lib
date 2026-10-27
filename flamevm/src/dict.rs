@@ -20,10 +20,10 @@ const MAX_OWNED_DEPTH: usize = 2 * crate::encoding::MAX_VALUE_DEPTH;
 /// Decoded dictionaries retain their authenticated [`Trie`] and load leaves on
 /// demand. Their typed-value cache preserves live witnesses and runtime values.
 ///
-/// Dicts are **never VM-copyable** (avoids variable gas for
-/// `dup`/`getdup` and the linear-leak hazard). They
-/// carry two independent sticky capability flags:
+/// Dicts carry three sticky capability flags:
 ///
+/// - `copyable` — true iff every value ever inserted was copyable.
+///   Once cleared, removal, replacement, and draining never restore it.
 /// - `droppable` — true iff every value ever inserted was droppable.
 ///   Once a non-droppable value enters (a `Token` — portable but
 ///   linear), the flag stays false even if later removed, so a
@@ -43,6 +43,7 @@ pub struct Dict {
     values: BTreeMap<Scalar, Value>,
     // Committed by the Dict envelope, not needed by the low-level Trie.
     len: usize,
+    copyable: bool,
     droppable: bool,
     portable: bool,
     // Conservative high-water mark; reset when empty. Not serialized and never
@@ -58,12 +59,13 @@ enum DictIndex {
 
 impl Dict {
     /// Creates an empty dictionary. A new empty dict is vacuously
-    /// droppable and portable.
+    /// copyable, droppable, and portable.
     pub fn new() -> Self {
         Dict {
             index: DictIndex::Native,
             values: BTreeMap::new(),
             len: 0,
+            copyable: true,
             droppable: true,
             portable: true,
             owned_depth: 1,
@@ -223,7 +225,7 @@ impl Dict {
     }
 
     /// Inserts a key-value pair. If the key already exists,
-    /// replaces the value and returns the prior one. Updates both sticky
+    /// replaces the value and returns the prior one. Updates all sticky
     /// capability flags from the new value.
     pub fn insert(&mut self, key: Scalar, value: Value) -> Option<Value> {
         self.insert_resolved(key, value, &mut ())
@@ -233,7 +235,7 @@ impl Dict {
     /// Inserts a key-value pair, failing if the key is already occupied.
     /// Returns the rejected value on conflict so the caller can decide
     /// whether to discard or surface it. A rejected insertion does not
-    /// update either sticky capability flag.
+    /// update any sticky capability flag.
     #[allow(clippy::result_large_err)]
     pub fn insert_strict(&mut self, key: Scalar, value: Value) -> Result<(), Value> {
         self.insert_strict_resolved(key, value, &mut ())
@@ -495,7 +497,7 @@ impl Dict {
         slice.try_load(|slice| {
             let len = usize::try_from(slice.load_u64()?).map_err(|_| CellError::LimitExceeded)?;
             let flags = slice.load_u8()?;
-            if flags & !3 != 0 {
+            if flags & !7 != 0 || (flags & 4 != 0 && flags & 2 == 0) {
                 return Err(CellError::InvalidFormat);
             }
             let trie = if len == 0 {
@@ -507,6 +509,7 @@ impl Dict {
                 index: DictIndex::CellBacked(Box::new(trie)),
                 values: BTreeMap::new(),
                 len,
+                copyable: flags & 4 != 0,
                 portable: flags & 1 != 0,
                 droppable: flags & 2 != 0,
                 owned_depth: 1,
@@ -526,16 +529,18 @@ impl Dict {
     }
 
     fn check_claimed_flags(&self, value: &Value) -> Result<(), CellError> {
-        if (self.portable && !value.is_portable()) || (self.droppable && !value.is_droppable()) {
+        if (self.copyable && !value.is_copyable())
+            || (self.portable && !value.is_portable())
+            || (self.droppable && !value.is_droppable())
+        {
             return Err(CellError::InvalidFormat);
         }
         Ok(())
     }
 
-    /// Dicts are never VM-copyable (avoids variable `dup`/`getdup` gas
-    /// and the linear-leak hazard).
+    /// O(1): once a non-copyable value is inserted, this stays false forever.
     pub fn is_copyable(&self) -> bool {
-        false
+        self.copyable
     }
 
     /// Returns true iff this dict can be sealed into long-term storage.
@@ -546,15 +551,14 @@ impl Dict {
     }
 
     /// Returns true iff this dict can be silently discarded by `drop`:
-    /// it is empty, or every member ever inserted was droppable. A dict
-    /// containing only `Variable` / `Constraint` / pure-computation
-    /// values is droppable but not copyable.
+    /// it is empty, or every member ever inserted was droppable. A zero-quantity
+    /// `ClearToken` or transcript can poison copyability without poisoning this flag.
     pub fn is_droppable(&self) -> bool {
         self.is_empty() || self.droppable
     }
 
-    /// Logical heap work needed for a Rust-level rollback clone. Used only
-    /// for gas charging; VM copyability remains governed by `try_clone`.
+    /// Logical heap work for VM copies and Rust-level rollback clones.
+    /// Copy permission remains governed by `try_clone`.
     pub(crate) fn clone_gas(&self) -> u64 {
         self.values
             .values()
@@ -563,12 +567,14 @@ impl Dict {
             })
     }
 
-    /// VM-level clone — always fails: dicts are non-copyable.
-    /// The `dup`/`getdup` family routes here, so a dict value can never
-    /// be duplicated on the stack. The Rust-level `Clone` impl is the
-    /// separate data-duplication path (registry snapshot / txlog entry).
+    /// VM-level clone, permitted only while the sticky copyable flag is set.
+    /// The separate Rust-level `Clone` remains available for rollback snapshots.
     pub fn try_clone(&self) -> Result<Dict, VMError> {
-        Err(VMError::TypeNotCopyable)
+        if self.copyable {
+            Ok(self.clone())
+        } else {
+            Err(VMError::TypeNotCopyable)
+        }
     }
 
     /// Builds a dict from a list of values with implicit keys 0, 1, 2, ...
@@ -583,6 +589,7 @@ impl Dict {
     }
 
     fn absorb_flags(&mut self, v: &Value) {
+        self.copyable &= v.is_copyable();
         self.droppable &= v.is_droppable();
         self.portable &= v.is_portable();
         self.owned_depth = self.owned_depth.max(1 + Self::value_owned_depth(v));
@@ -632,7 +639,11 @@ impl Dict {
             )?;
         }
         builder.store_u64(u64::try_from(self.len()).map_err(|_| CellError::LimitExceeded)?)?;
-        builder.store_u8(u8::from(self.portable) | (u8::from(self.droppable) << 1))?;
+        builder.store_u8(
+            u8::from(self.portable)
+                | (u8::from(self.droppable) << 1)
+                | (u8::from(self.copyable) << 2),
+        )?;
         if let Some(root) = trie.into_root() {
             builder.store_ref(root)?;
         }
@@ -993,8 +1004,108 @@ mod tests {
         let d = Dict::new();
         assert_eq!(d.len(), 0);
         assert!(d.is_empty());
+        assert!(d.is_copyable());
+        assert!(d.try_clone().is_ok());
         assert!(d.is_portable());
         assert!(d.get(&Scalar::from(0u64)).is_none());
+    }
+
+    #[test]
+    fn copyability_is_poisoned_by_successful_insertions_only() {
+        for backed in [false, true] {
+            let mut dict = Dict::from_values(vec![v(1)]);
+            if backed {
+                dict = Dict::from_cell(&dict.to_cell().unwrap(), &mut ()).unwrap();
+            }
+            assert!(dict.insert_strict(Scalar::ZERO, token(0)).is_err());
+            assert!(dict.is_copyable());
+            dict.insert(Scalar::ONE, token(0));
+            assert!(!dict.is_copyable());
+            assert!(dict.is_droppable());
+            dict.insert(Scalar::ONE, v(2));
+            assert!(!dict.is_copyable());
+            dict.remove(&Scalar::ONE).unwrap();
+            dict.remove(&Scalar::ZERO).unwrap();
+            assert!(dict.is_empty());
+            assert!(!dict.is_copyable());
+            assert!(matches!(dict.try_clone(), Err(VMError::TypeNotCopyable)));
+            let restored = Dict::from_cell(&dict.to_cell().unwrap(), &mut ()).unwrap();
+            assert!(!restored.is_copyable());
+            assert!(!Dict::from_values(vec![Value::Dict(restored)]).is_copyable());
+        }
+    }
+
+    #[test]
+    fn lazy_copy_shares_unloaded_cells_and_mutates_independently() {
+        let full = Dict::from_values(vec![Value::Dict(Dict::from_values(vec![v(7)]))])
+            .to_cell()
+            .unwrap();
+        let mut cells = CellIndex::collect(Arc::new(full.clone())).unwrap();
+        let detached = Cell::decode_record_exact(&full.encode_record()).unwrap();
+        let mut original = Dict::from_trusted_cell(&detached, &mut ()).unwrap();
+        let mut copy = original.try_clone().unwrap();
+        assert!(original.values.is_empty());
+        assert!(copy.values.is_empty());
+        assert_eq!(copy.to_cell().unwrap().id(), full.id());
+        copy.insert_resolved(Scalar::ZERO, v(9), &mut cells).unwrap();
+        assert!(matches!(
+            original.get_resolved(&Scalar::ZERO, &mut cells).unwrap(),
+            Some(Value::Dict(dict)) if dict.is_copyable()
+        ));
+        assert_eq!(original.to_cell().unwrap().id(), full.id());
+        assert_ne!(copy.to_cell().unwrap().id(), full.id());
+    }
+
+    #[test]
+    fn untrusted_import_rejects_forged_copyability_at_any_depth() {
+        // Zero tokens are droppable and portable, but never copyable.
+        let original = Dict::from_values(vec![token(0)]).to_cell().unwrap();
+        let mut payload = original.payload().to_vec();
+        payload[8] |= 4;
+        let forged = Cell::new(payload, original.refs().to_vec()).unwrap();
+        assert!(matches!(
+            Dict::from_cell(&forged, &mut ()),
+            Err(CellError::InvalidFormat)
+        ));
+        let mut lazy = Dict::from_trusted_cell(&forged, &mut ()).unwrap();
+        assert!(matches!(
+            lazy.get_resolved(&Scalar::ZERO, &mut ()),
+            Err(CellError::InvalidFormat)
+        ));
+        let outer = Dict::from_values(vec![Value::Dict(lazy)]).to_cell().unwrap();
+        assert!(matches!(
+            Dict::from_cell(&outer, &mut ()),
+            Err(CellError::InvalidFormat)
+        ));
+
+        let mut poisoned = Dict::from_values(vec![token(0)]);
+        poisoned.remove(&Scalar::ZERO).unwrap();
+        let outer = Dict::from_values(vec![Value::Dict(poisoned)]).to_cell().unwrap();
+        let mut payload = outer.payload().to_vec();
+        payload[8] |= 4;
+        let forged = Cell::new(payload, outer.refs().to_vec()).unwrap();
+        assert!(matches!(
+            Dict::from_cell(&forged, &mut ()),
+            Err(CellError::InvalidFormat)
+        ));
+    }
+
+    #[test]
+    fn copyability_wire_flag_is_explicit_and_requires_droppability() {
+        for flags in 0u8..=8 {
+            let mut payload = vec![0; 8];
+            payload.push(flags);
+            let cell = Cell::new(payload, vec![]).unwrap();
+            let decoded = Dict::from_cell(&cell, &mut ());
+            if matches!(flags, 4 | 5 | 8) {
+                assert!(matches!(decoded, Err(CellError::InvalidFormat)));
+            } else {
+                let dict = decoded.unwrap();
+                assert_eq!(dict.is_copyable(), flags & 4 != 0);
+                assert_eq!(dict.to_cell().unwrap().id(), cell.id());
+            }
+        }
+        assert_eq!(Dict::new().to_cell().unwrap().payload()[8], 7);
     }
 
     #[test]
@@ -1126,10 +1237,12 @@ mod tests {
         let mut original = Dict::from_values(vec![token(-1)]);
         original.remove(&Scalar::ZERO);
         assert!(original.is_empty());
+        assert!(!original.is_copyable());
         assert!(original.is_droppable());
         let encoded = original.to_cell().unwrap();
         let mut restored = Dict::from_cell(&encoded, &mut ()).unwrap();
         assert!(!restored.is_portable());
+        assert!(!restored.is_copyable());
         assert!(restored.is_droppable());
         restored.insert(Scalar::ONE, v(7));
         assert!(!restored.is_droppable());
@@ -1286,6 +1399,7 @@ mod tests {
         assert!(matches!(returned, Value::ClearToken(t) if t.qty() == Scalar::from(-7i64)));
         assert_eq!(dict.len(), 1);
         assert!(dict.is_portable());
+        assert!(dict.is_copyable());
         assert_eq!(dict.to_cell().unwrap().id(), full.id());
     }
 }

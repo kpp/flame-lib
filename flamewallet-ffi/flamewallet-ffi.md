@@ -17,22 +17,30 @@ an opaque handle; spending keys never leave a call. Keys are named by
 | `Wallet::from_view_key(view_key, network, next_index)` | View wallet: finds and opens, cannot spend. |
 | `Wallet::from_receiving_key(receiving_key, network, next_index)` | Receive wallet: finds, cannot open or spend. |
 | `kind()` | `Spend`, `View` or `Receive`. |
-| `address(path)` / `next_address()` | bech32f address and predicate. |
+| `address(path)` / `next_address()` | Receiving address, its tracking address, and predicate. |
 | `next_index()` | Receiving counter to persist. |
 | `owns(predicate, gap)` | Path a contract belongs to, if any. |
 | `receiving_key()` | `recv…` key a receive wallet is built from. |
 | `view_key()` | `view…` key a view wallet is built from; not on a receive wallet. |
-| `address_to_predicate(address, network)` | Predicate an address's payments are locked with. |
-| `decode_contract(bytes)` | Id, predicate, cleartext amount. |
-| `open_note(contract, note, path)` | Opening and memo from an output's note; not on a receive wallet. |
+| `receiving_address_to_predicate(address, network)` | Predicate a receiving address's payments are locked with. |
+| `predicate_to_tracking_address(predicate, network)` | Tracking address (`f1…` / `t1…`) a predicate names. |
+| `validate_receiving_address(address, network)` / `validate_tracking_address(...)` | Whether the address parses for the network. |
+| `memo_max_bytes()` | Longest memo one output takes. |
+| `native_flavor()` | Flavor of flames, as contracts and notes give it. |
+| `decode_contract(bytes)` | Id, predicate, cleartext amount and whether it is flames. |
+| `open_note(contract, note, path)` | Opening, whether it is flames, and memo from an output's note; not on a receive wallet. |
 | `opening_matches(contract, opening)` | Whether an opening opens a contract. |
 | `build_transfer(request)` | Txid, `BlockTx` bytes, each output with its note; spend wallet only. |
+| `build_issue(request)` | The same, for a confidential issuance spending one coin; spend wallet only. |
+| `issued_flavor(predicate, tag)` | Flavor an issuance spending a coin under `predicate` mints for `tag`. |
 
 Errors are `FlameError`; `InvalidBytes { what }` names the bad field,
 `Note { failure }` says why a note did not open, and `NotPermitted { wallet,
 needs }` says a call needs a wallet built from a stronger key.
 
-Outputs are paid to bech32f addresses. Each carries an encrypted note, and
+Outputs are paid to bech32f receiving addresses, `f1…e1…` / `t1…i1…`: a
+tracking address followed by an encryption key. The tracking address alone
+names the predicate, so it is what a predicate maps back to. Each output carries an encrypted note, and
 only its recipient can open it: amount, blinding factors and memo, as
 `docs/payments.md` specifies. A scan serves each contract with its note:
 `owns` finds the path, `open_note` gives the opening, and a later

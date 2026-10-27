@@ -1289,7 +1289,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "toml 0.8.23",
+ "zeroize",
 ]
 
 [[package]]
@@ -1352,6 +1354,24 @@ dependencies = [
  "spacesuit",
  "subtle",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "flamewallet-cli"
+version = "0.0.1"
+dependencies = [
+ "clap 4.6.7",
+ "flamechain",
+ "flamed-rpc",
+ "flamevm",
+ "flamewallet-ffi",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

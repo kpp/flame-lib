@@ -152,6 +152,92 @@ not a storage-derived bootstrap allowance, to execute `addstorage`. The
 transaction-end `usage <= capacity` check remains unchanged. Fetching a missing
 body into the current execution is not a storage purchase or persistent restore.
 
+### Incremental accounting
+
+The actor registry maintains per-actor incoming reference counts keyed by
+`CellID`, its retained bodies, and a cached sum of their canonical record sizes.
+The actor root contributes one reference; each edge from a retained body
+contributes one, including repeated edges to the same child. A body's bytes and
+outgoing edges are counted once, irrespective of its incoming reference count.
+References to missing bodies are tracked too, but add no body charge until the
+body is explicitly retained. This does not change the usage formula or leases.
+
+When replacing a root, accounting adds the new root first, activates explicitly
+supplied reachable bodies, then removes the old root. Unchanged shared subgraphs
+therefore remain retained without being removed and added again. A body and its
+outgoing references are released only when its last incoming reference
+disappears. Equal root hashes do not alone justify skipping an update: an
+explicitly supplied image can reveal additional bodies under the same root.
+Execution witnesses and resolver caches do not implicitly become actor-owned
+storage.
+
+These counts and totals are derived implementation state, not a new wire format
+or consensus commitment. Checkpoints and block undo restore them with the actor
+image; freezing discards the retained-body accounting while preserving the
+existing size metadata and lease rules. Existing `code_bytes` and `state_bytes`
+metadata keep their separate meanings; they are not replaced by the rent cache.
+
+This avoids recounting unchanged retained subgraphs for rent, but does not make
+every update proportional only to the changed cells. Initial accounting and
+explicit supplied-image traversal can visit a whole graph; copy-on-write map
+clones can copy the existing index. Export and commitment construction still
+collect the exact retained graph independently of the cached total.
+
+#### Small-update benchmark
+
+Run the opt-in benchmark with no competing tests:
+
+```sh
+cargo test -p flamechain --release --offline benchmark_small_updates -- --ignored --nocapture --test-threads=1
+```
+
+Measured on 2026-10-26 with Rust 1.90.0, an Apple M3 MacBook Air (24 GB RAM),
+release optimization, and no CPU affinity pinning. Each fixture is a fully
+retained four-way tree with unique 128-byte leaves, wrapped in the ordinary
+actor code/state image. Each update changes one leaf and supplies only its
+resident path, leaving unchanged siblings unloaded. Root construction and
+hashing are outside the timers for both implementations.
+
+The ranges below span the median timings from two runs, each with two warmups
+and 11 batched samples. The benchmark also prints p90 of the batch-average
+per-operation timings, not individual-update tail latency. MiB denotes
+canonical retained bytes, excluding leases, not heap consumption.
+
+| Retained cells | MiB | Supplied bodies | Full recount, ms | Incremental, ms | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,368 | 0.175 | 8 | 0.323–0.326 | 0.0331–0.0340 | 9.6–9.7× |
+| 21,848 | 2.79 | 10 | 8.70–8.81 | 0.760–0.864 | 10.1–11.6× |
+| 87,384 | 11.17 | 11 | 55.8–59.1 | 5.31–7.63 | 7.7–10.5× |
+| 349,528 | 44.67 | 12 | 307.9–308.8 | 32.7–41.4 | 7.5–9.4× |
+
+Full recount uses `collect_owned` and a checked sum of record sizes; incremental
+accounting uses resident-input collection and the production `replace_root`.
+Both include retirement of the old maps. Exact retained IDs, commitments,
+bytes, and reference-count agreement are checked before timing.
+
+An instrumented reproduction forces both COW copies before applying the same
+delta, then times retirement of the old maps. Copying and retirement account
+for approximately 85% at 1,368 cells, 98–99% at 21,848, 99% at 87,384, and
+99.7–99.8% at 349,528. These are diagnostic proportions from that reproduction,
+not a sampling profile of the production function. Separately measured map
+clones are not additive shares: allocation and cache state affect their times.
+
+For comparison, a unique-map, non-atomic control takes about 6, 8, 10, and
+12 microseconds respectively; it omits failure rollback and retained snapshots
+and is **not** a production replacement. A detached unchanged-root update takes
+about 0.2 microseconds and triggers no copies. COW copies map entries and `Arc`
+references, not all retained cell payloads. Changed roots trigger both copies
+even without external snapshots because `replace_root` first clones its own
+state for atomicity.
+
+The remaining large-state cost is therefore whole-map management, not walking
+the changed path. Removing only the internal clone would lose error atomicity
+and would not eliminate copies caused by checkpoint-held maps. Further gains
+require structural sharing within maps or delta-based undo integrated with
+checkpoints. This benchmark repeatedly changes a hot path; it excludes VM
+execution, value encoding and size metadata, commitment construction, leases,
+disk I/O, and peak-memory measurement. It is not an end-to-end throughput claim.
+
 ### Content, availability, and recovery
 
 Actor layouts and their ordered lease Tries are specified in

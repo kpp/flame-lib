@@ -6,8 +6,7 @@ use crate::Error;
 fn payload_len(hrp: &str) -> Option<usize> {
     match hrp {
         "spend" | "view" | "recv" | "testspend" | "testview" | "testrecv" => Some(96),
-        "f" | "tf" => Some(64),
-        "c" | "tc" => Some(32),
+        "f" | "t" | "e" | "i" => Some(32),
         _ => None,
     }
 }
@@ -78,13 +77,13 @@ mod tests {
         round_trip::<96>("spend", 166);
         round_trip::<96>("view", 165);
         round_trip::<96>("recv", 165);
-        round_trip::<64>("f", 111);
-        round_trip::<32>("c", 60);
+        round_trip::<32>("f", 60);
+        round_trip::<32>("e", 60);
         round_trip::<96>("testspend", 170);
         round_trip::<96>("testview", 169);
         round_trip::<96>("testrecv", 169);
-        round_trip::<64>("tf", 112);
-        round_trip::<32>("tc", 61);
+        round_trip::<32>("t", 60);
+        round_trip::<32>("i", 60);
     }
 
     #[test]
@@ -97,15 +96,15 @@ mod tests {
         assert_eq!(decode::<96>("spend", &unknown), Err(Error::InvalidEncoding));
         for length in [0, 31, 33, 100] {
             let wrong =
-                bech32::encode::<Bech32m>(Hrp::parse("c").unwrap(), &vec![0; length]).unwrap();
-            assert_eq!(decode::<32>("c", &wrong), Err(Error::InvalidLength));
+                bech32::encode::<Bech32m>(Hrp::parse("f").unwrap(), &vec![0; length]).unwrap();
+            assert_eq!(decode::<32>("f", &wrong), Err(Error::InvalidLength));
         }
-        for malformed in ["", "c", "c1", "c1!", " c1qqqqqq", "c1qqqqqq\n"] {
-            assert_eq!(decode::<32>("c", malformed), Err(Error::InvalidEncoding));
+        for malformed in ["", "f", "f1", "f1!", " f1qqqqqq", "f1qqqqqq\n"] {
+            assert_eq!(decode::<32>("f", malformed), Err(Error::InvalidEncoding));
         }
-        let wrong_checksum = bech32::encode::<Bech32>(Hrp::parse("c").unwrap(), &[0; 32]).unwrap();
+        let wrong_checksum = bech32::encode::<Bech32>(Hrp::parse("f").unwrap(), &[0; 32]).unwrap();
         assert_eq!(
-            decode::<32>("c", &wrong_checksum),
+            decode::<32>("f", &wrong_checksum),
             Err(Error::InvalidEncoding)
         );
     }
@@ -122,9 +121,9 @@ mod tests {
         };
         let mut symbols = [Fe32::Q; 52];
         symbols[51] = Fe32::P; // Nonzero padding after 32 bytes.
-        let nonzero = encode_symbols("c", &symbols);
+        let nonzero = encode_symbols("f", &symbols);
         assert!(CheckedHrpstring::new::<Bech32m>(&nonzero).is_ok());
-        assert_eq!(decode::<32>("c", &nonzero), Err(Error::InvalidEncoding));
+        assert_eq!(decode::<32>("f", &nonzero), Err(Error::InvalidEncoding));
         let excess = encode_symbols("recv", &[Fe32::Q; 155]); // Seven padding bits after 96 bytes.
         assert!(CheckedHrpstring::new::<Bech32m>(&excess).is_ok());
         assert_eq!(decode::<96>("recv", &excess), Err(Error::InvalidEncoding));

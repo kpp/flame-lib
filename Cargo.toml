@@ -21,6 +21,7 @@ members = [
     "flamed-rpc",
     "flamed",
     "flamebench",
+    "flamewallet-cli",
     "flame-chain-service",
     "flame-minting",
     "flame-storage",

@@ -1,4 +1,4 @@
-/** Which network addresses are encoded for: `f1…` or `tf1…`. */
+/** Which network the address's two bech32f components are encoded for. */
 export type Network = "mainnet" | "testnet";
 
 /**
@@ -16,8 +16,10 @@ export interface KeyPath {
 
 export interface IssuedAddress {
   path: KeyPath;
-  /** bech32f: `f1…` on mainnet, `tf1…` on testnet. */
-  address: string;
+  /** What a payer is given: the tracking address followed by the encryption key, `f1…e1…` / `t1…i1…`. */
+  receivingAddress: string;
+  /** The receiving address's first half, `f1…` / `t1…`, as `predicateToTrackingAddress` gives it. */
+  trackingAddress: string;
   /** The 32-byte compressed point payments to this address are locked with. */
   predicate: Uint8Array;
 }
@@ -31,7 +33,13 @@ export interface ContractInfo {
 }
 
 export type ContractValue =
-  | { kind: "clear"; qty: bigint; flavor: Uint8Array }
+  | {
+      kind: "clear";
+      qty: bigint;
+      flavor: Uint8Array;
+      /** Whether `flavor` is `nativeFlavor()`, flames. */
+      isNative: boolean;
+    }
   | { kind: "confidential" }
   | { kind: "other" };
 
@@ -60,7 +68,7 @@ export interface TransferOutput {
   qty: bigint;
   /** Absent for flames. */
   flavor?: Uint8Array;
-  /** Sealed into the note for the recipient alone; at most 4006 bytes. */
+  /** Sealed into the note for the recipient alone; at most `memoMaxBytes()`. */
   memo?: Uint8Array;
 }
 
@@ -94,6 +102,8 @@ export interface Transfer {
 /** What `Wallet.openNote` gives: the opening to spend with, and the memo. */
 export interface ReceivedNote {
   opening: Opening;
+  /** Whether `opening.flavor` is `nativeFlavor()`, flames. */
+  isNative: boolean;
   memo: Uint8Array;
 }
 

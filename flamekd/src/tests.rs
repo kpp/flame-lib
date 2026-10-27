@@ -125,7 +125,7 @@ fn typed_encodings_round_trip_and_reject_other_capabilities() {
     round_trip!(spend, SpendKey, 166);
     round_trip!(view, ViewKey, 165);
     round_trip!(recv, RecvKey, 165);
-    round_trip!(address, ReceivingAddress, 111);
+    round_trip!(address, ReceivingAddress, 120);
     round_trip!(tracking, TrackingAddress, 60);
     assert_eq!(
         recv.to_string().parse::<SpendKey>(),
@@ -170,32 +170,175 @@ fn testnet_encodings_bind_and_check_the_network() {
                 <$type>::from_bech32(&testnet.to_ascii_uppercase(), Network::Testnet).unwrap(),
                 $value
             );
-            assert_eq!(
-                <$type>::from_bech32(&mainnet, Network::Testnet),
-                Err(Error::InvalidEncoding)
-            );
-            assert_eq!(
-                <$type>::from_bech32(&testnet, Network::Mainnet),
-                Err(Error::InvalidEncoding)
-            );
-            assert_eq!(testnet.parse::<$type>(), Err(Error::InvalidEncoding));
+            assert!(<$type>::from_bech32(&mainnet, Network::Testnet).is_err());
+            assert!(<$type>::from_bech32(&testnet, Network::Mainnet).is_err());
+            assert!(testnet.parse::<$type>().is_err());
             let (_, symbols) = mainnet.split_once('1').unwrap();
             let replaced_prefix = format!("{}1{symbols}", $hrp);
-            assert_eq!(
-                <$type>::from_bech32(&replaced_prefix, Network::Testnet),
-                Err(Error::InvalidEncoding)
-            );
+            assert!(<$type>::from_bech32(&replaced_prefix, Network::Testnet).is_err());
         }};
     }
     round_trip!(spend, SpendKey, "testspend", 170);
     round_trip!(view, ViewKey, "testview", 169);
     round_trip!(recv, RecvKey, "testrecv", 169);
-    round_trip!(address, ReceivingAddress, "tf", 112);
-    round_trip!(tracking, TrackingAddress, "tc", 61);
+    round_trip!(address, ReceivingAddress, "t", 120);
+    round_trip!(tracking, TrackingAddress, "t", 60);
     assert_eq!(
         SpendKey::from_bech32(&view.to_bech32(Network::Testnet), Network::Testnet),
         Err(Error::InvalidEncoding)
     );
+}
+
+#[test]
+fn receiving_address_starts_with_the_complete_tracking_address() {
+    let address = root().to_recv().to_address();
+    for (network, tracking_hrp, encryption_hrp, length) in [
+        (Network::Mainnet, "f", "e", 60),
+        (Network::Testnet, "t", "i", 60),
+    ] {
+        let text = address.to_bech32(network);
+        let tracking = address.to_tracking_address().to_bech32(network);
+        assert_eq!(text.len(), length * 2);
+        assert_eq!(&text[..length], tracking);
+        assert_eq!(
+            encoding::decode::<32>(tracking_hrp, &text[..length]).unwrap(),
+            address.spending.compress().to_bytes()
+        );
+        assert_eq!(
+            encoding::decode::<32>(encryption_hrp, &text[length..]).unwrap(),
+            address.viewing.compress().to_bytes()
+        );
+        assert_eq!(ReceivingAddress::from_bech32(&text, network), Ok(address));
+        assert_eq!(
+            ReceivingAddress::from_bech32(&text.to_ascii_uppercase(), network),
+            Ok(address)
+        );
+        for mixed in [
+            format!("{}{}", text[..length].to_ascii_uppercase(), &text[length..]),
+            format!("{}{}", &text[..length], text[length..].to_ascii_uppercase()),
+        ] {
+            assert_eq!(
+                ReceivingAddress::from_bech32(&mixed, network),
+                Err(Error::InvalidEncoding)
+            );
+        }
+        // Both independently checksummed components bind every symbol.
+        for index in 0..text.len() {
+            let mut changed = text.as_bytes().to_vec();
+            changed[index] = if changed[index] == b'q' { b'p' } else { b'q' };
+            assert!(
+                ReceivingAddress::from_bech32(std::str::from_utf8(&changed).unwrap(), network)
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn receiving_address_rejects_mismatched_components_and_old_formats() {
+    use bech32::{Bech32m, Hrp};
+
+    let address = root().to_recv().to_address();
+    let spending = address.spending.compress().to_bytes();
+    let viewing = address.viewing.compress().to_bytes();
+    let f = encoding::encode("f", &spending);
+    let e = encoding::encode("e", &viewing);
+    let t = encoding::encode("t", &spending);
+    let i = encoding::encode("i", &viewing);
+    for text in [
+        format!("{e}{f}"),
+        format!("{f}{f}"),
+        format!("{e}{e}"),
+        format!("{f}{i}"),
+        format!("{t}{e}"),
+        format!("{t}{i}"),
+        format!("{f} {e}"),
+        format!("{f}\n{e}"),
+        bech32::encode::<Bech32m>(Hrp::parse("f").unwrap(), &address.to_bytes()).unwrap(),
+        bech32::encode::<Bech32m>(Hrp::parse("t").unwrap(), &address.to_bytes()).unwrap(),
+        format!("{f}{}", encoding::encode("f", &viewing)),
+    ] {
+        assert!(text.parse::<ReceivingAddress>().is_err(), "{text}");
+    }
+    for old_hrp in ["c", "tc", "tf"] {
+        let old = bech32::encode::<Bech32m>(Hrp::parse(old_hrp).unwrap(), &spending).unwrap();
+        assert!(TrackingAddress::from_bech32(&old, Network::Mainnet).is_err());
+        assert!(TrackingAddress::from_bech32(&old, Network::Testnet).is_err());
+    }
+    let old_testnet = format!(
+        "{}{}",
+        bech32::encode::<Bech32m>(Hrp::parse("tf").unwrap(), &spending).unwrap(),
+        bech32::encode::<Bech32m>(Hrp::parse("te").unwrap(), &viewing).unwrap()
+    );
+    assert!(ReceivingAddress::from_bech32(&old_testnet, Network::Testnet).is_err());
+    // Equal-length components must still belong to the same network.
+    for text in [format!("{t}{e}"), format!("{f}{i}")] {
+        for network in [Network::Mainnet, Network::Testnet] {
+            assert!(ReceivingAddress::from_bech32(&text, network).is_err());
+        }
+    }
+    assert!(e.parse::<TrackingAddress>().is_err());
+    for (hrp, data) in [("f", spending), ("e", viewing)] {
+        for length in [0, 31, 33, 64] {
+            let wrong = bech32::encode::<Bech32m>(
+                Hrp::parse(hrp).unwrap(),
+                &data.into_iter().cycle().take(length).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let text = if hrp == "f" {
+                format!("{wrong}{e}")
+            } else {
+                format!("{f}{wrong}")
+            };
+            assert!(text.parse::<ReceivingAddress>().is_err());
+        }
+    }
+}
+
+#[test]
+fn receiving_address_rejects_malformed_unicode_padding_and_points() {
+    use bech32::{Bech32m, Fe32, Fe32IterExt, Hrp};
+
+    let address = root().to_recv().to_address();
+    let f = address.to_tracking_address().to_string();
+    let e = encoding::encode("e", address.viewing.compress().as_bytes());
+    for malformed in [
+        String::new(),
+        "q".repeat(119),
+        "q".repeat(121),
+        "q".repeat(171),
+        format!("{}é{}", "q".repeat(59), "q".repeat(59)),
+        format!("{}\0{e}", &f[..59]),
+    ] {
+        assert!(malformed.parse::<ReceivingAddress>().is_err());
+    }
+    for (hrp, first) in [("f", true), ("e", false)] {
+        let mut symbols = [Fe32::Q; 52];
+        symbols[51] = Fe32::P;
+        let bad_padding: String = symbols
+            .into_iter()
+            .with_checksum::<Bech32m>(&Hrp::parse(hrp).unwrap())
+            .chars()
+            .collect();
+        let text = if first {
+            format!("{bad_padding}{e}")
+        } else {
+            format!("{f}{bad_padding}")
+        };
+        assert_eq!(
+            text.parse::<ReceivingAddress>(),
+            Err(Error::InvalidEncoding)
+        );
+        for (bytes, error) in [([0; 32], Error::ZeroKey), ([0xff; 32], Error::InvalidPoint)] {
+            let component = encoding::encode(hrp, &bytes);
+            let text = if first {
+                format!("{component}{e}")
+            } else {
+                format!("{f}{component}")
+            };
+            assert_eq!(text.parse::<ReceivingAddress>(), Err(error));
+        }
+    }
 }
 
 #[test]
@@ -264,25 +407,25 @@ fn reference_vectors() {
             &[][..],
             "4d7864baf60fae7dfc13f6ae21ca3d952effb8150d31f676aabb8385dab5ff077436bce57cafb4e2ac373fb1313d7a3d8ba3cc9dd7d37e4ddf4ed80c73ff6f0756174cc1d26976a5d1a307b2fb4197379a2f8ba40112452f9f7bc92b2d01f104",
             "58a8ba7ce9e780c32ba28ecdc159508e8afccb74596c6f29f94eff0552ba4336667506790c9021acfc302d3e6f1d0f65854a061cf87b44b51d3c885dde27da4256174cc1d26976a5d1a307b2fb4197379a2f8ba40112452f9f7bc92b2d01f104",
-            "f1tz5t5l8fu7qvx2az3mxuzk2s3690ejm5t9kx720efmls2546gvmxvagx0yxfqgdvlscz60n0r58ktp22qcw0s76yk5wnezzamcna5ssfgcs3c",
+            "f1tz5t5l8fu7qvx2az3mxuzk2s3690ejm5t9kx720efmls2546gvmqxyvkxme1ve6sv7gvjqs6elps95lx78g0vkz55psulpa5fdga8jy9mh38mfpqww34vv",
         ),
         (
             &[0][..],
             "ea4b455c0ca4612a80764577662c106e2ddda504bfe8dbbb8046bb9207eb2402e5a06f069a42ec117326f2f35b72e70cd7502bbff1076f7c707bf93b75edd60089cc4fc8023b48936cd3af9259d4732ac42d373064040470ff0b8155003a5b0c",
             "6c9d43624413b329de20094274dbeebbf43535f7ff307242c7fdd5248a0886468640e89f0cb97677ac949a3cd53710c4fd82c5bcfb16d4f45bcbc010a4884a3189cc4fc8023b48936cd3af9259d4732ac42d373064040470ff0b8155003a5b0c",
-            "f1djw5xcjyzwejnh3qp9p8fklwh06r2d0hluc8ysk8lh2jfzsgsergvs8gnuxtjanh4j2f50x4xugvflvzck70k9k573duhsqs5jyy5vgdmtj30",
+            "f1djw5xcjyzwejnh3qp9p8fklwh06r2d0hluc8ysk8lh2jfzsgserq0u0m93e1seqw38cvh9m80ty5ng7d2dcscn7c93dulvtdfazme0qppfygfgcsy33sak",
         ),
         (
             &[HARDENED][..],
             "d0ce5cf6dbcf65e686f93acd06ea7b3a2c3ba85c4801edfe909b9aaea0f1950db1f4e8583a3444c70f2331b85562851e50ff564ea3d962ebb717b64bb54082086b1b87cbad0acf6a556ef6e8a93e9f5d04e875ba3daadaf3f6373b9295e02502",
             "8afd6a2bb1c7bacf2b3e50255a829fcb1838d78d4d727b84fa3d16828fab702e3496bb96aaab48254a706f7e8af47860c4ad49f73fbeb602d92b22bffd9cc4726b1b87cbad0acf6a556ef6e8a93e9f5d04e875ba3daadaf3f6373b9295e02502",
-            "f13t7k52a3c7av72e72qj44q5levvr34udf4e8hp8685tg9ratwqhrf94mj642kjp9ffcx7l5273uxp39df8mnl04kqtvjkg4llkwvgushdv07q",
+            "f13t7k52a3c7av72e72qj44q5levvr34udf4e8hp8685tg9ratwqhqr54uq0e1xjtth9424dyz2jnsdalg4arcvrz26j0h87ltvqke9v3tllvuc3eqlccd8t",
         ),
         (
             &[HARDENED, 0x0102_0304][..],
             "17df83b0eb14baecdbeec3a28aae14f160c8e5f325811bb268182e63293a000433e008085c544e574b46edc30444b616f9e4935324e1bb2aa4146a84fdf3f70f2937614f4eab320d2c9af3c24c87c32fb1c508c85189df879a030259469eda09",
             "8a519096ebca5e78f98204887dd2a914e320d37d628ed9f4b49b21a469c0ef14b2aac2520ba5a2d4ee78796b9f8b0c563df10c96af7b26979268d5a38560ab062937614f4eab320d2c9af3c24c87c32fb1c508c85189df879a030259469eda09",
-            "f13fgep9htef0837vzqjy8m54fzn3jp5mav28dna95nvs6g6wqau2t92kz2g96tgk5aeu8j6ul3vx9v003pjt277exj7fx34drs4s2kps2e0jrr",
+            "f13fgep9htef0837vzqjy8m54fzn3jp5mav28dna95nvs6g6wqau2q8p9qgye1k24vy5st5k3dfmnc094elzcv2c7lzryk4aajd9ujdr268ptq4vrqy3jfmj",
         ),
     ] {
         let mut key = root.clone();
@@ -312,6 +455,6 @@ fn reference_vectors() {
             .to_address()
             .to_tracking_address()
             .to_string(),
-        "c1tz5t5l8fu7qvx2az3mxuzk2s3690ejm5t9kx720efmls2546gvmq72w85x"
+        "f1tz5t5l8fu7qvx2az3mxuzk2s3690ejm5t9kx720efmls2546gvmqxyvkxm"
     );
 }

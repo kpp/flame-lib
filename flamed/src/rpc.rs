@@ -13,10 +13,10 @@ use std::sync::Arc;
 use flamed_rpc::{
     async_trait, codes, ActorId, ActorQueryResult, ActorResult, BlockId, BlockResult,
     BlockTxEnvelope, BlocksResult, ContractEnvelope, ContractId, ContractResult, ErrorCode,
-    ErrorObjectOwned, FlamedApiServer, PendingTransactionsResult, PredicatePoint, ProofBytes,
-    ProofResult, RpcResult, ScanResult, TipResult, TransactionResult, TransactionsResult, TxId,
-    TxStatusResult, ValueEnvelope, MAX_PROOF_IDS, MAX_QUERY_BYTES, MAX_QUERY_GAS,
-    MAX_SCAN_PREDICATES,
+    ErrorObjectOwned, FlamedApiServer, HistoryResult, PendingTransactionsResult, PredicatePoint,
+    ProofBytes, ProofResult, RpcResult, ScanResult, TipResult, TransactionResult,
+    TransactionsResult, TxId, TxStatusResult, UnspentResult, ValueEnvelope, MAX_PROOF_IDS,
+    MAX_QUERY_BYTES, MAX_QUERY_GAS, MAX_SCAN_PREDICATES,
 };
 use jsonrpsee::server::{BatchRequestConfig, Server, ServerConfig, ServerHandle};
 
@@ -173,7 +173,7 @@ impl FlamedApiServer for FlamedRpc {
                     height: record.height,
                     txid: TxId(record.txid.0),
                     predicate: PredicatePoint(record.predicate),
-                    bytes: ContractEnvelope(record.contract.clone()),
+                    bytes: ContractEnvelope(node.read_cold(record.contract)?),
                     created_block: node.block_summary(record.height)?.id,
                     status,
                     tip: TipResult {
@@ -222,8 +222,35 @@ impl FlamedApiServer for FlamedRpc {
             let raw: Vec<[u8; 32]> = predicates.iter().map(|point| point.0).collect();
             Ok(ScanResult {
                 tip_height: node.tip().height,
-                outputs: node.scan(&raw, since_height),
+                outputs: node.scan(&raw, since_height)?,
             })
+        })
+        .await
+    }
+
+    async fn unspent(
+        &self,
+        address: String,
+        with_pending: Option<bool>,
+    ) -> RpcResult<UnspentResult> {
+        self.with_node(move |node| node.unspent(&address, with_pending.unwrap_or(false)))
+            .await
+    }
+
+    async fn history(
+        &self,
+        addresses: Vec<String>,
+        cursor: Option<String>,
+        limit: u32,
+        with_pending: Option<bool>,
+    ) -> RpcResult<HistoryResult> {
+        self.with_node(move |node| {
+            node.history(
+                &addresses,
+                cursor.as_deref(),
+                limit,
+                with_pending.unwrap_or(false),
+            )
         })
         .await
     }
@@ -263,8 +290,10 @@ impl From<NodeError> for ErrorObjectOwned {
             NodeError::Mempool(_) => codes::MEMPOOL_REJECTED,
             NodeError::Limit { .. } | NodeError::QueryGasLimit(_) => codes::LIMIT_EXCEEDED,
             NodeError::Decode(_) | NodeError::QueryDecode(_) => codes::INVALID_BYTES,
-            NodeError::StaleBlock => codes::STALE_BLOCK,
+            NodeError::StaleBlock | NodeError::StaleCursor { .. } => codes::STALE_BLOCK,
+            NodeError::Cursor(_) => ErrorCode::InvalidParams.code(),
             NodeError::Query(_) => codes::QUERY_FAILED,
+            NodeError::Address(_) | NodeError::WrongNetwork { .. } => codes::INVALID_ADDRESS,
             _ => ErrorCode::InternalError.code(),
         };
         ErrorObjectOwned::owned(code, error.to_string(), None::<()>)

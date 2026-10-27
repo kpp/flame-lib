@@ -5,7 +5,13 @@
 //! contract, and it never knew which predicate locked it. A wallet needs all
 //! three, so this node keeps them: `UtxoSet` for the proofs, `TxIndex` and
 //! `OutputIndex` for the history. All three are rebuilt by replaying
-//! `blocks.bin`, which is the only durable state there is.
+//! `blocks.bin`, which is the only durable state there is. The bulky bytes
+//! the indexes seldom read — effect logs, contracts, notes — are kept in
+//! `cold.bin` rather than in memory, and that file is rebuilt the same way.
+//!
+//! Times come from outside. A block's time is its core block's, which the
+//! core indexer reports and remembers; a transaction's admission time is
+//! this node's clock, kept in memory only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -19,20 +25,25 @@ use flamechain::{
 use flamed_rpc::{
     ActorCode, ActorId, ActorQueryResult, ActorResult, ActorStateEnvelope, BlockHeader, BlockId,
     BlockResult, BlockSummary, BlockTxEnvelope, BlocksResult, ContractEnvelope, ContractId,
-    ExecutionData, NoteEnvelope, PendingTransaction, PendingTransactionsResult, PredicatePoint,
-    ScanEntry, SpentAt, StateCommitment, TransactionResult, TransactionSummary, TransactionsResult,
-    TxId, ValueEnvelope, MAX_PAGE_SIZE, MAX_QUERY_BYTES, MAX_QUERY_GAS,
+    Counterparty, ExecutionData, HistoryContract, HistoryEntry, HistoryResult, NoteEnvelope,
+    PendingTransaction, PendingTransactionsResult, PredicatePoint, ProofBytes, ScanEntry, SpentAt,
+    StateCommitment, TipResult, TransactionResult, TransactionSummary, TransactionsResult, TxId,
+    UnspentEntry, UnspentResult, ValueEnvelope, MAX_HISTORY_ADDRESSES, MAX_PAGE_SIZE,
+    MAX_QUERY_BYTES, MAX_QUERY_GAS,
 };
+use flamekd::{Network, ReceivingAddress, TrackingAddress};
 use flamevm::{
     ActorID, Cell, CellDecode, CellEncode, CellEnvelope, CellError, CellID, CellReader, ContractID,
-    TxEntry, TxID, VMError, Value,
+    Predicate, TxEntry, TxID, VMError, Value,
 };
-use sha2::{Digest, Sha256};
 
-use crate::cells::{contract_bytes, log_bytes};
+use crate::cells::{contract_bytes, log_bytes, proof_bytes};
+use crate::cold::{Cold, ColdError, ColdStore};
 use crate::config::{GenesisFile, NodeConfig};
 use crate::genesis::{self, GenesisError};
-use crate::index::{OutputIndex, OutputRecord, SpendRecord, TxIndex, TxRecord};
+use crate::history::{self, Cursor, Direction, END_OF_BLOCK};
+use crate::index::{OutputIndex, OutputRecord, Position, SpendRecord, Touch, TxIndex, TxRecord};
+use crate::indexer::{unix_now, CoreError, CoreIndexer, MockIndexer};
 use crate::inspect;
 use crate::store::{BlockStore, StoreError};
 use crate::utxos::UtxoSet;
@@ -40,6 +51,13 @@ use crate::utxos::UtxoSet;
 /// The txid the indexes record for a genesis allocation, which no
 /// transaction created.
 pub const GENESIS_TXID: TxID = TxID([0; 32]);
+
+/// How many of the newest blocks the chain can still disconnect. This node
+/// has no peers and never rewinds, so the number is a margin for a future
+/// fork choice, not something anything uses today; what it buys is that the
+/// undo records of older blocks, a whole `Forest` each, are not kept for
+/// the life of the process.
+pub const UNDO_DEPTH: usize = 100;
 
 /// One node, shared by the RPC handlers and the minter.
 pub type SharedNode = Arc<Mutex<Node>>;
@@ -61,27 +79,27 @@ impl CellReader for QueryDecode<'_> {
     }
 }
 
-/// This devnet's stand-in for a core-chain identity.
-///
-/// `check_header` does not constrain `core_block_hash` and the header
-/// carries no timestamp, so a devnet needs some rule; height is the only
-/// thing a second node could independently agree on.
-pub fn core_block_hash(height: u64) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(b"flame.devnet.core");
-    digest.update(height.to_le_bytes());
-    digest.finalize().into()
-}
+pub use crate::indexer::core_block_hash;
 
 /// An archival node.
 pub struct Node {
     params: ChainParams,
+    network: Network,
     chain: Blockchain,
     mempool: Mempool,
     utxos: UtxoSet,
     txindex: TxIndex,
     outputs: OutputIndex,
+    cold: ColdStore,
     store: BlockStore,
+    // Read again only by the minter; a build without one asks it only
+    // while opening.
+    #[cfg_attr(not(any(test, feature = "devnet")), allow(dead_code))]
+    indexer: Box<dyn CoreIndexer>,
+    /// When each pending transaction was first admitted, by txid. A
+    /// transaction that leaves the pool by confirming takes its time into
+    /// `TxIndex`; one that leaves any other way takes it nowhere.
+    received: BTreeMap<[u8; 32], u64>,
 }
 
 // Every call into the node runs on the blocking pool behind a
@@ -136,9 +154,19 @@ pub enum TxStatus {
 }
 
 impl Node {
-    /// Opens a node: rebuilds the genesis, replays the archive, and starts
-    /// with an empty mempool.
+    /// Opens a node over the mock core indexer in `cfg.indexer_dir()`.
     pub fn open(genesis: &GenesisFile, cfg: &NodeConfig) -> Result<Node, NodeError> {
+        let indexer = MockIndexer::open(&cfg.indexer_dir())?;
+        Self::open_with(genesis, cfg, Box::new(indexer))
+    }
+
+    /// Opens a node: rebuilds the genesis, replays the archive with each
+    /// block's time from `indexer`, and starts with an empty mempool.
+    pub fn open_with(
+        genesis: &GenesisFile,
+        cfg: &NodeConfig,
+        indexer: Box<dyn CoreIndexer>,
+    ) -> Result<Node, NodeError> {
         fs::create_dir_all(&cfg.data_dir)?;
         let params = genesis.chain.params();
 
@@ -156,11 +184,12 @@ impl Node {
             });
         }
 
+        let mut cold = ColdStore::create(&cfg.cold_path())?;
         let mut utxos = UtxoSet::new();
         let mut outputs = OutputIndex::new();
         let mut txindex = TxIndex::new();
 
-        txindex.insert_block(block_summary(chain.header(), 0, 0, 0, 0));
+        txindex.insert_block(block_summary(chain.header(), None, 0, 0, 0, 0));
 
         for ((id, contract), record) in allocations.iter().zip(&genesis.contracts) {
             utxos.insert_transient(*id);
@@ -168,9 +197,10 @@ impl Node {
                 *id,
                 OutputRecord {
                     height: 0,
+                    index: 0,
                     txid: GENESIS_TXID,
                     predicate: contract.predicate.to_point().to_bytes(),
-                    contract: record.bytes.0.clone(),
+                    contract: cold.put(&record.bytes.0)?,
                     note: None,
                 },
             );
@@ -180,44 +210,66 @@ impl Node {
         }
 
         let mut store = BlockStore::open(&cfg.blocks_path())?;
+        let mut untimed = 0usize;
         // An archived block was validated when it was appended, so one that
         // will not decode or connect now means the archive is wrong, not
-        // that this block is skippable.
-        for block in store.replay(params)? {
+        // that this block is skippable. A block the indexer has no time for
+        // is still the same block; it is shown without one. One block is
+        // decoded at a time, so replay needs no more memory than the chain
+        // it rebuilds.
+        store.replay_each(params, |block| {
             let height = block.header.height;
+            let time = indexer.time_of(&block.header.core_block_hash)?;
+            untimed += usize::from(time.is_none());
             connect_block(
                 &mut chain,
                 &mut utxos,
                 &mut txindex,
                 &mut outputs,
+                &mut cold,
                 None,
                 &block,
+                time,
             )
             .map_err(|source| NodeError::Replay {
                 height,
                 source: Box::new(source),
             })?;
+            Ok::<_, NodeError>(())
+        })?;
+
+        if untimed != 0 {
+            eprintln!("flamed: the core indexer has no time for {untimed} archived block(s)");
         }
 
         let mempool = Mempool::new(&chain, mempool_policy(params, cfg.minimum_fee));
 
         Ok(Node {
             params,
+            network: genesis.chain.network.into(),
             chain,
             mempool,
             utxos,
             txindex,
             outputs,
+            cold,
             store,
+            indexer,
+            received: BTreeMap::new(),
         })
     }
 
     /// Offers a transaction to the mempool.
+    ///
+    /// The admission time is kept from the first admission: a transaction
+    /// the minter takes out and puts back is the same pending transaction.
     pub fn submit(&mut self, block_tx_bytes: &[u8]) -> Result<TxID, NodeError> {
         let block_tx =
             BlockTx::from_bytes_bounded(block_tx_bytes, self.params.version, self.params.limits)
                 .map_err(NodeError::Decode)?;
-        Ok(self.mempool.admit(block_tx)?.txid())
+        let txid = self.mempool.admit(block_tx)?.txid();
+        self.received.entry(txid.0).or_insert_with(unix_now);
+        Ok(txid)
     }
 
     /// The current tip.
@@ -248,9 +300,21 @@ impl Node {
         ids.iter().map(|id| (*id, self.proof(id))).collect()
     }
 
-    /// One contract as the node archived it.
+    /// One contract as the node archived it. Its bytes are in `cold.bin`,
+    /// and [`Self::read_cold`] fetches them.
     pub fn contract(&self, id: &ContractID) -> Option<&OutputRecord> {
         self.outputs.get(id)
+    }
+
+    /// Bytes an index record keeps in `cold.bin`.
+    pub fn read_cold(&self, cold: Cold) -> Result<Vec<u8>, NodeError> {
+        Ok(self.cold.get(cold)?)
+    }
+
+    /// A note an index record keeps in `cold.bin`, if it has one.
+    fn read_note(&self, note: Option<Cold>) -> Result<Option<NoteEnvelope>, NodeError> {
+        note.map(|cold| Ok(NoteEnvelope(self.read_cold(cold)?)))
+            .transpose()
     }
 
     /// A page of blocks, newest first.
@@ -395,17 +459,20 @@ impl Node {
             .txindex
             .get(&TxID(id.0))
             .ok_or_else(|| NodeError::NotFound(format!("transaction {id}")))?;
+        let log = self.read_cold(record.log)?;
 
         Ok(TransactionResult {
             summary: record.summary.clone(),
             height: record.height,
             block: BlockId(record.block.into_bytes()),
-            log: record.log.clone(),
+            block_time: self.block_time(record.height),
+            received_at: record.received_at,
             effects: if decode_effects {
-                Some(inspect::effects(&record.log)?)
+                Some(inspect::effects(&log)?)
             } else {
                 None
             },
+            log,
         })
     }
 
@@ -434,6 +501,12 @@ impl Node {
                         block_tx: BlockTxEnvelope(entry.transaction().to_bytes()?),
                         fee_sparks: entry.fee().to_string(),
                         witness_bytes: entry.witness_bytes() as u64,
+                        received_at: self
+                            .received
+                            .get(&entry.txid().0)
+                            .copied()
+                            .unwrap_or_default(),
+                        locktime: entry.transaction().tx.header.locktime,
                     })
                 })
                 .collect::<Result<_, CellError>>()?,
@@ -457,7 +530,11 @@ impl Node {
 
     /// Every contract created at `since_height` or later under one of these
     /// predicates, in height order, each with the note that followed it.
-    pub fn scan(&self, predicates: &[[u8; 32]], since_height: u64) -> Vec<ScanEntry> {
+    pub fn scan(
+        &self,
+        predicates: &[[u8; 32]],
+        since_height: u64,
+    ) -> Result<Vec<ScanEntry>, NodeError> {
         let unique: BTreeSet<[u8; 32]> = predicates.iter().copied().collect();
         let mut hits = Vec::new();
         for predicate in unique {
@@ -473,8 +550,9 @@ impl Node {
                     height: record.height,
                     txid: TxId(record.txid.0),
                     predicate: PredicatePoint(record.predicate),
-                    bytes: ContractEnvelope(record.contract.clone()),
-                    note: record.note.clone().map(NoteEnvelope),
+                    bytes: ContractEnvelope(self.read_cold(record.contract)?),
+                    time: self.block_time(record.height),
+                    note: self.read_note(record.note)?,
                     spent: self.outputs.spend_of(id).map(|spend| SpentAt {
                         height: spend.height,
                         txid: TxId(spend.txid.0),
@@ -484,7 +562,354 @@ impl Node {
         }
         // Stable, so contracts created in one block keep their order.
         hits.sort_by_key(|hit| hit.height);
-        hits
+        Ok(hits)
+    }
+
+    /// Every unspent contract locked to one address, each with its proof at
+    /// the tip, in creation order.
+    ///
+    /// With `with_pending`, the mempool is applied on top in admission
+    /// order: what it spends is left out, and what it creates follows the
+    /// confirmed contracts without a height or a proof. A contract one
+    /// pending transaction creates and a later one spends is in neither.
+    pub fn unspent(&self, address: &str, with_pending: bool) -> Result<UnspentResult, NodeError> {
+        let predicate = address_predicate(address, self.network)?;
+
+        let mut spent = BTreeSet::new();
+        let mut pending = Vec::new();
+        if with_pending {
+            for entry in self.mempool.entries() {
+                let entries = entry.log().entries();
+                for (index, effect) in entries.iter().enumerate() {
+                    match effect {
+                        TxEntry::Input(id) => {
+                            spent.insert(*id);
+                        }
+                        TxEntry::Output(contract)
+                            if contract.predicate.to_point().to_bytes() == predicate =>
+                        {
+                            pending.push(UnspentEntry {
+                                id: ContractId(contract.id()),
+                                txid: TxId(entry.txid().0),
+                                bytes: ContractEnvelope(contract_bytes(contract)?),
+                                note: note_after(entries, index).map(NoteEnvelope),
+                                height: None,
+                                time: None,
+                                received_at: self.received.get(&entry.txid().0).copied(),
+                                proof: None,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let mut outputs = Vec::new();
+        for id in self.outputs.under(&predicate) {
+            let (Some(proof), Some(record)) = (self.utxos.get(id), self.outputs.get(id)) else {
+                continue;
+            };
+            if spent.contains(id) {
+                continue;
+            }
+            outputs.push(UnspentEntry {
+                id: ContractId(*id),
+                txid: TxId(record.txid.0),
+                bytes: ContractEnvelope(self.read_cold(record.contract)?),
+                note: self.read_note(record.note)?,
+                height: Some(record.height),
+                time: self.block_time(record.height),
+                received_at: None,
+                proof: Some(ProofBytes(proof_bytes(proof))),
+            });
+        }
+        outputs.extend(
+            pending
+                .into_iter()
+                .filter(|output| !spent.contains(&output.id.0)),
+        );
+
+        let tip = self.tip();
+        Ok(UnspentResult {
+            tip: TipResult {
+                hash: BlockId(tip.hash.into_bytes()),
+                height: tip.height,
+                contract_root: tip.contract_root,
+            },
+            predicate: PredicatePoint(predicate),
+            outputs,
+        })
+    }
+
+    /// A page of what happened to a set of addresses; the RPC method
+    /// `history` says what each argument and field means.
+    pub fn history(
+        &self,
+        addresses: &[String],
+        cursor: Option<&str>,
+        limit: u32,
+        with_pending: bool,
+    ) -> Result<HistoryResult, NodeError> {
+        let limit = page_limit(limit)?;
+        if addresses.is_empty() || addresses.len() > MAX_HISTORY_ADDRESSES {
+            return Err(NodeError::Limit {
+                got: addresses.len(),
+                max: MAX_HISTORY_ADDRESSES,
+            });
+        }
+        let listed = addresses
+            .iter()
+            .map(|address| address_predicate(address, self.network))
+            .collect::<Result<Vec<_>, _>>()?;
+        let predicates: BTreeSet<[u8; 32]> = listed.iter().copied().collect();
+        let set = history::address_set(&predicates);
+        let cursor = cursor.map(|text| self.read_cursor(text, set)).transpose()?;
+        let direction = cursor.map_or(Direction::Older, |cursor| cursor.direction);
+
+        let (touches, more) = history::page(
+            predicates
+                .iter()
+                .map(|predicate| self.outputs.history(predicate)),
+            direction,
+            cursor.map(|cursor| cursor.position),
+            limit,
+        );
+        let entries = touches
+            .iter()
+            .map(|touch| self.history_entry(touch, &predicates))
+            .collect::<Result<_, _>>()?;
+
+        let tip = self.tip();
+        let at = |direction, position: Position| Cursor {
+            direction,
+            position,
+            block: self.block_id(position.0),
+            set,
+        };
+        let last = touches.last().map(|touch| touch.position);
+        // Everything up to the tip has been read once a page reaches it.
+        let at_tip = at(Direction::Newer, (tip.height, END_OF_BLOCK)).to_string();
+        let (older, newer, has_newer) = match (direction, cursor) {
+            (Direction::Older, first) => (
+                last.filter(|_| more)
+                    .map(|position| at(Direction::Older, position).to_string()),
+                first.is_none().then_some(at_tip),
+                false,
+            ),
+            (Direction::Newer, _) => match last.filter(|_| more) {
+                Some(position) => (None, Some(at(Direction::Newer, position).to_string()), true),
+                None => (None, Some(at_tip), false),
+            },
+        };
+
+        let (pending, pending_truncated) = match (with_pending, direction, cursor) {
+            (true, Direction::Newer, _) | (true, _, None) => {
+                let (pending, truncated) = self.pending_history(&predicates)?;
+                (Some(pending), truncated)
+            }
+            _ => (None, false),
+        };
+
+        Ok(HistoryResult {
+            tip: TipResult {
+                hash: BlockId(tip.hash.into_bytes()),
+                height: tip.height,
+                contract_root: tip.contract_root,
+            },
+            predicates: listed.into_iter().map(PredicatePoint).collect(),
+            entries,
+            older,
+            newer,
+            has_newer,
+            pending,
+            pending_truncated,
+        })
+    }
+
+    /// A cursor this node wrote, for these addresses, on a block still in
+    /// the chain.
+    fn read_cursor(&self, text: &str, set: [u8; 8]) -> Result<Cursor, NodeError> {
+        let cursor = Cursor::parse(text)
+            .ok_or_else(|| NodeError::Cursor(format!("{text:?} is not a history cursor")))?;
+        if cursor.set != set {
+            return Err(NodeError::Cursor(
+                "the cursor was made for other addresses".into(),
+            ));
+        }
+        let height = cursor.position.0;
+        if self.txindex.block(height).map(|block| block.id.0) != Some(cursor.block) {
+            return Err(NodeError::StaleCursor { height });
+        }
+        Ok(cursor)
+    }
+
+    /// The id of the block at a height this node has.
+    fn block_id(&self, height: u64) -> [u8; 32] {
+        self.txindex
+            .block(height)
+            .map(|block| block.id.0)
+            .expect("a position or the tip names a block this node has")
+    }
+
+    /// One confirmed transaction in a history.
+    fn history_entry(
+        &self,
+        touch: &Touch,
+        predicates: &BTreeSet<[u8; 32]>,
+    ) -> Result<HistoryEntry, NodeError> {
+        let record = self.txindex.get(&touch.txid);
+        let (all_spent, all_created) = self
+            .outputs
+            .of_tx(&touch.txid)
+            .map_or((&[][..], &[][..]), |tx| (&tx.spent[..], &tx.created[..]));
+        let predicate_of = |id: &ContractID| self.outputs.get(id).map(|output| output.predicate);
+        let (height, _) = touch.position;
+        Ok(HistoryEntry {
+            txid: TxId(touch.txid.0),
+            height: Some(height),
+            time: self.block_time(height),
+            received_at: record.and_then(|record| record.received_at),
+            // The genesis allocation is in no block's executions, and
+            // paid no fee.
+            fee_sparks: record
+                .map_or_else(|| "0".into(), |record| record.summary.fee_sparks.clone()),
+            created: self.history_contracts(&touch.created)?,
+            spent: self.history_contracts(&touch.spent)?,
+            others_spent: self
+                .counterparties(all_spent.iter().filter_map(predicate_of), predicates),
+            others_created: self
+                .counterparties(all_created.iter().filter_map(predicate_of), predicates),
+        })
+    }
+
+    /// The predicates in `seen` that are not among `predicates`, each once
+    /// in the order first seen, with their tracking addresses.
+    fn counterparties(
+        &self,
+        seen: impl IntoIterator<Item = [u8; 32]>,
+        predicates: &BTreeSet<[u8; 32]>,
+    ) -> Vec<Counterparty> {
+        let mut others: Vec<[u8; 32]> = Vec::new();
+        for predicate in seen {
+            if !predicates.contains(&predicate) && !others.contains(&predicate) {
+                others.push(predicate);
+            }
+        }
+        others
+            .into_iter()
+            .map(|predicate| Counterparty {
+                predicate: PredicatePoint(predicate),
+                address: TrackingAddress::from_bytes(&predicate)
+                    .ok()
+                    .map(|address| address.to_bech32(self.network)),
+            })
+            .collect()
+    }
+
+    /// A contract as a history shows it, as it was created, if this node
+    /// saw it created.
+    fn history_contract(&self, id: &ContractID) -> Result<Option<HistoryContract>, NodeError> {
+        let Some(output) = self.outputs.get(id) else {
+            return Ok(None);
+        };
+        Ok(Some(HistoryContract {
+            id: ContractId(*id),
+            predicate: PredicatePoint(output.predicate),
+            bytes: ContractEnvelope(self.read_cold(output.contract)?),
+            note: self.read_note(output.note)?,
+        }))
+    }
+
+    /// [`Self::history_contract`] for each of `ids` this node saw created.
+    fn history_contracts(&self, ids: &[ContractID]) -> Result<Vec<HistoryContract>, NodeError> {
+        ids.iter()
+            .filter_map(|id| self.history_contract(id).transpose())
+            .collect()
+    }
+
+    /// The pending transactions that touch `predicates`, in admission
+    /// order, and whether the list was cut at `MAX_PAGE_SIZE`.
+    ///
+    /// A pending transaction can spend what an earlier pending one created,
+    /// so the contracts the pool creates are kept as they go by: whole for
+    /// these addresses, by predicate for the others.
+    fn pending_history(
+        &self,
+        predicates: &BTreeSet<[u8; 32]>,
+    ) -> Result<(Vec<HistoryEntry>, bool), NodeError> {
+        let mut created_here = BTreeMap::new();
+        let mut pool_predicates = BTreeMap::new();
+        let mut entries = Vec::new();
+        for entry in self.mempool.entries() {
+            let log = entry.log().entries();
+            let (mut created, mut spent, mut fee) = (Vec::new(), Vec::new(), 0u128);
+            let (mut all_spent, mut all_created) = (Vec::new(), Vec::new());
+            for (index, effect) in log.iter().enumerate() {
+                match effect {
+                    TxEntry::Input(id) => {
+                        all_spent.extend(
+                            pool_predicates
+                                .remove(id)
+                                .or_else(|| self.outputs.get(id).map(|output| output.predicate)),
+                        );
+                        let ours = match created_here.remove(id) {
+                            Some(contract) => Some(contract),
+                            // Read only when it is one of these addresses'.
+                            None if self
+                                .outputs
+                                .get(id)
+                                .is_some_and(|output| predicates.contains(&output.predicate)) =>
+                            {
+                                self.history_contract(id)?
+                            }
+                            None => None,
+                        };
+                        spent.extend(ours);
+                    }
+                    TxEntry::Output(contract) => {
+                        let predicate = contract.predicate.to_point().to_bytes();
+                        pool_predicates.insert(contract.id(), predicate);
+                        all_created.push(predicate);
+                        if predicates.contains(&predicate) {
+                            let ours = HistoryContract {
+                                id: ContractId(contract.id()),
+                                predicate: PredicatePoint(predicate),
+                                bytes: ContractEnvelope(contract_bytes(contract)?),
+                                note: note_after(log, index).map(NoteEnvelope),
+                            };
+                            created_here.insert(contract.id(), ours.clone());
+                            created.push(ours);
+                        }
+                    }
+                    TxEntry::Fee(q) => fee += u128::from(*q),
+                    _ => {}
+                }
+            }
+            if created.is_empty() && spent.is_empty() {
+                continue;
+            }
+            if entries.len() == MAX_PAGE_SIZE as usize {
+                return Ok((entries, true));
+            }
+            entries.push(HistoryEntry {
+                txid: TxId(entry.txid().0),
+                height: None,
+                time: None,
+                received_at: self.received.get(&entry.txid().0).copied(),
+                fee_sparks: fee.to_string(),
+                created,
+                spent,
+                others_spent: self.counterparties(all_spent, predicates),
+                others_created: self.counterparties(all_created, predicates),
+            });
+        }
+        Ok((entries, false))
+    }
+
+    /// The time of the block at `height`, if the indexer knew it.
+    pub fn block_time(&self, height: u64) -> Option<u64> {
+        self.txindex.block(height).and_then(|block| block.time)
     }
 
     /// Whether a proof really proves membership at this tip.
@@ -522,6 +947,12 @@ impl Node {
     /// two places it is unusual are called out where they happen.
     #[cfg(any(test, feature = "devnet"))]
     pub fn mint_block(&mut self) -> Result<BlockHash, NodeError> {
+        // 0. Ask the indexer first: if it cannot answer, nothing has been
+        //    touched yet and the next tick tries again.
+        let height = self.chain.height().saturating_add(1);
+        let anchor = self.indexer.anchor(height)?;
+        let core = anchor.hash;
+
         // 1. Write every candidate down before draining the pool. `BlockTx`
         //    is not `Clone` and `build_block` consumes what it is given, so
         //    bytes are the only form that survives a retry — and a candidate
@@ -534,8 +965,6 @@ impl Node {
             .map_err(NodeError::Cell)?;
         let _ = self.mempool.take_all();
 
-        let height = self.chain.height().saturating_add(1);
-        let core = core_block_hash(height);
         // The pool is already drained, so an error here would take every
         // candidate with it — and the minter treats a failed build as
         // recoverable and keeps ticking. Put them all back first.
@@ -570,13 +999,16 @@ impl Node {
             &mut self.utxos,
             &mut self.txindex,
             &mut self.outputs,
+            &mut self.cold,
             Some(&mut self.mempool),
             &block,
+            Some(anchor.time),
         )
         .map_err(|source| NodeError::Archive {
             height,
             source: Box::new(source),
         })?;
+        self.settle_received();
 
         dropped += rebase.dropped;
         println!(
@@ -585,6 +1017,21 @@ impl Node {
             block.transactions.len()
         );
         Ok(hash)
+    }
+
+    /// Hands each confirmed transaction its admission time, and forgets the
+    /// times of transactions that left the pool without confirming.
+    #[cfg(any(test, feature = "devnet"))]
+    fn settle_received(&mut self) {
+        let pending: BTreeSet<[u8; 32]> =
+            self.mempool.entries().map(|entry| entry.txid().0).collect();
+        for (txid, time) in std::mem::take(&mut self.received) {
+            if pending.contains(&txid) {
+                self.received.insert(txid, time);
+            } else {
+                self.txindex.set_received(&TxID(txid), time);
+            }
+        }
     }
 
     /// Builds the largest prefix of `candidates` that fits in a block.
@@ -661,6 +1108,51 @@ impl Node {
     }
 }
 
+/// The predicate payments to a receiving or tracking address are locked
+/// by: `Predicate::opaque(S)`, the rule `flamepayments` builds outputs with.
+fn address_predicate(text: &str, network: Network) -> Result<[u8; 32], NodeError> {
+    predicate_of(text, network).map_err(|error| {
+        // `flamekd` reports a foreign network as a bad encoding; an address
+        // that decodes for the other network is well formed, just not ours.
+        let other = match network {
+            Network::Mainnet => Network::Testnet,
+            Network::Testnet => Network::Mainnet,
+        };
+        match predicate_of(text, other) {
+            Ok(_) => NodeError::WrongNetwork {
+                address: other,
+                node: network,
+            },
+            Err(_) => NodeError::Address(error),
+        }
+    })
+}
+
+/// [`address_predicate`] for one network, with `flamekd`'s own error.
+fn predicate_of(text: &str, network: Network) -> Result<[u8; 32], flamekd::Error> {
+    // A receiving address is a tracking address with an encryption key
+    // appended, so length alone says which one was meant, and the error
+    // names the right one.
+    let spending = if text.len() > TRACKING_ADDRESS_CHARS {
+        *ReceivingAddress::from_bech32(text, network)?.spending_key()
+    } else {
+        *TrackingAddress::from_bech32(text, network)?.spending_key()
+    };
+    Ok(Predicate::opaque(spending.compress()).to_point().to_bytes())
+}
+
+/// The length of a tracking address on either network.
+const TRACKING_ADDRESS_CHARS: usize = 60;
+
+/// An output's note: the entry right after it in its log, when that entry
+/// is `Data`, byte for byte.
+fn note_after(entries: &[TxEntry], index: usize) -> Option<Vec<u8>> {
+    match entries.get(index + 1) {
+        Some(TxEntry::Data(note)) => Some(note.clone()),
+        _ => None,
+    }
+}
+
 fn page_limit(limit: u32) -> Result<usize, NodeError> {
     if limit == 0 || limit > MAX_PAGE_SIZE {
         return Err(NodeError::Limit {
@@ -731,14 +1223,17 @@ fn build_chain(
 ///
 /// One function for minting and for replay, so an archived chain and a live
 /// one cannot drift apart. `mempool` is `None` during replay, where no pool
-/// exists yet.
+/// exists yet. `time` is the core block's, as the indexer reported it.
+#[allow(clippy::too_many_arguments)]
 fn connect_block(
     chain: &mut Blockchain,
     utxos: &mut UtxoSet,
     txindex: &mut TxIndex,
     outputs: &mut OutputIndex,
+    cold: &mut ColdStore,
     mempool: Option<&mut Mempool>,
     block: &Block,
+    time: Option<u64>,
 ) -> Result<(BlockHash, RebaseReport), NodeError> {
     // 1. `connect` reports only `ExecutionRecord { kind, txid }`, so the
     //    effects are read through an observer during block validation.
@@ -748,7 +1243,7 @@ fn connect_block(
     let block_id = block.header.id();
     let size_bytes = block.to_bytes()?.len() as u64;
     let mut messages = BTreeMap::new();
-    let mut staged: Vec<(TxID, TxRecord, Vec<UtxoEffect>)> = Vec::new();
+    let mut staged: Vec<StagedTx> = Vec::new();
 
     // 2. Nothing is recorded before the chain has accepted the block.
     let applied = chain.connect_with_observer(block, |record, log, error| {
@@ -767,6 +1262,10 @@ fn connect_block(
         //    entry after it when that entry is `Data`: the output's note,
         //    kept byte for byte and never parsed here.
         let entries = log.entries();
+        let locktime = match entries.first() {
+            Some(TxEntry::Header(header)) => header.locktime,
+            _ => 0,
+        };
         for (index, entry) in entries.iter().enumerate() {
             match entry {
                 TxEntry::Input(id) => {
@@ -776,19 +1275,12 @@ fn connect_block(
                 TxEntry::Output(contract) => {
                     output_count += 1;
                     let id = contract.id();
-                    changes.push(UtxoEffect::Output(
+                    changes.push(UtxoEffect::Output {
                         id,
-                        OutputRecord {
-                            height,
-                            txid,
-                            predicate: contract.predicate.to_point().to_bytes(),
-                            contract: contract_bytes(contract)?,
-                            note: match entries.get(index + 1) {
-                                Some(TxEntry::Data(note)) => Some(note.clone()),
-                                _ => None,
-                            },
-                        },
-                    ));
+                        predicate: contract.predicate.to_point().to_bytes(),
+                        contract: contract_bytes(contract)?,
+                        note: note_after(entries, index),
+                    });
                 }
                 TxEntry::Fee(q) => fees += u128::from(*q),
                 TxEntry::Send(m) => {
@@ -824,21 +1316,19 @@ fn connect_block(
             inputs,
             outputs: output_count,
             messages: sends,
+            locktime,
         };
 
         // 4. The log itself, for anyone who asks what this transaction did.
-        staged.push((
+        staged.push(StagedTx {
             txid,
-            TxRecord {
-                height,
-                block: block_id,
-                log: log_bytes(log)?,
-                summary,
-            },
+            log: log_bytes(log)?,
+            summary,
             changes,
-        ));
+        });
         Ok(())
     })?;
+    chain.forget_undo_below(UNDO_DEPTH);
 
     // 5. Every execution the chain ran that was not one of these external
     //    transactions produced effects this node can now see through
@@ -848,20 +1338,60 @@ fn connect_block(
     //    refund contract under the sender's refund predicate. That
     //    contract is real and in the accumulator, and this node can serve
     //    both a proof and a record for it.
-    for (txid, record, changes) in staged {
+    //    The bytes go to `cold.bin` only now that the block is accepted. A
+    //    failed write leaves the indexes part-way through this block, which
+    //    the caller treats like any other failure after a connect: as fatal.
+    //    `index` is each execution's place among the block's, the order
+    //    `staged`, and so `TxIndex::at_height`, keeps.
+    for (index, staged) in staged.into_iter().enumerate() {
+        let StagedTx {
+            txid,
+            log,
+            summary,
+            changes,
+        } = staged;
         for change in changes {
             match change {
                 UtxoEffect::Input(id) => {
                     utxos.remove(&id);
-                    outputs.spend(id, SpendRecord { height, txid });
+                    outputs.spend(
+                        id,
+                        SpendRecord {
+                            height,
+                            index: index as u32,
+                            txid,
+                        },
+                    );
                 }
-                UtxoEffect::Output(id, output) => {
+                UtxoEffect::Output {
+                    id,
+                    predicate,
+                    contract,
+                    note,
+                } => {
+                    let output = OutputRecord {
+                        height,
+                        index: index as u32,
+                        txid,
+                        predicate,
+                        contract: cold.put(&contract)?,
+                        note: note.map(|note| cold.put(&note)).transpose()?,
+                    };
                     utxos.insert_transient(id);
                     outputs.insert(id, output);
                 }
             }
         }
-        txindex.insert(txid, record);
+        txindex.insert(
+            txid,
+            TxRecord {
+                height,
+                block: block_id,
+                log: cold.put(&log)?,
+                summary,
+                received_at: None,
+            },
+        );
     }
 
     let internal = applied
@@ -877,6 +1407,7 @@ fn connect_block(
 
     txindex.insert_block(block_summary(
         &block.header,
+        time,
         block.transactions.len() as u32,
         internal,
         failed,
@@ -910,13 +1441,28 @@ fn connect_block(
     Ok((applied.id, rebase))
 }
 
+/// One execution as the observer saw it, before its bytes have a place in
+/// `cold.bin`.
+struct StagedTx {
+    txid: TxID,
+    log: Vec<u8>,
+    summary: TransactionSummary,
+    changes: Vec<UtxoEffect>,
+}
+
 enum UtxoEffect {
     Input(ContractID),
-    Output(ContractID, OutputRecord),
+    Output {
+        id: ContractID,
+        predicate: [u8; 32],
+        contract: Vec<u8>,
+        note: Option<Vec<u8>>,
+    },
 }
 
 fn block_summary(
     header: &flamechain::BlockHeader,
+    time: Option<u64>,
     transactions: u32,
     internal: u32,
     failed: u32,
@@ -937,6 +1483,7 @@ fn block_summary(
                 available_storage_units: header.state.available_storage_units,
             },
         },
+        time,
         transactions,
         internal,
         failed,
@@ -972,12 +1519,25 @@ pub enum NodeError {
     /// Query execution gas must be positive and fit the node's bound.
     #[error("actor query gas must be 1..={MAX_QUERY_GAS}, got {0}")]
     QueryGasLimit(u64),
+    /// A history cursor's block is no longer in the chain.
+    #[error("the block at height {height} that the cursor stands on is no longer in the chain")]
+    StaleCursor { height: u64 },
+    /// A history cursor this node did not write, or wrote for other
+    /// addresses.
+    #[error("invalid cursor: {0}")]
+    Cursor(String),
     /// A lookup's pinned block is no longer the current tip.
     #[error("the expected query block is not the current tip")]
     StaleBlock,
     /// A getter failed without committing effects.
     #[error("actor query failed: {0}")]
     Query(VMError),
+    /// An address that does not decode for this node's network.
+    #[error("invalid address: {0}")]
+    Address(flamekd::Error),
+    /// A well-formed address for the other network.
+    #[error("invalid address: it is a {address:?} address, and this node is on {node:?}")]
+    WrongNetwork { address: Network, node: Network },
     /// The mempool refused a transaction.
     #[error(transparent)]
     Mempool(#[from] MempoolError),
@@ -1026,6 +1586,12 @@ pub enum NodeError {
     /// The archive.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// `cold.bin`.
+    #[error(transparent)]
+    Cold(#[from] ColdError),
+    /// The core indexer.
+    #[error("core indexer: {0}")]
+    Indexer(#[from] CoreError),
     /// The filesystem.
     #[error(transparent)]
     Io(#[from] std::io::Error),

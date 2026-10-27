@@ -8,9 +8,12 @@
 mod actor;
 mod block;
 mod contract;
+mod history;
 mod node;
 mod rpc;
+mod times;
 mod transactions;
+mod unspent;
 
 use std::path::Path;
 
@@ -87,7 +90,7 @@ pub(crate) fn chainparams<K: AccountKey>(a: &Account<K>) -> ChainParamsFile {
         .address_at(util::RECEIVING, 0)
         .expect("first receiving address")
         .to_bech32(Network::Testnet);
-    assert!(address.starts_with("tf1"), "a testnet address");
+    assert!(address.starts_with("t1"), "a testnet address");
     ChainParamsFile {
         version: 1,
         network: NetworkName::Testnet,
@@ -114,6 +117,8 @@ pub(crate) fn devnet<K: AccountKey>(dir: &Path, a: &Account<K>) -> (GenesisFile,
         rpc_bind: "127.0.0.1:0".parse().expect("a literal socket address"),
         block_interval_secs: 15,
         minimum_fee: 0,
+        indexer_dir: None,
+        cold_path: None,
     };
     (genesis, cfg)
 }
@@ -189,7 +194,7 @@ pub(crate) fn received<K: ViewingKey>(
     n: u32,
 ) -> (Contract, Opening) {
     let predicate = account.predicate_at(branch, n).expect("predicate");
-    let hits = node.scan(&[predicate.to_point().to_bytes()], 0);
+    let hits = node.scan(&[predicate.to_point().to_bytes()], 0).unwrap();
     assert_eq!(hits.len(), 1, "one contract pays m/…/{branch}/{n}");
     let contract = contract_from_bytes(&hits[0].bytes.0).expect("canonical contract bytes decode");
     let note = open_note(
@@ -207,7 +212,8 @@ pub(crate) fn contract_of(node: &Node, id: &ContractID) -> Contract {
     let record = node
         .contract(id)
         .unwrap_or_else(|| panic!("the node has contract {}", hex::encode(id)));
-    contract_from_bytes(&record.contract).expect("canonical contract bytes decode")
+    contract_from_bytes(&node.read_cold(record.contract).expect("cold.bin reads"))
+        .expect("canonical contract bytes decode")
 }
 
 #[test]
@@ -286,5 +292,54 @@ mod store {
             panic!("a length prefix of u64::MAX is not a block");
         };
         assert!(matches!(error, StoreError::Truncated { offset: 0 }));
+    }
+}
+
+/// `cold.bin` is a cache: what matters is that it never serves wrong bytes,
+/// and that a node that lost it is a restart away from a whole one.
+mod cold {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::FileExt;
+
+    use tempfile::TempDir;
+
+    use crate::cold::{ColdError, ColdStore};
+
+    #[test]
+    fn blobs_read_back_and_a_flipped_byte_is_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("cold.bin");
+        let mut cold = ColdStore::create(&path).expect("create");
+        let first = cold.put(b"first").expect("put");
+        let empty = cold.put(b"").expect("put");
+        let second = cold.put(b"second").expect("put");
+        assert_eq!(cold.get(first).unwrap(), b"first");
+        assert_eq!(cold.get(empty).unwrap(), b"");
+        assert_eq!(cold.get(second).unwrap(), b"second");
+
+        let file = OpenOptions::new().write(true).open(&path).expect("open");
+        file.write_all_at(b"S", 5).expect("write");
+        assert!(matches!(
+            cold.get(second),
+            Err(ColdError::Corrupt { offset: 5 })
+        ));
+        assert_eq!(cold.get(first).unwrap(), b"first");
+
+        file.set_len(3).expect("truncate");
+        assert!(matches!(
+            cold.get(first),
+            Err(ColdError::Corrupt { offset: 0 })
+        ));
+    }
+
+    #[test]
+    fn a_new_store_leaves_an_open_one_reading_its_own_file() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("cold.bin");
+        let mut old = ColdStore::create(&path).expect("create");
+        let blob = old.put(b"old").expect("put");
+        let new = ColdStore::create(&path).expect("replace");
+        assert!(new.is_empty());
+        assert_eq!(old.get(blob).unwrap(), b"old");
     }
 }

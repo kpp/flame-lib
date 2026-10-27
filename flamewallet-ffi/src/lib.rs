@@ -22,15 +22,17 @@ mod transfer;
 #[cfg(test)]
 mod tests;
 
-pub use contract::{decode_contract, opening_matches, ContractInfo, ContractValue};
+pub use contract::{decode_contract, native_flavor, opening_matches, ContractInfo, ContractValue};
 pub use error::FlameError;
 pub use keys::{
-    address_to_predicate, generate_mnemonic, mnemonic_to_seed, validate_mnemonic, IssuedAddress,
-    KeyPath, Network, Wallet, WalletKind,
+    generate_mnemonic, mnemonic_to_seed, predicate_to_tracking_address,
+    receiving_address_to_predicate, validate_mnemonic, validate_receiving_address,
+    validate_tracking_address, IssuedAddress, KeyPath, Network, Wallet, WalletKind,
 };
 pub use note::{NoteFailure, ReceivedNote};
 pub use transfer::{
-    CreatedOutput, Opening, Transfer, TransferInput, TransferOutput, TransferRequest,
+    issued_flavor, memo_max_bytes, CreatedOutput, IssueRequest, Opening, Transfer, TransferInput,
+    TransferOutput, TransferRequest,
 };
 
 /// Branch `0` of the standard path: addresses handed out to payers.

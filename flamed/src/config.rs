@@ -109,10 +109,10 @@ params!(LimitsConfig, LimitsSection, BlockLimits, {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkName {
-    /// `tf1…` addresses.
+    /// Receiving addresses composed of `t1…` and `i1…` components.
     #[default]
     Testnet,
-    /// `f1…` addresses.
+    /// Receiving addresses composed of `f1…` and `e1…` components.
     Mainnet,
 }
 
@@ -131,7 +131,7 @@ impl From<NetworkName> for Network {
 pub struct ChainParamsFile {
     /// The Flame protocol version. Only 1 exists.
     pub version: u32,
-    /// The HRP an `address` allocation is read with.
+    /// The network an `address` allocation is read with.
     #[serde(default)]
     pub network: NetworkName,
     /// Storage parameters, where they differ from upstream.
@@ -181,23 +181,29 @@ pub struct GenesisSpec {
 pub struct ChainSection {
     /// The Flame protocol version.
     pub version: u32,
+    /// The network whose addresses the node reads, as `chainparams.toml`
+    /// named it. Not a chain parameter, so not in the genesis hash; absent
+    /// from a `genesis.json` written before it was recorded, which reads as
+    /// testnet, the same default `chainparams.toml` has.
+    #[serde(default)]
+    pub network: NetworkName,
     /// Storage parameters, every field written out.
     pub storage: StorageSection,
     /// Block limits, every field written out.
     pub limits: LimitsSection,
 }
 
-impl From<ChainParams> for ChainSection {
-    fn from(params: ChainParams) -> Self {
+impl ChainSection {
+    /// Records these parameters, and the network they were derived for.
+    pub fn new(params: ChainParams, network: NetworkName) -> Self {
         Self {
             version: params.version,
+            network,
             storage: params.storage.into(),
             limits: params.limits.into(),
         }
     }
-}
 
-impl ChainSection {
     /// The upstream parameters this section records.
     pub fn params(&self) -> ChainParams {
         ChainParams {
@@ -271,6 +277,16 @@ pub struct NodeConfig {
     /// The fee this node's mempool will not go below.
     #[serde(default)]
     pub minimum_fee: u64,
+    /// Where the mock core indexer keeps its table;
+    /// `<data_dir>/indexer` by default. Kept apart from `blocks.bin` on
+    /// purpose: it stands in for a separate service.
+    #[serde(default)]
+    pub indexer_dir: Option<PathBuf>,
+    /// Where the indexes keep the bytes they seldom read;
+    /// `<data_dir>/cold.bin` by default. A cache that every start rebuilds,
+    /// so it can live on a scratch disk.
+    #[serde(default)]
+    pub cold_path: Option<PathBuf>,
 }
 
 fn default_block_interval_secs() -> u64 {
@@ -297,6 +313,20 @@ impl NodeConfig {
         self.genesis
             .clone()
             .unwrap_or_else(|| self.data_dir.join("genesis.json"))
+    }
+
+    /// Where the mock core indexer keeps its table.
+    pub fn indexer_dir(&self) -> PathBuf {
+        self.indexer_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("indexer"))
+    }
+
+    /// Where the indexes keep the bytes they seldom read.
+    pub fn cold_path(&self) -> PathBuf {
+        self.cold_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("cold.bin"))
     }
 
     /// Where this node archives blocks.

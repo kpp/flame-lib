@@ -13,7 +13,8 @@ for wallets and nodes that interoperate. None of them is a consensus rule; see
 
 Implemented. `flamepayments` sends and receives: `build_transfer` seals a
 note for every output it creates, and `open_note` opens one. `flamed` keeps
-the note that follows each output and returns it from `scan`.
+the note that follows each output and returns it from `scan`, `unspent`
+and `history`.
 
 The protocol uses [FlameKD keys](flamekd.md#key-types-and-capabilities);
 this document owns the payment-specific cryptography and validation rules.
@@ -311,8 +312,10 @@ seed re-derives its addresses, asks a node for their outputs, and recovers
 every opening and memo. Two things bound that promise.
 
 **History.** Restoring needs an archival source that retains outputs and their
-notes ([The node](#the-node)). Consensus validation alone does not require
-retaining this history; see [Contracts and Utreexo](blockchain.md#contracts-and-utreexo).
+notes ([The node](#the-node)). From `flamed`, `history` gives a wallet's
+outputs and spends in one walk back from the tip, each spend with the note
+its output was created with, and `unspent` gives what it can spend now.
+Consensus validation alone does not require retaining this history; see [Contracts and Utreexo](blockchain.md#contracts-and-utreexo).
 
 **Lookahead.** A wallet finds only outputs to the addresses it derives. How
 far past its last used index a wallet looks is outside this specification,
@@ -349,14 +352,17 @@ enough.
 
 A node indexes outputs by predicate. For each `Output` it records the entry
 immediately following it, if that entry is `Data`, byte for byte, and
-returns it with the output: `ScanEntry.note` in `flamed-rpc`, base64 like the
-contract envelope. The node does not parse, check, or decrypt notes; it holds
-no keys.
+returns it with the output: `ScanEntry.note`, `UnspentEntry.note` and
+`HistoryContract.note` in `flamed-rpc`, base64 like the contract envelope. A
+`history` entry returns a spent output with the note it was created with, so
+a wallet can price a spend before it reaches the payment that created the
+output ([`flamed.md`](../flamed/flamed.md#history)). The node does not
+parse, check, or decrypt notes; it holds no keys.
 
-A node that prunes history and still answers `scan` MUST keep, with every
-unspent output it keeps, the note that follows it. Without the note the
-output can be found but not opened, and a wallet restoring from its seed
-cannot recover it.
+A node that prunes history and still answers `scan`, `unspent` or
+`history` MUST keep, with every unspent output it keeps, the note that
+follows it. Without the note the output can be found but not opened, and a
+wallet restoring from its seed cannot recover it.
 
 `flamed` rebuilds its indexes from its block archive at startup
 ([`flamed.md`](../flamed/flamed.md#what-the-node-keeps-that-the-chain-forgets)),
@@ -462,7 +468,7 @@ lines without whitespace.
 Recipient `m/35263'/1'/0'/0/0`, Receiving Address:
 
 ```
-tf1psxy35zgz289wuj33pm05vkl3sr40xp3ecdacw0dmuzu688wufwaf55kjxcgtw9v6tf5mvta3nk93nj8knx8phhrezer3n8999crggcz0p20m
+t1psxy35zgz289wuj33pm05vkl3sr40xp3ecdacw0dmuzu688wufwswqs2mci16nffdydssku2e5knfkchmr8vtr8y0dxvwr0w8j9j8rxw22tsxs3skplgjp
 ```
 
 Inputs:
@@ -504,7 +510,7 @@ d496c2
 Recipient `m/35263'/1'/0'/1/0`, Receiving Address:
 
 ```
-tf1lrkq0dfkh4q83pxp96rp62a4tlnn3ajw9gafvhd2uyg5vv3kmslegyut7k6ymyeygdpr5l4632djpd4a7vlfmt6pcrly3wj2rt2pxcgdelf8q
+t1lrkq0dfkh4q83pxp96rp62a4tlnn3ajw9gafvhd2uyg5vv3kmslsmupuudi1jsfchad5fkfjgs6z8flt4z5myzmtmue7nkh5rs87fzay5xk5zdsspe08qm
 ```
 
 Inputs:

@@ -197,7 +197,7 @@ fn a_node_serves_two_wallets_across_five_blocks() {
         &a,
         &[(RECEIVING, 0), (RECEIVING, 1), (RECEIVING, 2), (CHANGE, 0)],
     );
-    let hits = node.scan(&a_predicates, 0);
+    let hits = node.scan(&a_predicates, 0).unwrap();
     assert_eq!(
         hits.iter().map(|hit| hit.height).collect::<Vec<_>>(),
         vec![0, 1, 4, 5],
@@ -226,11 +226,13 @@ fn a_node_serves_two_wallets_across_five_blocks() {
     assert_eq!(a_recv2_opening.qty, b_payment);
 
     // `since_height` is the wallet's resume point.
-    let recent = node.scan(&a_predicates, 4);
+    let recent = node.scan(&a_predicates, 4).unwrap();
     assert_eq!(recent.len(), 2);
 
     // B sees its own two contracts and nothing of A's.
-    let b_hits = node.scan(&predicates(&b, &[(RECEIVING, 0), (CHANGE, 0)]), 0);
+    let b_hits = node
+        .scan(&predicates(&b, &[(RECEIVING, 0), (CHANGE, 0)]), 0)
+        .unwrap();
     assert_eq!(b_hits.len(), 2);
     assert_eq!(b_hits[0].id.0, b_id);
     assert_eq!(b_hits[0].spent.expect("B spent it").height, 5);
@@ -370,7 +372,7 @@ fn the_shipped_devnet_has_the_documented_genesis_hash() {
     let genesis = crate::genesis::derive(&shipped).expect("derive the shipped genesis");
     assert_eq!(
         hex::encode(genesis.genesis_hash.0),
-        "aed6c23dea081daffa0ad8e09d7d1436b506bbe6c76d5b4abef4897c9cff7801",
+        "38808a50580d7a1b8bebe2dce32e589e08b6951c38a341edf9b6d2961b4ca8a9",
         "update flamed.md's recorded session along with this value"
     );
     let ids: Vec<_> = genesis
@@ -381,18 +383,18 @@ fn the_shipped_devnet_has_the_documented_genesis_hash() {
     let (mut chain, _) = Blockchain::devnet_genesis(genesis.chain.params(), &ids).unwrap();
     assert_eq!(
         hex::encode(chain.state_commitment().contracts.0),
-        "8669b06a22fe97fcf02268f2d2a24f66dc39cb17c4041ec30195cd764eeed4b2",
+        "fa4a1dead03dc3e237197e323896949abb911fba062fefb0dc48dd46184d3979",
     );
     assert_eq!(
         hex::encode(ids[0]),
-        "e870be9e3aa372fd8d338abe54bc4ad6db48e6bbea8c8ca75091bd2693cd948e",
+        "373dbd58201b17f6fb216ed0a0228e1695927a8d8e449cda66941fbfd37cea3c",
     );
     let block = chain
         .build_block(crate::node::core_block_hash(1), Vec::new())
         .unwrap();
     assert_eq!(
         hex::encode(block.header.id().into_bytes()),
-        "027658ba156843a40d3042b97334e1a61c8ea889fbc9d02a402c1bed6759acaf",
+        "fb14e45762eafae0a0933ebb67c06dbbe68b37e9447b479a208a1131923c5d39",
     );
 }
 

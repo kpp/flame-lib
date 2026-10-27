@@ -15,6 +15,10 @@ clap = { version = "4", features = ["derive"] }
 flamechain = { path = "../flamechain" }
 flamed-rpc = { path = "../flamed-rpc" }
 flamekd = { path = "../flamekd" }
+# Devnet only, for `flamed address`: the wallet's own derivation, so the
+# genesis holder is exactly the address a wallet restored from the same
+# mnemonic shows first.
+flamepayments = { path = "../flamepayments", optional = true }
 flamevm = { path = "../flamevm" }
 hex = "0.3"
 jsonrpsee = { version = "0.26", features = ["server"] }
@@ -26,8 +30,10 @@ thiserror = "2"
 # `net` is named explicitly. `jsonrpsee-server` enables it anyway, so the
 # build would work without it today, but the IO driver this crate's own
 # runtime turns on must not depend on another crate's feature list.
-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
 toml = "0.8"
+zeroize = { version = "1", optional = true }
 
 # `flamechain` on purpose appears twice, the `flamepayments` pattern. The
 # dependency above, without features, is the one every consumer of this
@@ -44,5 +50,5 @@ tempfile = "3"
 
 [features]
 # Everything a public chain gets from minting and consensus, and this devnet
-# fakes: genesis allocations and the interval minter.
-devnet = ["flamechain/devnet"]
+# fakes: genesis allocations, the interval minter, and `flamed address`.
+devnet = ["flamechain/devnet", "dep:flamepayments", "dep:zeroize"]

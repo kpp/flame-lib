@@ -117,6 +117,12 @@ pub(crate) fn signcall_verification_transcript(message: &[u8]) -> Transcript {
     transcript
 }
 
+/// The transcript a `signcall` signature over `program` is made with: what
+/// a wallet signs, and what the VM checks it against.
+pub fn signcall_transcript(program: &Cell) -> Transcript {
+    signcall_verification_transcript(&VM::signcall_message(program))
+}
+
 /// Block-level immutable context (height, chain stats).
 pub struct BlockContext {
     pub height: u64,
@@ -721,7 +727,7 @@ pub fn query_actor(
     block: &BlockContext,
     cells: Arc<CellIndex>,
 ) -> Result<QueryResult, VMError> {
-    if !arg.is_portable() || (!arg.is_copyable() && !matches!(arg, Value::Dict(_))) {
+    if !arg.is_copyable() || !arg.is_portable() {
         return Err(VMError::NonDataInQuery);
     }
     let result = (|| {
@@ -1244,7 +1250,7 @@ impl VM {
     /// Export data while its source frame is still available; never export
     /// host witnesses or make a caller depend on the callee's storage cache.
     fn query_value(&mut self, value: Value) -> Result<Value, VMError> {
-        if !value.is_portable() || (!value.is_copyable() && !matches!(value, Value::Dict(_))) {
+        if !value.is_copyable() || !value.is_portable() {
             return Err(VMError::NonDataInQuery);
         }
         match value {
@@ -1254,19 +1260,7 @@ impl VM {
                 let mut reader = CodeCells(self.resolver());
                 let root = root.load_graph_scoped(&mut reader)?;
                 // Eager metered decoding validates every leaf, including lazy Dicts.
-                let value = Value::from_cell(&root, &mut reader)?;
-                fn data_only(value: &Value) -> bool {
-                    match value {
-                        Value::Dict(dict) => {
-                            dict.is_portable() && dict.entries().all(|(_, value)| data_only(value))
-                        }
-                        value => value.is_copyable() && value.is_portable(),
-                    }
-                }
-                if !data_only(&value) {
-                    return Err(VMError::NonDataInQuery);
-                }
-                Ok(value)
+                Ok(Value::from_cell(&root, &mut reader)?)
             }
             Value::Cell(cell) => {
                 let mut reader = CodeCells(self.resolver());

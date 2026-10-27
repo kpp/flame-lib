@@ -72,14 +72,57 @@ test('addresses and ownership', () => {
     const wallet = wasm.Wallet.fromSeed(bytes(clear.seed), 'testnet', 0);
     const first = wallet.nextAddress();
     assert.deepEqual(first.path, { branch: 0, index: 0 });
-    assert.ok(first.address.startsWith('tf1'));
+    assert.ok(first.receivingAddress.startsWith('t1'));
+    assert.equal(first.receivingAddress.length, 120);
+    assert.ok(first.receivingAddress.slice(60).startsWith('i1'));
     assert.equal(wallet.nextIndex(), 1);
-    assert.deepEqual(wasm.addressToPredicate(first.address, 'testnet'), first.predicate);
-    assert.throws(() => wasm.addressToPredicate(first.address, 'mainnet'), flameError('invalidAddress'));
+    assert.deepEqual(wasm.receivingAddressToPredicate(first.receivingAddress, 'testnet'), first.predicate);
+    assert.deepEqual(wasm.receivingAddressToPredicate(first.receivingAddress.toUpperCase(), 'testnet'), first.predicate);
+    assert.throws(() => wasm.receivingAddressToPredicate(first.receivingAddress.slice(0, 60), 'testnet'), flameError('invalidAddress'));
+    const corrupted = first.receivingAddress.slice(0, -1) + (first.receivingAddress.endsWith('q') ? 'p' : 'q');
+    assert.throws(() => wasm.receivingAddressToPredicate(corrupted, 'testnet'), flameError('invalidAddress'));
+    assert.throws(() => wasm.receivingAddressToPredicate(first.receivingAddress, 'mainnet'), flameError('invalidAddress'));
     assert.deepEqual(wallet.owns(first.predicate, 0), { branch: 0, index: 0 });
     assert.equal(wallet.owns(new Uint8Array(32).fill(1), 5), undefined);
     assert.ok(wallet.receivingKey().startsWith('testrecv1'));
     assert.ok(wallet.viewKey().startsWith('testview1'));
+
+    const mainnet = wasm.Wallet.fromSeed(bytes(clear.seed), 'mainnet', 0).nextAddress();
+    assert.equal(mainnet.receivingAddress.length, 120);
+    assert.ok(mainnet.receivingAddress.startsWith('f1'));
+    assert.ok(mainnet.receivingAddress.slice(60).startsWith('e1'));
+    assert.deepEqual(wasm.receivingAddressToPredicate(mainnet.receivingAddress, 'mainnet'), mainnet.predicate);
+    assert.ok(mainnet.trackingAddress.startsWith('f1'));
+    assert.equal(wasm.predicateToTrackingAddress(mainnet.predicate, 'mainnet'), mainnet.trackingAddress);
+});
+
+test('tracking addresses', () => {
+    const first = wasm.Wallet.fromSeed(bytes(clear.seed), 'testnet', 0).nextAddress();
+    assert.equal(first.trackingAddress, first.receivingAddress.slice(0, 60));
+    assert.equal(
+        wasm.predicateToTrackingAddress(wasm.receivingAddressToPredicate(first.receivingAddress, 'testnet'), 'testnet'),
+        first.trackingAddress
+    );
+    assert.ok(wasm.validateReceivingAddress(first.receivingAddress, 'testnet'));
+    assert.ok(!wasm.validateReceivingAddress(first.receivingAddress, 'mainnet'));
+    assert.ok(!wasm.validateReceivingAddress(first.trackingAddress, 'testnet'));
+    assert.ok(wasm.validateTrackingAddress(first.trackingAddress, 'testnet'));
+    assert.ok(!wasm.validateTrackingAddress(first.trackingAddress, 'mainnet'));
+    assert.ok(!wasm.validateTrackingAddress(first.receivingAddress, 'testnet'));
+    assert.throws(() => wasm.validateReceivingAddress(first.receivingAddress, 'Testnet'), TypeError);
+    assert.throws(() => wasm.validateTrackingAddress(first.trackingAddress, 'regtest'), TypeError);
+    for (const predicate of [new Uint8Array(31).fill(1), new Uint8Array(32), new Uint8Array(32).fill(0xff)]) {
+        assert.throws(() => wasm.predicateToTrackingAddress(predicate, 'testnet'),
+            flameError('invalidBytes', { what: 'predicate' }));
+    }
+});
+
+test('constants', () => {
+    assert.equal(wasm.memoMaxBytes(), 4006);
+    // `FLAME_FLAVOR = 1`, as a little-endian scalar.
+    const one = new Uint8Array(32);
+    one[0] = 1;
+    assert.deepEqual(wasm.nativeFlavor(), one);
 });
 
 test('a transfer from served bytes to signed bytes', () => {
@@ -89,6 +132,8 @@ test('a transfer from served bytes to signed bytes', () => {
     const allocation = wasm.decodeContract(bytes(clear.request.inputs[0].contract));
     assert.equal(allocation.value.kind, 'clear');
     assert.equal(typeof allocation.value.qty, 'bigint');
+    assert.deepEqual(allocation.value.flavor, wasm.nativeFlavor());
+    assert.equal(allocation.value.isNative, true);
     assert.deepEqual(alice.owns(allocation.predicate, 0), { branch: 0, index: 0 });
 
     const transfer = alice.buildTransfer(request(clear.request));
@@ -110,6 +155,8 @@ test('a transfer from served bytes to signed bytes', () => {
 
     const received = bob.openNote(toBob.contract, toBob.note, bobPath);
     assert.equal(received.opening.qty, BigInt(clear.request.outputs[0].qty));
+    assert.deepEqual(received.opening.flavor, wasm.nativeFlavor());
+    assert.equal(received.isNative, true);
     assert.ok(received.memo instanceof Uint8Array);
     assert.ok(wasm.openingMatches(toBob.contract, received.opening));
     const kept = alice.openNote(toChange.contract, toChange.note, changePath);
@@ -185,7 +232,7 @@ test('errors name what was wrong', () => {
     assert.throws(() => alice.buildTransfer(wrongKey), flameError('keyMismatch', { input: 0 }));
 
     const wrongNetwork = request(clear.request);
-    wrongNetwork.outputs[0].address = wasm.Wallet.fromSeed(bytes(clear.seed), 'mainnet', 0).nextAddress().address;
+    wrongNetwork.outputs[0].address = wasm.Wallet.fromSeed(bytes(clear.seed), 'mainnet', 0).nextAddress().receivingAddress;
     assert.throws(() => alice.buildTransfer(wrongNetwork), flameError('invalidAddress'));
 
     // A shape mistake is the caller's bug, thrown as a TypeError.

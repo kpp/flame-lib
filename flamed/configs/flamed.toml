@@ -4,5 +4,12 @@
 data_dir = "./data"
 genesis = "./genesis.json"
 rpc_bind = "127.0.0.1:8545"
-block_interval_secs = 15
+block_interval_secs = 5
 minimum_fee = 0
+# Where the mock core indexer keeps the times of the core blocks it hands
+# out. Default: <data_dir>/indexer.
+# indexer_dir = "./data/indexer"
+# Where the indexes keep effect logs, contracts and notes, which are read
+# only on request. A cache: every start deletes and rebuilds it. Default:
+# <data_dir>/cold.bin.
+# cold_path = "./data/cold.bin"

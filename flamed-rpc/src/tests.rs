@@ -3,8 +3,9 @@
 //! on.
 
 use crate::types::{
-    BlockId, ContractEnvelope, ContractId, NoteEnvelope, PredicatePoint, ProofBytes, ProofResult,
-    ScanEntry, ScanResult, SpentAt, TipResult, TxId, TxStatusResult,
+    BlockId, ContractEnvelope, ContractId, Counterparty, HistoryContract, HistoryEntry,
+    HistoryResult, NoteEnvelope, PredicatePoint, ProofBytes, ProofResult, ScanEntry, ScanResult,
+    SpentAt, TipResult, TxId, TxStatusResult, UnspentEntry, UnspentResult,
 };
 
 #[test]
@@ -112,6 +113,7 @@ fn an_unspent_scan_entry_omits_its_spend() {
         txid: TxId([0x44; 32]),
         predicate: PredicatePoint([0x55; 32]),
         bytes: ContractEnvelope(vec![0xde, 0xad]),
+        time: None,
         note: None,
         spent: None,
     };
@@ -121,6 +123,7 @@ fn an_unspent_scan_entry_omits_its_spend() {
     };
     let json = serde_json::to_value(&result).expect("serialize");
     assert!(json["outputs"][0].get("spent").is_none());
+    assert!(json["outputs"][0].get("time").is_none());
 
     let spent = ScanEntry {
         spent: Some(SpentAt {
@@ -136,6 +139,52 @@ fn an_unspent_scan_entry_omits_its_spend() {
 }
 
 #[test]
+fn a_pending_unspent_entry_trades_its_height_time_and_proof_for_received_at() {
+    let confirmed = UnspentEntry {
+        id: ContractId([0x33; 32]),
+        txid: TxId([0x44; 32]),
+        bytes: ContractEnvelope(vec![0xde, 0xad]),
+        note: None,
+        height: Some(1),
+        time: Some(1_800_000_000),
+        received_at: None,
+        proof: Some(ProofBytes(vec![0x01, 0x02])),
+    };
+    let result = UnspentResult {
+        tip: TipResult {
+            hash: BlockId([0x11; 32]),
+            height: 1,
+            contract_root: [0x22; 32],
+        },
+        predicate: PredicatePoint([0x55; 32]),
+        outputs: vec![
+            confirmed.clone(),
+            UnspentEntry {
+                height: None,
+                time: None,
+                received_at: Some(1_800_000_100),
+                proof: None,
+                ..confirmed
+            },
+        ],
+    };
+    let json = serde_json::to_value(&result).expect("serialize");
+    assert_eq!(json["outputs"][0]["height"], 1);
+    assert_eq!(json["outputs"][0]["proof"], "AQI=");
+    assert_eq!(json["outputs"][0]["time"], 1_800_000_000);
+    assert!(json["outputs"][0].get("received_at").is_none());
+    assert!(json["outputs"][1].get("height").is_none());
+    assert!(json["outputs"][1].get("time").is_none());
+    assert_eq!(json["outputs"][1]["received_at"], 1_800_000_100);
+    assert!(json["outputs"][1].get("proof").is_none());
+    assert!(json["outputs"][1].get("note").is_none());
+    assert_eq!(
+        serde_json::from_value::<UnspentResult>(json).expect("deserialize"),
+        result
+    );
+}
+
+#[test]
 fn a_scan_entry_carries_its_note_as_base64_or_omits_it() {
     let entry = ScanEntry {
         id: ContractId([0x33; 32]),
@@ -143,11 +192,13 @@ fn a_scan_entry_carries_its_note_as_base64_or_omits_it() {
         txid: TxId([0x44; 32]),
         predicate: PredicatePoint([0x55; 32]),
         bytes: ContractEnvelope(vec![0xde, 0xad]),
+        time: Some(1_760_000_000),
         note: Some(NoteEnvelope(vec![0x01, 0x02, 0x03, 0xff])),
         spent: None,
     };
     let json = serde_json::to_value(&entry).expect("serialize");
     assert_eq!(json["note"], "AQID/w==");
+    assert_eq!(json["time"], 1_760_000_000);
     assert_eq!(
         serde_json::from_value::<ScanEntry>(json).expect("deserialize"),
         entry
@@ -190,6 +241,7 @@ fn a_block_preserves_execution_categories_links_and_exact_fees() {
                     available_storage_units: 8192,
                 },
             },
+            time: Some(1_760_000_000),
             transactions: 1,
             internal: 1,
             failed: 1,
@@ -206,6 +258,7 @@ fn a_block_preserves_execution_categories_links_and_exact_fees() {
             inputs: 0,
             outputs: 1,
             messages: 0,
+            locktime: 0,
         }],
     };
     let json = serde_json::to_value(&result).unwrap();
@@ -223,6 +276,7 @@ fn a_block_preserves_execution_categories_links_and_exact_fees() {
                         "available_storage_units": 8192
                     }
                 },
+                "time": 1_760_000_000,
                 "transactions": 1, "internal": 1, "failed": 1, "size_bytes": 1234
             },
             "executions": [{
@@ -232,7 +286,7 @@ fn a_block_preserves_execution_categories_links_and_exact_fees() {
                     "actor": "88".repeat(32), "error": "actor not found"
                 },
                 "fee_sparks": "18446744073709551615", "inputs": 0, "outputs": 1,
-                "messages": 0
+                "messages": 0, "locktime": 0
             }]
         })
     );
@@ -277,10 +331,11 @@ fn execution_data_is_nested_and_requires_each_variants_fields() {
             inputs: 0,
             outputs: 0,
             messages: 0,
+            locktime: 1_760_000_000,
         };
         let expected = json!({
             "id": "66".repeat(32), "fee_sparks": "0", "inputs": 0,
-            "outputs": 0, "messages": 0, "execution": fields
+            "outputs": 0, "messages": 0, "locktime": 1_760_000_000, "execution": fields
         });
         assert_eq!(serde_json::to_value(&summary).unwrap(), expected);
         assert_eq!(
@@ -302,4 +357,84 @@ fn execution_data_is_nested_and_requires_each_variants_fields() {
             );
         }
     }
+}
+
+#[test]
+fn a_history_page_omits_what_does_not_apply() {
+    let contract = HistoryContract {
+        id: ContractId([0x33; 32]),
+        predicate: PredicatePoint([0x55; 32]),
+        bytes: ContractEnvelope(vec![0xde, 0xad]),
+        note: None,
+    };
+    let confirmed = HistoryEntry {
+        txid: TxId([0x44; 32]),
+        height: Some(1),
+        time: Some(1_800_000_000),
+        received_at: None,
+        fee_sparks: "1000".into(),
+        created: vec![contract.clone()],
+        spent: vec![],
+        others_spent: vec![Counterparty {
+            predicate: PredicatePoint([0x66; 32]),
+            address: None,
+        }],
+        others_created: vec![],
+    };
+    let result = HistoryResult {
+        tip: TipResult {
+            hash: BlockId([0x11; 32]),
+            height: 1,
+            contract_root: [0x22; 32],
+        },
+        predicates: vec![PredicatePoint([0x55; 32])],
+        entries: vec![confirmed.clone()],
+        older: None,
+        newer: Some("newer:1:end:11:22".into()),
+        has_newer: false,
+        pending: None,
+        pending_truncated: false,
+    };
+    let json = serde_json::to_value(&result).expect("serialize");
+    assert!(json["older"].is_null());
+    assert_eq!(json["newer"], "newer:1:end:11:22");
+    assert!(json.get("pending").is_none());
+    assert!(json.get("pending_truncated").is_none());
+    assert!(json["entries"][0].get("received_at").is_none());
+    assert!(json["entries"][0]["created"][0].get("note").is_none());
+    assert_eq!(json["entries"][0]["spent"], serde_json::json!([]));
+    assert!(json["entries"][0]["others_spent"][0]
+        .get("address")
+        .is_none());
+    // An entry from a node that does not know the other side yet.
+    let mut older_node = json["entries"][0].clone();
+    older_node
+        .as_object_mut()
+        .expect("an object")
+        .remove("others_spent");
+    older_node
+        .as_object_mut()
+        .expect("an object")
+        .remove("others_created");
+    let read: HistoryEntry = serde_json::from_value(older_node).expect("deserialize");
+    assert!(read.others_spent.is_empty() && read.others_created.is_empty());
+    assert_eq!(
+        serde_json::from_value::<HistoryResult>(json).expect("deserialize"),
+        result
+    );
+
+    let with_pending = HistoryResult {
+        pending: Some(vec![HistoryEntry {
+            height: None,
+            time: None,
+            received_at: Some(1_800_000_100),
+            ..confirmed
+        }]),
+        pending_truncated: true,
+        ..result
+    };
+    let json = serde_json::to_value(&with_pending).expect("serialize");
+    assert_eq!(json["pending_truncated"], true);
+    assert!(json["pending"][0].get("height").is_none());
+    assert_eq!(json["pending"][0]["received_at"], 1_800_000_100);
 }

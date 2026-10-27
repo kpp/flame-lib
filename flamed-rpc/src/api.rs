@@ -14,8 +14,9 @@ use jsonrpsee::proc_macros::rpc;
 
 use crate::types::{
     ActorId, ActorQueryResult, ActorResult, BlockId, BlockResult, BlockTxEnvelope, BlocksResult,
-    ContractId, ContractResult, PendingTransactionsResult, PredicatePoint, ProofResult, ScanResult,
-    TipResult, TransactionResult, TransactionsResult, TxId, TxStatusResult, ValueEnvelope,
+    ContractId, ContractResult, HistoryResult, PendingTransactionsResult, PredicatePoint,
+    ProofResult, ScanResult, TipResult, TransactionResult, TransactionsResult, TxId,
+    TxStatusResult, UnspentResult, ValueEnvelope,
 };
 
 /// The `flamed` JSON-RPC 2.0 API. Parameters are positional, in the order
@@ -55,8 +56,8 @@ pub trait FlamedApi {
     async fn actor(&self, id: ActorId) -> RpcResult<ActorResult>;
 
     /// Runs an actor getter against the current committed tip, without effects.
-    /// Arguments and results are Scalar, Point, Cell, or portable Dicts whose
-    /// entries recursively contain only these data values, as Value envelopes.
+    /// Arguments and results must be copyable and portable, as Value envelopes.
+    /// Dicts must retain both sticky flags, including when empty.
     /// Gas must be 1..=MAX_QUERY_GAS; envelopes are limited to MAX_QUERY_BYTES.
     /// If supplied, `expected_block` must match the current tip; a mismatch
     /// returns STALE_BLOCK. Historical blocks are not queried.
@@ -104,4 +105,40 @@ pub trait FlamedApi {
         predicates: Vec<PredicatePoint>,
         since_height: u64,
     ) -> RpcResult<ScanResult>;
+
+    /// Every unspent contract locked to one receiving or tracking address,
+    /// with a proof for each against the current tip. Set `with_pending` to
+    /// true to apply the mempool on top: contracts a pending transaction
+    /// spends are left out, and contracts it creates are added without a
+    /// height or a proof. The default is false.
+    /// `INVALID_ADDRESS` if the address does not decode for this network.
+    #[method(name = "unspent")]
+    async fn unspent(
+        &self,
+        address: String,
+        with_pending: Option<bool>,
+    ) -> RpcResult<UnspentResult>;
+
+    /// What happened to a wallet's addresses, a page at a time, with a
+    /// cursor at each end of what has been read (`HistoryResult`).
+    ///
+    /// Without `cursor`, the newest entries; with an `older` cursor, the
+    /// entries before it; with a `newer` one, the entries after it, oldest
+    /// first. Every page needs the same `addresses`, up to
+    /// `MAX_HISTORY_ADDRESSES`. `limit` is 1..=`MAX_PAGE_SIZE`.
+    /// `with_pending` (default false) adds the mempool to a first or newer
+    /// page. Each entry also names the other side: whose contracts it spent
+    /// and whom it created contracts for, beyond the asked addresses.
+    /// `STALE_BLOCK` if the block a cursor stands on is no longer in the
+    /// chain: start again without one. `INVALID_ADDRESS` for an address,
+    /// invalid params for a cursor that does not read or was made for other
+    /// addresses.
+    #[method(name = "history")]
+    async fn history(
+        &self,
+        addresses: Vec<String>,
+        cursor: Option<String>,
+        limit: u32,
+        with_pending: Option<bool>,
+    ) -> RpcResult<HistoryResult>;
 }

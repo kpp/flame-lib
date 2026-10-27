@@ -14,6 +14,21 @@ fn check_vectors(formatted: &str, raw: &str, key: &SpendKey, network: Network) {
     let recv = view.to_recv();
     let receiving = recv.to_address();
     let tracking = receiving.to_tracking_address();
+    let receiving_text = receiving.to_bech32(network);
+    let tracking_text = tracking.to_bech32(network);
+    assert!(receiving_text.starts_with(&tracking_text));
+    assert_eq!(tracking_text.len(), 60);
+    assert_eq!(receiving_text.len(), 120);
+    let encryption_hrp = match network {
+        Network::Mainnet => "e",
+        Network::Testnet => "i",
+    };
+    let encryption = bech32::encode::<bech32::Bech32m>(
+        bech32::Hrp::parse(encryption_hrp).unwrap(),
+        &receiving.to_bytes()[32..],
+    )
+    .unwrap();
+    assert_eq!(receiving_text, tracking_text + &encryption);
 
     macro_rules! check {
         ($label:literal, $raw_label:literal, $value:expr, $ty:ty) => {

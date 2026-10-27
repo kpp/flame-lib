@@ -124,6 +124,8 @@ async fn contract_tracks_spending_and_survives_replay() {
         .unwrap();
     drop(shared);
 
+    // `cold.bin` is a cache: a node that lost it rebuilds it from blocks.
+    std::fs::remove_file(cfg.cold_path()).unwrap();
     let reopened = Node::open(&genesis, &cfg).unwrap();
     let rpc = crate::rpc::FlamedRpc::new(Arc::new(Mutex::new(reopened)));
     assert_eq!(rpc.contract(genesis_id).await.unwrap(), spent);

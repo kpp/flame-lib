@@ -80,7 +80,20 @@ async fn query_actor_is_bounded_pinned_and_returns_only_data() {
             .unwrap()
             .encode(),
     );
+    let mut poisoned = Dict::from_values(vec![Value::ClearToken(flamevm::ClearToken::new(
+        flamevm::Scalar::ONE,
+        flamevm::Scalar::ZERO,
+    ))]);
+    poisoned.remove(&flamevm::Scalar::ZERO).unwrap();
+    assert!(poisoned.is_empty());
     let cases = [
+        (
+            actor,
+            ValueEnvelope(Value::Dict(poisoned).to_envelope().unwrap().encode()),
+            MAX_QUERY_GAS,
+            None,
+            codes::QUERY_FAILED,
+        ),
         (actor, argument.clone(), 0, None, codes::LIMIT_EXCEEDED),
         (
             actor,
@@ -223,13 +236,19 @@ fn query_actor_rejects_invalid_and_expanding_dict_envelopes() {
     let token = Value::ClearToken(flamevm::ClearToken::new(Scalar::ONE, Scalar::ZERO))
         .to_cell()
         .unwrap();
-    let forged = dict_cell(&[dict_cell(&[token], 3)], 3);
+    let forged = dict_cell(&[dict_cell(&[token], 7)], 7);
     assert!(matches!(
         node.query_actor(actor, envelope(forged), MAX_QUERY_GAS, None),
         Err(crate::node::NodeError::QueryDecode(CellError::InvalidFormat))
     ));
 
-    let root = Arc::new(dict_cell(&[], 3));
+    // Older headers still decode, but absent copyability is never inferred.
+    assert!(matches!(
+        node.query_actor(actor, envelope(dict_cell(&[], 3)), MAX_QUERY_GAS, None),
+        Err(crate::node::NodeError::Query(flamevm::VMError::NonDataInQuery))
+    ));
+
+    let root = Arc::new(dict_cell(&[], 7));
     let mut missing = CellIndex::new();
     missing.insert(root.clone()).unwrap();
     let missing = ValueEnvelope(CellEnvelope::new(root.id(), missing).unwrap().encode());
@@ -240,7 +259,7 @@ fn query_actor_rejects_invalid_and_expanding_dict_envelopes() {
 
     let mut shared = Value::Scalar(Scalar::ZERO).to_cell().unwrap();
     for _ in 0..24 {
-        shared = dict_cell(&[shared.clone(), shared], 3);
+        shared = dict_cell(&[shared.clone(), shared], 7);
     }
     let shared = envelope(shared);
     assert!(shared.0.len() < MAX_QUERY_BYTES);

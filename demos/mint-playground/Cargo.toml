@@ -9,11 +9,16 @@ publish = false
 
 [dependencies]
 axum = "0.8"
+flamed-rpc = { path = "../../flamed-rpc" }
 flamekd = { path = "../../flamekd" }
+# The payout wallet: the same library as the `flamewallet` CLI.
+flamewallet-cli = { path = "../../flamewallet-cli" }
+flamewallet-ffi = { path = "../../flamewallet-ffi" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal", "fs"] }
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

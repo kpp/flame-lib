@@ -50,7 +50,7 @@ pub struct ActorQueryResult {
     pub block: BlockId,
     /// Height of that block.
     pub height: u64,
-    /// One data Value (Scalar, Point, Cell, or recursively data-only portable Dict).
+    /// One copyable, portable Value, including a Dict retaining both sticky flags.
     pub value: ValueEnvelope,
     /// VM execution gas consumed, excluding transport decoding.
     pub gas_used: u64,
@@ -203,6 +203,9 @@ pub struct ScanEntry {
     pub predicate: PredicatePoint,
     /// Its bytes, as published.
     pub bytes: ContractEnvelope,
+    /// The creating block's time, in Unix seconds; see [`BlockSummary::time`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<u64>,
     /// The `Data` entry right after it in its log, if any: the note a
     /// confidential output's recipient opens. Absent when none followed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,6 +222,144 @@ pub struct ScanResult {
     pub tip_height: u64,
     /// The contracts, in height order.
     pub outputs: Vec<ScanEntry>,
+}
+
+/// One contract an address can spend.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnspentEntry {
+    /// The contract's id.
+    pub id: ContractId,
+    /// The transaction that created it.
+    pub txid: TxId,
+    /// Its bytes, as published.
+    pub bytes: ContractEnvelope,
+    /// The `Data` entry right after it in its log, if any. Absent when none
+    /// followed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<NoteEnvelope>,
+    /// The height that created it. Absent while its transaction is pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u64>,
+    /// The creating block's time, in Unix seconds; see [`BlockSummary::time`].
+    /// Absent while pending, or when the indexer has no time for the block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<u64>,
+    /// While pending: when this node admitted its transaction, in Unix
+    /// seconds. Absent once confirmed, or when the node has restarted since
+    /// admitting it; see [`PendingTransaction::received_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<u64>,
+    /// A membership proof valid against `tip`. Absent while its transaction
+    /// is pending: a contract the chain has not inserted has nothing to prove.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<ProofBytes>,
+}
+
+/// What one address can spend, and the tip it was answered at.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnspentResult {
+    /// The tip every proof is valid against.
+    pub tip: TipResult,
+    /// The predicate the address resolved to.
+    pub predicate: PredicatePoint,
+    /// Confirmed contracts in creation order, then pending ones in mempool
+    /// admission order.
+    pub outputs: Vec<UnspentEntry>,
+}
+
+/// One contract a history entry created or spent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryContract {
+    /// The contract's id.
+    pub id: ContractId,
+    /// The predicate that locks it: which of the asked addresses it is.
+    pub predicate: PredicatePoint,
+    /// Its bytes, as published.
+    pub bytes: ContractEnvelope,
+    /// The `Data` entry right after it in its creating log, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<NoteEnvelope>,
+}
+
+/// One transaction that created or spent a contract of the asked addresses.
+///
+/// An entry never changes once the transaction has confirmed: it says what
+/// happened, not what is true now. `unspent` says what is true now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    /// The transaction, or all zeros for the genesis allocation.
+    pub txid: TxId,
+    /// Its height. Absent while pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u64>,
+    /// Its block's time, in Unix seconds; see [`BlockSummary::time`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<u64>,
+    /// When this node admitted it, in Unix seconds; see
+    /// [`TransactionResult::received_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<u64>,
+    /// Its fee in sparks, as an exact decimal string.
+    pub fee_sparks: String,
+    /// Contracts it created for the asked addresses: by address, then in
+    /// log order.
+    pub created: Vec<HistoryContract>,
+    /// Contracts of the asked addresses it spent, each with the bytes and
+    /// note it was created with: by address, then in log order.
+    pub spent: Vec<HistoryContract>,
+    /// Who else's contracts it spent: on a receive, who paid. Each
+    /// predicate once, in log order.
+    #[serde(default)]
+    pub others_spent: Vec<Counterparty>,
+    /// Who else it created contracts for: on a send, who was paid; on a
+    /// receive, the payer's change. Each predicate once, in log order.
+    #[serde(default)]
+    pub others_created: Vec<Counterparty>,
+}
+
+/// The other side of a history entry: a predicate none of the asked
+/// addresses resolved to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Counterparty {
+    /// The predicate.
+    pub predicate: PredicatePoint,
+    /// Its tracking address, `f1…` / `t1…`, when it is one. A receiving
+    /// address cannot be rebuilt from a predicate: its encryption key is
+    /// not on chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+/// A page of history, and the cursors around it.
+///
+/// A cursor is a readable string for debugging, not a format: pass it back
+/// as it came, and expect it to change without notice.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryResult {
+    /// The tip this page was answered at.
+    pub tip: TipResult,
+    /// The predicate each address resolved to, in the order asked.
+    pub predicates: Vec<PredicatePoint>,
+    /// Confirmed entries: newest first on a first or older page, oldest
+    /// first on a newer page.
+    pub entries: Vec<HistoryEntry>,
+    /// On a first or older page, where older entries continue. Null when
+    /// there are none, and always on a newer page.
+    pub older: Option<String>,
+    /// On a first or newer page, where to read what comes after this page.
+    /// Null on an older page.
+    pub newer: Option<String>,
+    /// On a newer page: whether entries past `newer` already exist, so it
+    /// is worth asking again right away. False on other pages.
+    pub has_newer: bool,
+    /// With `with_pending`, on a first or newer page: the mempool's
+    /// transactions that touch the asked addresses, in admission order,
+    /// without a height or time. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Vec<HistoryEntry>>,
+    /// Whether `pending` was cut at [`MAX_PAGE_SIZE`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_truncated: bool,
 }
 
 /// Execution category and its data.
@@ -261,6 +402,10 @@ pub struct TransactionSummary {
     pub outputs: u32,
     /// Number of outgoing asynchronous messages.
     pub messages: u32,
+    /// The header's `locktime`, as signed: `0` for no lock, otherwise a
+    /// height or Unix time as in Bitcoin. The chain does not check it yet.
+    /// Zero for internal executions.
+    pub locktime: u32,
 }
 
 /// A public execution effect.
@@ -516,6 +661,13 @@ pub struct TransactionResult {
     pub height: u64,
     /// Containing block identifier.
     pub block: BlockId,
+    /// The containing block's time, in Unix seconds; see [`BlockSummary::time`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_time: Option<u64>,
+    /// When this node admitted it to its mempool, in Unix seconds. Absent
+    /// when this node never held it pending, or has restarted since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<u64>,
     /// Canonical public effect log as a base64 CellEnvelope.
     #[serde(with = "crate::codec::base64")]
     pub log: Vec<u8>,
@@ -545,6 +697,10 @@ pub struct PendingTransaction {
     pub fee_sparks: String,
     /// Witness size counted by the mempool, in bytes.
     pub witness_bytes: u64,
+    /// When this node admitted it, in Unix seconds.
+    pub received_at: u64,
+    /// The header's `locktime`, as signed; see [`TransactionSummary::locktime`].
+    pub locktime: u32,
 }
 
 /// A bounded view of the current mempool, in admission order.
@@ -598,6 +754,11 @@ pub struct BlockSummary {
     pub id: BlockId,
     /// Complete consensus header.
     pub header: BlockHeader,
+    /// The time of the core block the header anchors to, in Unix seconds,
+    /// as the node's core indexer reports it. Absent for genesis and for a
+    /// core block the indexer does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<u64>,
     /// External transaction count.
     pub transactions: u32,
     /// Internal execution count, including failures.
@@ -630,6 +791,9 @@ pub struct BlocksResult {
 /// Maximum entries in a `blocks`, `transactions`, or `pending_transactions` response.
 pub const MAX_PAGE_SIZE: u32 = 100;
 
+/// The most addresses one `history` call may name.
+pub const MAX_HISTORY_ADDRESSES: usize = 256;
+
 /// The most predicates one `scan` may name.
 ///
 /// It bounds the question, not the answer: a predicate with a long history
@@ -660,4 +824,8 @@ pub mod codes {
     pub const STALE_BLOCK: i32 = -32005;
     /// Actor query execution failed, including gas exhaustion or a write attempt.
     pub const QUERY_FAILED: i32 = -32006;
+    /// An address did not decode, or is for another network. Not `-32007`:
+    /// jsonrpsee answers oversized requests with that, and reserves
+    /// `-32005..=-32011` for its own server errors.
+    pub const INVALID_ADDRESS: i32 = -32012;
 }

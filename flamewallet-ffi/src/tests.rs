@@ -100,16 +100,92 @@ fn addresses_and_counter() {
     let alice = wallet(&A_SEED);
     let first = alice.next_address().expect("issue");
     assert_eq!(first.path, receiving(0));
-    assert!(first.address.starts_with("tf1"));
+    assert!(first.receiving_address.starts_with("t1"));
+    assert_eq!(first.receiving_address.len(), 120);
+    assert!(first.receiving_address[60..].starts_with("i1"));
+    let parsed =
+        flamekd::ReceivingAddress::from_bech32(&first.receiving_address, flamekd::Network::Testnet)
+            .expect("parse issued address");
+    let tracking = parsed
+        .to_tracking_address()
+        .to_bech32(flamekd::Network::Testnet);
+    assert_eq!(&first.receiving_address[..60], tracking);
+    assert_eq!(first.tracking_address, tracking);
+    assert_eq!(
+        predicate_to_tracking_address(first.predicate.clone(), Network::Testnet).expect("encode"),
+        first.tracking_address
+    );
+    assert!(validate_receiving_address(
+        first.receiving_address.clone(),
+        Network::Testnet
+    ));
+    assert!(!validate_receiving_address(
+        first.receiving_address.clone(),
+        Network::Mainnet
+    ));
+    assert!(!validate_receiving_address(
+        first.tracking_address.clone(),
+        Network::Testnet
+    ));
+    assert!(validate_tracking_address(
+        first.tracking_address.clone(),
+        Network::Testnet
+    ));
+    assert!(!validate_tracking_address(
+        first.tracking_address.clone(),
+        Network::Mainnet
+    ));
+    assert!(!validate_tracking_address(
+        first.receiving_address.clone(),
+        Network::Testnet
+    ));
     assert_eq!(alice.next_index(), 1);
     assert_eq!(
-        address_to_predicate(first.address.clone(), Network::Testnet).expect("parse"),
+        receiving_address_to_predicate(first.receiving_address.clone(), Network::Testnet)
+            .expect("parse"),
+        first.predicate
+    );
+    assert_eq!(
+        receiving_address_to_predicate(first.receiving_address.to_uppercase(), Network::Testnet)
+            .expect("uppercase address"),
         first.predicate
     );
     assert!(matches!(
-        address_to_predicate(first.address, Network::Mainnet),
+        receiving_address_to_predicate(tracking, Network::Testnet),
         Err(FlameError::InvalidAddress { .. })
     ));
+    let mut corrupted = first.receiving_address.clone();
+    corrupted.pop();
+    corrupted.push(if first.receiving_address.ends_with('q') {
+        'p'
+    } else {
+        'q'
+    });
+    assert!(matches!(
+        receiving_address_to_predicate(corrupted, Network::Testnet),
+        Err(FlameError::InvalidAddress { .. })
+    ));
+    assert!(matches!(
+        receiving_address_to_predicate(first.receiving_address, Network::Mainnet),
+        Err(FlameError::InvalidAddress { .. })
+    ));
+
+    let mainnet = wallet_on(&A_SEED, Network::Mainnet)
+        .next_address()
+        .expect("mainnet address");
+    assert_eq!(mainnet.receiving_address.len(), 120);
+    assert!(mainnet.receiving_address.starts_with("f1"));
+    assert!(mainnet.receiving_address[60..].starts_with("e1"));
+    assert_eq!(
+        receiving_address_to_predicate(mainnet.receiving_address, Network::Mainnet)
+            .expect("parse mainnet address"),
+        mainnet.predicate
+    );
+    assert!(mainnet.tracking_address.starts_with("f1"));
+    assert_eq!(
+        predicate_to_tracking_address(mainnet.predicate.clone(), Network::Mainnet).expect("encode"),
+        mainnet.tracking_address
+    );
 
     // A reopened wallet finds an address issued past its counter only once
     // the counter is restored or the gap covers it.
@@ -129,6 +205,28 @@ fn addresses_and_counter() {
         .view_key()
         .expect("view key")
         .starts_with("testview1"));
+}
+
+#[test]
+fn predicate_to_tracking_address_refuses_what_is_not_a_point() {
+    let refused = |predicate: Vec<u8>| {
+        matches!(
+            predicate_to_tracking_address(predicate, Network::Testnet),
+            Err(FlameError::InvalidBytes { what, .. }) if what == "predicate"
+        )
+    };
+    assert!(refused(vec![0x01; 31]));
+    assert!(refused(vec![0x01; 33]));
+    // The identity, and bytes that decompress to no Ristretto point.
+    assert!(refused(vec![0x00; 32]));
+    assert!(refused(vec![0xff; 32]));
+}
+
+#[test]
+fn constants() {
+    // `docs/payments.md` "Notes" fixes the memo bound.
+    assert_eq!(memo_max_bytes(), 4006);
+    assert_eq!(native_flavor(), FLAME_FLAVOR.to_bytes().to_vec());
 }
 
 #[test]
@@ -162,7 +260,8 @@ fn two_wallets_spend_across_two_blocks() {
         info.value,
         ContractValue::Clear {
             qty: ALLOCATION,
-            flavor: FLAME_FLAVOR.to_bytes().to_vec()
+            flavor: native_flavor(),
+            is_native: true,
         }
     );
     assert_eq!(
@@ -188,13 +287,13 @@ fn two_wallets_spend_across_two_blocks() {
         }],
         outputs: vec![
             TransferOutput {
-                address: bob_address.address.clone(),
+                address: bob_address.receiving_address.clone(),
                 qty: payment,
                 flavor: None,
                 memo: b"for the bicycle".to_vec(),
             },
             TransferOutput {
-                address: change.address.clone(),
+                address: change.receiving_address.clone(),
                 qty: ALLOCATION - payment - FEE,
                 flavor: None,
                 memo: Vec::new(),
@@ -218,7 +317,7 @@ fn two_wallets_spend_across_two_blocks() {
     elsewhere.outputs[0].address = wallet_on(&B_SEED, Network::Mainnet)
         .address(receiving(0))
         .expect("address")
-        .address;
+        .receiving_address;
     assert!(matches!(
         alice.build_transfer(elsewhere),
         Err(FlameError::InvalidAddress { .. })
@@ -248,6 +347,8 @@ fn two_wallets_spend_across_two_blocks() {
         )
         .expect("Bob opens his note");
     assert_eq!(received.opening.qty, payment);
+    assert_eq!(received.opening.flavor, native_flavor());
+    assert!(received.is_native);
     assert_eq!(received.memo, b"for the bicycle");
     assert!(opening_matches(to_bob.contract.clone(), received.opening.clone()).expect("check"));
     let kept = alice
@@ -400,13 +501,13 @@ fn two_wallets_spend_across_two_blocks() {
             }],
             outputs: vec![
                 TransferOutput {
-                    address: alice_second.address.clone(),
+                    address: alice_second.receiving_address.clone(),
                     qty: back,
                     flavor: None,
                     memo: Vec::new(),
                 },
                 TransferOutput {
-                    address: bob_change.address,
+                    address: bob_change.receiving_address,
                     qty: payment - back - FEE,
                     flavor: None,
                     memo: Vec::new(),

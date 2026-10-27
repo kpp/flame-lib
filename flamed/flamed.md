@@ -33,8 +33,15 @@ are not in it:
   output, the `Data` entry right after it in its log, byte for byte and
   never parsed ([Confidential payments](../docs/payments.md#the-node)).
 
-All three live in memory and are rebuilt by replaying `blocks.bin`. The only
-durable state this node has is that file and `genesis.json`.
+All three live in memory and are rebuilt by replaying `blocks.bin`, except
+for the bulky bytes the indexes seldom read: effect logs, contracts and
+notes. Those are appended to `cold.bin` and read back on request, each
+checked against a hash its record keeps. `cold.bin` is a cache. Every start
+deletes it and replay writes it again, so a lost or corrupt one costs a
+restart, and a corrupt read is an error that says so, never wrong bytes.
+The only durable state this node has is `blocks.bin` and `genesis.json`. Block times are
+not its own: they belong to the core indexer, which keeps them in its own
+directory ([Times](#times)).
 
 ## The three files
 
@@ -69,14 +76,22 @@ not the limits. Comparing whole `chainparams.toml` files is what makes a
 network agree.
 
 **`flamed.toml`** is one node's local policy: where its data lives, where to
-listen, how often to mint, and the fee it will not go below. None of it is
-consensus — the block header carries no timestamp, and a fee floor is an
-opinion about what is worth relaying.
+listen, how often to mint, the fee it will not go below, and where the mock
+core indexer keeps its table (`indexer_dir`, `<data_dir>/indexer` by
+default), and where `cold.bin` goes (`cold_path`, `<data_dir>/cold.bin` by
+default; any scratch disk will do). None of it is consensus — the block header carries no timestamp,
+and a fee floor is an opinion about what is worth relaying.
 
 `blocks.bin` sits beside them in the data directory: one record per block, a
 `u64` little-endian length then the block's canonical bytes. A torn trailing
 record means the process died mid-append; the node refuses to start and
 names the byte offset, and truncating the file there is the recovery.
+SIGINT and SIGTERM do not cause one: the node stops minting at the next
+tick boundary, finishes a block already under way, answers the RPC calls in
+flight, and exits once nothing holds the node. A second signal skips the
+wait for RPC clients but still waits for the archive: it takes the node
+lock, which no append is ever outside of, and exits holding it. Only
+SIGKILL can tear a record.
 
 ## The RPC
 
@@ -93,18 +108,23 @@ lowercase hex strings; blobs are standard base64.
 | `submit_tx` | `block_tx` | the txid, once the mempool has taken it |
 | `tx_status` | `txid` | `unknown`, `mempool`, or `confirmed` with where |
 | `scan` | `predicates`, `since_height` | every contract created under those predicates since that height, each with its note |
+| `unspent` | `address`, `with_pending?` | every unspent contract locked to a receiving or tracking address, with its note, block time and a proof at the tip; with `with_pending`, mempool spends are removed and pending outputs are added with `received_at` instead of a height, time or proof |
+| `history` | `addresses`, `cursor?`, `limit`, `with_pending?` | the transactions that created or spent contracts of up to 256 addresses, a page at a time from either end; see [History](#history) |
 
 Server-defined error codes, in the JSON-RPC 2.0 server range: `-32001`
 `NOT_FOUND`, `-32002` `MEMPOOL_REJECTED`, `-32003` `LIMIT_EXCEEDED`,
-`-32004` `INVALID_BYTES`, `-32005` `STALE_BLOCK`, `-32006` `QUERY_FAILED`.
+`-32004` `INVALID_BYTES`, `-32005` `STALE_BLOCK`, `-32006` `QUERY_FAILED`,
+`-32012` `INVALID_ADDRESS`. `-32007` through `-32011` are skipped because
+jsonrpsee uses them for its own errors, such as an oversized request.
 Anything else is `-32603`, which means the node is
 broken rather than the request.
 
 `query_actor` invokes the actor with one data argument, no authenticated
 caller, and `readwrite = false`. Its argument and result are base64
-`CellEnvelope`s encoding one VM `Value`: Scalar, Point, Cell, or a portable
-Dict containing only these values recursively. Empty and nested Dicts are
-accepted; token and runtime values are rejected at any depth. Envelopes
+`CellEnvelope`s encoding one VM `Value`: Scalar, Point, Cell, or a Dict whose
+sticky `copyable` and `portable` flags remain true. Fresh empty and nested Dicts
+are accepted; inserting a non-copyable value permanently disqualifies that Dict,
+even after removal. Token and runtime values are rejected at any depth. Envelopes
 are limited to 64 KiB, typed Dict decoding is bounded, and execution gas must
 be 1..=1,000,000. The result's
 `gas_used` includes VM work but excludes bounded envelope decoding. No fee
@@ -131,18 +151,105 @@ methods without the VM behind them. The crate defines them once with
 `#[rpc(server, client)]`, so the node's server and every consumer's client
 are generated from the same declaration and cannot drift.
 
+## History
+
+`history` is the log of a wallet: every transaction that created a contract
+for one of its addresses or spent one, with those contracts' bytes and notes.
+The node cannot see amounts; the wallet opens the notes. A spent contract
+comes with the note it was created with, so a wallet restored from its seed
+can price a spend before it has paged back to the receipt. An entry never
+changes once confirmed: it says what happened, and `unspent` says what is
+true now. A transaction that touched several of the addresses, like a
+payment that sends change to another address, is one entry. The genesis
+allocation is an entry at height 0 with an all-zero txid and no fee.
+
+A wallet holds two cursors around what it has read, and the range only
+grows:
+
+| Call | Reads | Returns |
+|---|---|---|
+| no `cursor` | the newest entries, newest first | `older`, and `newer` at the tip |
+| `older` cursor | the entries before it, newest first | the next `older`, null at the beginning |
+| `newer` cursor | the entries after it, oldest first | the next `newer`, and `has_newer` when the page was cut short |
+
+`with_pending` adds the mempool's transactions for these addresses to a first
+or newer page, as `pending`: a fresh snapshot each time, never part of the
+paging, capped at 100 (`pending_truncated`). A pending transaction that
+confirms arrives once, through the newer cursor.
+
+A cursor is a position, never an offset: `older:12:3:<block>:<addresses>` is
+the 4th execution of block 12. The chain only grows, so the entries on either
+side of a position are the same however many blocks come after. The cursor
+also names the block at that height and fingerprints the addresses: a cursor
+on a block the chain no longer has is `STALE_BLOCK`, and the wallet starts
+again without one; a cursor asked with other addresses, or one this node did
+not write, is invalid params. The format is for reading in a debugger and is
+promised to no one: pass a cursor back as it came, and expect it to change
+with any release.
+
+Each address's history is a list in chain order, kept in RAM and rebuilt
+by replay like the rest of the index. A page is a binary search into each
+list and a merge, so its cost is the page and the number of addresses, not
+the length of the history.
+
+## Times
+
+A Flame header has no time field, and none is planned: a block's time is the
+time of the Bitcoin block its `core_block_hash` names. A transaction has
+three times, each vouched for by someone different.
+
+| Field | Where | Who vouches for it |
+|---|---|---|
+| `time` | `BlockSummary`, and `ScanEntry` and `UnspentEntry` for the creating block | the core indexer |
+| `block_time` | `TransactionResult` | the core indexer, through the block |
+| `locktime` | `TransactionSummary`, `PendingTransaction` | the sender: signed, never checked |
+| `received_at` | `PendingTransaction`, `TransactionResult`, and `UnspentEntry` while pending | this node's clock |
+
+All are Unix seconds. `time` and `block_time` are absent for genesis and for a
+block the indexer does not know. `received_at` is absent on a confirmed
+transaction this node never held pending, and after a restart, because the
+mempool is not durable and neither are its times.
+
+**The core indexer** is the `CoreIndexer` trait in `src/indexer.rs`: `anchor`
+names the core block to commit in the next header and its time, and
+`time_of` gives back the time of a core block already anchored to. The
+minter calls `anchor`; `Node::open` calls `time_of` for every archived block
+while replaying, which is how a restarted node gets back the times it had.
+The node holds the times only in its block index.
+
+`MockIndexer` is the only implementation, and it has no Bitcoin behind it.
+It anchors height `h` to `core_block_hash(h)`, the same devnet rule as
+before, so existing archives replay unchanged. The time is this machine's
+clock when the indexer first saw that height. Each one is appended to
+`<indexer_dir>/core-times.txt` (`<hex hash> <unix seconds>` per line) and
+synced before `anchor` returns, so any time a block was shown with can be
+given back. A torn last line is dropped; any other bad line stops the node
+from starting. If the table is lost, the node still opens and serves every
+block, without times, and prints how many it could not time.
+
+A real indexer replaces it through `Node::open_with` and the node stays the
+same. Several Flame blocks then anchor to one Bitcoin block and share its
+time, which the hash-keyed lookup already allows.
+
+**`locktime`** is documented as Bitcoin's: below `500_000_000` a height,
+otherwise Unix seconds before which the transaction is invalid, and `0`
+for no lock: include as soon as possible. Nothing enforces it yet, and the
+node shows it as signed. A wallet that wants a signing time on record can
+set it to the current Unix time, which is already reached and so does not
+delay the transaction; it is the sender's claim, covered by the TxID.
+
 ## A recorded session
 
 ```console
 $ cargo run -p flamed --features devnet -- genesis \
       --chainparams flamed/configs/chainparams.toml --out ./genesis.json
-genesis aed6c23dea081daffa0ad8e09d7d1436b506bbe6c76d5b4abef4897c9cff7801 with 1 allocation(s) -> ./genesis.json
+genesis 38808a50580d7a1b8bebe2dce32e589e08b6951c38a341edf9b6d2961b4ca8a9 with 1 allocation(s) -> ./genesis.json
 
 $ cargo run -p flamed --features devnet -- run --config flamed/configs/flamed.toml
 flamed: height 0 with 1 unspent contract(s), 0 block(s) archived
 flamed: serving JSON-RPC on http://127.0.0.1:8545
-flamed: minting every 15s
-block 1 027658ba156843a40d3042b97334e1a61c8ea889fbc9d02a402c1bed6759acaf txs=0 dropped=0
+flamed: minting every 5s
+block 1 fb14e45762eafae0a0933ebb67c06dbbe68b37e9447b479a208a1131923c5d39 txs=0 dropped=0
 ```
 
 Running `genesis` twice on the same network definition gives identical
@@ -153,10 +260,10 @@ same network by comparing files.
 $ curl -s -X POST -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"tip","params":[]}' \
     http://127.0.0.1:8545
-{"jsonrpc":"2.0","id":1,"result":{"hash":"aed6c23d…","height":0,"contract_root":"8669b06a…"}}
+{"jsonrpc":"2.0","id":1,"result":{"hash":"38808a50…","height":0,"contract_root":"fa4a1dea…"}}
 
 $ curl -s -X POST -H 'content-type: application/json' \
-    --data '{"jsonrpc":"2.0","id":2,"method":"proof","params":["e870be9e…"]}' \
+    --data '{"jsonrpc":"2.0","id":2,"method":"proof","params":["373dbd58…"]}' \
     http://127.0.0.1:8545
 {"jsonrpc":"2.0","id":2,"result":{"status":"unspent","proof":"AQAAAAAAAAAAAAAAAA=="}}
 ```
@@ -178,11 +285,50 @@ that recorded session: two accounts from fixed seeds, a payment, a sweep, a
 restart, and a spend by the recipient — every transaction built by
 `flamepayments`, submitted to the node, and confirmed.
 
+## The image
+
+`flamed/Dockerfile` builds one devnet node as an image, and CI
+(`.github/workflows/flamed-image.yml`) pushes it to GHCR as
+`ghcr.io/runflame/flamed:<full commit hash>` from every push to `main` that
+touches flamed or a crate it is built from, moving `:main` along. A pull
+request into `main` runs the same build and smoke test and pushes nothing.
+Nothing deploys the image; a host is deployed by naming a commit, never
+`:main`. The tag and the `org.opencontainers.image.revision` label are the
+same full hash.
+
+| Path | What |
+|---|---|
+| `/etc/flamed/flamed.toml` | [`configs/flamed.image.toml`](configs/flamed.image.toml): RPC on `0.0.0.0:8545`, data in `/var/lib/flamed` |
+| `/etc/flamed/chainparams.toml` | `configs/chainparams.toml` with the genesis holder replaced |
+| `/etc/flamed/genesis.json` | derived from it at build time |
+| `/var/lib/flamed` | the volume: `blocks.bin`, the mock indexer's times, and `cold.bin`, a cache rebuilt on every start |
+
+The genesis holder is the first receiving address of a BIP-39 mnemonic with
+no passphrase, the address a wallet restored from that phrase shows first.
+The build reads the phrase from the build secret `genesis_mnemonic`, turns
+it into that address with `flamed address`, and keeps nothing else of it: no
+layer of either stage holds the phrase. CI passes the org secret
+`FLAMED_GENESIS_MNEMONIC` on `main` and fails without it; a dry run uses
+BIP-39's public all-zero phrase (`abandon` ×11, `about`) and checks the
+address it gets.
+
+The same mnemonic and the same `chainparams.toml` give the same genesis, so
+consecutive images are normally one chain. A run summary names the genesis
+hash; an image whose hash differs from the running one is a new chain, and
+it will not start on the old `blocks.bin`.
+
+Stopping the container is a kill: `flamed` installs no signal handler, and
+as PID 1 it is not killed by SIGTERM or SIGINT, so a stop ends in SIGKILL.
+A kill mid-append leaves a torn record, the node refuses to start naming
+the byte offset, and truncating `blocks.bin` there is the recovery. The
+RPC has no authentication and no rate limit: publish it on loopback and put
+a proxy in front.
+
 ## The devnet feature
 
 Everything that exists only because minting and consensus are not designed
 yet is behind `devnet`: the genesis allocations and the interval minter.
-Without it, `flamed` has no `genesis` subcommand, contains no `Minter`, and
+Without it, `flamed` has no `genesis` or `address` subcommand, contains no `Minter`, and
 refuses a `genesis.json` that has any allocation, naming the feature in the
 refusal.
 
@@ -197,12 +343,15 @@ an `any(test, ..)` arm there would name items that library does not have.
 
 Stated plainly, because each of these is a real limit and not a detail:
 
-- **Memory grows with the chain.** `Blockchain` keeps one `BlockUndo` per
-  connected block — a header, a cloned `Forest`, and an actor undo record —
-  and releases them only on a disconnect or a reorganization, neither of
-  which a single node with no peers ever performs. At a 15-second interval
-  that is roughly 5,800 records a day. A long-lived `flamed run` is bounded
-  by memory, not by disk.
+- **Memory still grows with the chain, more slowly.** What has to stay in
+  memory does: one live Utreexo proof per unspent contract, which every
+  block rewrites, and per block and per contract, a small index record whose
+  bulk is in `cold.bin`. Undo records, a whole `Forest` each, are kept for
+  the newest `UNDO_DEPTH` (100) blocks only, so the chain cannot be rewound
+  further than that. Nothing rewinds it today: this node has no peers. A
+  long-lived `flamed run` is still bounded by memory, mostly by how many
+  contracts are unspent, and a restart does not help: replay rebuilds the
+  same state.
 - **`scan` is bounded in questions, not in work.** At most 1024 predicates
   per call, but each one walks every contract ever created under it with the
   node lock held, and `since_height` filters records it has already walked
@@ -235,8 +384,10 @@ Stated plainly, because each of these is a real limit and not a detail:
   an `Input`, so nothing the node believes unspent can have been spent
   behind its back. Closing the gap needs an upstream change — `connect`
   returning the logs it already has.
+- **Block times are only as good as the indexer.** The mock's times are
+  this machine's clock and can be lost with its directory. Nothing about
+  them is consensus until a real indexer authenticates the core block.
 - **The mempool does not survive a restart**, and neither do the indexes —
-  they are rebuilt by replaying every block from genesis. Replay decodes the
-  whole archive into memory before connecting any of it, so the node is
-  slowest and hungriest to start exactly when it has been running longest.
-  Fine for a devnet; not a strategy for a long chain.
+  they are rebuilt by replaying every block from genesis, one block at a
+  time, so the node is slowest to start exactly when it has been running
+  longest. Fine for a devnet; not a strategy for a long chain.

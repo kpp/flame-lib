@@ -3,14 +3,14 @@
 //! Flame's block producers are minters. There is no consensus here and no
 //! competition for the next block: one node, one timer, one block per tick.
 
-use std::process;
 use std::time::Duration;
 
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 
 use crate::node::{NodeError, SharedNode};
 
-/// Mints one block per interval, forever.
+/// Mints one block per interval until told to stop.
 pub struct Minter {
     node: SharedNode,
     interval: Duration,
@@ -22,12 +22,28 @@ impl Minter {
         Self { node, interval }
     }
 
-    /// Runs until the process ends.
+    /// Runs until `shutdown` is cancelled, or until a mint fails in a way
+    /// the node cannot carry on from.
     ///
     /// Each tick mints on the blocking pool, because a connect re-runs every
     /// transaction's proof and can take hundreds of milliseconds — that is
     /// not work for a runtime thread.
-    pub async fn run(self) {
+    ///
+    /// Cancellation is only ever seen between ticks. A mint already under
+    /// way is awaited to the end, because a block archive cut off between
+    /// the append and the connect is a node that refuses to start. A fatal
+    /// error cancels `shutdown` itself before it is returned: a node that
+    /// answers queries about a chain it has quietly stopped extending is
+    /// worse than one that is gone.
+    pub async fn run(self, shutdown: CancellationToken) -> Result<(), Fatal> {
+        let halted = self.mint_until(&shutdown).await;
+        if halted.is_err() {
+            shutdown.cancel();
+        }
+        halted
+    }
+
+    async fn mint_until(&self, shutdown: &CancellationToken) -> Result<(), Fatal> {
         let mut ticker = tokio::time::interval(self.interval);
         // A mint that overruns its interval must not be followed by a
         // burst of instant blocks: the default behaviour fires every
@@ -38,7 +54,10 @@ impl Minter {
         // a node that has just started is not already a block ahead.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = ticker.tick() => {}
+            }
             let node = self.node.clone();
             let minted = tokio::task::spawn_blocking(move || {
                 // A poisoned lock means some earlier operation panicked
@@ -48,34 +67,32 @@ impl Minter {
                 let mut node = node.lock().map_err(|_| Fatal::Poisoned)?;
                 node.mint_block().map_err(Fatal::from).map(|_| ())
             })
-            .await;
+            .await
+            .map_err(|error| Fatal::Panicked(error.to_string()))?;
 
             match minted {
-                Ok(Ok(())) => {}
-                Ok(Err(Fatal::Recoverable(error))) => eprintln!("mint failed: {error}"),
+                Ok(()) => {}
+                Err(Fatal::Recoverable(error)) => eprintln!("mint failed: {error}"),
                 // Every remaining case means this process can no longer be
-                // trusted to extend its own archive, and a node that
-                // answers queries about a chain it has quietly stopped
-                // extending is worse than one that is gone.
-                Ok(Err(fatal)) => {
-                    eprintln!("fatal: {fatal}");
-                    process::exit(1);
-                }
-                Err(error) => {
-                    eprintln!("fatal: the mint task panicked: {error}");
-                    process::exit(1);
-                }
+                // trusted to extend its own archive.
+                Err(fatal) => return Err(fatal),
             }
         }
     }
 }
 
-/// What a tick can come back with.
+/// Why the minter stopped for good.
+///
+/// `Recoverable` is what a single tick can come back with, and the minter
+/// only logs it; `run` returns every other variant.
 #[derive(Debug, thiserror::Error)]
-enum Fatal {
+pub enum Fatal {
     /// An earlier operation panicked while holding the node.
     #[error("the node state is poisoned: an earlier operation panicked")]
     Poisoned,
+    /// The mint task itself panicked.
+    #[error("the mint task panicked: {0}")]
+    Panicked(String),
     /// Disk and memory may no longer agree.
     #[error(transparent)]
     Archive(NodeError),

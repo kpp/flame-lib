@@ -30,6 +30,9 @@ impl CellIndex {
     pub fn contains(&self, id: &CellID) -> bool {
         self.cells.contains_key(id)
     }
+    pub fn remove(&mut self, id: &CellID) -> Option<Arc<Cell>> {
+        self.cells.remove(id)
+    }
     pub fn iter(&self) -> impl Iterator<Item = (&CellID, &Arc<Cell>)> {
         self.cells.iter()
     }

@@ -7,6 +7,8 @@ use flamechain::BlockHash;
 use flamed_rpc::{BlockSummary, BlocksResult, TransactionSummary, TransactionsResult};
 use flamevm::TxID;
 
+use crate::cold::Cold;
+
 /// Where a transaction landed, and what it did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxRecord {
@@ -14,10 +16,14 @@ pub struct TxRecord {
     pub height: u64,
     /// That block's hash.
     pub block: BlockHash,
-    /// Its effect log, as a `CellEnvelope`.
-    pub log: Vec<u8>,
+    /// Its effect log, as a `CellEnvelope`, in `cold.bin`.
+    pub log: Cold,
     /// Public execution summary.
     pub summary: TransactionSummary,
+    /// When this node first admitted it to its mempool, in Unix seconds.
+    /// `None` after a replay: the mempool is not durable, and neither is
+    /// this.
+    pub received_at: Option<u64>,
 }
 
 /// Confirmed transactions, by id.
@@ -40,6 +46,14 @@ impl TxIndex {
     pub fn insert(&mut self, txid: TxID, record: TxRecord) {
         self.by_height.entry(record.height).or_default().push(txid);
         self.txs.insert(txid.0, record);
+    }
+
+    /// Records when a confirmed transaction was first admitted. A txid that
+    /// has not confirmed is ignored.
+    pub fn set_received(&mut self, txid: &TxID, time: u64) {
+        if let Some(record) = self.txs.get_mut(&txid.0) {
+            record.received_at = Some(time);
+        }
     }
 
     /// What the node knows about one transaction.

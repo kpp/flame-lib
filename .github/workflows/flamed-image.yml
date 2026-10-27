@@ -1,0 +1,171 @@
+name: flamed image
+
+# Builds flamed/Dockerfile, starts it and checks that it serves and mints,
+# then, from main only, pushes it to GHCR as ghcr.io/runflame/flamed:<full
+# commit hash> and moves `:main` to it. A pull request into main runs the
+# same build and check and pushes nothing: the dry run before merging. Nothing
+# deploys it: the infrastructure playbook is run by hand with the full commit
+# hash of the build to deploy (infrastructure repo, dev README → flamed).
+#
+# The genesis holder is the first receiving address of the BIP-39 mnemonic
+# in the org secret FLAMED_GENESIS_MNEMONIC (no passphrase), passed to the
+# build as a secret: the image carries the address, never the phrase. Only a
+# build of main reads that secret; a dry run uses the public test mnemonic
+# below and checks the address it bakes in.
+#
+# The paths are what the image is built from: flamed and flamewallet-cli with
+# the workspace crates they depend on, and the toolchain.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'flamed/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'cells/**'
+      - 'flamechain/**'
+      - 'flamed-rpc/**'
+      - 'flamekd/**'
+      - 'flamepayments/**'
+      - 'flamewallet-cli/**'
+      - 'flamewallet-ffi/**'
+      - 'flamevm/**'
+      - 'merkle/**'
+      - 'musig/**'
+      - 'readerwriter/**'
+      - 'spacesuit/**'
+      - 'starsig/**'
+      - '.github/workflows/flamed-image.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'flamed/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'cells/**'
+      - 'flamechain/**'
+      - 'flamed-rpc/**'
+      - 'flamekd/**'
+      - 'flamepayments/**'
+      - 'flamewallet-cli/**'
+      - 'flamewallet-ffi/**'
+      - 'flamevm/**'
+      - 'merkle/**'
+      - 'musig/**'
+      - 'readerwriter/**'
+      - 'spacesuit/**'
+      - 'starsig/**'
+      - '.github/workflows/flamed-image.yml'
+  workflow_dispatch:
+
+# A newer push supersedes a build still running; its commit gets no image.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/runflame/flamed
+      # The full commit, the same in the tag and in the revision label: the
+      # dev playbook deploys by this tag and checks it against the label.
+      TAG: ${{ github.sha }}
+      # BIP-39's all-zero entropy, public everywhere: dry runs only.
+      DRY_RUN_MNEMONIC: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+      # Its first testnet receiving address, which `flamed address` printed.
+      DRY_RUN_HOLDER: t1jm7lvg3wswggzq5jk0pfu9ayxrlxkl0qqq8ayxe37v2xjl5zscqqme4sc8i14fc9hj4zjzcqvrmu5wylx9lsl8j7yxh3shdzalqyjjvymtpfretq6hprkj
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    # The secret is named only on main, so no other ref's run ever sees it.
+    # Missing there, the build fails rather than fall back to the test phrase.
+    - name: Build
+      env:
+        MAIN_MNEMONIC: ${{ github.ref == 'refs/heads/main' && secrets.FLAMED_GENESIS_MNEMONIC || '' }}
+      run: |
+        set -euo pipefail
+        if [ "$GITHUB_REF" = refs/heads/main ]; then
+          [ -n "$MAIN_MNEMONIC" ] || { echo "::error::FLAMED_GENESIS_MNEMONIC is empty: set the org secret and give this repository access to it"; exit 1; }
+          export GENESIS_MNEMONIC="$MAIN_MNEMONIC"
+        else
+          export GENESIS_MNEMONIC="$DRY_RUN_MNEMONIC"
+        fi
+        docker build -f flamed/Dockerfile \
+          --secret id=genesis_mnemonic,env=GENESIS_MNEMONIC \
+          --label "org.opencontainers.image.revision=$TAG" \
+          -t "$IMAGE:$TAG" .
+
+    # What was baked in, for the summary; a dry run must have the test holder.
+    - name: Genesis
+      id: genesis
+      run: |
+        set -euo pipefail
+        hash="$(docker run --rm --entrypoint cat "$IMAGE:$TAG" /etc/flamed/genesis.json | jq -r .genesis_hash)"
+        holder="$(docker run --rm --entrypoint cat "$IMAGE:$TAG" /etc/flamed/chainparams.toml | sed -n 's/^address = "\(.*\)"$/\1/p')"
+        [ -n "$hash" ] && [ -n "$holder" ] || { echo "no genesis hash or holder in the image"; exit 1; }
+        if [ "$GITHUB_REF" != refs/heads/main ] && [ "$holder" != "$DRY_RUN_HOLDER" ]; then
+          echo "holder is $holder, expected the dry-run holder $DRY_RUN_HOLDER"; exit 1
+        fi
+        echo "hash=$hash" >> "$GITHUB_OUTPUT"
+        echo "holder=$holder" >> "$GITHUB_OUTPUT"
+
+    # Starts the image as the host does, waits for the RPC, then for the
+    # first minted block on top of this genesis.
+    - name: Smoke test
+      run: |
+        set -euo pipefail
+        docker run -d --name flamed -p 127.0.0.1:8545:8545 "$IMAGE:$TAG"
+        trap 'docker logs flamed; docker rm -f flamed >/dev/null' EXIT
+        tip() {
+          curl -sf -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tip","params":[]}' \
+            http://127.0.0.1:8545/
+        }
+        for _ in $(seq 30); do tip >/dev/null && break; sleep 1; done
+        tip | tee /dev/stderr | jq -e '.result' >/dev/null
+        for _ in $(seq 40); do
+          height="$(tip | jq -r '.result.height')"
+          [ "$height" -ge 1 ] && break
+          sleep 1
+        done
+        [ "$height" -ge 1 ] || { echo "no block minted within 40s"; exit 1; }
+        # The wallet in the image reaches the node; a dry run's genesis
+        # wallet is the test phrase's, and holds the whole supply.
+        docker exec flamed flamewallet --version
+        if [ "$GITHUB_REF" != refs/heads/main ]; then
+          echo "$DRY_RUN_MNEMONIC" | docker exec -i flamed sh -c \
+            'flamewallet --wallet /tmp/genesis.json --node http://127.0.0.1:8545 restore >/dev/null && flamewallet --wallet /tmp/genesis.json balance'
+        fi
+
+    # Only from main: a pull request or a manual run elsewhere pushes nothing.
+    - name: Push
+      if: github.ref == 'refs/heads/main'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GENESIS_HASH: ${{ steps.genesis.outputs.hash }}
+        GENESIS_HOLDER: ${{ steps.genesis.outputs.holder }}
+      run: |
+        set -euo pipefail
+        echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        docker push "$IMAGE:$TAG"
+        docker tag "$IMAGE:$TAG" "$IMAGE:main"
+        docker push "$IMAGE:main"
+        docker logout ghcr.io
+        {
+          echo "Pushed \`$IMAGE:$TAG\` and moved \`:main\` to it. Nothing is deployed."
+          echo
+          echo "Genesis \`$GENESIS_HASH\`, the whole supply under \`$GENESIS_HOLDER\`. A genesis hash different from the one dev runs is a new chain: see the infrastructure repo, dev README → flamed."
+          echo
+          echo "To deploy this build, from \`dev/playground/\` in the infrastructure repo: \`ansible-playbook flamed/deploy.yml --ask-vault-pass -e image_tag=$TAG\`"
+        } >> "$GITHUB_STEP_SUMMARY"

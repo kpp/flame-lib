@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use curve25519_dalek::ristretto::CompressedRistretto;
-use flamekd::{Language, Mnemonic, ReceivingAddress, RecvKey, ViewKey};
+use flamekd::{Language, Mnemonic, ReceivingAddress, RecvKey, TrackingAddress, ViewKey};
 use flamepayments::{Account, AccountKey, ReceiveAccount, SpendAccount, ViewAccount};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -12,9 +12,9 @@ use zeroize::Zeroizing;
 use crate::convert::array32;
 use crate::error::FlameError;
 use crate::note::{self, ReceivedNote};
-use crate::transfer::{self, Transfer, TransferRequest};
+use crate::transfer::{self, IssueRequest, Transfer, TransferRequest};
 
-/// Which network addresses are encoded for: `f1…` or `tf1…`.
+/// Which network the address's two bech32f components are encoded for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum Network {
     Mainnet,
@@ -43,8 +43,12 @@ pub struct KeyPath {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct IssuedAddress {
     pub path: KeyPath,
-    /// bech32f: `f1…` on mainnet, `tf1…` on testnet.
-    pub address: String,
+    /// What a payer is given: the tracking address followed by the
+    /// encryption key, `f1…e1…` / `t1…i1…`.
+    pub receiving_address: String,
+    /// The receiving address's first half, `f1…` / `t1…`: it names the
+    /// predicate alone, as [`predicate_to_tracking_address`] gives it.
+    pub tracking_address: String,
     /// The 32-byte compressed point that locks payments to this address.
     pub predicate: Vec<u8>,
 }
@@ -82,16 +86,52 @@ pub fn mnemonic_to_seed(phrase: String, passphrase: String) -> Result<Vec<u8>, F
     Ok(parse_mnemonic(&phrase)?.to_seed(passphrase).to_vec())
 }
 
-/// The predicate a payment to `address` is locked with: the address's
-/// spending point. Refuses an address encoded for the other network.
+/// The predicate a payment to receiving `address` is locked with: the
+/// address's spending point. Refuses an address encoded for the other
+/// network.
 #[uniffi::export]
-pub fn address_to_predicate(address: String, network: Network) -> Result<Vec<u8>, FlameError> {
-    let address = ReceivingAddress::from_bech32(&address, network.into()).map_err(|error| {
-        FlameError::InvalidAddress {
-            reason: error.to_string(),
-        }
-    })?;
+pub fn receiving_address_to_predicate(
+    address: String,
+    network: Network,
+) -> Result<Vec<u8>, FlameError> {
+    let address = parse_receiving_address(&address, network.into())?;
     Ok(address.spending_key().compress().to_bytes().to_vec())
+}
+
+/// The tracking address, `f1…` / `t1…`, that names `predicate`: the first
+/// half of the receiving address whose payments it locks. Refuses bytes
+/// that are not 32, or not a valid, non-identity point.
+#[uniffi::export]
+pub fn predicate_to_tracking_address(
+    predicate: Vec<u8>,
+    network: Network,
+) -> Result<String, FlameError> {
+    let address = TrackingAddress::from_bytes(&array32("predicate", &predicate)?)
+        .map_err(|error| FlameError::bytes("predicate", error))?;
+    Ok(address.to_bech32(network.into()))
+}
+
+/// Whether `address` is a receiving address, `f1…e1…` / `t1…i1…`, for
+/// `network`.
+#[uniffi::export]
+pub fn validate_receiving_address(address: String, network: Network) -> bool {
+    parse_receiving_address(&address, network.into()).is_ok()
+}
+
+/// Whether `address` is a tracking address, `f1…` / `t1…`, for `network`.
+/// A whole receiving address is not one.
+#[uniffi::export]
+pub fn validate_tracking_address(address: String, network: Network) -> bool {
+    TrackingAddress::from_bech32(&address, network.into()).is_ok()
+}
+
+pub(crate) fn parse_receiving_address(
+    address: &str,
+    network: flamekd::Network,
+) -> Result<ReceivingAddress, FlameError> {
+    ReceivingAddress::from_bech32(address, network).map_err(|error| FlameError::InvalidAddress {
+        reason: error.to_string(),
+    })
 }
 
 fn parse_mnemonic(phrase: &str) -> Result<Mnemonic, FlameError> {
@@ -357,6 +397,19 @@ impl Wallet {
         };
         transfer::build(&account, request)
     }
+
+    /// Builds, proves and signs a confidential issuance, as
+    /// [`Wallet::build_transfer`] does a transfer. The issuer's key signs
+    /// the issuance program, which fixes the amount, the outputs and the
+    /// one contract it spends, so the published signature authorizes
+    /// nothing else.
+    pub fn build_issue(&self, request: IssueRequest) -> Result<Transfer, FlameError> {
+        let account = match &*self.account() {
+            Holder::Spend(account) => account.clone(),
+            holder => return Err(holder.refuse(WalletKind::Spend)),
+        };
+        transfer::issue(&account, request)
+    }
 }
 
 fn invalid_key(error: flamekd::Error) -> FlameError {
@@ -386,7 +439,8 @@ fn issued<K: AccountKey>(account: &Account<K>, path: KeyPath) -> Result<IssuedAd
     let address = account.address_at(path.branch, path.index)?;
     Ok(IssuedAddress {
         path,
-        address: address.to_bech32(account.network()),
+        receiving_address: address.to_bech32(account.network()),
+        tracking_address: address.to_tracking_address().to_bech32(account.network()),
         predicate: address.spending_key().compress().to_bytes().to_vec(),
     })
 }

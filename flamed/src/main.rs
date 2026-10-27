@@ -8,11 +8,12 @@
 //! devnet `use` lives inside a gated body.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 
 use clap::{Parser, Subcommand};
 use flamed::config::{GenesisFile, NodeConfig};
 use flamed::node::{Node, SharedNode};
+use tokio_util::sync::CancellationToken;
 
 /// The Flame node.
 #[derive(Parser)]
@@ -33,6 +34,15 @@ enum Command {
         /// Where to write the genesis.
         #[arg(long, default_value = "./genesis.json")]
         out: PathBuf,
+    },
+    /// Prints the first receiving address of the wallet whose BIP-39
+    /// mnemonic is read from stdin, with no passphrase: the address a
+    /// wallet restored from that mnemonic shows first. Devnet builds only.
+    #[cfg(feature = "devnet")]
+    Address {
+        /// The network definition whose `network` the address is for.
+        #[arg(long)]
+        chainparams: PathBuf,
     },
     /// Opens a chain and serves it.
     Run {
@@ -66,6 +76,11 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
+        #[cfg(feature = "devnet")]
+        Command::Address { chainparams } => {
+            println!("{}", first_address(&chainparams)?);
+            Ok(())
+        }
         // Built by hand rather than with `#[tokio::main]`, because
         // `flamed genesis` is synchronous and must not need a runtime.
         Command::Run { config } => tokio::runtime::Builder::new_multi_thread()
@@ -73,6 +88,31 @@ fn dispatch() -> Result<(), Box<dyn std::error::Error>> {
             .build()?
             .block_on(run(config)),
     }
+}
+
+/// `m/35263'/network'/0'/0/0` of the mnemonic on stdin, in bech32f. The
+/// phrase is a secret: it is never echoed, not even in an error, since a
+/// parse error can name the word it stopped at.
+#[cfg(feature = "devnet")]
+fn first_address(chainparams: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read;
+
+    use flamekd::{util, Mnemonic, Network};
+    use flamepayments::SpendAccount;
+    use zeroize::Zeroizing;
+
+    let network: Network = flamed::config::ChainParamsFile::load(chainparams)?
+        .network
+        .into();
+    let mut phrase = Zeroizing::new(String::new());
+    std::io::stdin().read_to_string(&mut phrase)?;
+    let mnemonic =
+        Mnemonic::parse(phrase.trim()).map_err(|_| "stdin is not a valid BIP-39 mnemonic")?;
+    let seed = Zeroizing::new(mnemonic.to_seed(""));
+    let address = SpendAccount::from_seed(&seed, network, 0)?
+        .address_at(util::RECEIVING, 0)?
+        .to_bech32(network);
+    Ok(address)
 }
 
 async fn run(config: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -89,17 +129,140 @@ async fn run(config: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Installed only now, so a signal during `Node::open` still ends the
+    // process on the spot: replay only reads, and an operator who stops a
+    // long one should not have to wait it out.
+    let mut signals = Termination::install()?;
+
     let (addr, handle) = flamed::rpc::serve(Arc::clone(&node), cfg.rpc_bind).await?;
     println!("flamed: serving JSON-RPC on http://{addr}");
 
+    // Cancelled by a signal, or by the minter when it cannot go on. Every
+    // task that touches the node winds down on it.
+    let shutdown = CancellationToken::new();
+
     #[cfg(feature = "devnet")]
-    {
-        tokio::spawn(flamed::minter::Minter::new(Arc::clone(&node), cfg.block_interval()).run());
+    let minter = {
+        let minter = flamed::minter::Minter::new(Arc::clone(&node), cfg.block_interval());
         println!("flamed: minting every {}s", cfg.block_interval_secs);
+        tokio::spawn(minter.run(shutdown.clone()))
+    };
+
+    tokio::select! {
+        signal = signals.next() => println!("flamed: {signal}, shutting down (again to force)"),
+        _ = shutdown.cancelled() => {}
+        // Nothing stops the server but this function, so this arm is a
+        // guard, not a path: should it ever stop on its own, the node goes
+        // down with it rather than minting with no one able to ask.
+        _ = handle.clone().stopped() => eprintln!("flamed: the RPC server stopped unexpectedly"),
+    }
+    shutdown.cancel();
+
+    let wind_down = async {
+        // A graceful stop: no new connections, and the calls already in
+        // flight are answered first. `Err` only means it had already
+        // stopped.
+        let _ = handle.stop();
+        handle.stopped().await;
+        #[cfg(feature = "devnet")]
+        return minter.await;
+        #[cfg(not(feature = "devnet"))]
+        Ok::<_, tokio::task::JoinError>(Ok::<(), std::convert::Infallible>(()))
+    };
+    let halted = tokio::select! {
+        halted = wind_down => halted?,
+        signal = signals.next() => {
+            eprintln!("flamed: {signal} again, dropping the RPC calls in flight");
+            force_exit(node).await;
+        }
+    };
+
+    // The last word on the node. Each RPC call runs its work on the
+    // blocking pool, and a client that hangs up drops the future but not
+    // the work, so the server stopping does not mean the node is idle.
+    // Taking the lock does: whatever held it has finished. A poisoned lock
+    // is fine here, since nothing is going to change the node again.
+    let height = tokio::task::spawn_blocking(move || tip_height(&node.lock())).await?;
+    println!("flamed: stopped at height {height}");
+
+    halted?;
+    Ok(())
+}
+
+/// Ends the process without waiting for anything but the disk.
+///
+/// The block archive is written only under the node lock, so taking it
+/// waits out an append already under way, and holding it while the
+/// process exits means no other one can start. Everything else — a reply
+/// half sent, a transaction half admitted to the mempool — lives in memory
+/// and is rebuilt or resubmitted after a restart.
+async fn force_exit(node: SharedNode) -> ! {
+    let exited = tokio::task::spawn_blocking(move || {
+        let guard = node.lock();
+        println!("flamed: stopped at height {}, forced", tip_height(&guard));
+        // `exit` runs no destructors, so the guard is never released.
+        std::process::exit(1)
+    })
+    .await;
+    // Only a panic in that closure gets here, and it was the lock that
+    // panicked: nothing is writing, so there is nothing left to wait for.
+    eprintln!("flamed: forced stop failed: {exited:?}");
+    std::process::exit(1)
+}
+
+/// The tip height behind a lock that may be poisoned.
+fn tip_height(guard: &LockResult<MutexGuard<'_, Node>>) -> u64 {
+    match guard {
+        Ok(node) => node.tip().height,
+        Err(poisoned) => poisoned.get_ref().tip().height,
+    }
+}
+
+/// SIGINT and SIGTERM, as a stream.
+///
+/// Installing the handlers replaces the default disposition, which is to
+/// die on the spot, for the rest of the process. The handlers are made once
+/// and kept, so a second signal that arrives while the first is being acted
+/// on is queued rather than lost.
+struct Termination {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl Termination {
+    #[cfg(unix)]
+    fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
     }
 
-    // Never resolves unless something stops the server, and holds the last
-    // handle so the server is not dropped out from under itself.
-    handle.stopped().await;
-    Ok(())
+    /// Resolves on the next signal, naming it.
+    #[cfg(unix)]
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn install() -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+
+    #[cfg(not(unix))]
+    async fn next(&mut self) -> &'static str {
+        // A failure to listen is a Ctrl-C this node will never hear, and
+        // pending forever is exactly what that looks like.
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        "Ctrl-C"
+    }
 }

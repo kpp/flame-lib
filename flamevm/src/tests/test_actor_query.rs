@@ -165,6 +165,18 @@ fn query_rejects_nondata_results() {
             .return_(),
         ScriptBuilder::new()
             .drop_()
+            .push_int(FLAME_FLAVOR)
+            .pushtoken()
+            .push_int(0u64)
+            .push_int(1u64)
+            .dict()
+            .push_int(0u64)
+            .get()
+            .drop_()
+            .drop_()
+            .return_(),
+        ScriptBuilder::new()
+            .drop_()
             .push_cell(CellValue::from_bytes(vec![]).unwrap())
             .slice()
             .return_(),
@@ -210,11 +222,11 @@ fn queries_accept_empty_and_nested_dns_dict_arguments_and_results() {
         let expected = arg.to_cell().unwrap().id();
         let result = query(&mut registry, actor, arg.clone()).unwrap();
         assert_eq!(result.value.to_cell().unwrap().id(), expected);
-        assert!(!result.value.is_copyable());
-        assert!(matches!(
-            result.value.try_clone(),
-            Err(VMError::TypeNotCopyable)
-        ));
+        assert!(result.value.is_copyable());
+        assert_eq!(
+            result.value.try_clone().unwrap().to_cell().unwrap().id(),
+            expected
+        );
         let vm = run_actor_call(&mut registry, actor, arg, true);
         assert_eq!(vm.current_call.stack[0].to_cell().unwrap().id(), expected);
         assert_int(&vm.current_call.stack[1], Scalar::ONE);
@@ -248,24 +260,45 @@ fn queries_accept_empty_and_nested_dns_dict_arguments_and_results() {
 }
 
 #[test]
-fn query_dict_normalization_preserves_sticky_flags() {
+fn queries_reject_dicts_with_poisoned_copyability_even_when_drained() {
     let mut dict = Dict::new();
     dict.insert(
         Scalar::ZERO,
         Value::ClearToken(ClearToken::new(Scalar::ONE, FLAME_FLAVOR)),
     );
     dict.remove(&Scalar::ZERO).unwrap();
-    dict.insert(Scalar::ONE, unit());
-    assert!(!dict.is_droppable());
-    let expected = dict.to_cell().unwrap().id();
     let mut registry = MemRegistry::new();
     let actor = deploy_query(&mut registry, ScriptBuilder::new().return_(), unit());
-    let result = query(&mut registry, actor, Value::Dict(dict)).unwrap();
-    let Value::Dict(dict) = result.value else {
-        panic!("expected Dict")
-    };
-    assert!(!dict.is_droppable());
-    assert_eq!(dict.to_cell().unwrap().id(), expected);
+    for empty in [true, false] {
+        if !empty {
+            dict.insert(Scalar::ONE, unit());
+            assert!(!dict.is_droppable());
+        }
+        assert!(!dict.is_copyable());
+        let backed = Dict::from_cell(&dict.to_cell().unwrap(), &mut ()).unwrap();
+        for arg in [Value::Dict(dict.clone()), Value::Dict(backed)] {
+            assert!(matches!(
+                query(&mut registry, actor, arg),
+                Err(VMError::NonDataInQuery)
+            ));
+        }
+    }
+}
+
+#[test]
+fn queries_reject_copyable_dicts_with_nonportable_values() {
+    let slice = crate::Slice::new(Arc::new(Cell::new(vec![], vec![]).unwrap())).unwrap();
+    let arg = Value::Dict(Dict::from_values(vec![Value::Dict(Dict::from_values(
+        vec![Value::Slice(slice)],
+    ))]));
+    assert!(arg.is_copyable());
+    assert!(!arg.is_portable());
+    let mut registry = MemRegistry::new();
+    let actor = deploy_query(&mut registry, ScriptBuilder::new().return_(), unit());
+    assert!(matches!(
+        query(&mut registry, actor, arg),
+        Err(VMError::NonDataInQuery)
+    ));
 }
 
 #[test]
