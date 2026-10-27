@@ -297,8 +297,8 @@ test('every referenced UI element exists once in the page', async () => {
 test('both pages keep Dashboard and Mint links together on the left and mark the active page', async () => {
   const html = await readFile(new URL('./index.html', import.meta.url), 'utf8');
   const header = html.match(/<header\b[^>]*>[\s\S]*?<\/header>/)[0];
-  assert.match(header, /<a\b[^>]*id="nav-dashboard"[^>]*href="\/"[^>]*>Dashboard<\/a>/);
-  assert.match(header, /<a\b[^>]*id="nav-mint"[^>]*href="\/mint"[^>]*>Mint<\/a>/);
+  assert.match(header, /<a\b[^>]*id="nav-dashboard"[^>]*href="\/classic"[^>]*>Dashboard<\/a>/);
+  assert.match(header, /<a\b[^>]*id="nav-mint"[^>]*href="\/classic\/mint"[^>]*>Mint<\/a>/);
   assert.ok(header.indexOf('id="nav-dashboard"') < header.indexOf('id="nav-mint"'));
   assert.ok(header.indexOf('id="nav-mint"') < header.indexOf('class="topbar-actions"'));
   assert.doesNotMatch(header, /id="navigation"/);

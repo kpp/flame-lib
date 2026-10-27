@@ -7,7 +7,7 @@ use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -249,14 +249,59 @@ async fn wallet_asset(js: bool) -> Response {
     }
 }
 
+// The app's design runtime compiles its component with `new Function` and styles
+// every element inline; everything else stays as strict as the classic pages.
+const APP_CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.coinbase.com; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+
+fn script(source: &'static str) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        source,
+    )
+}
+
 fn router(store: Store) -> Router {
     Router::new()
         .route(
             "/",
+            get(|| async {
+                (
+                    [(header::CONTENT_SECURITY_POLICY, APP_CSP)],
+                    Html(include_str!("../web/app/index.html")),
+                )
+            }),
+        )
+        .route("/mint", get(|| async { Redirect::to("/#demo") }))
+        .route(
+            "/live.js",
+            get(|| async { script(include_str!("../web/app/live.js")) }),
+        )
+        .route(
+            "/nav.js",
+            get(|| async { script(include_str!("../web/app/nav.js")) }),
+        )
+        .route(
+            "/support.js",
+            get(|| async { script(include_str!("../web/app/support.js")) }),
+        )
+        .route(
+            "/vendor/react.production.min.js",
+            get(|| async { script(include_str!("../web/app/vendor/react.production.min.js")) }),
+        )
+        .route(
+            "/vendor/react-dom.production.min.js",
+            get(|| async {
+                script(include_str!(
+                    "../web/app/vendor/react-dom.production.min.js"
+                ))
+            }),
+        )
+        .route(
+            "/classic",
             get(|| async { Html(include_str!("../web/index.html")) }),
         )
         .route(
-            "/mint",
+            "/classic/mint",
             get(|| async { Html(include_str!("../web/index.html")) }),
         )
         .route(
@@ -315,7 +360,9 @@ async fn revision_header(request: axum::extract::Request, next: Next) -> Respons
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_SECURITY_POLICY, "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' https://api.coinbase.com; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'".parse().unwrap());
+    if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' https://api.coinbase.com; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'".parse().unwrap());
+    }
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
     headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
     headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
@@ -902,7 +949,19 @@ mod tests {
     async fn routes_submission_retry_and_public_reward_export() {
         let (store, thread) = Store::open(PathBuf::from(":memory:")).unwrap();
         let app = router(store.clone());
-        for path in ["/", "/mint", "/app.js", "/style.css", "/api/state"] {
+        for path in [
+            "/",
+            "/live.js",
+            "/nav.js",
+            "/support.js",
+            "/vendor/react.production.min.js",
+            "/vendor/react-dom.production.min.js",
+            "/classic",
+            "/classic/mint",
+            "/app.js",
+            "/style.css",
+            "/api/state",
+        ] {
             let response = app
                 .clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -916,7 +975,22 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .contains("connect-src 'self' https://api.coinbase.com;"));
+            // Only the app page may evaluate its design runtime.
+            assert_eq!(
+                response.headers()[header::CONTENT_SECURITY_POLICY]
+                    .to_str()
+                    .unwrap()
+                    .contains("'unsafe-eval'"),
+                path == "/"
+            );
         }
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/mint").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[header::LOCATION], "/#demo");
         let contribution = contribution();
         let first = json(
             app.clone()

@@ -205,9 +205,10 @@ export function contributionStatus(contribution, height) {
   return height < contribution.start_block + contribution.duration - 1 ? 'active' : 'finished';
 }
 
-if (typeof document !== 'undefined') {
+// The classic pages only; the main app imports this module for its helpers.
+if (typeof document !== 'undefined' && document.getElementById('contribution-form')) {
   const element = id => document.getElementById(id);
-  const minting = location.pathname.replace(/\/$/, '') === '/mint';
+  const minting = location.pathname.replace(/\/$/, '').endsWith('/mint');
   const number = (value, digits = 0) => new Intl.NumberFormat('en', { maximumFractionDigits: digits }).format(value);
   const whole = value => number(Math.trunc(value) || 0);
   let unit = 'sat';
