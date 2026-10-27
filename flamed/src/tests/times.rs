@@ -110,11 +110,11 @@ fn a_transaction_carries_its_signing_time_and_admission_time() {
     // A wallet's history reads the creating block's time beside each
     // output; the genesis allocation has none.
     let change = a.predicate_at(CHANGE, 0).unwrap().to_point().to_bytes();
-    let hits = node.scan(&[change], 0);
+    let hits = node.scan(&[change], 0).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].time, node.block_time(1));
     let allocation = genesis.contracts[0].predicate.0;
-    assert_eq!(node.scan(&[allocation], 0)[0].time, None);
+    assert_eq!(node.scan(&[allocation], 0).unwrap()[0].time, None);
 }
 
 /// An indexer with a clock of its own, standing in for the real one.

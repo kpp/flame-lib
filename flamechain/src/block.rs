@@ -1246,6 +1246,26 @@ impl Blockchain {
         Ok(())
     }
 
+    /// Keeps the undo records of the newest `depth` blocks and drops the
+    /// rest, so the chain can be rewound by at most `depth` blocks:
+    /// [`Self::disconnect_tip`] and [`Self::reorganize`] then refuse with
+    /// [`ChainError::UndoUnavailable`] there. Each record holds a whole
+    /// `Forest`, so a chain that is never rewound otherwise grows by one on
+    /// every block for as long as it runs.
+    ///
+    /// Cheap to call after every connect: it walks down from the newest
+    /// prunable block and stops at the first one already pruned.
+    pub fn forget_undo_below(&mut self, depth: usize) {
+        let Some(end) = self.active.len().checked_sub(depth) else {
+            return;
+        };
+        for id in self.active[..end].iter().rev() {
+            if self.undo.remove(id).is_none() {
+                break;
+            }
+        }
+    }
+
     pub fn disconnect_tip(&mut self, expected: BlockHash) -> Result<(), ChainError> {
         if self.tip() != expected || self.header.height == 0 {
             return Err(ChainError::NotActiveTip);
@@ -2995,5 +3015,32 @@ mod tests {
             chain.state_commitment().available_storage_units,
             initial_pool
         );
+    }
+
+    #[test]
+    fn forgotten_undo_bounds_how_far_the_chain_rewinds() {
+        let mut chain = Blockchain::new(ChainParams::default()).unwrap();
+        let mut tips = Vec::new();
+        for core in 1..=5u8 {
+            let block = chain.build_block([core; 32], vec![]).unwrap();
+            tips.push(chain.connect(&block).unwrap().id);
+        }
+
+        chain.forget_undo_below(2);
+        assert_eq!(chain.undo.len(), 2);
+        // Again, and after one more block: only the newly deep one goes.
+        chain.forget_undo_below(2);
+        let block = chain.build_block([6; 32], vec![]).unwrap();
+        tips.push(chain.connect(&block).unwrap().id);
+        chain.forget_undo_below(2);
+        assert_eq!(chain.undo.len(), 2);
+
+        chain.disconnect_tip(tips[5]).unwrap();
+        chain.disconnect_tip(tips[4]).unwrap();
+        assert!(matches!(
+            chain.disconnect_tip(tips[3]),
+            Err(ChainError::UndoUnavailable)
+        ));
+        assert_eq!(chain.tip(), tips[3]);
     }
 }

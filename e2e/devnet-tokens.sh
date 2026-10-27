@@ -91,7 +91,7 @@ say "Where everything ended up"
 show A "${a[@]}"
 show B "${b[@]}"
 expect "A's soot" "$(balance "$soot" "${a[@]}")" 1450
-expect "A's Flame" "$(balance FLM "${a[@]}")" 99499991000
+expect "A's Flame" "$(balance FLM "${a[@]}")" 999999999499991000
 expect "B's Flame" "$(balance FLM "${b[@]}")" 499997000
 
 echo

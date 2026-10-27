@@ -5,7 +5,9 @@
 //! contract, and it never knew which predicate locked it. A wallet needs all
 //! three, so this node keeps them: `UtxoSet` for the proofs, `TxIndex` and
 //! `OutputIndex` for the history. All three are rebuilt by replaying
-//! `blocks.bin`, which is the only durable state there is.
+//! `blocks.bin`, which is the only durable state there is. The bulky bytes
+//! the indexes seldom read — effect logs, contracts, notes — are kept in
+//! `cold.bin` rather than in memory, and that file is rebuilt the same way.
 //!
 //! Times come from outside. A block's time is its core block's, which the
 //! core indexer reports and remembers; a transaction's admission time is
@@ -36,6 +38,7 @@ use flamevm::{
 };
 
 use crate::cells::{contract_bytes, log_bytes, proof_bytes};
+use crate::cold::{Cold, ColdError, ColdStore};
 use crate::config::{GenesisFile, NodeConfig};
 use crate::genesis::{self, GenesisError};
 use crate::history::{self, Cursor, Direction, END_OF_BLOCK};
@@ -48,6 +51,13 @@ use crate::utxos::UtxoSet;
 /// The txid the indexes record for a genesis allocation, which no
 /// transaction created.
 pub const GENESIS_TXID: TxID = TxID([0; 32]);
+
+/// How many of the newest blocks the chain can still disconnect. This node
+/// has no peers and never rewinds, so the number is a margin for a future
+/// fork choice, not something anything uses today; what it buys is that the
+/// undo records of older blocks, a whole `Forest` each, are not kept for
+/// the life of the process.
+pub const UNDO_DEPTH: usize = 100;
 
 /// One node, shared by the RPC handlers and the minter.
 pub type SharedNode = Arc<Mutex<Node>>;
@@ -80,6 +90,7 @@ pub struct Node {
     utxos: UtxoSet,
     txindex: TxIndex,
     outputs: OutputIndex,
+    cold: ColdStore,
     store: BlockStore,
     // Read again only by the minter; a build without one asks it only
     // while opening.
@@ -173,6 +184,7 @@ impl Node {
             });
         }
 
+        let mut cold = ColdStore::create(&cfg.cold_path())?;
         let mut utxos = UtxoSet::new();
         let mut outputs = OutputIndex::new();
         let mut txindex = TxIndex::new();
@@ -188,7 +200,7 @@ impl Node {
                     index: 0,
                     txid: GENESIS_TXID,
                     predicate: contract.predicate.to_point().to_bytes(),
-                    contract: record.bytes.0.clone(),
+                    contract: cold.put(&record.bytes.0)?,
                     note: None,
                 },
             );
@@ -202,8 +214,10 @@ impl Node {
         // An archived block was validated when it was appended, so one that
         // will not decode or connect now means the archive is wrong, not
         // that this block is skippable. A block the indexer has no time for
-        // is still the same block; it is shown without one.
-        for block in store.replay(params)? {
+        // is still the same block; it is shown without one. One block is
+        // decoded at a time, so replay needs no more memory than the chain
+        // it rebuilds.
+        store.replay_each(params, |block| {
             let height = block.header.height;
             let time = indexer.time_of(&block.header.core_block_hash)?;
             untimed += usize::from(time.is_none());
@@ -212,6 +226,7 @@ impl Node {
                 &mut utxos,
                 &mut txindex,
                 &mut outputs,
+                &mut cold,
                 None,
                 &block,
                 time,
@@ -220,7 +235,8 @@ impl Node {
                 height,
                 source: Box::new(source),
             })?;
-        }
+            Ok::<_, NodeError>(())
+        })?;
 
         if untimed != 0 {
             eprintln!("flamed: the core indexer has no time for {untimed} archived block(s)");
@@ -236,6 +252,7 @@ impl Node {
             utxos,
             txindex,
             outputs,
+            cold,
             store,
             indexer,
             received: BTreeMap::new(),
@@ -283,9 +300,21 @@ impl Node {
         ids.iter().map(|id| (*id, self.proof(id))).collect()
     }
 
-    /// One contract as the node archived it.
+    /// One contract as the node archived it. Its bytes are in `cold.bin`,
+    /// and [`Self::read_cold`] fetches them.
     pub fn contract(&self, id: &ContractID) -> Option<&OutputRecord> {
         self.outputs.get(id)
+    }
+
+    /// Bytes an index record keeps in `cold.bin`.
+    pub fn read_cold(&self, cold: Cold) -> Result<Vec<u8>, NodeError> {
+        Ok(self.cold.get(cold)?)
+    }
+
+    /// A note an index record keeps in `cold.bin`, if it has one.
+    fn read_note(&self, note: Option<Cold>) -> Result<Option<NoteEnvelope>, NodeError> {
+        note.map(|cold| Ok(NoteEnvelope(self.read_cold(cold)?)))
+            .transpose()
     }
 
     /// A page of blocks, newest first.
@@ -430,6 +459,7 @@ impl Node {
             .txindex
             .get(&TxID(id.0))
             .ok_or_else(|| NodeError::NotFound(format!("transaction {id}")))?;
+        let log = self.read_cold(record.log)?;
 
         Ok(TransactionResult {
             summary: record.summary.clone(),
@@ -437,12 +467,12 @@ impl Node {
             block: BlockId(record.block.into_bytes()),
             block_time: self.block_time(record.height),
             received_at: record.received_at,
-            log: record.log.clone(),
             effects: if decode_effects {
-                Some(inspect::effects(&record.log)?)
+                Some(inspect::effects(&log)?)
             } else {
                 None
             },
+            log,
         })
     }
 
@@ -500,7 +530,11 @@ impl Node {
 
     /// Every contract created at `since_height` or later under one of these
     /// predicates, in height order, each with the note that followed it.
-    pub fn scan(&self, predicates: &[[u8; 32]], since_height: u64) -> Vec<ScanEntry> {
+    pub fn scan(
+        &self,
+        predicates: &[[u8; 32]],
+        since_height: u64,
+    ) -> Result<Vec<ScanEntry>, NodeError> {
         let unique: BTreeSet<[u8; 32]> = predicates.iter().copied().collect();
         let mut hits = Vec::new();
         for predicate in unique {
@@ -516,9 +550,9 @@ impl Node {
                     height: record.height,
                     txid: TxId(record.txid.0),
                     predicate: PredicatePoint(record.predicate),
-                    bytes: ContractEnvelope(record.contract.clone()),
+                    bytes: ContractEnvelope(self.read_cold(record.contract)?),
                     time: self.block_time(record.height),
-                    note: record.note.clone().map(NoteEnvelope),
+                    note: self.read_note(record.note)?,
                     spent: self.outputs.spend_of(id).map(|spend| SpentAt {
                         height: spend.height,
                         txid: TxId(spend.txid.0),
@@ -528,7 +562,7 @@ impl Node {
         }
         // Stable, so contracts created in one block keep their order.
         hits.sort_by_key(|hit| hit.height);
-        hits
+        Ok(hits)
     }
 
     /// Every unspent contract locked to one address, each with its proof at
@@ -582,8 +616,8 @@ impl Node {
             outputs.push(UnspentEntry {
                 id: ContractId(*id),
                 txid: TxId(record.txid.0),
-                bytes: ContractEnvelope(record.contract.clone()),
-                note: record.note.clone().map(NoteEnvelope),
+                bytes: ContractEnvelope(self.read_cold(record.contract)?),
+                note: self.read_note(record.note)?,
                 height: Some(record.height),
                 time: self.block_time(record.height),
                 received_at: None,
@@ -644,7 +678,7 @@ impl Node {
         let entries = touches
             .iter()
             .map(|touch| self.history_entry(touch, &predicates))
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let tip = self.tip();
         let at = |direction, position: Position| Cursor {
@@ -719,7 +753,11 @@ impl Node {
     }
 
     /// One confirmed transaction in a history.
-    fn history_entry(&self, touch: &Touch, predicates: &BTreeSet<[u8; 32]>) -> HistoryEntry {
+    fn history_entry(
+        &self,
+        touch: &Touch,
+        predicates: &BTreeSet<[u8; 32]>,
+    ) -> Result<HistoryEntry, NodeError> {
         let record = self.txindex.get(&touch.txid);
         let (all_spent, all_created) = self
             .outputs
@@ -727,7 +765,7 @@ impl Node {
             .map_or((&[][..], &[][..]), |tx| (&tx.spent[..], &tx.created[..]));
         let predicate_of = |id: &ContractID| self.outputs.get(id).map(|output| output.predicate);
         let (height, _) = touch.position;
-        HistoryEntry {
+        Ok(HistoryEntry {
             txid: TxId(touch.txid.0),
             height: Some(height),
             time: self.block_time(height),
@@ -736,21 +774,13 @@ impl Node {
             // paid no fee.
             fee_sparks: record
                 .map_or_else(|| "0".into(), |record| record.summary.fee_sparks.clone()),
-            created: touch
-                .created
-                .iter()
-                .filter_map(|id| self.history_contract(id))
-                .collect(),
-            spent: touch
-                .spent
-                .iter()
-                .filter_map(|id| self.history_contract(id))
-                .collect(),
+            created: self.history_contracts(&touch.created)?,
+            spent: self.history_contracts(&touch.spent)?,
             others_spent: self
                 .counterparties(all_spent.iter().filter_map(predicate_of), predicates),
             others_created: self
                 .counterparties(all_created.iter().filter_map(predicate_of), predicates),
-        }
+        })
     }
 
     /// The predicates in `seen` that are not among `predicates`, each once
@@ -777,15 +807,25 @@ impl Node {
             .collect()
     }
 
-    /// A contract as a history shows it, as it was created.
-    fn history_contract(&self, id: &ContractID) -> Option<HistoryContract> {
-        let output = self.outputs.get(id)?;
-        Some(HistoryContract {
+    /// A contract as a history shows it, as it was created, if this node
+    /// saw it created.
+    fn history_contract(&self, id: &ContractID) -> Result<Option<HistoryContract>, NodeError> {
+        let Some(output) = self.outputs.get(id) else {
+            return Ok(None);
+        };
+        Ok(Some(HistoryContract {
             id: ContractId(*id),
             predicate: PredicatePoint(output.predicate),
-            bytes: ContractEnvelope(output.contract.clone()),
-            note: output.note.clone().map(NoteEnvelope),
-        })
+            bytes: ContractEnvelope(self.read_cold(output.contract)?),
+            note: self.read_note(output.note)?,
+        }))
+    }
+
+    /// [`Self::history_contract`] for each of `ids` this node saw created.
+    fn history_contracts(&self, ids: &[ContractID]) -> Result<Vec<HistoryContract>, NodeError> {
+        ids.iter()
+            .filter_map(|id| self.history_contract(id).transpose())
+            .collect()
     }
 
     /// The pending transactions that touch `predicates`, in admission
@@ -813,10 +853,18 @@ impl Node {
                                 .remove(id)
                                 .or_else(|| self.outputs.get(id).map(|output| output.predicate)),
                         );
-                        let ours = created_here.remove(id).or_else(|| {
-                            self.history_contract(id)
-                                .filter(|contract| predicates.contains(&contract.predicate.0))
-                        });
+                        let ours = match created_here.remove(id) {
+                            Some(contract) => Some(contract),
+                            // Read only when it is one of these addresses'.
+                            None if self
+                                .outputs
+                                .get(id)
+                                .is_some_and(|output| predicates.contains(&output.predicate)) =>
+                            {
+                                self.history_contract(id)?
+                            }
+                            None => None,
+                        };
                         spent.extend(ours);
                     }
                     TxEntry::Output(contract) => {
@@ -951,6 +999,7 @@ impl Node {
             &mut self.utxos,
             &mut self.txindex,
             &mut self.outputs,
+            &mut self.cold,
             Some(&mut self.mempool),
             &block,
             Some(anchor.time),
@@ -1175,11 +1224,13 @@ fn build_chain(
 /// One function for minting and for replay, so an archived chain and a live
 /// one cannot drift apart. `mempool` is `None` during replay, where no pool
 /// exists yet. `time` is the core block's, as the indexer reported it.
+#[allow(clippy::too_many_arguments)]
 fn connect_block(
     chain: &mut Blockchain,
     utxos: &mut UtxoSet,
     txindex: &mut TxIndex,
     outputs: &mut OutputIndex,
+    cold: &mut ColdStore,
     mempool: Option<&mut Mempool>,
     block: &Block,
     time: Option<u64>,
@@ -1192,14 +1243,11 @@ fn connect_block(
     let block_id = block.header.id();
     let size_bytes = block.to_bytes()?.len() as u64;
     let mut messages = BTreeMap::new();
-    let mut staged: Vec<(TxID, TxRecord, Vec<UtxoEffect>)> = Vec::new();
+    let mut staged: Vec<StagedTx> = Vec::new();
 
     // 2. Nothing is recorded before the chain has accepted the block.
     let applied = chain.connect_with_observer(block, |record, log, error| {
         let txid = record.txid;
-        // Its place among the block's executions, the order `staged`, and
-        // so `TxIndex::at_height`, keeps.
-        let position = staged.len() as u32;
 
         let mut changes = Vec::new();
         let mut received = None;
@@ -1227,17 +1275,12 @@ fn connect_block(
                 TxEntry::Output(contract) => {
                     output_count += 1;
                     let id = contract.id();
-                    changes.push(UtxoEffect::Output(
+                    changes.push(UtxoEffect::Output {
                         id,
-                        OutputRecord {
-                            height,
-                            index: position,
-                            txid,
-                            predicate: contract.predicate.to_point().to_bytes(),
-                            contract: contract_bytes(contract)?,
-                            note: note_after(entries, index),
-                        },
-                    ));
+                        predicate: contract.predicate.to_point().to_bytes(),
+                        contract: contract_bytes(contract)?,
+                        note: note_after(entries, index),
+                    });
                 }
                 TxEntry::Fee(q) => fees += u128::from(*q),
                 TxEntry::Send(m) => {
@@ -1277,19 +1320,15 @@ fn connect_block(
         };
 
         // 4. The log itself, for anyone who asks what this transaction did.
-        staged.push((
+        staged.push(StagedTx {
             txid,
-            TxRecord {
-                height,
-                block: block_id,
-                log: log_bytes(log)?,
-                summary,
-                received_at: None,
-            },
+            log: log_bytes(log)?,
+            summary,
             changes,
-        ));
+        });
         Ok(())
     })?;
+    chain.forget_undo_below(UNDO_DEPTH);
 
     // 5. Every execution the chain ran that was not one of these external
     //    transactions produced effects this node can now see through
@@ -1299,7 +1338,18 @@ fn connect_block(
     //    refund contract under the sender's refund predicate. That
     //    contract is real and in the accumulator, and this node can serve
     //    both a proof and a record for it.
-    for (index, (txid, record, changes)) in staged.into_iter().enumerate() {
+    //    The bytes go to `cold.bin` only now that the block is accepted. A
+    //    failed write leaves the indexes part-way through this block, which
+    //    the caller treats like any other failure after a connect: as fatal.
+    //    `index` is each execution's place among the block's, the order
+    //    `staged`, and so `TxIndex::at_height`, keeps.
+    for (index, staged) in staged.into_iter().enumerate() {
+        let StagedTx {
+            txid,
+            log,
+            summary,
+            changes,
+        } = staged;
         for change in changes {
             match change {
                 UtxoEffect::Input(id) => {
@@ -1313,13 +1363,35 @@ fn connect_block(
                         },
                     );
                 }
-                UtxoEffect::Output(id, output) => {
+                UtxoEffect::Output {
+                    id,
+                    predicate,
+                    contract,
+                    note,
+                } => {
+                    let output = OutputRecord {
+                        height,
+                        index: index as u32,
+                        txid,
+                        predicate,
+                        contract: cold.put(&contract)?,
+                        note: note.map(|note| cold.put(&note)).transpose()?,
+                    };
                     utxos.insert_transient(id);
                     outputs.insert(id, output);
                 }
             }
         }
-        txindex.insert(txid, record);
+        txindex.insert(
+            txid,
+            TxRecord {
+                height,
+                block: block_id,
+                log: cold.put(&log)?,
+                summary,
+                received_at: None,
+            },
+        );
     }
 
     let internal = applied
@@ -1369,9 +1441,23 @@ fn connect_block(
     Ok((applied.id, rebase))
 }
 
+/// One execution as the observer saw it, before its bytes have a place in
+/// `cold.bin`.
+struct StagedTx {
+    txid: TxID,
+    log: Vec<u8>,
+    summary: TransactionSummary,
+    changes: Vec<UtxoEffect>,
+}
+
 enum UtxoEffect {
     Input(ContractID),
-    Output(ContractID, OutputRecord),
+    Output {
+        id: ContractID,
+        predicate: [u8; 32],
+        contract: Vec<u8>,
+        note: Option<Vec<u8>>,
+    },
 }
 
 fn block_summary(
@@ -1500,6 +1586,9 @@ pub enum NodeError {
     /// The archive.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// `cold.bin`.
+    #[error(transparent)]
+    Cold(#[from] ColdError),
     /// The core indexer.
     #[error("core indexer: {0}")]
     Indexer(#[from] CoreError),

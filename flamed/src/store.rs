@@ -51,17 +51,33 @@ impl BlockStore {
         Ok(())
     }
 
-    /// Every archived block, in order, rebuilding the offset table.
+    /// Every archived block, in order, collected. For tests and tools: a
+    /// node replays with [`Self::replay_each`], which holds one block at a
+    /// time.
+    pub fn replay(&mut self, params: ChainParams) -> Result<Vec<Block>, StoreError> {
+        let mut blocks = Vec::new();
+        self.replay_each(params, |block| {
+            blocks.push(block);
+            Ok::<_, StoreError>(())
+        })?;
+        Ok(blocks)
+    }
+
+    /// Hands every archived block to `each`, in order, rebuilding the
+    /// offset table, and stops at the first error either side returns.
     ///
     /// `params` comes from `genesis.json`, never from `Default`:
     /// `from_bytes_bounded` enforces the limits it is handed, and a node that
     /// replayed its own archive under someone else's limits would be
     /// deciding validity by whichever build it happens to be.
-    pub fn replay(&mut self, params: ChainParams) -> Result<Vec<Block>, StoreError> {
-        let length = self.file.seek(SeekFrom::End(0))?;
+    pub fn replay_each<E: From<StoreError>>(
+        &mut self,
+        params: ChainParams,
+        mut each: impl FnMut(Block) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let length = self.file.seek(SeekFrom::End(0)).map_err(StoreError::from)?;
         self.offsets.clear();
 
-        let mut blocks = Vec::new();
         let mut offset = 0u64;
         while offset < length {
             let mut prefix = [0u8; 8];
@@ -73,24 +89,24 @@ impl BlockStore {
                 .and_then(|start| start.checked_add(size))
                 .ok_or(StoreError::Truncated { offset })?;
             if end > length {
-                return Err(StoreError::Truncated { offset });
+                return Err(StoreError::Truncated { offset }.into());
             }
 
             let mut bytes =
                 vec![0u8; usize::try_from(size).map_err(|_| StoreError::Truncated { offset })?];
             self.read_exact_at(&mut bytes, offset + 8)?;
-            blocks.push(
-                Block::from_bytes_bounded(&bytes, params)
-                    .map_err(|source| StoreError::Decode { offset, source })?,
-            );
+            let block = Block::from_bytes_bounded(&bytes, params)
+                .map_err(|source| StoreError::Decode { offset, source })?;
+            drop(bytes);
+            each(block)?;
 
             self.offsets.push(offset);
             offset = end;
         }
 
         // Leave the cursor where the next append belongs.
-        self.file.seek(SeekFrom::End(0))?;
-        Ok(blocks)
+        self.file.seek(SeekFrom::End(0)).map_err(StoreError::from)?;
+        Ok(())
     }
 
     /// How many blocks are archived.

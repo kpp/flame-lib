@@ -16,6 +16,7 @@
 //! why.
 
 pub mod cells;
+pub mod cold;
 pub mod config;
 pub mod genesis;
 pub mod history;

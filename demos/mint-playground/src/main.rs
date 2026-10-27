@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod db;
+mod payout;
 
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
@@ -20,6 +21,9 @@ enum Command {
     Submit(db::ContributionRequest, Reply<db::Submitted>),
     Minter(db::MinterRequest, Reply<db::Minter>),
     Rewards(Reply<Vec<db::RewardBalance>>),
+    PayoutState(i64, i64, Reply<db::PayoutState>),
+    RecordPayout(db::PendingPayout, Vec<db::PayoutItem>, Reply<()>),
+    SettlePayout(String, Option<i64>, Reply<()>),
     Tick(Reply<()>),
     Stop(oneshot::Sender<()>),
 }
@@ -55,6 +59,15 @@ impl Store {
                         }
                         Command::Rewards(reply) => {
                             let _ = reply.send(database.rewards());
+                        }
+                        Command::PayoutState(min_sparks, limit, reply) => {
+                            let _ = reply.send(database.payout_state(min_sparks, limit));
+                        }
+                        Command::RecordPayout(payout, items, reply) => {
+                            let _ = reply.send(database.record_payout(payout, items));
+                        }
+                        Command::SettlePayout(txid, height, reply) => {
+                            let _ = reply.send(database.settle_payout(&txid, height));
                         }
                         Command::Tick(reply) => {
                             let _ = reply.send(database.tick());
@@ -330,14 +343,22 @@ async fn clock(store: Store) -> Result<(), ApiError> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let first = arguments.next();
+    if first
+        .as_deref()
+        .is_some_and(|value| value == "--new-payout-key")
+        && arguments.len() == 0
+    {
+        return payout::new_key(&mut std::io::stdout().lock());
+    }
     let resetting = first.as_deref().is_some_and(|value| value == "--reset-db");
     let path = if resetting { arguments.next() } else { first }
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/mint.sqlite3"));
     if arguments.next().is_some() {
-        return Err(
-            std::io::Error::other("Usage: mint-playground [--reset-db] [database-path]").into(),
-        );
+        return Err(std::io::Error::other(
+            "Usage: mint-playground [--reset-db] [database-path] | --new-payout-key",
+        )
+        .into());
     }
     if resetting {
         return db::reset(&path, &mut std::io::stdout().lock());
@@ -345,6 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
+    let payout = payout::Payout::from_env().map_err(std::io::Error::other)?;
     let (store, thread) = Store::open(path).map_err(std::io::Error::other)?;
     let address = std::env::var("MINT_LISTEN").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
@@ -355,6 +377,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = tokio::select! {
         result = axum::serve(listener, router(store.clone())) => result,
         result = clock(store.clone()) => Err(std::io::Error::other(result.err().map(|error| error.1).unwrap_or_default())),
+        result = async {
+            match payout {
+                Some(payout) => payout.run(store.clone()).await,
+                None => std::future::pending().await,
+            }
+        } => Err(std::io::Error::other(result.err().unwrap_or_default())),
         result = tokio::signal::ctrl_c() => result,
     };
     store.stop().await;
@@ -371,6 +399,26 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn a_new_payout_key_is_a_fresh_phrase_a_wallet_opens() {
+        let key = || {
+            let mut out = Vec::new();
+            crate::payout::new_key(&mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let (first, second) = (key(), key());
+        assert_ne!(first, second);
+        assert!(first.ends_with('\n'));
+        assert_eq!(first.split_whitespace().count(), 24);
+        flamewallet_ffi::Wallet::from_mnemonic(
+            first.trim().into(),
+            String::new(),
+            flamewallet_ffi::Network::Testnet,
+            0,
+        )
+        .unwrap();
+    }
 
     async fn json(response: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
