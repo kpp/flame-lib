@@ -19,6 +19,11 @@ WORKDIR /src
 COPY . .
 
 RUN cargo build --release --locked -p flamed --features devnet
+# The wallet ships beside the node, so the host can spend from the genesis
+# wallet (funding the mint demo's payout wallet, infrastructure repo) without
+# a Rust toolchain on anyone's machine. A build of its own: built with flamed,
+# it would get flamed's devnet features unified into its dependencies.
+RUN cargo build --release --locked -p flamewallet-cli
 
 # chainparams.toml names one holder by `address`; it is replaced by the first
 # receiving address of the mnemonic, so the whole devnet supply is spendable
@@ -49,7 +54,7 @@ RUN groupadd --system --gid 10001 flamed \
     && mkdir -p /var/lib/flamed \
     && chown flamed:flamed /var/lib/flamed
 
-COPY --from=build /src/target/release/flamed /usr/local/bin/flamed
+COPY --from=build /src/target/release/flamed /src/target/release/flamewallet /usr/local/bin/
 COPY flamed/configs/flamed.image.toml /etc/flamed/flamed.toml
 COPY --from=build /out/chainparams.toml /out/genesis.json /etc/flamed/
 
