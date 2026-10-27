@@ -58,6 +58,12 @@ cd flamewallet-ffi/host-tests/swift && swift test
 
 Extra rustflags go in `FLAME_RUSTFLAGS`, not `RUSTFLAGS`. Android needs the
 NDK and `cargo-ndk`; the app needs `net.java.dev.jna:jna:<version>@aar`.
+The package ships `android/consumer-rules.pro` with the R8 rules for JNA and
+the UniFFI bindings, so minified release builds need no extra config.
+No build here runs that Kotlin through Gradle and R8, so after bumping JNA or
+UniFFI, or changing `package_name` in `uniffi.toml` or how the bindings load, check the rules in
+`package-native.sh` still cover what JNA reaches by reflection, and confirm
+with a minified release build of an app on the new rc.
 
 ## Releasing
 
