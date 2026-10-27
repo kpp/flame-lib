@@ -1,5 +1,8 @@
 //! Actor storage leases and the concrete FlameVM actor registry.
 
+mod accounting;
+
+use accounting::RetainedCells;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -124,8 +127,7 @@ struct LiveActor {
     root: Cell,
     /// Only explicitly retained code/state bodies; transaction resolution never
     /// inserts into this bag. Registry/lease metadata is reconstructed separately.
-    cells: Arc<CellIndex>,
-    resident_bytes: u64,
+    retained: RetainedCells,
 }
 
 #[derive(Clone, Default)]
@@ -224,29 +226,15 @@ impl LiveActor {
             .ok_or(CellError::InvalidFormat.into())
     }
 
-    fn retain_changes(&mut self) -> Result<(), CellError> {
-        if self.root.is_pruned() {
-            return Err(CellError::PrunedCell);
-        }
-        let code = match &self.code {
-            Some(code) => CellRef::resident(code.clone()),
-            None => self.root.refs()[0].clone(),
-        };
-        let state = match &self.state {
-            Some(state) => CellRef::resident(state.to_cell()?),
-            None => self.root.refs()[1].clone(),
-        };
-        let root = Cell::new(Vec::new(), vec![code, state])?;
+    fn retain_changes(&mut self, root: Cell) -> Result<(), CellError> {
         // Reserve an outer proof level for freezing without losing older cuts.
         if root.level() >= MAX_CELL_LEVEL {
             return Err(CellError::InvalidLevel);
         }
-        let cells = collect_owned([Arc::new(root.clone())], &self.cells)?;
-        self.resident_bytes = cells.iter().try_fold(0u64, |size, (_, cell)| {
-            size.checked_add(cell.record_size() as u64)
-                .ok_or(CellError::LimitExceeded)
-        })?;
-        self.cells = Arc::new(cells);
+        // Walk attached inputs, including distinct resident views of the same
+        // hash, but do not re-walk the prior actor-owned graph.
+        let supplied = CellIndex::collect(Arc::new(root.clone()))?;
+        self.retained.replace_root(root.id(), &supplied)?;
         self.root = root.detached();
         Ok(())
     }
@@ -451,8 +439,7 @@ impl ActorStore {
                 // The whole-image commitment continues to own all hidden assets.
                 live.code = None;
                 live.state = None;
-                live.cells = Arc::new(CellIndex::new());
-                live.resident_bytes = 0;
+                live.retained = RetainedCells::default();
             }
         }
         Ok(())
@@ -510,7 +497,8 @@ impl ActorStore {
 
     fn usage_slot(&self, slot: &ActorSlot) -> Result<u64, VMError> {
         let live = slot.live.as_ref().ok_or(VMError::ActorNotFound)?;
-        live.resident_bytes
+        live.retained
+            .bytes
             .checked_add({
                 (slot.leases.len() as u64)
                     .checked_mul(self.params.lease_record_bytes)
@@ -595,11 +583,11 @@ impl ActorStore {
 
         // Read only committed public cells, never cached values or private witnesses.
         // In particular, load_state would check out the actor for execution.
-        let mut cells = live.cells.as_ref().clone();
+        let mut cells = live.retained.cells.as_ref().clone();
         let code = match self.load_code_with_cells(actor, &mut cells) {
             Ok(code) => Some(CellEnvelope::new(
                 code.id(),
-                collect_owned([Arc::new(code)], &live.cells)?,
+                collect_owned([Arc::new(code)], &live.retained.cells)?,
             )?),
             Err(VMError::ActorFrozen | VMError::Cell(CellError::MissingCell(_))) => None,
             Err(error) => return Err(error),
@@ -608,8 +596,8 @@ impl ActorStore {
         let code_root = live.root.refs().first().map(CellRef::id);
         let state_root = live.root.refs().get(1).map(CellRef::id);
         let state = state_root
-            .and_then(|id| live.cells.get(&id))
-            .map(|root| CellEnvelope::new(root.id(), collect_owned([root], &live.cells)?))
+            .and_then(|id| live.retained.cells.get(&id))
+            .map(|root| CellEnvelope::new(root.id(), collect_owned([root], &live.retained.cells)?))
             .transpose()?;
 
         Ok(ActorInfo {
@@ -632,7 +620,7 @@ impl ActorStore {
         let prior = slot
             .live
             .as_ref()
-            .map_or(&empty, |live| live.cells.as_ref());
+            .map_or(&empty, |live| live.retained.cells.as_ref());
         let cells = Arc::new(collect_owned([Arc::clone(&root)], prior)?);
         Ok(StoredActor {
             root: root.id(),
@@ -691,7 +679,7 @@ impl ActorStore {
         let live = self.actors.get_mut(&key).unwrap().live.as_mut().unwrap();
         live.state = Some(state);
         live.state_bytes = state_bytes;
-        live.retain_changes()?;
+        live.retain_changes(image)?;
         self.validate_actor_storage(actor, height)
     }
 
@@ -771,7 +759,7 @@ impl ActorRegistry for ActorStore {
             return Err(CellError::CellCommitmentMismatch(expected.hash(cap)?).into());
         }
 
-        let mut restored = live.cells.as_ref().clone();
+        let mut restored = CellIndex::new();
         let mut seen = BTreeSet::new();
         let mut pending = vec![proof];
         while let Some(cell) = pending.pop() {
@@ -791,19 +779,14 @@ impl ActorRegistry for ActorStore {
                 }
             }
         }
-        let restored = collect_owned([Arc::new(root.clone())], &restored)?;
-        let bytes = restored.iter().try_fold(0u64, |bytes, (_, cell)| {
-            bytes
-                .checked_add(cell.record_size() as u64)
-                .ok_or(VMError::StorageArithmeticOverflow)
-        })?;
+        let mut retained = live.retained.clone();
+        retained.replace_root(root.id(), &restored)?;
         self.record_actor(key);
         let live = self.actors.get_mut(&key).unwrap().live.as_mut().unwrap();
         live.root = root;
         live.code = None;
         live.state = None;
-        live.cells = Arc::new(restored);
-        live.resident_bytes = bytes;
+        live.retained = retained;
         Ok(())
     }
 
@@ -861,7 +844,7 @@ impl ActorRegistry for ActorStore {
         let live = self.actors.get_mut(&key).unwrap().live.as_mut().unwrap();
         live.state = Some(state);
         live.state_bytes = state_bytes;
-        live.retain_changes()?;
+        live.retain_changes(image)?;
         self.record_checked_out();
         self.checked_out.remove(&key);
         Ok(())
@@ -904,7 +887,7 @@ impl ActorRegistry for ActorStore {
         // nested call returns. Reuse the committed code/state body set: the
         // registry's actor/lease metadata is not an execution witness source.
         let live = self.require_live(actor.to_hash())?.live.as_ref().unwrap();
-        Ok(Arc::clone(&live.cells))
+        Ok(Arc::clone(&live.retained.cells))
     }
 
     fn actor_code_bytes(&self, actor: &ActorID) -> Result<u64, VMError> {
@@ -942,7 +925,7 @@ impl ActorRegistry for ActorStore {
         let live = self.actors.get_mut(&key).unwrap().live.as_mut().unwrap();
         live.code_bytes = code.payload().len() as u64;
         live.code = Some(code);
-        live.retain_changes()?;
+        live.retain_changes(image)?;
         Ok(())
     }
 
@@ -1083,15 +1066,14 @@ impl ActorRegistry for ActorStore {
             ],
         )?;
         let mut live = LiveActor {
-            root,
+            root: root.clone(),
             code_bytes: code.payload().len() as u64,
             code: Some(code),
             state: Some(state),
             state_bytes,
-            cells: Arc::new(CellIndex::new()),
-            resident_bytes: 0,
+            retained: RetainedCells::default(),
         };
-        live.retain_changes()?;
+        live.retain_changes(root)?;
         self.record_actor(key);
         self.actors.insert(
             key,
@@ -1125,6 +1107,100 @@ mod tests {
     fn freeze(store: &mut ActorStore) {
         store.pending_destruction.insert(actor().to_hash());
         store.freeze_expired_actors().unwrap();
+    }
+
+    fn assert_accounted_graph(store: &ActorStore, expected: &CellIndex) {
+        let live = store.actors[&actor().to_hash()].live.as_ref().unwrap();
+        assert_eq!(live.retained.cells.id().unwrap(), expected.id().unwrap());
+        let bytes: u64 = expected
+            .iter()
+            .map(|(_, cell)| cell.record_size() as u64)
+            .sum();
+        assert_eq!(live.retained.bytes, bytes);
+        let lease_bytes =
+            store.actors[&actor().to_hash()].leases.len() as u64 * store.params.lease_record_bytes;
+        assert_eq!(store.actor_usage(&actor()).unwrap(), bytes + lease_bytes);
+    }
+
+    #[test]
+    fn incremental_accounting_survives_code_state_changes_freezing_and_undo() {
+        let leaf = Cell::new(vec![12; 80], vec![]).unwrap();
+        let shared = Cell::new(vec![11; 200], vec![leaf.clone().into()]).unwrap();
+        let code = Cell::new(vec![0], vec![shared.clone().into()]).unwrap();
+        let state = Value::Cell(shared.clone().into());
+        let mut store = ActorStore::new(StorageParams::default()).unwrap();
+        store.deploy(actor(), code.clone(), state.clone()).unwrap();
+        store.purchase_storage(&actor(), 1_024, 0).unwrap().unwrap();
+        let original = image(&store);
+        let all = store.actor_cells(&actor()).unwrap();
+        let before = store.actor_root().unwrap();
+        let complete = proof(
+            original.id(),
+            &all,
+            &all.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        );
+
+        store.push_checkpoint();
+        let new_code = Cell::new(vec![1], vec![]).unwrap();
+        store.set_code(&actor(), new_code.clone()).unwrap();
+        let expected = Cell::new(
+            vec![],
+            vec![new_code.clone().into(), state.to_cell().unwrap().into()],
+        )
+        .unwrap();
+        let expected = collect_owned([Arc::new(expected)], &all).unwrap();
+        assert_accounted_graph(&store, &expected);
+        assert!(store.actor_cells(&actor()).unwrap().contains(&shared.id()));
+
+        store.push_checkpoint();
+        store.load_state(&actor()).unwrap();
+        let new_state = Value::Scalar(Scalar::ONE);
+        store.save_state(&actor(), new_state.clone()).unwrap();
+        let expected = Cell::new(
+            vec![],
+            vec![new_code.into(), new_state.to_cell().unwrap().into()],
+        )
+        .unwrap();
+        let expected = collect_owned([Arc::new(expected)], &all).unwrap();
+        assert_accounted_graph(&store, &expected);
+        assert!(!store.actor_cells(&actor()).unwrap().contains(&shared.id()));
+        assert!(!store.actor_cells(&actor()).unwrap().contains(&leaf.id()));
+        store.pop_checkpoint_commit();
+        store.pop_checkpoint_rollback();
+        assert_eq!(store.actor_root().unwrap(), before);
+        assert_accounted_graph(&store, &all);
+        assert!(Arc::ptr_eq(&store.actor_cells(&actor()).unwrap(), &all));
+
+        // A mutation after undo exercises the restored reference counts too.
+        store.load_state(&actor()).unwrap();
+        store
+            .save_state(&actor(), Value::Scalar(Scalar::ONE))
+            .unwrap();
+        assert!(store.actor_cells(&actor()).unwrap().contains(&shared.id()));
+        store
+            .set_code(&actor(), Cell::new(vec![1], vec![]).unwrap())
+            .unwrap();
+        assert!(!store.actor_cells(&actor()).unwrap().contains(&shared.id()));
+
+        // Freeze, restore, and rollback must carry bytes and ownership together.
+        let mut restored = ActorStore::new(StorageParams::default()).unwrap();
+        restored.deploy(actor(), code, state).unwrap();
+        restored
+            .purchase_storage(&actor(), 1_024, 0)
+            .unwrap()
+            .unwrap();
+        restored.push_checkpoint();
+        restored
+            .begin_block(restored.params.lease_duration_blocks)
+            .unwrap();
+        restored.freeze_expired_actors().unwrap();
+        assert_accounted_graph(&restored, &CellIndex::new());
+        restored
+            .restore_with_cells(&actor(), &complete.into(), &mut ())
+            .unwrap();
+        assert_accounted_graph(&restored, &all);
+        restored.pop_checkpoint_rollback();
+        assert_accounted_graph(&restored, &all);
     }
 
     fn proof(root: CellID, source: &CellIndex, ids: &[CellID]) -> Cell {
@@ -1249,6 +1325,8 @@ mod tests {
         store.pop_checkpoint_commit();
         assert_eq!(image(&store).id(), root.id());
         let mut first = store.actor_cells(&actor()).unwrap().as_ref().clone();
+        assert_accounted_graph(&store, &first);
+        let first_usage = store.actor_usage(&actor()).unwrap();
         assert!(read_cell(&mut first, &data.refs()[0]).is_ok());
         assert!(
             matches!(read_cell(&mut first, &data.refs()[1].to_unloaded()),
@@ -1266,6 +1344,11 @@ mod tests {
         assert!(read_cell(&mut merged, &data.refs()[1].to_unloaded()).is_ok());
         assert_eq!(merged.id().unwrap(), all.id().unwrap());
         assert_eq!(image(&store).id(), root.id());
+        assert_accounted_graph(&store, &all);
+        assert_eq!(
+            store.actor_usage(&actor()).unwrap(),
+            first_usage + right.record_size() as u64
+        );
     }
 
     #[test]
@@ -1713,7 +1796,7 @@ mod tests {
             .as_mut()
             .unwrap();
         assert!(live.code.is_some() && live.state.is_some());
-        live.cells = Arc::new(CellIndex::new());
+        live.retained.cells = Arc::new(CellIndex::new());
         let info = store.actor_info(&actor(), 0).unwrap();
         assert!(info.code.is_none() && info.state.is_none());
     }
@@ -1739,12 +1822,22 @@ mod tests {
             .unwrap();
         let mut resident = CellIndex::new();
         resident
-            .insert(live.cells.get(&live.child(0).unwrap().id()).unwrap())
+            .insert(
+                live.retained
+                    .cells
+                    .get(&live.child(0).unwrap().id())
+                    .unwrap(),
+            )
             .unwrap();
         resident
-            .insert(live.cells.get(&live.child(1).unwrap().id()).unwrap())
+            .insert(
+                live.retained
+                    .cells
+                    .get(&live.child(1).unwrap().id())
+                    .unwrap(),
+            )
             .unwrap();
-        live.cells = Arc::new(resident);
+        live.retained.cells = Arc::new(resident);
         let info = store.actor_info(&actor(), 0).unwrap();
         assert_eq!(
             info.code.as_ref().map(CellEnvelope::root),
