@@ -13,8 +13,8 @@ name: flamed image
 # build of main reads that secret; a dry run uses the public test mnemonic
 # below and checks the address it bakes in.
 #
-# The paths are what the image is built from: flamed with the workspace
-# crates it depends on, and the toolchain.
+# The paths are what the image is built from: flamed and flamewallet-cli with
+# the workspace crates they depend on, and the toolchain.
 
 on:
   push:
@@ -29,6 +29,8 @@ on:
       - 'flamed-rpc/**'
       - 'flamekd/**'
       - 'flamepayments/**'
+      - 'flamewallet-cli/**'
+      - 'flamewallet-ffi/**'
       - 'flamevm/**'
       - 'merkle/**'
       - 'musig/**'
@@ -48,6 +50,8 @@ on:
       - 'flamed-rpc/**'
       - 'flamekd/**'
       - 'flamepayments/**'
+      - 'flamewallet-cli/**'
+      - 'flamewallet-ffi/**'
       - 'flamevm/**'
       - 'merkle/**'
       - 'musig/**'
@@ -136,6 +140,13 @@ jobs:
           sleep 1
         done
         [ "$height" -ge 1 ] || { echo "no block minted within 40s"; exit 1; }
+        # The wallet in the image reaches the node; a dry run's genesis
+        # wallet is the test phrase's, and holds the whole supply.
+        docker exec flamed flamewallet --version
+        if [ "$GITHUB_REF" != refs/heads/main ]; then
+          echo "$DRY_RUN_MNEMONIC" | docker exec -i flamed sh -c \
+            'flamewallet --wallet /tmp/genesis.json --node http://127.0.0.1:8545 restore >/dev/null && flamewallet --wallet /tmp/genesis.json balance'
+        fi
 
     # Only from main: a pull request or a manual run elsewhere pushes nothing.
     - name: Push
