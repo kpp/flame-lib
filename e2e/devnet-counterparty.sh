@@ -3,6 +3,7 @@
 # transaction. The genesis wallet A pays a fresh wallet B, and B pays part
 # of it back; each side's history, pending and confirmed, names the other
 # by tracking address: `from` who paid the wallet, `to` whom it paid.
+# Both sides also show the fee the payer paid.
 # Exits non-zero on the first thing that is wrong. Run from anywhere:
 #
 #   e2e/devnet-counterparty.sh
@@ -36,6 +37,7 @@ b_address="$("$wallet" "${b[@]}" --json address | field "[0]['address']")"
 say "Genesis: A's allocation came from no one"
 expect "A's allocation, from" "$(newest from "${a[@]}")" ""
 expect "A's allocation, to" "$(newest to "${a[@]}")" ""
+expect "A's allocation paid no fee" "$(newest fee_sparks "${a[@]}")" 0
 
 say "A pays B 12.5 Flame; pending, both sides name the other"
 "$wallet" "${a[@]}" send "$b_address" 12.5 --memo "from A" >/dev/null
@@ -52,17 +54,21 @@ expect "B's item is confirmed" "$(newest pending "${b[@]}")" False
 expect "B was paid from A" "$(newest from "${b[@]}")" "$(tracking "$a_address")"
 expect "A paid B" "$(newest to "${a[@]}")" "$(tracking "$b_address")"
 
-say "B pays 2 back"
-"$wallet" "${b[@]}" send "$a_address" 2 --wait >/dev/null
+say "B pays 2 back, with a fee of 2500 sparks"
+"$wallet" "${b[@]}" send "$a_address" 2 --fee 2500 --wait >/dev/null
 expect "A was paid from B" "$(newest from "${a[@]}")" "$(tracking "$b_address")"
 expect "A paid no one" "$(newest to "${a[@]}")" ""
 expect "B paid A" "$(newest to "${b[@]}")" "$(tracking "$a_address")"
 expect "B was paid by no one" "$(newest from "${b[@]}")" ""
+expect "B's fee" "$(newest fee_sparks "${b[@]}")" 2500
+expect "A sees B's fee" "$(newest fee_sparks "${a[@]}")" 2500
 
 say "As B's history prints it"
 "$wallet" "${b[@]}" history | sed 's/^/   /'
 "$wallet" "${b[@]}" history | grep -q "from $(tracking "$a_address")" ||
     { echo "FAIL: B's history does not print who paid it" >&2; exit 1; }
+[[ "$("$wallet" "${b[@]}" history | sed -n 1p)" == *"  fee 0.000025 FLM"* ]] ||
+    { echo "FAIL: B's history does not print the fee it paid" >&2; exit 1; }
 
 echo
 echo "devnet counterparty: ok"

@@ -470,6 +470,13 @@ async fn run(cli: Cli) -> Result<(), Error> {
                             .collect::<Vec<_>>()
                             .join(", ");
                         let mut line = format!("{when}  {}  {changes}", item.txid);
+                        match item.fee_sparks.parse::<i128>() {
+                            Ok(0) => {}
+                            Ok(fee) => {
+                                line += &format!("  fee {} FLM", format_qty(fee, Flavor::flame()))
+                            }
+                            Err(_) => line += &format!("  fee {} sparks", item.fee_sparks),
+                        }
                         if !item.from.is_empty() {
                             line += &format!("  from {}", item.from.join(", "));
                         }
