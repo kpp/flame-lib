@@ -173,7 +173,7 @@ impl FlamedApiServer for FlamedRpc {
                     height: record.height,
                     txid: TxId(record.txid.0),
                     predicate: PredicatePoint(record.predicate),
-                    bytes: ContractEnvelope(record.contract.clone()),
+                    bytes: ContractEnvelope(node.read_cold(record.contract)?),
                     created_block: node.block_summary(record.height)?.id,
                     status,
                     tip: TipResult {
@@ -222,7 +222,7 @@ impl FlamedApiServer for FlamedRpc {
             let raw: Vec<[u8; 32]> = predicates.iter().map(|point| point.0).collect();
             Ok(ScanResult {
                 tip_height: node.tip().height,
-                outputs: node.scan(&raw, since_height),
+                outputs: node.scan(&raw, since_height)?,
             })
         })
         .await

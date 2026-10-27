@@ -7,6 +7,8 @@ use flamechain::BlockHash;
 use flamed_rpc::{BlockSummary, BlocksResult, TransactionSummary, TransactionsResult};
 use flamevm::TxID;
 
+use crate::cold::Cold;
+
 /// Where a transaction landed, and what it did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxRecord {
@@ -14,8 +16,8 @@ pub struct TxRecord {
     pub height: u64,
     /// That block's hash.
     pub block: BlockHash,
-    /// Its effect log, as a `CellEnvelope`.
-    pub log: Vec<u8>,
+    /// Its effect log, as a `CellEnvelope`, in `cold.bin`.
+    pub log: Cold,
     /// Public execution summary.
     pub summary: TransactionSummary,
     /// When this node first admitted it to its mempool, in Unix seconds.

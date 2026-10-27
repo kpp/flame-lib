@@ -282,6 +282,11 @@ pub struct NodeConfig {
     /// purpose: it stands in for a separate service.
     #[serde(default)]
     pub indexer_dir: Option<PathBuf>,
+    /// Where the indexes keep the bytes they seldom read;
+    /// `<data_dir>/cold.bin` by default. A cache that every start rebuilds,
+    /// so it can live on a scratch disk.
+    #[serde(default)]
+    pub cold_path: Option<PathBuf>,
 }
 
 fn default_block_interval_secs() -> u64 {
@@ -315,6 +320,13 @@ impl NodeConfig {
         self.indexer_dir
             .clone()
             .unwrap_or_else(|| self.data_dir.join("indexer"))
+    }
+
+    /// Where the indexes keep the bytes they seldom read.
+    pub fn cold_path(&self) -> PathBuf {
+        self.cold_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("cold.bin"))
     }
 
     /// Where this node archives blocks.
