@@ -24,6 +24,7 @@ if [ "${VERSION%%-*}" != "${CRATE_VERSION%%[-+]*}" ]; then
   exit 1
 fi
 KOTLIN_PACKAGE="$(sed -n 's/^package_name = "\(.*\)"$/\1/p' "$ROOT/flamewallet-ffi/uniffi.toml")"
+[ -n "$KOTLIN_PACKAGE" ] || { echo "no package_name in flamewallet-ffi/uniffi.toml" >&2; exit 1; }
 
 [ -d "$APPLE/FlameWalletFFI.xcframework" ] || { echo "no $APPLE; run build-apple.sh" >&2; exit 1; }
 [ -d "$ANDROID/jniLibs" ] || { echo "no $ANDROID; run build-android.sh" >&2; exit 1; }
@@ -92,6 +93,7 @@ android {
   defaultConfig {
     minSdk 24
     versionName '$VERSION'
+    consumerProguardFiles 'consumer-rules.pro'
   }
 
   compileOptions {
@@ -109,6 +111,21 @@ dependencies {
   api 'net.java.dev.jna:jna:5.15.0@aar'
 }
 GRADLE
+
+# R8 rules the app picks up through consumerProguardFiles; without them a
+# minified release build strips what JNA looks up by reflection.
+cat >"$OUT/android/consumer-rules.pro" <<PRO
+# JNA references AWT, which Android does not have.
+-dontwarn java.awt.**
+# JNA reads Structure fields, Library methods and Callback signatures by name.
+-keep class com.sun.jna.** { *; }
+-keepclassmembers class * extends com.sun.jna.** { public *; }
+# Structure field layout comes from @Structure.FieldOrder; -keep alone
+# does not keep annotations.
+-keepattributes RuntimeVisibleAnnotations
+# UniFFI bindings: Structure subclasses, the native Library, callback vtables.
+-keep class $KOTLIN_PACKAGE.** { *; }
+PRO
 
 cat >"$OUT/expo-module.config.json" <<'JSON'
 {
