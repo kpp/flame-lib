@@ -3,10 +3,12 @@
  * Flame minting consensus AS IMPLEMENTED in runflame/flame-lib @ fbd94bc (PR #14).
  *
  * This model deliberately reproduces the current behaviour, bugs included.
- * The invariants at the bottom state what docs/consensus/design-doc.md promises;
- * each `run` test drives the model into a state where one of them is violated,
- * reproducing an issue from the review doc (FL-01 .. FL-08). FL-09 was found while checking
- * this model against the code and is not in the review doc yet.
+ * The invariants at the bottom state what docs/consensus/design-doc.md promises, plus
+ * what the code itself needs: a Bitcoin rollback undoes the block (rollbackUndoes,
+ * rollbackCommutesWithArrival). Each `run` test in flame_consensus_test.qnt drives the
+ * model into a state where one of them is violated, reproducing an issue from the review
+ * doc (FL-01 .. FL-08). FL-09, FL-10 and FL-11 were found while checking this model
+ * against the code and are not in the review doc yet.
  * A fixed protocol should live in a separate module and pass the same invariants.
  *
  * TODO: this model is a hybrid of two PR #14 configurations that no single deployment runs:
@@ -34,7 +36,15 @@
  *  - Honest minters act on node n1's view, like a minter attached to a local node, once per
  *    BTC tip (minter_worker.rs:44-47): a core block that shows up later at the same tip is
  *    not endorsed until the next tip.
- *  - Bitcoin: no reorgs, but miners may delay (censor) any endorsement for a while.
+ *  - Bitcoin is bitcoin.qnt (instance B), each node's bitcoind is one of its observers.
+ *    K_REORG = 2. CENSOR_WINDOW is off: miners may delay (censor) any
+ *    endorsement for any time. An endorsement is a B transaction; `w.payload` keeps what
+ *    it means. Each minter starts with one genesis coin. An honest minter funds an
+ *    endorsement like fund_transaction_from_script: a confirmed output of its script,
+ *    change back to it (transaction_builder.rs). The adversary spends any output it has,
+ *    spent or not, and may withhold the transaction.
+ *    On a reorg a node rolls its blocks back one by one, then applies the new ones
+ *    (ConsensusEvent::BitcoinReorg, consensus_manager.rs:370-384).
  *  - Rewards (FL-04) are not modelled: Quint has no floats. Only the halving constant is checked.
  *  - MAX_DELAY is 2 instead of 10 (orchestrator/defaults.rs) to keep traces short;
  *    the logic does not depend on the value.
@@ -57,7 +67,8 @@ module flame_minting {
     target: int,        // CoreBlockHeader.target_btc_height -- NOT validated (FL-01)
   }
 
-  // MintingEndorsementData::V1 { flame_block_height, flame_block_hash } plus inclusion height.
+  // MintingEndorsementData::V1 { flame_block_height, flame_block_hash } plus inclusion height
+  // (-1 in `w.payload`: a transaction's height depends on the branch).
   type Endorsement = { minter: str, blockId: BlockId, coreHeight: int, incl: int }
 
   // WeightedBlockHeader { parent_weight, effective_power }
@@ -65,7 +76,7 @@ module flame_minting {
 
   // What one node (ConsensusStorage + ChainStorage + cursor) holds.
   type NodeState = {
-    cursor: int,                              // last processed Bitcoin height
+    cursor: int,                              // last processed Bitcoin block (B hash)
     known: Set[BlockId],                      // ChainStorage
     importOrder: List[BlockId],               // order used by CoreBlockSource::get_core_block
     firstSeenAt: BlockId -> int,              // cursor when the block arrived (model bookkeeping)
@@ -73,22 +84,26 @@ module flame_minting {
     storedEff: (str, int) -> int,             // effective power stored with each endorsement
     pending: Set[Endorsement],                // EndorsementStorage.pending_endorsements
     doubleSigned: Set[str],                   // DoubleSignStorage: any entry = banned forever
+    dsEvidence: Set[Endorsement],             // DoubleSign.endorsements of every entry
     weights: BlockId -> WeightRec,            // WeightedHeaderStorage
   }
 
   type World = {
-    btcHeight: int,
-    btcChain: List[Set[Endorsement]],         // btcChain[h - 1] = endorsements included at height h
-    mempool: Set[Endorsement],
+    payload: int -> Endorsement,              // B txid -> the endorsement it carries
     blocks: BlockId -> Block,                 // every Flame block ever created
     nextId: int,
     bft: BlockId,                             // BFT's own last block
   }
 
   // InMemoryMinterJournal: core height -> endorsed block; lost on restart.
-  // lastTip: MinterWorker::run last_tip, -1 = None.
+  // lastTip: MinterWorker::run last_tip, a B hash (BtcBlockTip compares height and hash),
+  // -1 = None.
   // missed: target heights for which the worker found no core block (model bookkeeping, FL-09).
-  type MinterState = { journal: int -> BlockId, conflicts: Set[int], lastTip: int, missed: Set[int] }
+  // unsent: core heights reserved in the journal whose transaction was never sent
+  // (EndorsementState::Reserved).
+  type MinterState = {
+    journal: int -> BlockId, conflicts: Set[int], lastTip: int, missed: Set[int], unsent: Set[int],
+  }
 
   // ------------------------------------------------------------------
   // Parameters
@@ -114,6 +129,16 @@ module flame_minting {
   pure val MAX_CORE = 5
   pure val GHOST = 999              // a block id that is never created
   pure val GENESIS = 0
+  pure val MAX_ENDORSEMENTS = 8     // Bitcoin transactions
+
+  import bitcoin(
+    OBSERVERS = NODES,
+    OWNERS = MINTERS,
+    K_REORG = 2,
+    CENSOR_WINDOW = MAX_BTC + 1,    // off
+    MAX_BLOCKS = MAX_BTC + 1,       // with genesis
+    MAX_TXS = MAX_ENDORSEMENTS,
+  ) as B from "./bitcoin"
 
   // ------------------------------------------------------------------
   // Pure helpers
@@ -254,6 +279,9 @@ module flame_minting {
     val affected = removedKeys.map(k => n.stored.get(k).blockId).union(accepted.map(e => e.blockId))
     val weights1 = affected.fold(n.weights, (ws, b) =>
       applyDelta(blocks, n.known, ws, b, deltaFor(blocks, n, accepted, removedKeys, b)))
+    // HeightEndorsements::record_endorsement: every endorsement at the height, stored one first
+    val evidence = eligible.filter(e => dsKeys.contains(keyOf(e)))
+      .union(removedKeys.map(k => n.stored.get(k)))
     val keptKeys = storedKeys.exclude(removedKeys)
     val stored1 = accepted.fold(keptKeys.mapBy(k => n.stored.get(k)), (m, e) => m.put(keyOf(e), e))
     val eff1 = accepted.fold(keptKeys.mapBy(k => n.storedEff.get(k)), (m, e) =>
@@ -264,6 +292,7 @@ module flame_minting {
       storedEff: eff1,
       pending: n.pending.exclude(batch).union(pendingNew.filter(e => not(disq.contains(e.minter)))),
       doubleSigned: n.doubleSigned.union(disq),
+      dsEvidence: n.dsEvidence.union(evidence),
       weights: weights1,
     }
   }
@@ -285,11 +314,71 @@ module flame_minting {
     else n1
   }
 
-  pure def processBtcBlock(world: World, n: NodeState): NodeState = {
-    val h = n.cursor + 1
-    val n1 = processBatch(world.blocks, n, world.btcChain[h - 1])
+  // endorsements included in Bitcoin block h
+  pure def endorsementsIn(world: World, c: B::Btc, h: int): Set[Endorsement] =
+    c.blocks.get(h).txs.filter(t => world.payload.keys().contains(t))
+      .map(t => { ...world.payload.get(t), incl: B::heightOf(c, h) })
+
+  // h: the child of the cursor on the node's Bitcoin branch
+  pure def processBtcBlock(world: World, c: B::Btc, n: NodeState, h: int): NodeState = {
+    val n1 = processBatch(world.blocks, n, endorsementsIn(world, c, h))
     { ...n1, cursor: h }
   }
+
+  pure def ofMinters(es: Set[Endorsement], ms: Set[str]): Set[Endorsement] = es.filter(e => ms.contains(e.minter))
+
+  // BitcoinBlockProcessor::rollback of the cursor block (bitcoin_block_processor.rs:402-483,
+  // bitcoin_rollback.rs): every minter with an endorsement in the block loses its stored and
+  // pending endorsements and its double signs; what is left of them (stored, pending,
+  // double-sign evidence, minus this block) is evaluated again as one batch.
+  pure def rollbackBtcBlock(world: World, c: B::Btc, n: NodeState): NodeState = {
+    val h = n.cursor
+    val hh = B::heightOf(c, h)
+    val ms = endorsementsIn(world, c, h).map(e => e.minter)
+    val storedKeys = n.stored.keys().filter(k => ms.contains(k._1))
+    val storedMs = storedKeys.map(k => n.stored.get(k))
+    val remaining = storedMs.union(ofMinters(n.pending, ms)).union(ofMinters(n.dsEvidence, ms)).filter(e => e.incl != hh)
+    // evaluate_with_removals: the removed endorsements give their power back
+    val weights0 = storedKeys.map(k => n.stored.get(k).blockId).fold(n.weights, (ws, b) =>
+      applyDelta(world.blocks, n.known, ws, b,
+        0 - storedKeys.filter(k => n.stored.get(k).blockId == b).fold(0, (sum, k) => sum + n.storedEff.get(k))))
+    val kept = n.stored.keys().exclude(storedKeys)
+    val n0 = {
+      ...n,
+      stored: kept.mapBy(k => n.stored.get(k)),
+      storedEff: kept.mapBy(k => n.storedEff.get(k)),
+      pending: n.pending.exclude(ofMinters(n.pending, ms)),
+      doubleSigned: n.doubleSigned.exclude(ms),
+      dsEvidence: n.dsEvidence.exclude(ofMinters(n.dsEvidence, ms)),
+      weights: weights0,
+    }
+    { ...processBatch(world.blocks, n0, remaining), cursor: c.blocks.get(h).parent }
+  }
+
+  // what a rollback must restore exactly
+  pure def consensusState(n: NodeState): (
+    (str, int) -> Endorsement, (str, int) -> int, Set[Endorsement], Set[str], Set[Endorsement], BlockId -> WeightRec, int
+  ) = (n.stored, n.storedEff, n.pending, n.doubleSigned, n.dsEvidence, n.weights, n.cursor)
+
+  // an output of m that no transaction spends yet: the change of its last endorsement
+  pure def walletCoin(c: B::Btc, m: str): (int, int) =
+    B::spendableOuts(c, c.txs.keys()).exclude(B::spent(c, c.txs.keys()))
+      .filter(op => B::outAt(c, op).owner == m)
+      .fold((-1, -1), (_acc, op) => op)
+
+  // what fund_transaction_from_script can spend: listunspent with confirmations > 0 on the
+  // minter's script, minus outputs its bitcoind's mempool already spends
+  pure def confirmedCoins(c: B::Btc, tip: int, m: str): Set[(int, int)] =
+    B::listUnspent(c, tip, m, c.broadcast, 1)
+
+  // ... and takes the largest (ties: the smallest outpoint)
+  pure def pickCoin(c: B::Btc, coins: Set[(int, int)]): (int, int) =
+    coins.fold((-1, -1), (best, op) =>
+      if (best == (-1, -1)) op
+      else if (B::outAt(c, op).value != B::outAt(c, best).value)
+        if (B::outAt(c, op).value > B::outAt(c, best).value) op else best
+      else if (op._1 < best._1 or (op._1 == best._1 and op._2 < best._2)) op
+      else best)
 
   // ------------------------------------------------------------------
   // State
@@ -298,6 +387,7 @@ module flame_minting {
   var w: World
   var nodes: str -> NodeState
   var minters: str -> MinterState
+  // and B::btc, B::views, B::maxReorg, B::bcastHeight
 
   // demo-consensus root: a core block with core height 1 (target_btc_height is configurable).
   // TODO: the spec does not define genesis (core or not, core height, target, endorsable);
@@ -307,43 +397,72 @@ module flame_minting {
   }
 
   pure val emptyNode: NodeState = {
-    cursor: 0,
+    cursor: B::GENESIS,
     known: Set(GENESIS),
     importOrder: [GENESIS],
-    firstSeenAt: Map(GENESIS -> 0),
+    firstSeenAt: Map(GENESIS -> B::GENESIS),
     stored: Map(),
     storedEff: Map(),
     pending: Set(),
     doubleSigned: Set(),
+    dsEvidence: Set(),
     weights: Map(GENESIS -> { parentWeight: 0, effPower: 0 }),
   }
 
   action init = all {
-    w' = {
-      btcHeight: 0, btcChain: List(), mempool: Set(),
-      blocks: Map(GENESIS -> genesisBlock), nextId: 1, bft: GENESIS,
-    },
+    B::init,
+    w' = { payload: Map(), blocks: Map(GENESIS -> genesisBlock), nextId: 1, bft: GENESIS },
     nodes' = NODES.mapBy(_n => emptyNode),
-    minters' = HONEST.mapBy(_m => { journal: Map(), conflicts: Set(), lastTip: -1, missed: Set() }),
+    minters' = HONEST.mapBy(_m => { journal: Map(), conflicts: Set(), lastTip: B::NO_BLOCK, missed: Set(), unsent: Set() }),
   }
+
+  // the tip of a node's bitcoind; honest minters and the BFT read node n1's
+  def btcTip(nd: str): int = B::views.get(nd)
+
+  def btcHeight(nd: str): int = B::heightOf(B::btc, btcTip(nd))
 
   // ------------------------------------------------------------------
   // Actions
   // ------------------------------------------------------------------
 
-  // A Bitcoin block; endorsements of `censored` minters stay in the mempool.
+  action bitcoinUnchanged = all {
+    B::btc' = B::btc,
+    B::views' = B::views,
+    B::maxReorg' = B::maxReorg,
+    B::bcastHeight' = B::bcastHeight,
+  }
+
+  action flameUnchanged = all { w' = w, nodes' = nodes, minters' = minters }
+
+  // Bitcoin on its own: mining, censoring, publishing, bitcoinds following the chain.
+  action btcStep = all { B::envStep, flameUnchanged }
+
+  // An honest Bitcoin block on the best tip; endorsements of `censored` minters stay in the
+  // mempool. The nodes' bitcoinds do not see it yet (observeBtc).
   action mineBtc(censored: Set[str]): bool = {
-    val included = w.mempool.filter(e => not(censored.contains(e.minter)))
+    val tip = B::bestTip(B::btc)
     all {
-      w.btcHeight < MAX_BTC,
-      w' = {
-        ...w,
-        btcHeight: w.btcHeight + 1,
-        btcChain: w.btcChain.append(included.map(e => { ...e, incl: w.btcHeight + 1 })),
-        mempool: w.mempool.exclude(included),
-      },
-      nodes' = nodes,
-      minters' = minters,
+      B::mineHonest(tip, B::mempool(B::btc, tip).filter(t => not(censored.contains(w.payload.get(t).minter)))),
+      flameUnchanged,
+    }
+  }
+
+  // ... on any parent: a fork, if `parent` is not the best tip
+  action mineBtcOn(parent: int, censored: Set[str]): bool = all {
+    B::mineHonest(parent, B::mempool(B::btc, parent).filter(t => not(censored.contains(w.payload.get(t).minter)))),
+    flameUnchanged,
+  }
+
+  // A node's bitcoind adopts the best tip.
+  action observeBtc(nd: str): bool = all { B::observe(nd, B::bestTip(B::btc)), flameUnchanged }
+
+  // A minter signs `e` spending `coin`, change back to itself, and relays it or keeps it.
+  // The caller assigns nodes' and minters'.
+  action sendEndorsement(e: Endorsement, coin: (int, int), private: bool): bool = {
+    val tx = B::payment(B::btc, coin, e.minter)
+    all {
+      if (private) B::withholdTx(tx) else B::relayTx(tx),
+      w' = { ...w, payload: w.payload.put(tx.id, e) },
     }
   }
 
@@ -355,7 +474,7 @@ module flame_minting {
     val n = nodes.get("n1")
     val canon = canonicalTip(w.blocks, n)
     val parent = if (isAncestorOrSelf(w.blocks, canon, w.bft)) w.bft else canon
-    val target = w.btcHeight + 2
+    val target = btcHeight("n1") + 2
     val id = 100 + w.nextId
     all {
       w.nextId < MAX_BLOCKS,
@@ -371,6 +490,7 @@ module flame_minting {
       },
       nodes' = nodes,
       minters' = minters,
+      bitcoinUnchanged,
     }
   }
 
@@ -393,6 +513,7 @@ module flame_minting {
       },
       nodes' = nodes,
       minters' = minters,
+      bitcoinUnchanged,
     }
   }
 
@@ -402,32 +523,46 @@ module flame_minting {
   // let the minter endorse a core block that arrives after its tip was processed (FL-09).
   action honestEndorse(m: str): bool = {
     val n = nodes.get("n1")
-    val target = w.btcHeight + 1
+    val tip = btcTip("n1")
+    val target = btcHeight("n1") + 1
     val bid = firstImportedWithTarget(w.blocks, n, target)
     val ch = if (bid >= 0) w.blocks.get(bid).coreHeight else -1
     val prev = minters.get(m)
-    val ms = { ...prev, lastTip: w.btcHeight, missed: prev.missed.exclude(Set(target)) }
+    val ms = { ...prev, lastTip: tip, missed: prev.missed.exclude(Set(target)) }
     val reserved = ms.journal.keys().contains(ch)
     all {
-      prev.lastTip != w.btcHeight,
+      prev.lastTip != tip,
       nodes' = nodes,
       if (bid < 0)
         // "No core block for the BTC target height": the tip is used up, no retry (FL-09)
-        all { minters' = minters.set(m, { ...ms, missed: ms.missed.union(Set(target)) }), w' = w }
+        all { minters' = minters.set(m, { ...ms, missed: ms.missed.union(Set(target)) }), w' = w, bitcoinUnchanged }
       else if (reserved and ms.journal.get(ch) == bid)
         // AlreadyReserved: nothing to do
-        all { minters' = minters.set(m, ms), w' = w }
+        all { minters' = minters.set(m, ms), w' = w, bitcoinUnchanged }
       else if (reserved)
         // InMemoryMinterJournal::ConflictingEndorsement: logged, minter abstains (FL-02)
         all {
           minters' = minters.set(m, { ...ms, conflicts: ms.conflicts.union(Set(ch)) }),
           w' = w,
+          bitcoinUnchanged,
         }
-      else
-        all {
-          minters' = minters.set(m, { ...ms, journal: ms.journal.put(ch, bid) }),
-          w' = { ...w, mempool: w.mempool.union(Set({ minter: m, blockId: bid, coreHeight: ch, incl: -1 })) },
-        },
+      else {
+        val coins = confirmedCoins(B::btc, tip, m)
+        val reservedMs = { ...ms, journal: ms.journal.put(ch, bid) }
+        if (coins == Set())
+          // write_reserve_endorsement succeeded, send_endorsement fails ("no confirmed safe
+          // UTXOs"): the reservation stays, the worker moves on, AlreadyReserved never resends
+          all {
+            minters' = minters.set(m, { ...reservedMs, unsent: ms.unsent.union(Set(ch)) }),
+            w' = w,
+            bitcoinUnchanged,
+          }
+        else
+          all {
+            minters' = minters.set(m, reservedMs),
+            sendEndorsement({ minter: m, blockId: bid, coreHeight: ch, incl: -1 }, pickCoin(B::btc, coins), false),
+          }
+      },
     }
   }
 
@@ -435,9 +570,12 @@ module flame_minting {
   // and the new worker processes the current tip again.
   action restartMinter(m: str): bool = all {
     minters.get(m).journal.keys().size() > 0,
-    minters' = minters.set(m, { ...minters.get(m), journal: Map(), conflicts: Set(), lastTip: -1 }),
+    minters' = minters.set(m, {
+      ...minters.get(m), journal: Map(), conflicts: Set(), lastTip: B::NO_BLOCK, unsent: Set(),
+    }),
     w' = w,
     nodes' = nodes,
+    bitcoinUnchanged,
   }
 
   // Anyone may build a block anywhere, with any core metadata (design-doc.md:444, FL-01).
@@ -454,14 +592,21 @@ module flame_minting {
     },
     nodes' = nodes,
     minters' = minters,
+    bitcoinUnchanged,
   }
 
-  // Adversary (or a burn-less identity) endorses any (core height, hash), known or not.
-  action advEndorse(m: str, bid: BlockId, ch: int): bool = all {
-    w' = { ...w, mempool: w.mempool.union(Set({ minter: m, blockId: bid, coreHeight: ch, incl: -1 })) },
+  // Adversary (or a burn-less identity) endorses any (core height, hash), known or not,
+  // with any output it has: a spent one makes a conflicting transaction.
+  action advEndorseWith(m: str, coin: (int, int), private: bool, bid: BlockId, ch: int): bool = all {
+    B::outAt(B::btc, coin).owner == m,
+    sendEndorsement({ minter: m, blockId: bid, coreHeight: ch, incl: -1 }, coin, private),
     nodes' = nodes,
     minters' = minters,
   }
+
+  // ... relayed, spending the change of its last endorsement
+  action advEndorse(m: str, bid: BlockId, ch: int): bool =
+    advEndorseWith(m, walletCoin(B::btc, m), false, bid, ch)
 
   // Gossip: any created block may reach any node at any time, or never (withholding).
   action deliver(nd: str, b: BlockId): bool = all {
@@ -471,18 +616,28 @@ module flame_minting {
     nodes' = nodes.set(nd, arrive(w.blocks, nodes.get(nd), b)),
     w' = w,
     minters' = minters,
+    bitcoinUnchanged,
   }
 
-  action processBtc(nd: str): bool = all {
-    nodes.get(nd).cursor < w.btcHeight,
-    nodes' = nodes.set(nd, processBtcBlock(w, nodes.get(nd))),
-    w' = w,
-    minters' = minters,
+  // The indexer hands the node the next step towards its bitcoind's tip: roll back the
+  // cursor block while it is off that branch, then apply the next block of the branch.
+  action processBtc(nd: str): bool = {
+    val n = nodes.get(nd)
+    val tip = btcTip(nd)
+    all {
+      n.cursor != tip,
+      nodes' = nodes.set(nd,
+        if (B::isAncestor(B::btc, n.cursor, tip))
+          processBtcBlock(w, B::btc, n, B::chain(B::btc, tip)[B::heightOf(B::btc, n.cursor) + 1])
+        else rollbackBtcBlock(w, B::btc, n)),
+      w' = w,
+      minters' = minters,
+      bitcoinUnchanged,
+    }
   }
 
   action step = any {
-    nondet censored = MINTERS.powerset().oneOf()
-    mineBtc(censored),
+    btcStep,
     bftPropose,
     bftRegular,
     nondet m = HONEST.oneOf()
@@ -497,7 +652,9 @@ module flame_minting {
     nondet m = ADVERSARY.union(NO_BURN).oneOf()
     nondet bid = w.blocks.keys().union(Set(GHOST)).oneOf()
     nondet ch = 0.to(MAX_CORE).oneOf()
-    advEndorse(m, bid, ch),
+    nondet coin = B::allOutpoints(B::btc).oneOf()
+    nondet private = Set(true, false).oneOf()
+    advEndorseWith(m, coin, private, bid, ch),
     nondet nd = NODES.oneOf()
     nondet b = w.blocks.keys().oneOf()
     deliver(nd, b),
@@ -510,13 +667,13 @@ module flame_minting {
   // ------------------------------------------------------------------
 
   // FL-01: on the canonical chain core targets strictly increase (one core block per BTC slot).
-  val canonicalSlotsIncrease: bool = {
-    val n = nodes.get("n1")
+  val canonicalSlotsIncrease: bool = NODES.forall(nd => {
+    val n = nodes.get(nd)
     val cores = ancestorsOrSelf(w.blocks, canonicalTip(w.blocks, n)).filter(b => w.blocks.get(b).isCore)
     cores.forall(x => cores.forall(y =>
       (w.blocks.get(x).height < w.blocks.get(y).height) implies
         (w.blocks.get(x).target < w.blocks.get(y).target)))
-  }
+  })
 
   pure def endorsedOnTimeByAllHonest(blocks: BlockId -> Block, n: NodeState, b: BlockId): bool =
     HONEST.forall(m => {
@@ -528,13 +685,13 @@ module flame_minting {
 
   // FL-01, FL-05: a 36% adversary cannot displace an honest core block
   // that every honest minter endorsed with zero delay.
-  val honestCoreBlocksStay: bool = {
-    val n = nodes.get("n1")
+  val honestCoreBlocksStay: bool = NODES.forall(nd => {
+    val n = nodes.get(nd)
     val tip = canonicalTip(w.blocks, n)
     n.known
       .filter(b => w.blocks.get(b).honest and w.blocks.get(b).isCore and endorsedOnTimeByAllHonest(w.blocks, n, b))
       .forall(b => isAncestorOrSelf(w.blocks, b, tip))
-  }
+  })
 
   // FL-02: an honest minter following fork choice is never blocked by its own journal...
   val honestMintersNeverBlocked: bool = HONEST.forall(m => minters.get(m).conflicts.size() == 0)
@@ -552,22 +709,28 @@ module flame_minting {
   }
 
   // FL-07: pending endorsements come from minters with power and expire after MAX_DELAY.
+  // Disputed (PR #49): the author holds the attack too costly, one Bitcoin transaction
+  // per pending record.
   val pendingBounded: bool =
     NODES.forall(nd => nodes.get(nd).pending.forall(e =>
-      POWER.get(e.minter) > 0 and nodes.get(nd).cursor - e.incl <= MAX_DELAY))
+      POWER.get(e.minter) > 0 and B::heightOf(B::btc, nodes.get(nd).cursor) - e.incl <= MAX_DELAY))
 
   // FL-08: design-doc.md:144 -- a block that shows up long after its slot cannot gain weight.
-  val lateBlocksGetNoWeight: bool = {
-    val n = nodes.get("n1")
+  // Disputed (PR #49): the author reads design-doc.md:14 as limiting delayed endorsements
+  // only, and holds a delayed block reveal an acceptable risk.
+  val lateBlocksGetNoWeight: bool = NODES.forall(nd => {
+    val n = nodes.get(nd)
     n.known.forall(b =>
-      if (w.blocks.get(b).isCore and n.firstSeenAt.get(b) - w.blocks.get(b).target > MAX_DELAY)
+      if (w.blocks.get(b).isCore and B::heightOf(B::btc, n.firstSeenAt.get(b)) - w.blocks.get(b).target > MAX_DELAY)
         n.weights.get(b).effPower == 0
       else true)
-  }
+  })
 
   // FL-09: core-blocks.md step 3 -- an honest minter that found no core block for its tip
   // still endorses it once it arrives; it never ends up holding a missed slot whose honest
   // core block node n1 knows by now.
+  // Disputed (PR #49): the author calls endorsing only an already known core block the
+  // simplest strategy, since a late endorsement earns less.
   val honestMintersNeverMissSlot: bool = {
     val n = nodes.get("n1")
     HONEST.forall(m => minters.get(m).missed.forall(t =>
@@ -577,6 +740,52 @@ module flame_minting {
         w.blocks.get(b).target == t,
       }))))
   }
+
+  // FL-10: an honest minter sends every endorsement it reserves.
+  // fund_transaction_from_script spends confirmed outputs only (transaction_builder.rs:106)
+  // and returns the change to the same script, so while the minter's last endorsement waits
+  // for a block it has nothing to spend. Endorser::endorse has already reserved the core
+  // height (endorser.rs:45-55), the worker logs the error and waits for the next tip
+  // (minter_worker.rs:99-100), and a reserved height is never sent again
+  // (in_memory_minter_journal.rs:86-88).
+  // A failed send after a restart is harmless when an earlier transaction carries the same
+  // endorsement.
+  val honestEndorsementsSent: bool = HONEST.forall(m => {
+    val ms = minters.get(m)
+    ms.unsent.forall(ch => w.payload.keys().exists(t =>
+      w.payload.get(t) == { minter: m, blockId: ms.journal.get(ch), coreHeight: ch, incl: -1 }))
+  })
+
+  // for tests, which cannot see B
+  val B_maxReorg: int = B::maxReorg
+  def onBtcBranch(nd: str): bool = B::isAncestor(B::btc, nodes.get(nd).cursor, btcTip(nd))
+  def nextBlockMinters(nd: str): Set[str] =
+    B::publishedBlocks(B::btc).filter(h => B::btc.blocks.get(h).parent == nodes.get(nd).cursor)
+      .fold(Set(), (acc, h) => acc.union(endorsementsIn(w, B::btc, h).map(e => e.minter)))
+
+  // Rolling back a Bitcoin block undoes it: a node that applied the next block of any
+  // branch and rolled it back is where it was (ConsensusUndo).
+  val rollbackUndoes: bool = NODES.forall(nd => {
+    val n = nodes.get(nd)
+    B::publishedBlocks(B::btc).filter(h => B::btc.blocks.get(h).parent == n.cursor).forall(h =>
+      consensusState(rollbackBtcBlock(w, B::btc, processBtcBlock(w, B::btc, n, h))) == consensusState(n))
+  })
+
+  // ... also when a Flame block arrives in between: the node ends where a node that never
+  // saw the Bitcoin block is after the same arrival.
+  val rollbackCommutesWithArrival: bool = NODES.forall(nd => {
+    val n = nodes.get(nd)
+    B::publishedBlocks(B::btc).filter(h => B::btc.blocks.get(h).parent == n.cursor).forall(h =>
+      w.blocks.keys().filter(b => not(n.known.contains(b)) and n.known.contains(w.blocks.get(b).parent))
+        .forall(b =>
+          consensusState(rollbackBtcBlock(w, B::btc, arrive(w.blocks, processBtcBlock(w, B::btc, n, h), b)))
+            == consensusState(arrive(w.blocks, n, b))))
+  })
+
+  // FL-11: both properties above fail when the rolled-back block holds an endorsement of a
+  // minter banned by an earlier block: the rollback evaluates the minter's stored endorsements
+  // and its double-sign evidence as one batch, and a double sign anywhere in a batch drops
+  // all of the minter's endorsements in it (endorsement_validator.rs:141-150).
 
   // FL-06: the security argument assumes burns last at least 2048 blocks.
   val paramsMatchRationale: bool = MIN_DURATION >= RATIONALE_MIN_DURATION
@@ -590,191 +799,11 @@ module flame_minting {
     pendingBounded,
     lateBlocksGetNoWeight,
     honestMintersNeverMissSlot,
+    honestEndorsementsSent,
+    rollbackUndoes,                 // FL-11
+    rollbackCommutesWithArrival,    // FL-11
   }
 
-  // ------------------------------------------------------------------
-  // Reproductions: each run ends in a state that violates one promise
-  // ------------------------------------------------------------------
-
-  // FL-01: three core blocks on one target outweigh an honest block with 7/11 of the power.
-  run fl01CoreSpamTest =
-    init
-      .then(advBlock(GENESIS, true, 2, 1))                // id 1
-      .then(advBlock(1, true, 3, 1))                      // id 2, same target
-      .then(advBlock(2, true, 4, 1))                      // id 3, same target
-      .then(advEndorse("a", 1, 2))
-      .then(advEndorse("a", 2, 3))
-      .then(advEndorse("a", 3, 4))
-      .then(bftPropose)                                   // id 104: core 2, target 2
-      .then(deliver("n1", 104))
-      .then(deliver("n1", 1))
-      .then(deliver("n1", 2))
-      .then(deliver("n1", 3))
-      .then(mineBtc(Set()))                               // BTC 1: adversary endorsements
-      .then(honestEndorse("h1"))
-      .then(honestEndorse("h2"))
-      .then(mineBtc(Set()))                               // BTC 2: honest endorsements, delay 0
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .expect(and {
-        canonicalTip(w.blocks, nodes.get("n1")) == 3,     // weight 6 vs 2
-        not(canonicalSlotsIncrease),
-        not(honestCoreBlocksStay),
-      })
-
-  // FL-05: same slot, valid metadata, 4 vs 7 power -> both weigh floor(log2) = 2;
-  // the adversary's smaller hash wins the tie.
-  run fl05TieGrindTest =
-    init
-      .then(bftPropose)                                   // id 101: core 2, target 2
-      .then(deliver("n1", 101))
-      .then(advBlock(GENESIS, true, 2, 2))                // id 2: core 2, target 2
-      .then(deliver("n1", 2))
-      .then(mineBtc(Set()))                               // BTC 1
-      .then(honestEndorse("h1"))
-      .then(honestEndorse("h2"))
-      .then(advEndorse("a", 2, 2))
-      .then(mineBtc(Set()))                               // BTC 2: everyone on time
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .expect(and {
-        canonicalTip(w.blocks, nodes.get("n1")) == 2,
-        canonicalSlotsIncrease,                           // not FL-01: metadata is valid
-        not(honestCoreBlocksStay),
-      })
-
-  // FL-02: Bitcoin miners delay honest endorsements, a valid adversary branch with fewer
-  // core blocks wins, BFT restarts on it and reuses core height 3. The honest journal refuses
-  // to endorse; after a restart the minter endorses and is banned forever.
-  run fl02HonestSlashedTest =
-    init
-      .then(bftPropose)                                   // A1 = 101: core 2, target 2
-      .then(deliver("n1", 101))
-      .then(mineBtc(Set()))                               // BTC 1
-      .then(honestEndorse("h1"))                          // journal: 2 -> 101
-      .then(honestEndorse("h2"))
-      .then(bftPropose)                                   // A2 = 102: core 3, target 3
-      .then(deliver("n1", 102))
-      .then(advBlock(GENESIS, true, 2, 3))                // B1 = 3: core 2, target 3
-      .then(deliver("n1", 3))
-      .then(mineBtc(HONEST))                              // BTC 2: honest txs delayed
-      .then(honestEndorse("h1"))                          // journal: 3 -> 102
-      .then(honestEndorse("h2"))
-      .then(advEndorse("a", 3, 2))
-      .then(mineBtc(HONEST))                              // BTC 3: only the adversary
-      .then(mineBtc(Set()))                               // BTC 4: honest txs, delays 2 and 1
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))                             // B1 (2) beats A1 + A2 (0 + 1)
-      .then(bftPropose)                                   // 104 on B1: core 3, target 6
-      .then(deliver("n1", 104))
-      .then(mineBtc(Set()))                               // BTC 5
-      .then(honestEndorse("h1"))                          // core 3 already reserved for 102
-      .expect(and {
-        // fork choice moved to B1; the fresh 104 ties with its parent and loses on hash (FL-05)
-        canonicalTip(w.blocks, nodes.get("n1")) == 3,
-        w.blocks.get(104).parent == 3,
-        not(honestMintersNeverBlocked),
-      })
-      .then(restartMinter("h1"))                          // in-memory journal is gone
-      .then(honestEndorse("h1"))
-      .then(mineBtc(Set()))                               // BTC 6
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .expect(not(honestNeverDoubleSigned))
-
-  // FL-03: same blocks, same Bitcoin chain, different arrival order -> different weights.
-  run fl03OrderDependenceTest =
-    init
-      .then(advBlock(GENESIS, true, 2, 1))                // B1 = 1: core 2
-      .then(advBlock(GENESIS, true, 3, 2))                // X = 2: core 3
-      .then(advBlock(GENESIS, true, 3, 2))                // Y = 3: core 3, other hash
-      .then(advEndorse("a", 1, 2))
-      .then(mineBtc(Set()))                               // BTC 1: a -> B1
-      .then(advEndorse("a", 2, 3))
-      .then(advEndorse("a", 3, 3))
-      .then(mineBtc(Set()))                               // BTC 2: a signs X and Y
-      // n1 knows B1 early
-      .then(deliver("n1", 1))
-      .then(processBtc("n1"))
-      .then(deliver("n1", 2))
-      .then(deliver("n1", 3))
-      .then(processBtc("n1"))
-      // n2 learns about the double sign before B1 arrives
-      .then(processBtc("n2"))
-      .then(deliver("n2", 2))
-      .then(deliver("n2", 3))
-      .then(processBtc("n2"))
-      .then(deliver("n2", 1))
-      .expect(and {
-        nodes.get("n1").weights.get(1).effPower == 4,
-        nodes.get("n2").weights.get(1).effPower == 0,
-        not(determinism),
-      })
-
-  // FL-07: an identity without burns endorses a block that will never exist; it stays forever.
-  run fl07PendingDosTest =
-    init
-      .then(advEndorse("x", GHOST, 1))
-      .then(mineBtc(Set()))
-      .then(processBtc("n1"))
-      .then(mineBtc(Set()))
-      .then(mineBtc(Set()))
-      .then(mineBtc(Set()))
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .expect(and {
-        nodes.get("n1").pending.size() == 1,
-        not(pendingBounded),
-      })
-
-  // FL-08: endorse a hidden block on time, reveal it three BTC blocks later: full weight.
-  run fl08HiddenForkTest =
-    init
-      .then(advBlock(GENESIS, true, 2, 1))                // id 1: core 2, withheld
-      .then(advEndorse("a", 1, 2))
-      .then(mineBtc(Set()))                               // BTC 1: on time
-      .then(mineBtc(Set()))
-      .then(mineBtc(Set()))
-      .then(mineBtc(Set()))
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .then(deliver("n1", 1))                             // revealed at cursor 4
-      .expect(and {
-        nodes.get("n1").weights.get(1).effPower == 4,
-        not(lateBlocksGetNoWeight),
-      })
-
-  // FL-09: the honest core block reaches n1 right after h1 processed the tip: h1 never
-  // endorses it, h2 (which processes the tip later) does. The block gets 3 of 7 honest power.
-  run fl09MissedSlotTest =
-    init
-      .then(bftPropose)                                   // id 101: core 2, target 2; gossip slow
-      .then(mineBtc(Set()))                               // BTC 1
-      .then(honestEndorse("h1"))                          // no core block for target 2 yet
-      .then(deliver("n1", 101))                           // arrives at the same tip
-      .then(honestEndorse("h2"))                          // h2 sees it
-      .expect(and {
-        minters.get("h1").missed == Set(2),
-        not(honestMintersNeverMissSlot),
-      })
-      .then(mineBtc(Set()))                               // BTC 2: only h2, delay 0
-      .then(honestEndorse("h1"))                          // tip 2 -> target 3: nothing
-      .then(processBtc("n1"))
-      .then(processBtc("n1"))
-      .expect(and {
-        nodes.get("n1").weights.get(101).effPower == 3,
-        not(nodes.get("n1").stored.keys().contains(("h1", 2))),
-        not(honestMintersNeverMissSlot),
-      })
-
-  // FL-06: parameters in code contradict the rationale.
-  run fl06ParamsTest = init.expect(not(paramsMatchRationale))
-
-  // Minor: 50 FLM in sparks reaches zero after 33 halvings, not 64 (design-doc.md:549).
-  run halvingTest = init.expect(5_000_000_000 / 2^33 == 0 and 5_000_000_000 / 2^32 > 0)
+  // Bitcoin's own invariants still hold with Flame on top: they must never fail.
+  val bitcoinOk: bool = B::allInvariants
 }
