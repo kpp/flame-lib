@@ -7,7 +7,7 @@
  * what the code itself needs: a Bitcoin rollback undoes the block (rollbackUndoes,
  * rollbackCommutesWithArrival). Each `run` test in flame_consensus_test.qnt drives the
  * model into a state where one of them is violated, reproducing an issue from the review
- * doc (FL-01 .. FL-08). FL-09, FL-10 and FL-11 were found while checking this model
+ * doc (FL-01 .. FL-08). FL-09 .. FL-12 were found while checking this model
  * against the code and are not in the review doc yet.
  * A fixed protocol should live in a separate module and pass the same invariants.
  *
@@ -85,6 +85,7 @@ module flame_minting {
     pending: Set[Endorsement],                // EndorsementStorage.pending_endorsements
     doubleSigned: Set[str],                   // DoubleSignStorage: any entry = banned forever
     dsEvidence: Set[Endorsement],             // DoubleSign.endorsements of every entry
+    banAt: str -> int,                        // BTC height of the minter's first double sign
     weights: BlockId -> WeightRec,            // WeightedHeaderStorage
   }
 
@@ -108,6 +109,20 @@ module flame_minting {
   // ------------------------------------------------------------------
   // Parameters
   // ------------------------------------------------------------------
+
+  // Tmp params for fixes; all false = the code.
+  // FL-01: a core block's target is above the last core target of its chain.
+  const FIX_FL01: bool
+  // FL-02: the minter journal is persistent: a restart keeps it.
+  const FIX_FL02: bool
+  // FL-03: a minter is banned from the Bitcoin height of its first double sign on;
+  // its endorsements included earlier stay valid, except at the double-signed core height.
+  const FIX_FL03: bool
+  // FL-05: block weights are compared exactly, not as floor(log2) (decimals in the real fix;
+  // the model takes the exact value, so rounding issues of the real fix are not covered).
+  const FIX_FL05: bool
+  // FL-10: an honest minter may also spend the change of its own unconfirmed endorsements.
+  const FIX_FL10: bool
 
   pure val HONEST = Set("h1", "h2")
   pure val ADVERSARY = Set("a")
@@ -177,11 +192,22 @@ module flame_minting {
     if (c == -1) 0 else blocks.get(c).target
   }
 
-  // weighted_header_storage.rs:50-57
-  pure def chainWeight(blocks: BlockId -> Block, n: NodeState, b: BlockId): int = {
-    val rec = n.weights.get(b)
-    rec.parentWeight + (if (blocks.get(b).isCore) ilog2(rec.effPower) else 0)
-  }
+  // weighted_header_storage.rs:50-57; FIX_FL05: exact, see exactWeight
+  pure def chainWeight(blocks: BlockId -> Block, n: NodeState, b: BlockId): int =
+    if (FIX_FL05) exactWeight(blocks, n, b)
+    else {
+      val rec = n.weights.get(b)
+      rec.parentWeight + (if (blocks.get(b).isCore) ilog2(rec.effPower) else 0)
+    }
+
+  // FIX_FL05: the sum of log2(effective power) over the chain's core blocks, compared without
+  // rounding: 2^weight = the product of the powers (a power of 0 or 1 adds log2 = 0, like
+  // checked_ilog2().unwrap_or(0))
+  pure def exactWeight(blocks: BlockId -> Block, n: NodeState, b: BlockId): int =
+    ancestorsOrSelf(blocks, b).filter(x => blocks.get(x).isCore).fold(1, (acc, x) => {
+      val p = n.weights.get(x).effPower
+      acc * (if (p > 1) p else 1)
+    })
 
   // weighted_header_storage.rs:42-47: max weight, ties -> smallest hash; ALL blocks are candidates
   pure def canonicalTip(blocks: BlockId -> Block, n: NodeState): BlockId =
@@ -210,15 +236,19 @@ module flame_minting {
     else false
 
   // endorsement_validator.rs:69-84: unknown block -> pending, no power check (FL-07)
+  // banned now (FL-03), or (FIX_FL03) at the endorsement's inclusion height
+  pure def bannedFor(n: NodeState, e: Endorsement): bool =
+    n.doubleSigned.contains(e.minter) and (not(FIX_FL03) or n.banAt.get(e.minter) <= e.incl)
+
   pure def isPendingE(blocks: BlockId -> Block, n: NodeState, e: Endorsement): bool =
-    not(isKnownCore(blocks, n, e)) and not(n.doubleSigned.contains(e.minter))
+    not(isKnownCore(blocks, n, e)) and not(bannedFor(n, e))
 
   // endorsement_validator.rs:85-104: target reached, not banned NOW (FL-03), has burns
   pure def isEligible(blocks: BlockId -> Block, n: NodeState, e: Endorsement): bool =
     if (isKnownCore(blocks, n, e))
       and {
         e.incl >= blocks.get(e.blockId).target,
-        not(n.doubleSigned.contains(e.minter)),
+        not(bannedFor(n, e)),
         POWER.get(e.minter) > 0,
       }
     else false
@@ -251,11 +281,32 @@ module flame_minting {
   ): BlockId -> WeightRec = {
     val oldP = ws.get(b).effPower
     val newP = oldP + d
-    val dl = ilog2(newP) - ilog2(oldP)
+    // FIX_FL05: chain weights are computed from the powers, parentWeight is not used
+    val dl = if (FIX_FL05) 0 else ilog2(newP) - ilog2(oldP)
     val ws1 = ws.set(b, { ...ws.get(b), effPower: newP })
     descendants(blocks, known, b).fold(ws1, (acc, x) =>
       acc.set(x, { ...acc.get(x), parentWeight: acc.get(x).parentWeight + dl }))
   }
+
+  pure val NEVER = 1000000
+
+  pure def minInt(a: int, b: int): int = if (a < b) a else b
+
+  // FIX_FL03: the inclusion height at which core height k got its second hash
+  pure def banPoint(n: NodeState, eligible: Set[Endorsement], k: (str, int)): int = {
+    val es = eligible.filter(e => keyOf(e) == k)
+      .union(if (n.stored.keys().contains(k)) Set(n.stored.get(k)) else Set())
+    val first = es.map(e => e.blockId).map(b => es.filter(e => e.blockId == b).fold(NEVER, (acc, e) => minInt(acc, e.incl)))
+    val m1 = first.fold(NEVER, (acc, x) => minInt(acc, x))
+    val tied = es.map(e => e.blockId).filter(b => es.filter(e => e.blockId == b).fold(NEVER, (acc, e) => minInt(acc, e.incl)) == m1)
+    if (tied.size() > 1) m1 else first.exclude(Set(m1)).fold(NEVER, (acc, x) => minInt(acc, x))
+  }
+
+  // a disqualified minter loses all its endorsements in the batch (code: endorsement_validator.rs
+  // 141-150), or (FIX_FL03) only those included at or after its ban height
+  pure def dropped(e: Endorsement, disq: Set[str], banAfter: str -> int): bool =
+    if (FIX_FL03) banAfter.keys().contains(e.minter) and e.incl >= banAfter.get(e.minter)
+    else disq.contains(e.minter)
 
   /// EndorsementValidator + Weighter + ConsensusOperations on one batch of endorsements:
   /// a Bitcoin block, or the pending endorsements of a block that just arrived.
@@ -267,13 +318,25 @@ module flame_minting {
     // double sign = same minter, same CORE HEIGHT, different hash (FL-02)
     val dsKeys = eKeys.filter(k => hashesAt(n, eligible, k).size() > 1)
     val disq = dsKeys.map(k => k._1)
+    // FIX_FL03: the ban starts at the earliest height where some core height has two hashes
+    val banAfter = n.doubleSigned.union(disq).mapBy(m => {
+      val fresh = dsKeys.filter(k => k._1 == m).fold(NEVER, (acc, k) => minInt(acc, banPoint(n, eligible, k)))
+      if (n.doubleSigned.contains(m)) minInt(n.banAt.get(m), fresh) else fresh
+    })
+    // FIX_FL03: stored endorsements included at or after the ban lose their weight too
+    val lateKeys = if (FIX_FL03)
+        storedKeys.filter(k => banAfter.keys().contains(k._1) and n.stored.get(k).incl >= banAfter.get(k._1))
+      else Set()
     // only the stored endorsement at the conflicting height is removed;
     // the minter's endorsements at other heights keep their weight (FL-03)
-    val removedKeys = dsKeys.filter(k => storedKeys.contains(k))
+    val removedKeys = dsKeys.filter(k => storedKeys.contains(k)).union(lateKeys)
     val accKeys = eKeys.filter(k => and {
       not(dsKeys.contains(k)),
-      not(disq.contains(k._1)),
+      not(dropped(firstOf(eligible.filter(e => keyOf(e) == k)), disq, banAfter)),
       not(storedKeys.contains(k)),
+      // FIX_FL03: a double-signed core height stays dropped, also for an endorsement
+      // included before the ban that reaches the node late
+      not(FIX_FL03) or n.dsEvidence.forall(e => keyOf(e) != k),
     })
     val accepted = accKeys.map(k => firstOf(eligible.filter(e => keyOf(e) == k)))
     val affected = removedKeys.map(k => n.stored.get(k).blockId).union(accepted.map(e => e.blockId))
@@ -281,7 +344,7 @@ module flame_minting {
       applyDelta(blocks, n.known, ws, b, deltaFor(blocks, n, accepted, removedKeys, b)))
     // HeightEndorsements::record_endorsement: every endorsement at the height, stored one first
     val evidence = eligible.filter(e => dsKeys.contains(keyOf(e)))
-      .union(removedKeys.map(k => n.stored.get(k)))
+      .union(dsKeys.filter(k => storedKeys.contains(k)).map(k => n.stored.get(k)))
     val keptKeys = storedKeys.exclude(removedKeys)
     val stored1 = accepted.fold(keptKeys.mapBy(k => n.stored.get(k)), (m, e) => m.put(keyOf(e), e))
     val eff1 = accepted.fold(keptKeys.mapBy(k => n.storedEff.get(k)), (m, e) =>
@@ -290,9 +353,12 @@ module flame_minting {
       ...n,
       stored: stored1,
       storedEff: eff1,
-      pending: n.pending.exclude(batch).union(pendingNew.filter(e => not(disq.contains(e.minter)))),
+      pending:
+        if (FIX_FL03) n.pending.exclude(batch).union(pendingNew).filter(e => not(dropped(e, disq, banAfter)))
+        else n.pending.exclude(batch).union(pendingNew.filter(e => not(disq.contains(e.minter)))),
       doubleSigned: n.doubleSigned.union(disq),
       dsEvidence: n.dsEvidence.union(evidence),
+      banAt: banAfter,
       weights: weights1,
     }
   }
@@ -301,7 +367,7 @@ module flame_minting {
   // parent_weight = chain weight of the parent; flame_block_processor.rs:91-110 then
   // re-evaluates the pending endorsements of a core block against the CURRENT state.
   pure def arrive(blocks: BlockId -> Block, n: NodeState, b: BlockId): NodeState = {
-    val pw = chainWeight(blocks, n, blocks.get(b).parent)
+    val pw = if (FIX_FL05) 0 else chainWeight(blocks, n, blocks.get(b).parent)
     val n1 = {
       ...n,
       known: n.known.union(Set(b)),
@@ -329,15 +395,18 @@ module flame_minting {
 
   // BitcoinBlockProcessor::rollback of the cursor block (bitcoin_block_processor.rs:402-483,
   // bitcoin_rollback.rs): every minter with an endorsement in the block loses its stored and
-  // pending endorsements and its double signs; what is left of them (stored, pending,
-  // double-sign evidence, minus this block) is evaluated again as one batch.
+  // pending endorsements and its double signs; everything else of them (every endorsement
+  // in the applied blocks, get_applied_endorsements, plus stored, pending and double-sign
+  // evidence, minus this block) is evaluated again as one batch.
   pure def rollbackBtcBlock(world: World, c: B::Btc, n: NodeState): NodeState = {
     val h = n.cursor
     val hh = B::heightOf(c, h)
     val ms = endorsementsIn(world, c, h).map(e => e.minter)
     val storedKeys = n.stored.keys().filter(k => ms.contains(k._1))
     val storedMs = storedKeys.map(k => n.stored.get(k))
-    val remaining = storedMs.union(ofMinters(n.pending, ms)).union(ofMinters(n.dsEvidence, ms)).filter(e => e.incl != hh)
+    val applied = B::chain(c, h).foldl(Set(), (acc, b) => acc.union(endorsementsIn(world, c, b)))
+    val remaining = ofMinters(applied, ms).union(storedMs).union(ofMinters(n.pending, ms))
+      .union(ofMinters(n.dsEvidence, ms)).filter(e => e.incl != hh)
     // evaluate_with_removals: the removed endorsements give their power back
     val weights0 = storedKeys.map(k => n.stored.get(k).blockId).fold(n.weights, (ws, b) =>
       applyDelta(world.blocks, n.known, ws, b,
@@ -350,15 +419,19 @@ module flame_minting {
       pending: n.pending.exclude(ofMinters(n.pending, ms)),
       doubleSigned: n.doubleSigned.exclude(ms),
       dsEvidence: n.dsEvidence.exclude(ofMinters(n.dsEvidence, ms)),
+      banAt: n.banAt.keys().exclude(ms).mapBy(m => n.banAt.get(m)),
       weights: weights0,
     }
     { ...processBatch(world.blocks, n0, remaining), cursor: c.blocks.get(h).parent }
   }
 
-  // what a rollback must restore exactly
+  // what a rollback must restore exactly. Double signs are compared by (minter, core height):
+  // a rollback re-evaluates the minter's whole history, so its DoubleSign record may also list
+  // later endorsements that the ban made the node ignore. Only storage differs, not weights.
   pure def consensusState(n: NodeState): (
-    (str, int) -> Endorsement, (str, int) -> int, Set[Endorsement], Set[str], Set[Endorsement], BlockId -> WeightRec, int
-  ) = (n.stored, n.storedEff, n.pending, n.doubleSigned, n.dsEvidence, n.weights, n.cursor)
+    (str, int) -> Endorsement, (str, int) -> int, Set[Endorsement], Set[str], Set[(str, int)], BlockId -> WeightRec, int,
+    str -> int
+  ) = (n.stored, n.storedEff, n.pending, n.doubleSigned, n.dsEvidence.map(e => keyOf(e)), n.weights, n.cursor, n.banAt)
 
   // an output of m that no transaction spends yet: the change of its last endorsement
   pure def walletCoin(c: B::Btc, m: str): (int, int) =
@@ -369,7 +442,14 @@ module flame_minting {
   // what fund_transaction_from_script can spend: listunspent with confirmations > 0 on the
   // minter's script, minus outputs its bitcoind's mempool already spends
   pure def confirmedCoins(c: B::Btc, tip: int, m: str): Set[(int, int)] =
-    B::listUnspent(c, tip, m, c.broadcast, 1)
+    B::listUnspent(c, tip, m, c.broadcast, 1).union(if (FIX_FL10) ownChange(c, tip, m) else Set())
+
+  // FIX_FL10: the minter's outputs created by its transactions waiting in the mempool and not
+  // spent by another one (listunspent minconf=0 for the wallet's own change)
+  pure def ownChange(c: B::Btc, tip: int, m: str): Set[(int, int)] = {
+    val waiting = B::mempool(c, tip)
+    B::spendableOuts(c, waiting).exclude(B::spent(c, waiting)).filter(op => B::outAt(c, op).owner == m)
+  }
 
   // ... and takes the largest (ties: the smallest outpoint)
   pure def pickCoin(c: B::Btc, coins: Set[(int, int)]): (int, int) =
@@ -406,6 +486,7 @@ module flame_minting {
     pending: Set(),
     doubleSigned: Set(),
     dsEvidence: Set(),
+    banAt: Map(),
     weights: Map(GENESIS -> { parentWeight: 0, effPower: 0 }),
   }
 
@@ -570,9 +651,9 @@ module flame_minting {
   // and the new worker processes the current tip again.
   action restartMinter(m: str): bool = all {
     minters.get(m).journal.keys().size() > 0,
-    minters' = minters.set(m, {
-      ...minters.get(m), journal: Map(), conflicts: Set(), lastTip: B::NO_BLOCK, unsent: Set(),
-    }),
+    minters' = minters.set(m,
+      if (FIX_FL02) { ...minters.get(m), lastTip: B::NO_BLOCK }
+      else { ...minters.get(m), journal: Map(), conflicts: Set(), lastTip: B::NO_BLOCK, unsent: Set() }),
     w' = w,
     nodes' = nodes,
     bitcoinUnchanged,
@@ -613,6 +694,9 @@ module flame_minting {
     w.blocks.keys().contains(b),
     not(nodes.get(nd).known.contains(b)),
     nodes.get(nd).known.contains(w.blocks.get(b).parent),
+    // FIX_FL01: the node rejects a core block whose target does not move forward
+    not(FIX_FL01) or not(w.blocks.get(b).isCore)
+      or w.blocks.get(b).target > lastCoreTarget(w.blocks, w.blocks.get(b).parent),
     nodes' = nodes.set(nd, arrive(w.blocks, nodes.get(nd), b)),
     w' = w,
     minters' = minters,

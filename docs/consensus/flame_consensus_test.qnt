@@ -1,12 +1,13 @@
 // -*- mode: Bluespec; -*-
 /**
  * Reproductions for flame_consensus.qnt: each run ends in a state that violates one
- * promise of the design doc or one property the code needs (FL-01 .. FL-11), plus
+ * promise of the design doc or one property the code needs (FL-01 .. FL-12), plus
  * parameter checks and the normal scenario.
  *   quint test flame_consensus_test.qnt
  */
 module flame_consensus_test {
-  import flame_minting.* from "./flame_consensus"
+  // the code as it is: no fixes
+  import flame_minting(FIX_FL01 = false, FIX_FL02 = false, FIX_FL03 = false, FIX_FL05 = false, FIX_FL10 = false).* from "./flame_consensus"
 
   // An honest Bitcoin block that both nodes' bitcoinds see at once.
   run btcBlock(censored: Set[str]): bool =
@@ -178,6 +179,34 @@ module flame_consensus_test {
         nodes.get("n1").weights.get(1).effPower == 0,
         nodes.get("n2").weights.get(1).effPower == 4,
         not(determinism),
+      })
+
+  // FL-12: the honest BFT skipped slot 1 (its first target is tip + 2). The adversary fills it:
+  // its branch has core blocks for slots 1 and 2, the honest one only for slot 2. Weight adds
+  // up per core block, so log2(2) + log2(4) = 3 beats log2(7) = 2.81: 4 of 11 power displaces
+  // an honest block every honest minter endorsed on time. Metadata is valid (not FL-01) and
+  // exact weights do not help (not FL-05).
+  run fl12SkippedSlotTest =
+    init
+      .then(bftPropose)                                   // 101: core 2, target 2
+      .then(advBlock(GENESIS, true, 2, 1))                // 2: core 2, target 1, the skipped slot
+      .then(advBlock(2, true, 3, 2))                      // 3: core 3, target 2
+      .then(deliver("n1", 101))
+      .then(deliver("n1", 2))
+      .then(deliver("n1", 3))
+      .then(btcBlock(Set()))                              // BTC 1
+      .then(honestEndorse("h1"))                          // target 2 -> 101
+      .then(honestEndorse("h2"))
+      .then(advEndorse("a", 2, 2))
+      .then(advEndorse("a", 3, 3))
+      .then(btcBlock(Set()))                              // BTC 2: 101 on time, 2 one block late
+      .then(processBtc("n1"))
+      .then(processBtc("n1"))
+      .expect(and {
+        endorsedOnTimeByAllHonest(w.blocks, nodes.get("n1"), 101),
+        canonicalTip(w.blocks, nodes.get("n1")) == 3,
+        canonicalSlotsIncrease,
+        not(honestCoreBlocksStay),
       })
 
   // FL-03: same blocks, same Bitcoin chain, different arrival order -> different weights.
